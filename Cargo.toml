@@ -1,0 +1,46 @@
+[workspace]
+members = [
+    "crates/tzap-cli",
+    "crates/tzap-core",
+]
+resolver = "2"
+
+[workspace.package]
+authors = ["Frank Zhu"]
+description = "Rust reference implementation of the tzap archive format specification"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.82"
+
+[workspace.dependencies]
+aes-gcm = "0.10"
+aes-gcm-siv = "0.11"
+anyhow = "1"
+argon2 = { version = "0.5", features = ["std"] }
+byteorder = "1"
+chacha20poly1305 = "0.10"
+clap = { version = "4", features = ["derive"] }
+crc32c = "0.6"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+rand = "0.8"
+reed-solomon-erasure = "6"
+rpassword = "7"
+sha2 = "0.10"
+subtle = "2"
+tar = "0.4"
+thiserror = "2"
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v4"] }
+zeroize = { version = "1", features = ["zeroize_derive"] }
+zstd = "0.13"
+
+[workspace.dependencies.assert_cmd]
+version = "2"
+
+[workspace.dependencies.predicates]
+version = "3"
+
+[workspace.dependencies.tempfile]
+version = "3"
