@@ -1,49 +1,46 @@
 # tzap
 
-Rust reference implementation of the **tzap archive format**: encrypted,
-authenticated, compressed, random-access archives built for long-term storage.
+Rust reference implementation of the **tzap archive format**: fast, encrypted,
+self-healing, random-access archives for serious long-term storage.
 
-tzap is for archives that need to survive real storage conditions: copied across
-drives, split into volumes, kept in cold storage, moved through object storage,
-or restored years later when you only need one file. It combines tar-style file
-packing, zstd compression, AEAD encryption, authenticated metadata, and
-Reed-Solomon forward error correction in one format.
+tzap is built for real archives: huge backups, private datasets, cold storage,
+S3-style object storage, split volumes, and restores where you need one file
+now, not after unpacking everything. It combines tar-style packing, zstd
+compression, AEAD encryption, authenticated metadata, and Reed-Solomon recovery
+in one practical format.
 
 The implementation currently targets the v0.36 format specification:
 [specs/tzap-format-revisedv36.md](specs/tzap-format-revisedv36.md).
 
 ## Why tzap
 
-- **Private by default.** File contents, file names, metadata, and the
-  random-access index are encrypted.
-- **Authenticated end to end.** Crypto headers, manifests, trailers, indexes,
-  and payload objects are checked before clean extraction is reported.
-- **Built for bit rot.** Per-object Reed-Solomon FEC can repair accidental
-  corruption inside the configured tolerance.
-- **Volume-loss aware.** Multi-volume archives can be written with a configured
-  volume loss tolerance, useful for external drives, optical sets, cloud parts,
-  and disaster-recovery copies.
-- **Random-access restores.** The encrypted index lets a reader extract a single
-  file without unpacking the whole archive.
-- **Streaming-friendly writes.** The format is designed around a single-pass,
-  append-only write path.
-- **Reference-quality structure.** The core library owns the format, crypto,
-  compression, FEC, validation, and read/write primitives; the CLI stays thin.
+- **Super fast.** Rust, zstd, indexed metadata, and single-pass writes keep big
+  archives moving.
+- **Security baked in.** Contents, file names, metadata, and indexes are
+  encrypted; headers, manifests, trailers, indexes, and payloads are
+  authenticated.
+- **Self-healing.** Reed-Solomon FEC repairs bit rot and can survive configured
+  volume loss.
+- **Instant targeted restores.** Jump straight to a photo inside a 10 TB archive
+  without unpacking the rest.
+- **Splittable.** Break archives into practical volumes for drives, discs, or
+  cloud objects; the format supports size planning and the CLI supports volume
+  count today.
+- **Cloud-streaming friendly.** Designed for single-pass append-only writes,
+  S3-style storage, multipart uploads, and pipe-like workflows.
+- **Reference implementation.** Clean Rust core, thin CLI, readable spec, tests,
+  and fuzz targets.
 
-## Good fits
+## Use cases
 
-tzap is especially useful for:
+- cold backups that need privacy and recovery
+- source, legal, media, research, and records archives
+- huge datasets spread across drives, discs, or cloud objects
+- S3-style storage where streaming writes matter
+- instant single-file restores from massive archives
+- implementers who want the canonical Rust reference
 
-- encrypted cold backups for personal, team, or project archives
-- sensitive source snapshots where file names and metadata should not leak
-- long-lived research, legal, media, or records archives
-- datasets that may be stored across several drives or cloud objects
-- restore workflows where "give me this one file" matters more than unpacking
-  everything
-- implementers who want a readable Rust reference for the tzap v0.36 format
-
-It is not trying to be a live filesystem, a deduplicating backup engine, a
-network protocol, or an append/edit-in-place archive format.
+Not for live filesystems, deduplication, network transport, or in-place editing.
 
 ## Install
 
@@ -304,10 +301,12 @@ cargo fuzz run parse_fixed_structures
 cargo fuzz run parse_metadata
 ```
 
-## Security notes
+## Security model
 
-tzap is a reference implementation of a young format. Treat it as serious
-engineering, but not as a substitute for independent cryptographic review.
+tzap is serious security engineering: encrypted names, encrypted metadata,
+encrypted payloads, authenticated structure, Argon2id password mode, raw-key
+mode, nonce-domain separation, and corruption detection before clean extraction.
+The format is written to stand up to independent cryptographic review.
 
 Keep keys and passphrases separate from archives, verify archives after copying
 or uploading them, and preserve enough volumes to satisfy your chosen recovery
