@@ -27,6 +27,8 @@ pub struct OwnedTarMember {
     pub kind: TarEntryKind,
     pub data: Vec<u8>,
     pub link_target: Option<Vec<u8>>,
+    pub mode: u32,
+    pub mtime: u64,
     pub logical_size: u64,
     pub diagnostics: Vec<MetadataDiagnostic>,
 }
@@ -37,6 +39,8 @@ pub struct ParsedTarMember<'a> {
     pub kind: TarEntryKind,
     pub data: &'a [u8],
     pub link_target: Option<Vec<u8>>,
+    pub mode: u32,
+    pub mtime: u64,
     pub logical_size: u64,
     pub diagnostics: Vec<MetadataDiagnostic>,
 }
@@ -48,6 +52,8 @@ impl ParsedTarMember<'_> {
             kind: self.kind,
             data: self.data.to_vec(),
             link_target: self.link_target.clone(),
+            mode: self.mode,
+            mtime: self.mtime,
             logical_size: self.logical_size,
             diagnostics: self.diagnostics.clone(),
         }
@@ -150,6 +156,8 @@ pub fn parse_tar_member_group<'a>(
                     b'1' => TarEntryKind::Hardlink,
                     _ => TarEntryKind::Regular,
                 };
+                let mode = parse_tar_octal(&header[100..108])? as u32;
+                let mtime = parse_tar_octal(&header[136..148])?;
                 let path = canonical_main_path(header, kind, &metadata, max_path_length)?;
                 let link_target =
                     canonical_link_target(header, kind, &path, &metadata, max_path_length)?;
@@ -171,6 +179,8 @@ pub fn parse_tar_member_group<'a>(
                     } else {
                         &[]
                     },
+                    mode,
+                    mtime,
                     link_target,
                     logical_size,
                     diagnostics: metadata.diagnostics,
@@ -880,6 +890,8 @@ mod tests {
                 kind: TarEntryKind::Regular,
                 data: b"blocked".to_vec(),
                 link_target: None,
+                mode: 0o644,
+                mtime: 0,
                 logical_size: 7,
                 diagnostics: Vec::new(),
             };
@@ -896,14 +908,16 @@ mod tests {
     fn safe_restore_requires_hardlink_target_to_be_existing_regular_file() {
         let tmp = tempdir().unwrap();
         fs::write(tmp.path().join("target.txt"), b"target").unwrap();
-        let member = OwnedTarMember {
-            path: b"linked.txt".to_vec(),
-            kind: TarEntryKind::Hardlink,
-            data: Vec::new(),
-            link_target: Some(b"target.txt".to_vec()),
-            logical_size: 0,
-            diagnostics: Vec::new(),
-        };
+            let member = OwnedTarMember {
+                path: b"linked.txt".to_vec(),
+                kind: TarEntryKind::Hardlink,
+                data: Vec::new(),
+                link_target: Some(b"target.txt".to_vec()),
+                mode: 0o644,
+                mtime: 0,
+                logical_size: 0,
+                diagnostics: Vec::new(),
+            };
 
         restore_tar_member(tmp.path(), &member, SafeExtractionOptions::default()).unwrap();
         assert_eq!(fs::read(tmp.path().join("linked.txt")).unwrap(), b"target");
@@ -917,6 +931,8 @@ mod tests {
             kind: TarEntryKind::Symlink,
             data: Vec::new(),
             link_target: Some(b"/outside".to_vec()),
+            mode: 0o644,
+            mtime: 0,
             logical_size: 0,
             diagnostics: Vec::new(),
         };
@@ -938,6 +954,8 @@ mod tests {
             kind: TarEntryKind::Directory,
             data: Vec::new(),
             link_target: None,
+            mode: 0o644,
+            mtime: 0,
             logical_size: 0,
             diagnostics: Vec::new(),
         };
@@ -966,6 +984,8 @@ mod tests {
             kind: TarEntryKind::Hardlink,
             data: Vec::new(),
             link_target: Some(b"a/a".to_vec()),
+            mode: 0o644,
+            mtime: 0,
             logical_size: 0,
             diagnostics: Vec::new(),
         };

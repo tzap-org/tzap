@@ -1067,6 +1067,7 @@ dependencies = [
  "predicates",
  "rand",
  "rpassword",
+ "serde_json",
  "tempfile",
  "tzap-core",
 ]

@@ -55,6 +55,10 @@ impl Default for ReaderOptions {
 pub struct ArchiveEntry {
     pub path: String,
     pub file_data_size: u64,
+    pub kind: TarEntryKind,
+    pub mode: u32,
+    pub mtime: u64,
+    pub diagnostics: Vec<MetadataDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,8 +382,17 @@ impl OpenedArchive {
     }
 
     pub fn list_files(&self) -> Result<Vec<ArchiveEntry>, FormatError> {
-        let mut final_entries = BTreeMap::<String, (u64, u64)>::new();
-        for shard in self.load_all_index_shards()? {
+        #[derive(Clone, Copy)]
+        struct WinningEntry {
+            start: u64,
+            file_data_size: u64,
+            shard_index: usize,
+            file_index: usize,
+        }
+
+        let shards = self.load_all_index_shards()?;
+        let mut final_entries = BTreeMap::<String, WinningEntry>::new();
+        for (shard_index, shard) in shards.iter().enumerate() {
             for (idx, file) in shard.files.iter().enumerate() {
                 let path = utf8_path(
                     shard
@@ -392,22 +405,39 @@ impl OpenedArchive {
                         .ok_or(FormatError::InvalidArchive(
                             "FileEntry tar member start is missing",
                         ))?;
-                final_entries
-                    .entry(path)
-                    .and_modify(|(best_start, file_data_size)| {
-                        if start > *best_start {
-                            *best_start = start;
-                            *file_data_size = file.file_data_size;
-                        }
-                    })
-                    .or_insert((start, file.file_data_size));
+                if let Some(winner) = final_entries.get_mut(&path) {
+                    if start >= winner.start {
+                        winner.start = start;
+                        winner.file_data_size = file.file_data_size;
+                        winner.shard_index = shard_index;
+                        winner.file_index = idx;
+                    }
+                } else {
+                    final_entries.insert(
+                        path,
+                        WinningEntry {
+                            start,
+                            file_data_size: file.file_data_size,
+                            shard_index,
+                            file_index: idx,
+                        },
+                    );
+                }
             }
         }
         Ok(final_entries
             .into_iter()
-            .map(|(path, (_, file_data_size))| ArchiveEntry {
-                path,
-                file_data_size,
+            .map(|(path, winner)| {
+                let shard = &shards[winner.shard_index];
+                let member = self.decode_loaded_owned_tar_member(shard, winner.file_index, false)?;
+                Ok(ArchiveEntry {
+                    path,
+                    file_data_size: winner.file_data_size,
+                    kind: member.kind,
+                    mode: member.mode,
+                    mtime: member.mtime,
+                    diagnostics: member.diagnostics,
+                })
             })
             .collect())
     }
@@ -2705,7 +2735,11 @@ mod tests {
             opened.list_files().unwrap(),
             vec![ArchiveEntry {
                 path: "dir/hello.txt".to_string(),
-                file_data_size: 8
+                file_data_size: 8,
+                kind: TarEntryKind::Regular,
+                mode: 0o644,
+                mtime: 0,
+                diagnostics: Vec::new(),
             }]
         );
         opened.verify().unwrap();
@@ -2846,7 +2880,11 @@ mod tests {
             opened.list_files().unwrap(),
             vec![ArchiveEntry {
                 path: "same.txt".to_string(),
-                file_data_size: 5
+                file_data_size: 5,
+                kind: TarEntryKind::Regular,
+                mode: 0o644,
+                mtime: 0,
+                diagnostics: Vec::new(),
             }]
         );
         assert_eq!(
@@ -2875,7 +2913,11 @@ mod tests {
             opened.list_files().unwrap(),
             vec![ArchiveEntry {
                 path: "dir/sidecar.txt".to_string(),
-                file_data_size: 13
+                file_data_size: 13,
+                kind: TarEntryKind::Regular,
+                mode: 0o644,
+                mtime: 0,
+                diagnostics: Vec::new(),
             }]
         );
         assert_eq!(
@@ -2905,7 +2947,11 @@ mod tests {
             opened.list_files().unwrap(),
             vec![ArchiveEntry {
                 path: "dir/dict.txt".to_string(),
-                file_data_size: 44
+                file_data_size: 44,
+                kind: TarEntryKind::Regular,
+                mode: 0o644,
+                mtime: 0,
+                diagnostics: Vec::new(),
             }]
         );
         assert_eq!(
