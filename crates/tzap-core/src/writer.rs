@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::compression::{compress_zstd_frame, compress_zstd_frame_with_dictionary};
 use crate::crypto::{
-    aead_encrypt, build_aad, compute_hmac, derive_nonce, HmacDomain, MasterKey, Subkeys,
+    aead_encrypt, build_aad, compute_hmac, derive_nonce, HmacDomain, KdfParams, MasterKey, Subkeys,
 };
 use crate::fec::encode_parity_gf16;
 use crate::format::{
@@ -143,7 +143,16 @@ pub fn write_archive(
     master_key: &MasterKey,
     options: WriterOptions,
 ) -> Result<WrittenArchive, FormatError> {
-    write_archive_inner(files, master_key, options, None)
+    write_archive_inner(files, master_key, options, None, &KdfParams::Raw)
+}
+
+pub fn write_archive_with_kdf(
+    files: &[RegularFile<'_>],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    kdf_params: &KdfParams,
+) -> Result<WrittenArchive, FormatError> {
+    write_archive_inner(files, master_key, options, None, kdf_params)
 }
 
 pub fn write_archive_with_dictionary(
@@ -167,7 +176,38 @@ pub fn write_archive_with_dictionary(
             "dictionary decompressed size exceeds u32",
         ));
     }
-    write_archive_inner(files, master_key, options, Some(dictionary))
+    write_archive_inner(
+        files,
+        master_key,
+        options,
+        Some(dictionary),
+        &KdfParams::Raw,
+    )
+}
+
+pub fn write_archive_with_dictionary_and_kdf(
+    files: &[RegularFile<'_>],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    dictionary: &[u8],
+    kdf_params: &KdfParams,
+) -> Result<WrittenArchive, FormatError> {
+    if dictionary.is_empty() {
+        return Err(FormatError::WriterUnsupported(
+            "dictionary archives require a non-empty dictionary",
+        ));
+    }
+    if files.is_empty() {
+        return Err(FormatError::WriterUnsupported(
+            "dictionary archives require at least one file",
+        ));
+    }
+    if dictionary.len() > u32::MAX as usize {
+        return Err(FormatError::WriterUnsupported(
+            "dictionary decompressed size exceeds u32",
+        ));
+    }
+    write_archive_inner(files, master_key, options, Some(dictionary), kdf_params)
 }
 
 fn write_archive_inner(
@@ -175,6 +215,7 @@ fn write_archive_inner(
     master_key: &MasterKey,
     options: WriterOptions,
     dictionary: Option<&[u8]>,
+    kdf_params: &KdfParams,
 ) -> Result<WrittenArchive, FormatError> {
     let options = plan_writer_options(options)?;
     validate_m6_file_scope(files.len())?;
@@ -192,6 +233,7 @@ fn write_archive_inner(
         &subkeys,
         &archive_uuid,
         &session_id,
+        kdf_params,
     )?;
 
     let mut next_block_index = 0u64;
@@ -488,14 +530,26 @@ fn build_crypto_header(
     subkeys: &Subkeys,
     archive_uuid: &[u8; 16],
     session_id: &[u8; 16],
+    kdf_params: &KdfParams,
 ) -> Result<Vec<u8>, FormatError> {
-    let length = CRYPTO_HEADER_FIXED_LEN + 2 + CRYPTO_EXTENSION_HEADER_LEN + CRYPTO_HEADER_HMAC_LEN;
+    let kdf_payload = serialize_kdf_params(kdf_params)?;
+    let length = CRYPTO_HEADER_FIXED_LEN
+        .checked_add(kdf_payload.len())
+        .and_then(|value| value.checked_add(CRYPTO_EXTENSION_HEADER_LEN))
+        .and_then(|value| value.checked_add(CRYPTO_HEADER_HMAC_LEN))
+        .ok_or(FormatError::WriterUnsupported(
+            "CryptoHeader length overflow",
+        ))?;
+    let kdf_algo = match kdf_params {
+        KdfParams::Raw => KdfAlgo::Raw,
+        KdfParams::Argon2id { .. } => KdfAlgo::Argon2id,
+    };
     let fixed = CryptoHeaderFixed {
         length: length as u32,
         compression_algo: CompressionAlgo::ZstdFramed,
         aead_algo: options.aead_algo,
         fec_algo: FecAlgo::ReedSolomonGF16,
-        kdf_algo: KdfAlgo::Raw,
+        kdf_algo,
         chunk_size: options.chunk_size,
         envelope_target_size: options.envelope_target_size,
         block_size: options.block_size,
@@ -514,7 +568,7 @@ fn build_crypto_header(
     };
 
     let mut bytes = fixed.to_bytes().to_vec();
-    bytes.extend_from_slice(&(KdfAlgo::Raw as u16).to_le_bytes());
+    bytes.extend_from_slice(&kdf_payload);
     bytes.extend_from_slice(&0u16.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     let hmac = compute_hmac(
@@ -525,6 +579,49 @@ fn build_crypto_header(
         &bytes,
     );
     bytes.extend_from_slice(&hmac);
+    Ok(bytes)
+}
+
+fn serialize_kdf_params(params: &KdfParams) -> Result<Vec<u8>, FormatError> {
+    let mut bytes = Vec::new();
+    match params {
+        KdfParams::Raw => {
+            bytes.extend_from_slice(&(KdfAlgo::Raw as u16).to_le_bytes());
+        }
+        KdfParams::Argon2id {
+            t_cost,
+            m_cost_kib,
+            parallelism,
+            salt,
+        } => {
+            if *t_cost == 0 {
+                return Err(FormatError::InvalidKdfParams("t_cost must be non-zero"));
+            }
+            if *parallelism == 0 {
+                return Err(FormatError::InvalidKdfParams(
+                    "parallelism must be non-zero",
+                ));
+            }
+            if *m_cost_kib < parallelism.saturating_mul(8) {
+                return Err(FormatError::InvalidKdfParams(
+                    "m_cost_kib must be at least 8 * parallelism",
+                ));
+            }
+            if !(8..=64).contains(&salt.len()) {
+                return Err(FormatError::InvalidKdfParams(
+                    "argon2id salt length must be 8..64",
+                ));
+            }
+            let salt_len = u16::try_from(salt.len())
+                .map_err(|_| FormatError::InvalidKdfParams("argon2id salt too long"))?;
+            bytes.extend_from_slice(&(KdfAlgo::Argon2id as u16).to_le_bytes());
+            bytes.extend_from_slice(&t_cost.to_le_bytes());
+            bytes.extend_from_slice(&m_cost_kib.to_le_bytes());
+            bytes.extend_from_slice(&parallelism.to_le_bytes());
+            bytes.extend_from_slice(&salt_len.to_le_bytes());
+            bytes.extend_from_slice(salt);
+        }
+    }
     Ok(bytes)
 }
 

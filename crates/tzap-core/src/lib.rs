@@ -25,5 +25,6 @@ pub use reader::{
 };
 pub use tar_model::{MetadataDiagnostic, SafeExtractionOptions, TarEntryKind};
 pub use writer::{
-    write_archive, write_archive_with_dictionary, write_empty_archive, RegularFile, WriterOptions,
+    write_archive, write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
+    write_archive_with_kdf, write_empty_archive, RegularFile, WriterOptions,
 };

@@ -509,6 +509,8 @@ Acceptance:
 
 ## Milestone 12: CLI Hardening And UX
 
+Status: complete.
+
 Purpose: make the reference implementation usable without hiding spec failures.
 
 Deliverables:
@@ -527,6 +529,27 @@ Acceptance:
 - CLI smoke tests for all commands.
 - Error messages distinguish wrong key, corrupt archive, unsupported revision,
   unsafe path, missing bootstrap, and degraded metadata.
+
+Completed implementation:
+
+- `tzap create` writes single-volume archives to the requested output path and
+  striped multi-volume archives as `BASENAME.NNN` files.
+- `tzap create --bootstrap-out FILE` writes the v0.36 bootstrap sidecar emitted
+  by the writer.
+- `tzap create --dictionary FILE` routes through the dictionary writer.
+- `tzap create --password-stdin` emits Argon2id KdfParams in CryptoHeader;
+  `--keyfile` remains raw 32-byte master-key mode.
+- `tzap list`, `tzap verify`, and `tzap extract` share bootstrap-aware and
+  multi-volume-aware open paths.
+- `tzap extract` restores safely to `-C DIR` by default and supports
+  `--stdout` for exact single-file payload output.
+- Runtime failures are reported with stable diagnostic categories and exit
+  codes for wrong key, corrupt archive, unsupported revision, unsafe path,
+  missing bootstrap, unsupported feature, and I/O errors.
+- Metadata fidelity diagnostics are surfaced as `degraded-metadata` warnings
+  during filesystem extraction.
+- CLI smoke tests cover create, list, verify, bootstrap sidecar open, safe
+  extraction, and wrong-key diagnostic classification.
 
 ## Milestone 13: Corpus, Mutation Tests, Fuzzing, And Interop
 

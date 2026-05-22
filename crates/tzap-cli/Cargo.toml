@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-rpassword.workspace = true
+rand.workspace = true
 tzap-core = { path = "../tzap-core" }
 
 [dev-dependencies]
