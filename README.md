@@ -1,6 +1,6 @@
 # tzap
 
-Rust reference implementation of the **tzap archive format**: fast, encrypted,
+Rust reference implementation of the **tzap archive format**: ultra fast, encrypted,
 self-healing, random-access archives for serious long-term storage.
 
 tzap is built for real archives: huge backups, private datasets, cold storage,
