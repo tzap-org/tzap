@@ -141,7 +141,7 @@ impl CryptoHeaderFixed {
     pub fn parse(bytes: &[u8], volume_crypto_header_length: u32) -> Result<Self, FormatError> {
         expect_len("CryptoHeaderFixed", CRYPTO_HEADER_FIXED_LEN, bytes.len())?;
         expect_magic("CryptoHeaderFixed", TZCH_MAGIC, &bytes[0..4])?;
-        expect_zero("CryptoHeaderFixed", &bytes[59..60])?;
+        expect_zero("CryptoHeaderFixed", &bytes[47..48])?;
         expect_zero("CryptoHeaderFixed", &bytes[60..76])?;
 
         let length = read_u32(bytes, 4)?;
@@ -1128,13 +1128,23 @@ mod tests {
         );
 
         let mut bytes = crypto_fixed().to_bytes();
-        bytes[59] = 1;
+        bytes[47] = 1;
         assert_eq!(
             CryptoHeaderFixed::parse(&bytes, crypto_fixed().length).unwrap_err(),
             FormatError::NonZeroReserved {
                 structure: "CryptoHeaderFixed"
             }
         );
+    }
+
+    #[test]
+    fn crypto_header_fixed_treats_expected_volume_size_as_advisory_not_reserved() {
+        let mut header = crypto_fixed();
+        header.expected_volume_size = 1u64 << 56;
+
+        let parsed = CryptoHeaderFixed::parse(&header.to_bytes(), header.length).unwrap();
+
+        assert_eq!(parsed.expected_volume_size, 1u64 << 56);
     }
 
     #[test]

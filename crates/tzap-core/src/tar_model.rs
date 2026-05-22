@@ -189,6 +189,101 @@ pub fn parse_tar_member_group<'a>(
     }
 }
 
+pub fn validate_tar_stream_total_extraction_size(
+    stream: &[u8],
+    max_path_length: u32,
+    cap: u64,
+) -> Result<(), FormatError> {
+    if stream.len() % TAR_BLOCK_LEN != 0 {
+        return Err(FormatError::InvalidArchive(
+            "tar stream is not block aligned",
+        ));
+    }
+
+    let mut cursor = 0usize;
+    let mut total = 0u64;
+    while cursor < stream.len() {
+        let group_end = tar_member_group_end(stream, cursor)?;
+        let member = parse_tar_member_group(&stream[cursor..group_end], max_path_length)?;
+        if member.kind == TarEntryKind::Regular {
+            total = total
+                .checked_add(member.logical_size)
+                .ok_or(FormatError::InvalidArchive(
+                    "total extraction size overflow",
+                ))?;
+            if total > cap {
+                return Err(FormatError::ReaderUnsupported(
+                    "total extraction size exceeds configured cap",
+                ));
+            }
+        }
+        cursor = group_end;
+    }
+    Ok(())
+}
+
+fn tar_member_group_end(stream: &[u8], start: usize) -> Result<usize, FormatError> {
+    let mut cursor = start;
+    let mut metadata = LocalMetadata::default();
+
+    loop {
+        let header = slice(stream, cursor, TAR_BLOCK_LEN)?;
+        if header.iter().all(|byte| *byte == 0) {
+            return Err(FormatError::InvalidArchive("tar member header is empty"));
+        }
+        verify_tar_checksum(header)?;
+        let typeflag = header[156];
+        let header_size = parse_tar_octal(&header[124..136])?;
+        let is_main = matches!(typeflag, 0 | b'0' | b'5' | b'2' | b'1');
+        let effective_size = if is_main {
+            metadata.pax_size.unwrap_or(header_size)
+        } else {
+            header_size
+        };
+        let payload_start = checked_add(cursor, TAR_BLOCK_LEN)?;
+        let payload_len = to_usize(effective_size)?;
+        let payload_end = checked_add(payload_start, payload_len)?;
+        let padded_end = checked_add(payload_end, padding_to_512(payload_len))?;
+        let payload = slice(stream, payload_start, payload_len)?;
+        if padded_end > stream.len() {
+            return Err(FormatError::InvalidArchive(
+                "tar member payload exceeds stream",
+            ));
+        }
+        if stream[payload_end..padded_end]
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(FormatError::InvalidArchive(
+                "tar member padding is non-zero",
+            ));
+        }
+
+        match typeflag {
+            b'x' => {
+                parse_pax_records(payload, &mut metadata)?;
+                cursor = padded_end;
+            }
+            b'L' | b'K' => {
+                cursor = padded_end;
+            }
+            b'g' => {
+                return Err(FormatError::InvalidArchive(
+                    "global PAX headers are not allowed",
+                ));
+            }
+            0 | b'0' | b'5' | b'2' | b'1' => return Ok(padded_end),
+            _ => return Err(FormatError::ReaderUnsupported("unsupported tar entry type")),
+        }
+
+        if cursor >= stream.len() {
+            return Err(FormatError::InvalidArchive(
+                "tar member group has metadata records but no main entry",
+            ));
+        }
+    }
+}
+
 pub fn restore_tar_member(
     root: &Path,
     member: &OwnedTarMember,

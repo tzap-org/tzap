@@ -18,8 +18,8 @@ use crate::metadata::{
     EnvelopeEntry, FileEntry, FrameEntry, IndexRoot, IndexShard, MetadataLimits, ShardEntry,
 };
 use crate::tar_model::{
-    parse_tar_member_group, restore_tar_member, MetadataDiagnostic, OwnedTarMember,
-    SafeExtractionOptions, TarEntryKind,
+    parse_tar_member_group, restore_tar_member, validate_tar_stream_total_extraction_size,
+    MetadataDiagnostic, OwnedTarMember, SafeExtractionOptions, TarEntryKind,
 };
 use crate::wire::{
     BlockRecord, BootstrapSidecarHeader, CryptoHeader, CryptoHeaderFixed, ManifestFooter,
@@ -31,12 +31,14 @@ const MANIFEST_HMAC_COVERED_LEN: usize = 104;
 const SIDECAR_HMAC_COVERED_LEN: usize = 92;
 const DEFAULT_MAX_VERIFY_TAR_SIZE: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_TRAILING_GARBAGE_SCAN: usize = 1024 * 1024;
+const DEFAULT_MAX_TOTAL_EXTRACTION_SIZE: u64 = 100 * 1024 * 1024 * 1024;
 const DIRECTORY_HINT_REQUIRED_FILE_COUNT: u64 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReaderOptions {
     pub max_trailing_garbage_scan: usize,
     pub max_verify_tar_size: usize,
+    pub max_total_extraction_size: u64,
 }
 
 impl Default for ReaderOptions {
@@ -44,6 +46,7 @@ impl Default for ReaderOptions {
         Self {
             max_trailing_garbage_scan: DEFAULT_MAX_TRAILING_GARBAGE_SCAN,
             max_verify_tar_size: DEFAULT_MAX_VERIFY_TAR_SIZE,
+            max_total_extraction_size: DEFAULT_MAX_TOTAL_EXTRACTION_SIZE,
         }
     }
 }
@@ -66,6 +69,7 @@ pub struct ExtractedArchiveMember {
 #[derive(Debug, Clone)]
 pub struct OpenedArchive {
     options: ReaderOptions,
+    observed_archive_bytes: u64,
     subkeys: Subkeys,
     blocks: BTreeMap<u64, BlockRecord>,
     pub volume_header: VolumeHeader,
@@ -151,6 +155,8 @@ impl OpenedArchive {
             return Err(FormatError::InvalidArchive("no volumes supplied"));
         }
 
+        let observed_archive_bytes =
+            observed_archive_size(volumes.iter().map(|volume| volume.len() as u64))?;
         let mut first: Option<ParsedSeekableVolume> = None;
         let mut seen_volume_indexes = BTreeSet::new();
         let mut blocks = BTreeMap::new();
@@ -224,6 +230,7 @@ impl OpenedArchive {
 
         Ok(Self {
             options,
+            observed_archive_bytes,
             subkeys: first.subkeys,
             blocks,
             volume_header: first.volume_header,
@@ -241,6 +248,8 @@ impl OpenedArchive {
         master_key: &MasterKey,
         options: ReaderOptions,
     ) -> Result<Self, FormatError> {
+        let observed_archive_bytes =
+            observed_archive_size([bytes.len() as u64, bootstrap_sidecar.len() as u64])?;
         if bytes.len() < VOLUME_HEADER_LEN {
             return Err(FormatError::InvalidLength {
                 structure: "archive",
@@ -356,6 +365,7 @@ impl OpenedArchive {
 
         Ok(Self {
             options,
+            observed_archive_bytes,
             subkeys,
             blocks,
             volume_header,
@@ -599,7 +609,7 @@ impl OpenedArchive {
                             "FileEntry tar member start is missing",
                         ))?;
                 file_extents.push((start, file.tar_member_group_size));
-                let member = self.extract_loaded_member(shard, idx)?;
+                let member = self.decode_loaded_owned_tar_member(shard, idx, false)?;
                 let path = shard
                     .file_path(idx)
                     .ok_or(FormatError::InvalidArchive("FileEntry path is missing"))?;
@@ -783,10 +793,22 @@ impl OpenedArchive {
         shard: &IndexShard,
         file_index: usize,
     ) -> Result<OwnedTarMember, FormatError> {
+        self.decode_loaded_owned_tar_member(shard, file_index, true)
+    }
+
+    fn decode_loaded_owned_tar_member(
+        &self,
+        shard: &IndexShard,
+        file_index: usize,
+        enforce_extraction_cap: bool,
+    ) -> Result<OwnedTarMember, FormatError> {
         let file = shard
             .files
             .get(file_index)
             .ok_or(FormatError::InvalidArchive("FileEntry index out of bounds"))?;
+        if enforce_extraction_cap {
+            self.validate_total_extraction_size(file.file_data_size)?;
+        }
         let expected_path = shard
             .file_path(file_index)
             .ok_or(FormatError::InvalidArchive("FileEntry path is missing"))?;
@@ -841,6 +863,16 @@ impl OpenedArchive {
 
     fn metadata_limits(&self) -> MetadataLimits {
         metadata_limits(&self.crypto_header)
+    }
+
+    fn validate_total_extraction_size(&self, logical_size: u64) -> Result<(), FormatError> {
+        let cap = total_extraction_size_cap(self.options, self.observed_archive_bytes);
+        if logical_size > cap {
+            return Err(FormatError::ReaderUnsupported(
+                "total extraction size exceeds configured cap",
+            ));
+        }
+        Ok(())
     }
 
     fn decompress_payload_frame(
@@ -1769,7 +1801,7 @@ fn sequential_payload_parity_is_guaranteed(crypto_header: &CryptoHeaderFixed) ->
 fn sequential_extract_tar_stream_with_options(
     bytes: &[u8],
     master_key: &MasterKey,
-    _options: ReaderOptions,
+    options: ReaderOptions,
 ) -> Result<Vec<u8>, FormatError> {
     if bytes.len() < VOLUME_HEADER_LEN {
         return Err(FormatError::InvalidLength {
@@ -1920,6 +1952,12 @@ fn sequential_extract_tar_stream_with_options(
         &subkeys,
         &volume_header,
         parsed_crypto.fixed.block_size,
+    )?;
+    let observed_archive_bytes = observed_archive_size([bytes.len() as u64])?;
+    validate_tar_stream_total_extraction_size(
+        &tar_stream,
+        parsed_crypto.fixed.max_path_length,
+        total_extraction_size_cap(options, observed_archive_bytes),
     )?;
     Ok(tar_stream)
 }
@@ -2574,6 +2612,20 @@ fn validate_non_overlapping_object_ranges(ranges: &mut [(u64, u64)]) -> Result<(
     Ok(())
 }
 
+fn observed_archive_size(sizes: impl IntoIterator<Item = u64>) -> Result<u64, FormatError> {
+    sizes.into_iter().try_fold(0u64, |sum, size| {
+        sum.checked_add(size).ok_or(FormatError::InvalidArchive(
+            "observed archive size overflow",
+        ))
+    })
+}
+
+fn total_extraction_size_cap(options: ReaderOptions, observed_archive_bytes: u64) -> u64 {
+    options
+        .max_total_extraction_size
+        .min(observed_archive_bytes.saturating_mul(10))
+}
+
 fn utf8_path(bytes: &[u8]) -> Result<String, FormatError> {
     std::str::from_utf8(bytes)
         .map(|path| path.to_owned())
@@ -2947,6 +2999,45 @@ mod tests {
     }
 
     #[test]
+    fn extraction_rejects_logical_payload_above_total_size_cap() {
+        let archive = write_archive(
+            &[RegularFile::new("cap.txt", b"payload")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut options = ReaderOptions::default();
+        options.max_total_extraction_size = 3;
+        let opened =
+            OpenedArchive::open_with_options(&archive.bytes, &master_key(), options).unwrap();
+
+        assert_eq!(
+            opened.extract_file("cap.txt").unwrap_err(),
+            FormatError::ReaderUnsupported("total extraction size exceeds configured cap")
+        );
+    }
+
+    #[test]
+    fn verify_does_not_apply_extraction_payload_cap() {
+        let archive = write_archive(
+            &[RegularFile::new("verify-cap.txt", b"payload")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut options = ReaderOptions::default();
+        options.max_total_extraction_size = 3;
+        let opened =
+            OpenedArchive::open_with_options(&archive.bytes, &master_key(), options).unwrap();
+
+        opened.verify().unwrap();
+        assert_eq!(
+            opened.extract_file("verify-cap.txt").unwrap_err(),
+            FormatError::ReaderUnsupported("total extraction size exceeds configured cap")
+        );
+    }
+
+    #[test]
     fn dictionary_sidecar_requires_dictionary_record_section() {
         let archive = write_archive_with_dictionary(
             &[RegularFile::new("dict-missing.txt", b"common words")],
@@ -3041,6 +3132,24 @@ mod tests {
         let member = parse_tar_member_group(&tar_stream, 4096).unwrap();
         assert_eq!(member.path, b"seq.txt");
         assert_eq!(member.data, b"streaming");
+    }
+
+    #[test]
+    fn sequential_rejects_logical_payload_above_total_size_cap() {
+        let archive = write_archive(
+            &[RegularFile::new("seq-cap.txt", b"payload")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut options = ReaderOptions::default();
+        options.max_total_extraction_size = 3;
+
+        assert_eq!(
+            sequential_extract_tar_stream_with_options(&archive.bytes, &master_key(), options)
+                .unwrap_err(),
+            FormatError::ReaderUnsupported("total extraction size exceeds configured cap")
+        );
     }
 
     #[test]
