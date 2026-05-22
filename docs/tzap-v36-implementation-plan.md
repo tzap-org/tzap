@@ -312,16 +312,40 @@ Acceptance:
 
 ## Milestone 7: Minimal Reader, List, Verify, And Random Extract
 
+Status: complete.
+
 Purpose: complete the first useful read path.
 
 Deliverables:
 
-- Seekable open algorithm from §17.1.
-- Trailer-from-end lookup and optional trailing-garbage scan.
-- ManifestFooter bootstrap.
-- IndexRoot and IndexShard loading.
-- Random file extraction.
-- Full-archive verify for metadata and payload frame coverage.
+- Complete: Seekable open algorithm from §17.1 for the M6 single-volume,
+  dictionary-free archive profile.
+- Complete: Trailer-from-end lookup with optional bounded trailing-garbage
+  scan.
+- Complete: ManifestFooter bootstrap with HMAC, identity, authoritative,
+  size-canonicality, and trailer-offset validation.
+- Complete: IndexRoot and IndexShard loading through FEC, AEAD, suffix
+  depadding, exact metadata zstd-frame validation, and metadata structural
+  validation.
+- Complete: Post-M6 v0.36.7 metadata conformance update: validate
+  DirectoryHintShardEntry canonical ordering as
+  `(first_dir_hash, last_dir_hash, hint_shard_index)`, while preserving
+  `hint_shard_index` uniqueness and the adjacent range check
+  `last_dir_hash <= next.first_dir_hash`.
+- Complete: Random file extraction by exact normalized path, default
+  last-entry-wins selection, payload envelope authentication, frame
+  decompression, and tar member path/size verification.
+- Complete: Full-archive verify for metadata totals, distinct frame/envelope
+  coverage, payload AEAD/zstd coverage, reconstructed tar-stream SHA-256,
+  and FileEntry tar-member bindings.
+- Complete: Minimal core API:
+  `open_archive`, `OpenedArchive::list_files`, `OpenedArchive::verify`, and
+  `OpenedArchive::extract_file`.
+- Complete: Minimal raw-key CLI wiring for `tzap list`, `tzap verify`, and
+  `tzap extract ARCHIVE path`; password UX and sidecar options remain assigned
+  to M12 and M9 respectively.
+- Complete: Writer trailer byte-count bug fixed so emitted
+  `VolumeTrailer.bytes_written` equals the trailer offset required by §12.
 
 Acceptance:
 
@@ -331,6 +355,9 @@ Acceptance:
 - Rejects wrong key, mixed volumes, corrupt trailer, corrupt footer, corrupt
   IndexRoot, corrupt IndexShard, corrupt payload, and non-authoritative
   ManifestFooter for random access.
+- Rejects IndexRoot directory-hint shard rows that are sorted by
+  `(first_dir_hash, hint_shard_index)` but not by the v0.36.7
+  `(first_dir_hash, last_dir_hash, hint_shard_index)` key.
 
 ## Milestone 8: Safe Extraction And Tar Metadata Profile
 
@@ -447,6 +474,9 @@ Deliverables:
 - Golden fixtures.
 - Mutation fixture generator.
 - v0.36 §28.1 corpus coverage.
+- Equal-`first_dir_hash` DirectoryHintShardEntry fixture: `[H, H]` and
+  `[H, Z]` ranges with `hint_shard_index` values assigned in the opposite
+  order, proving the v0.36.7 sort key and rejection behavior.
 - `cargo fuzz` targets for parsers.
 - Cross-platform path behavior tests.
 - Round-trip property tests for writer/reader.

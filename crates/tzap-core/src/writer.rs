@@ -270,11 +270,7 @@ pub fn write_archive(
     )?;
     bytes.extend_from_slice(&manifest_footer);
 
-    let bytes_written = checked_u64_add(
-        bytes.len() as u64,
-        VOLUME_TRAILER_LEN as u64,
-        "VolumeTrailer.bytes_written",
-    )?;
+    let bytes_written = bytes.len() as u64;
     let trailer = build_volume_trailer(
         &subkeys,
         archive_uuid,
@@ -925,7 +921,7 @@ mod tests {
 
         let trailer_offset = bytes.len() - VOLUME_TRAILER_LEN;
         let trailer = VolumeTrailer::parse(&bytes[trailer_offset..]).unwrap();
-        assert_eq!(trailer.bytes_written, bytes.len() as u64);
+        assert_eq!(trailer.bytes_written, trailer_offset as u64);
         verify_hmac(
             HmacDomain::VolumeTrailer,
             &subkeys.mac_key,

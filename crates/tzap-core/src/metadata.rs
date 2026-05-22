@@ -1910,8 +1910,12 @@ fn shard_entry_sort_key(entry: &ShardEntry) -> ([u8; 8], [u8; 8], u64) {
     )
 }
 
-fn directory_hint_shard_sort_key(entry: &DirectoryHintShardEntry) -> ([u8; 8], u64) {
-    (entry.first_dir_hash, entry.hint_shard_index)
+fn directory_hint_shard_sort_key(entry: &DirectoryHintShardEntry) -> ([u8; 8], [u8; 8], u64) {
+    (
+        entry.first_dir_hash,
+        entry.last_dir_hash,
+        entry.hint_shard_index,
+    )
 }
 
 fn table_offset(len: usize, cursor: usize) -> u32 {
@@ -2037,6 +2041,61 @@ mod tests {
         assert_eq!(parsed.header.file_count, 0);
         assert!(parsed.shards.is_empty());
         assert!(parsed.directory_hint_shards.is_empty());
+    }
+
+    #[test]
+    fn rejects_directory_hint_rows_sorted_by_old_v36_key_only() {
+        let h = [0x10; 8];
+        let z = [0x20; 8];
+        let root = IndexRoot {
+            header: IndexRootHeader {
+                file_count: 1,
+                ..IndexRootHeader::empty()
+            },
+            shards: vec![ShardEntry {
+                shard_index: 0,
+                first_block_index: 0,
+                data_block_count: 1,
+                parity_block_count: 1,
+                encrypted_size: 4096,
+                decompressed_size: 64,
+                file_count: 1,
+                first_path_hash: h,
+                last_path_hash: z,
+            }],
+            directory_hint_shards: vec![
+                DirectoryHintShardEntry {
+                    hint_shard_index: 0,
+                    first_dir_hash: h,
+                    last_dir_hash: z,
+                    first_block_index: 10,
+                    data_block_count: 1,
+                    parity_block_count: 1,
+                    encrypted_size: 4096,
+                    decompressed_size: 72,
+                    entry_count: 1,
+                },
+                DirectoryHintShardEntry {
+                    hint_shard_index: 1,
+                    first_dir_hash: h,
+                    last_dir_hash: h,
+                    first_block_index: 12,
+                    data_block_count: 1,
+                    parity_block_count: 1,
+                    encrypted_size: 4096,
+                    decompressed_size: 72,
+                    entry_count: 1,
+                },
+            ],
+        };
+
+        assert_eq!(
+            IndexRoot::parse(&root.to_bytes(), false, MetadataLimits::default()).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexRoot",
+                reason: "DirectoryHintShardEntry rows are not sorted"
+            }
+        );
     }
 
     #[test]

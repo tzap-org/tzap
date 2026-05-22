@@ -9,6 +9,7 @@ pub mod fec;
 pub mod format;
 pub mod metadata;
 pub mod padding;
+pub mod reader;
 pub mod wire;
 pub mod writer;
 
@@ -16,4 +17,5 @@ pub use crypto::{HmacDomain, KdfParams, MasterKey, Subkeys};
 pub use format::{
     AeadAlgo, CompressionAlgo, FecAlgo, FormatError, KdfAlgo, FORMAT_VERSION, VOLUME_FORMAT_REV,
 };
+pub use reader::{open_archive, ArchiveEntry, OpenedArchive, ReaderOptions};
 pub use writer::{RegularFile, WriterOptions};

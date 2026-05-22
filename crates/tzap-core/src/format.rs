@@ -432,4 +432,10 @@ pub enum FormatError {
 
     #[error("writer invariant failed: {0}")]
     WriterInvariant(&'static str),
+
+    #[error("reader unsupported case: {0}")]
+    ReaderUnsupported(&'static str),
+
+    #[error("invalid archive: {0}")]
+    InvalidArchive(&'static str),
 }
