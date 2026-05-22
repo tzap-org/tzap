@@ -1,12 +1,12 @@
-# tzap
+# tzap - the only open source archive you need
 
 Rust reference implementation of the **tzap archive format**: super fast, encrypted,
 self-healing, random-access archives for serious long-term storage.
 
 tzap is built for real archives: huge backups, private datasets, cold storage,
-S3-style object storage, split volumes, and restores where you need one file
-now, not after unpacking everything. It combines packing, fast compression, strong encryption, authenticated metadata, and recovery
-in one practical format.
+S3-style object storage, split volumes, and immediate single-file restores. It
+combines packing, fast compression, strong encryption, authenticated metadata,
+and recovery in one practical format.
 
 The implementation currently targets the v0.36 format specification:
 [specs/tzap-format-revisedv36.md](specs/tzap-format-revisedv36.md).
@@ -18,10 +18,10 @@ The implementation currently targets the v0.36 format specification:
 - **Security baked in.** Contents, file names, metadata, and indexes are
   encrypted; headers, manifests, trailers, indexes, and payloads are
   authenticated.
-- **Self-healing.** Reed-Solomon FEC repairs bit rot and can survive configured
-  volume loss.
+- **Self-healing.** Reed-Solomon FEC adds configurable recovery capacity across
+  volumes and long-term storage media.
 - **Instant targeted restores.** Jump straight to a photo inside a 10 TB archive
-  without unpacking the rest.
+  while the rest stays packed.
 - **Splittable.** Break archives into practical volumes for drives, discs, or
   cloud objects by volume count or target volume size.
 - **Cloud-streaming friendly.** Designed for single-pass append-only writes,
@@ -38,7 +38,8 @@ The implementation currently targets the v0.36 format specification:
 - instant single-file restores from massive archives
 - implementers who want the canonical Rust reference
 
-Not for live filesystems, deduplication, network transport, or in-place editing.
+Focused on archive creation, verification, listing, extraction, streaming
+storage, and recovery workflows.
 
 ## Install
 
@@ -102,9 +103,8 @@ tzap extract --keyfile tzap.key --stdout project.tzap project/notes.txt
 
 ## Password mode
 
-Instead of a raw key file, tzap can derive the master key from a passphrase with
-Argon2id. The CLI reads the passphrase from stdin so it does not need to appear
-in shell history.
+Password mode derives the master key from a passphrase with Argon2id. The CLI
+reads the passphrase from stdin so shell history stays clean.
 
 ```sh
 printf '%s\n' "$TZAP_PASSPHRASE" | \
@@ -148,6 +148,18 @@ backup.tzap.002
 backup.tzap.003
 ```
 
+Tune the self-healing budget:
+
+```sh
+tzap create \
+  --keyfile tzap.key \
+  --volumes 4 \
+  --volume-loss-tolerance 1 \
+  --bit-rot-buffer-pct 10 \
+  -o vault.tzap \
+  ./vault
+```
+
 Or split by target volume size:
 
 ```sh
@@ -181,8 +193,8 @@ tzap extract \
 ## Bootstrap sidecars
 
 Bootstrap sidecars carry startup metadata for workflows that benefit from
-separate bootstrap material, including non-seekable or random-access-oriented
-read paths.
+separate bootstrap material, including pipe-like and random-access-oriented read
+paths.
 
 ```sh
 tzap create \
@@ -211,7 +223,7 @@ tzap create \
 ```
 
 Dictionary archives are still encrypted and authenticated. The dictionary object
-is part of the archive data model, not an external plaintext dependency.
+lives inside the protected archive data model.
 
 ## CLI
 
@@ -228,21 +240,20 @@ Important `create` options:
 - `--password-stdin`: derive the archive key from a passphrase with Argon2id
 - `--volumes <n>`: write a striped multi-volume archive
 - `--volume-size <size>`: choose the number of volumes from a target size
-- `--volume-loss-tolerance <n>`: add enough parity for volume-loss recovery
-- `--bit-rot-buffer-pct <n>`: reserve additional FEC for accidental corruption
+- `--volume-loss-tolerance <n>`: add enough parity for volume recovery
+- `--bit-rot-buffer-pct <n>`: set additional FEC as a percentage of data capacity
 - `--dictionary <path>`: include a zstd dictionary
 - `--bootstrap-out <path>`: write a bootstrap sidecar
 - `--compression-level <n>`: choose the zstd compression level
 - `--chunk-size`, `--envelope-size`, `--block-size`: tune archive layout
 
-Stable diagnostic categories include `wrong-key`, `corrupt-archive`,
-`unsupported-revision`, `unsafe-path`, `missing-bootstrap`, and
-`unsupported-feature`.
+Stable diagnostics cover key validation, archive integrity, revision
+compatibility, path safety, bootstrap sidecars, and feature negotiation.
 
 ## Library usage
 
 `tzap-core` exposes the reference read/write primitives for applications that
-want the format without shelling out to the CLI.
+want direct access to the format from application code.
 
 ```rust
 use tzap_core::{
@@ -314,7 +325,7 @@ cargo fuzz run parse_metadata
 
 tzap is serious security engineering: encrypted names, encrypted metadata,
 encrypted payloads, authenticated structure, Argon2id password mode, raw-key
-mode, nonce-domain separation, and corruption detection before clean extraction.
+mode, nonce-domain separation, and integrity checks before clean extraction.
 The format is written to stand up to independent cryptographic review.
 
 Keep keys and passphrases separate from archives, verify archives after copying
