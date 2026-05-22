@@ -1,6 +1,7 @@
 /target/
 **/*.rs.bk
 .DS_Store
+.claude/
 /plugin-specs
 fuzz/target/
 /docs
