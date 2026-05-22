@@ -14,6 +14,18 @@ pub const CRYPTO_EXTENSION_HEADER_LEN: usize = 6;
 pub const CRYPTO_EXTENSION_MAX_VALUE_LEN: u32 = 256;
 pub const MASTER_KEY_LEN: usize = 32;
 pub const SUBKEY_LEN: usize = 32;
+pub const READER_MAX_ARGON2ID_M_COST_KIB: u32 = 4 * 1024 * 1024;
+pub const READER_MAX_ARGON2ID_T_COST: u32 = 100;
+pub const READER_MAX_ARGON2ID_PARALLELISM: u32 = 64;
+pub const READER_MAX_CRYPTO_HEADER_LEN: u32 = 64 * 1024;
+pub const READER_MAX_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
+pub const READER_MAX_ENVELOPE_TARGET_SIZE: u32 = 64 * 1024 * 1024;
+pub const READER_MAX_BLOCK_SIZE: u32 = 1024 * 1024;
+pub const READER_MAX_STRIPE_WIDTH: u32 = 4096;
+pub const READER_MAX_FEC_CLASS_SHARDS: u32 = 4096;
+pub const READER_MAX_INDEX_FEC_CLASS_SHARDS: u32 = 4096;
+pub const READER_MAX_INDEX_ROOT_FEC_CLASS_SHARDS: u32 = 131_070;
+pub const READER_MAX_PATH_LENGTH: u32 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -254,6 +266,13 @@ pub enum FormatError {
 
     #[error("block_size {0} must be even")]
     OddBlockSize(u32),
+
+    #[error("reader resource cap exceeded for {field}: cap {cap}, actual {actual}")]
+    ReaderResourceLimitExceeded {
+        field: &'static str,
+        cap: u64,
+        actual: u64,
+    },
 
     #[error("invalid block flags 0x{0:02x}")]
     InvalidBlockFlags(u8),

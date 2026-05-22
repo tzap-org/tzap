@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::compression::{
     decompress_exact_zstd_frame, decompress_exact_zstd_frame_with_dictionary,
+    validate_exact_zstd_frame,
 };
 use crate::crypto::{decrypt_padded_aead_object, verify_hmac, HmacDomain, MasterKey, Subkeys};
 use crate::fec::repair_data_gf16;
@@ -13,8 +14,8 @@ use crate::format::{
     MANIFEST_FOOTER_LEN, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::metadata::{
-    normalize_lookup_file_path, EnvelopeEntry, FileEntry, FrameEntry, IndexRoot, IndexShard,
-    MetadataLimits, ShardEntry,
+    hash_prefix, normalize_lookup_file_path, DirectoryHintShardEntry, DirectoryHintTable,
+    EnvelopeEntry, FileEntry, FrameEntry, IndexRoot, IndexShard, MetadataLimits, ShardEntry,
 };
 use crate::tar_model::{
     parse_tar_member_group, restore_tar_member, MetadataDiagnostic, OwnedTarMember,
@@ -29,6 +30,7 @@ const TRAILER_HMAC_COVERED_LEN: usize = 96;
 const MANIFEST_HMAC_COVERED_LEN: usize = 104;
 const SIDECAR_HMAC_COVERED_LEN: usize = 92;
 const DEFAULT_MAX_VERIFY_TAR_SIZE: usize = 128 * 1024 * 1024;
+const DEFAULT_MAX_TRAILING_GARBAGE_SCAN: usize = 1024 * 1024;
 const DIRECTORY_HINT_REQUIRED_FILE_COUNT: u64 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +42,7 @@ pub struct ReaderOptions {
 impl Default for ReaderOptions {
     fn default() -> Self {
         Self {
-            max_trailing_garbage_scan: 0,
+            max_trailing_garbage_scan: DEFAULT_MAX_TRAILING_GARBAGE_SCAN,
             max_verify_tar_size: DEFAULT_MAX_VERIFY_TAR_SIZE,
         }
     }
@@ -81,6 +83,8 @@ struct ObjectExtent {
     parity_block_count: u32,
     encrypted_size: u32,
 }
+
+type DirectoryHintMap = BTreeMap<Vec<u8>, BTreeSet<u32>>;
 
 pub fn open_archive<'a>(
     bytes: &'a [u8],
@@ -506,11 +510,6 @@ impl OpenedArchive {
                 "IndexRoot file_count requires directory hints",
             ));
         }
-        if !self.index_root.directory_hint_shards.is_empty() {
-            return Err(FormatError::ReaderUnsupported(
-                "M7 verify does not validate directory hint shards",
-            ));
-        }
         verify_dense_keys(&frames, self.index_root.header.frame_count, "FrameEntry")?;
         verify_dense_keys(
             &envelopes,
@@ -587,7 +586,10 @@ impl OpenedArchive {
         }
 
         let mut file_extents = Vec::new();
-        for shard in &shards {
+        let mut directory_hint_map = DirectoryHintMap::new();
+        for (shard_row_index, shard) in shards.iter().enumerate() {
+            let shard_row_index = u32::try_from(shard_row_index)
+                .map_err(|_| FormatError::InvalidArchive("shard row index overflow"))?;
             for idx in 0..shard.files.len() {
                 let file = &shard.files[idx];
                 let start =
@@ -597,10 +599,23 @@ impl OpenedArchive {
                             "FileEntry tar member start is missing",
                         ))?;
                 file_extents.push((start, file.tar_member_group_size));
-                let _ = self.extract_loaded_member(shard, idx)?;
+                let member = self.extract_loaded_member(shard, idx)?;
+                let path = shard
+                    .file_path(idx)
+                    .ok_or(FormatError::InvalidArchive("FileEntry path is missing"))?;
+                add_expected_directory_hint_rows(
+                    &mut directory_hint_map,
+                    shard_row_index,
+                    path,
+                    member.kind,
+                );
             }
         }
         validate_file_extent_coverage_ranges(&file_extents, tar_len)?;
+        if !self.index_root.directory_hint_shards.is_empty() {
+            let hint_tables = self.load_all_directory_hint_tables()?;
+            validate_directory_hint_tables_against_expected(&hint_tables, &directory_hint_map)?;
+        }
 
         Ok(())
     }
@@ -636,6 +651,47 @@ impl OpenedArchive {
             entry.decompressed_size,
         )?;
         IndexShard::parse(&plaintext, entry, self.metadata_limits())
+    }
+
+    fn load_all_directory_hint_tables(&self) -> Result<Vec<DirectoryHintTable>, FormatError> {
+        self.index_root
+            .directory_hint_shards
+            .iter()
+            .map(|entry| self.load_directory_hint_table(entry))
+            .collect()
+    }
+
+    fn load_directory_hint_table(
+        &self,
+        entry: &DirectoryHintShardEntry,
+    ) -> Result<DirectoryHintTable, FormatError> {
+        let plaintext = load_metadata_object_from_parts(
+            &self.blocks,
+            &self.subkeys,
+            &self.volume_header,
+            &self.crypto_header,
+            ObjectExtent {
+                first_block_index: entry.first_block_index,
+                data_block_count: entry.data_block_count,
+                parity_block_count: entry.parity_block_count,
+                encrypted_size: entry.encrypted_size,
+            },
+            BlockKind::DirectoryHintData,
+            BlockKind::DirectoryHintParity,
+            &self.subkeys.dir_hint_key,
+            &self.subkeys.index_nonce_seed,
+            b"dirhint",
+            entry.hint_shard_index,
+            self.crypto_header.index_fec_data_shards,
+            self.crypto_header.index_fec_parity_shards,
+            entry.decompressed_size,
+        )?;
+        DirectoryHintTable::parse(
+            &plaintext,
+            entry,
+            self.index_root.header.shard_count,
+            self.metadata_limits(),
+        )
     }
 
     fn load_payload_envelope(&self, envelope: &EnvelopeEntry) -> Result<Vec<u8>, FormatError> {
@@ -820,6 +876,14 @@ impl OpenedArchive {
                 shard.data_block_count,
                 shard.parity_block_count,
                 "IndexShard",
+            )?);
+        }
+        for hint in &self.index_root.directory_hint_shards {
+            ranges.push(object_block_range(
+                hint.first_block_index,
+                hint.data_block_count,
+                hint.parity_block_count,
+                "DirectoryHintShardEntry",
             )?);
         }
         if self.crypto_header.has_dictionary != 0 {
@@ -1255,9 +1319,18 @@ fn validate_sidecar_size_cap(
     crypto_header: &CryptoHeaderFixed,
     file_size: u64,
 ) -> Result<(), FormatError> {
-    let record_len = crypto_header.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
+    let record_len = checked_u64_add(
+        crypto_header.block_size as u64,
+        BLOCK_RECORD_FRAMING_LEN as u64,
+        "bootstrap sidecar cap overflow",
+    )?;
     let max_index_records = crypto_header.index_root_fec_data_shards as u64
         + crypto_header.index_root_fec_parity_shards as u64;
+    let max_record_section_bytes = checked_u64_mul(
+        max_index_records,
+        record_len,
+        "bootstrap sidecar cap overflow",
+    )?;
     if header.index_root_records_length % record_len != 0 {
         return Err(FormatError::InvalidArchive(
             "bootstrap sidecar IndexRoot records length is not aligned",
@@ -1288,18 +1361,18 @@ fn validate_sidecar_size_cap(
             ))?;
     }
     if header.has_index_root_records() {
-        cap =
-            cap.checked_add(max_index_records * record_len)
-                .ok_or(FormatError::InvalidArchive(
-                    "bootstrap sidecar cap overflow",
-                ))?;
+        cap = checked_u64_add(
+            cap,
+            max_record_section_bytes,
+            "bootstrap sidecar cap overflow",
+        )?;
     }
     if header.has_dictionary_records() {
-        cap =
-            cap.checked_add(max_index_records * record_len)
-                .ok_or(FormatError::InvalidArchive(
-                    "bootstrap sidecar cap overflow",
-                ))?;
+        cap = checked_u64_add(
+            cap,
+            max_record_section_bytes,
+            "bootstrap sidecar cap overflow",
+        )?;
     }
     if file_size > cap {
         return Err(FormatError::InvalidArchive(
@@ -1530,28 +1603,24 @@ fn parse_stream_block_prefix(
     let mut blocks = BTreeMap::new();
     let mut offset = start;
     let mut observed_block_count = 0u64;
-    let mut previous_index = None;
 
     while bytes.get(offset..offset + 4) == Some(b"TZBK") {
-        let record =
-            BlockRecord::parse(slice(bytes, offset, record_len, "BlockRecord")?, block_size)?;
-        if record.block_index % volume_header.stripe_width as u64
-            != volume_header.volume_index as u64
-        {
-            return Err(FormatError::InvalidArchive(
-                "BlockRecord index does not belong to this volume",
-            ));
-        }
-        if let Some(previous) = previous_index {
-            if record.block_index != previous + volume_header.stripe_width as u64 {
-                return Err(FormatError::InvalidArchive(
-                    "BlockRecords are not strictly consecutive",
-                ));
+        let expected_block_index =
+            expected_stream_block_index(volume_header, observed_block_count)?;
+        let raw = slice(bytes, offset, record_len, "BlockRecord")?;
+        match BlockRecord::parse(raw, block_size) {
+            Ok(record) => {
+                if record.block_index != expected_block_index {
+                    return Err(FormatError::InvalidArchive(
+                        "BlockRecord index does not match stream position",
+                    ));
+                }
+                if blocks.insert(record.block_index, record).is_some() {
+                    return Err(FormatError::InvalidArchive("duplicate BlockRecord index"));
+                }
             }
-        }
-        previous_index = Some(record.block_index);
-        if blocks.insert(record.block_index, record).is_some() {
-            return Err(FormatError::InvalidArchive("duplicate BlockRecord index"));
+            Err(err) if block_record_error_is_recoverable_erasure(&err) => {}
+            Err(err) => return Err(err),
         }
         offset = checked_add(offset, record_len, "BlockRecord")?;
         observed_block_count = observed_block_count
@@ -1560,6 +1629,45 @@ fn parse_stream_block_prefix(
     }
 
     Ok((blocks, offset, observed_block_count))
+}
+
+fn expected_stream_block_index(
+    volume_header: &VolumeHeader,
+    observed_block_count: u64,
+) -> Result<u64, FormatError> {
+    checked_u64_add(
+        volume_header.volume_index as u64,
+        checked_u64_mul(
+            observed_block_count,
+            volume_header.stripe_width as u64,
+            "BlockRecord index overflow",
+        )?,
+        "BlockRecord index overflow",
+    )
+}
+
+fn parse_sequential_block_or_erasure(
+    bytes: &[u8],
+    offset: usize,
+    record_len: usize,
+    block_size: usize,
+    volume_header: &VolumeHeader,
+    observed_block_count: u64,
+) -> Result<Option<BlockRecord>, FormatError> {
+    let expected_block_index = expected_stream_block_index(volume_header, observed_block_count)?;
+    let raw = slice(bytes, offset, record_len, "BlockRecord")?;
+    match BlockRecord::parse(raw, block_size) {
+        Ok(record) => {
+            if record.block_index != expected_block_index {
+                return Err(FormatError::InvalidArchive(
+                    "BlockRecord index does not match stream position",
+                ));
+            }
+            Ok(Some(record))
+        }
+        Err(err) if block_record_error_is_recoverable_erasure(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 fn parse_terminal_material(
@@ -1619,12 +1727,43 @@ struct PendingSequentialEnvelope {
     data_shards: Vec<Option<Vec<u8>>>,
     parity_shards: Vec<Option<Vec<u8>>>,
     saw_last_data: bool,
+    awaiting_tentative_parity: bool,
 }
 
 impl PendingSequentialEnvelope {
     fn is_empty(&self) -> bool {
         self.data_shards.is_empty() && self.parity_shards.is_empty()
     }
+}
+
+fn handle_sequential_payload_erasure(
+    pending: &mut PendingSequentialEnvelope,
+    crypto_header: &CryptoHeaderFixed,
+    metadata_seen: bool,
+) -> Result<(), FormatError> {
+    if metadata_seen || pending.saw_last_data {
+        return Err(FormatError::BadCrc {
+            structure: "BlockRecord",
+        });
+    }
+    if !sequential_payload_parity_is_guaranteed(crypto_header) {
+        return Err(FormatError::BadCrc {
+            structure: "BlockRecord",
+        });
+    }
+    pending.data_shards.push(None);
+    pending.awaiting_tentative_parity = true;
+    if pending.data_shards.len() > crypto_header.fec_data_shards as usize {
+        return Err(FormatError::InvalidArchive(
+            "sequential payload envelope exceeds data-shard cap",
+        ));
+    }
+    Ok(())
+}
+
+fn sequential_payload_parity_is_guaranteed(crypto_header: &CryptoHeaderFixed) -> bool {
+    crypto_header.fec_parity_shards > 0
+        && (crypto_header.volume_loss_tolerance > 0 || crypto_header.bit_rot_buffer_pct > 0)
 }
 
 fn sequential_extract_tar_stream_with_options(
@@ -1668,39 +1807,39 @@ fn sequential_extract_tar_stream_with_options(
         .ok_or(FormatError::InvalidArchive("BlockRecord length overflow"))?;
     let mut offset = crypto_end;
     let mut observed_block_count = 0u64;
-    let mut previous_index = None;
     let mut metadata_seen = false;
     let mut pending = PendingSequentialEnvelope::default();
     let mut next_envelope_index = 0u64;
     let mut tar_stream = Vec::new();
 
     while bytes.get(offset..offset + 4) == Some(b"TZBK") {
-        let record =
-            BlockRecord::parse(slice(bytes, offset, record_len, "BlockRecord")?, block_size)?;
-        if record.block_index % volume_header.stripe_width as u64
-            != volume_header.volume_index as u64
-        {
-            return Err(FormatError::InvalidArchive(
-                "BlockRecord index does not belong to this volume",
-            ));
-        }
-        if let Some(previous) = previous_index {
-            if record.block_index != previous + volume_header.stripe_width as u64 {
-                return Err(FormatError::InvalidArchive(
-                    "BlockRecords are not strictly consecutive",
-                ));
-            }
-        }
-        previous_index = Some(record.block_index);
+        let record = parse_sequential_block_or_erasure(
+            bytes,
+            offset,
+            record_len,
+            block_size,
+            &volume_header,
+            observed_block_count,
+        )?;
         observed_block_count = observed_block_count
             .checked_add(1)
             .ok_or(FormatError::InvalidArchive("BlockRecord count overflow"))?;
+        let Some(record) = record else {
+            handle_sequential_payload_erasure(&mut pending, &parsed_crypto.fixed, metadata_seen)?;
+            offset = checked_add(offset, record_len, "BlockRecord")?;
+            continue;
+        };
 
         match record.kind {
             BlockKind::PayloadData => {
                 if metadata_seen {
                     return Err(FormatError::InvalidArchive(
                         "payload BlockRecord appears after metadata",
+                    ));
+                }
+                if pending.awaiting_tentative_parity {
+                    return Err(FormatError::InvalidArchive(
+                        "sequential payload envelope boundary is ambiguous after CRC erasure",
                     ));
                 }
                 if pending.saw_last_data {
@@ -1730,7 +1869,10 @@ fn sequential_extract_tar_stream_with_options(
                         "payload parity BlockRecord appears after metadata",
                     ));
                 }
-                if pending.data_shards.is_empty() || !pending.saw_last_data {
+                if pending.awaiting_tentative_parity {
+                    pending.awaiting_tentative_parity = false;
+                    pending.saw_last_data = true;
+                } else if pending.data_shards.is_empty() || !pending.saw_last_data {
                     return Err(FormatError::InvalidArchive(
                         "payload parity appears before envelope data is complete",
                     ));
@@ -1827,6 +1969,12 @@ fn finalize_sequential_envelope(
             "sequential payload envelope exceeds parity-shard cap",
         ));
     }
+    let required_parity = required_object_parity(pending.data_shards.len() as u64, crypto_header)?;
+    if pending.parity_shards.len() < required_parity as usize {
+        return Err(FormatError::InvalidArchive(
+            "sequential payload envelope has insufficient parity for recovery settings",
+        ));
+    }
 
     let repaired = repair_data_gf16(
         &pending.data_shards,
@@ -1868,6 +2016,7 @@ fn decode_concatenated_zstd_frames(
             return Err(FormatError::InvalidZstdFrame);
         }
         let end = checked_add(cursor, frame_len, "zstd frame")?;
+        validate_exact_zstd_frame(&plaintext[cursor..end])?;
         let decoded = if let Some(dictionary) = dictionary {
             let mut decoder =
                 zstd::stream::Decoder::with_dictionary(&plaintext[cursor..end], dictionary)
@@ -2078,11 +2227,25 @@ fn validate_object_extent(
             "encrypted object exceeds its class parity-shard maximum",
         ));
     }
-    let total = extent.data_block_count as u64 + extent.parity_block_count as u64;
+    let required_parity = required_object_parity(extent.data_block_count as u64, crypto_header)?;
+    if extent.parity_block_count < required_parity {
+        return Err(FormatError::InvalidArchive(
+            "encrypted object has insufficient parity for recovery settings",
+        ));
+    }
+    let total = checked_u64_add(
+        extent.data_block_count as u64,
+        extent.parity_block_count as u64,
+        "encrypted object shard count overflow",
+    )?;
     if total > 65_535 {
         return Err(FormatError::FecTooManyShards(total as usize));
     }
-    let expected = extent.data_block_count as u64 * crypto_header.block_size as u64;
+    let expected = checked_u64_mul(
+        extent.data_block_count as u64,
+        crypto_header.block_size as u64,
+        "encrypted object size overflow",
+    )?;
     if expected != extent.encrypted_size as u64 {
         return Err(FormatError::InvalidArchive(
             "encrypted object size is not data_block_count * block_size",
@@ -2094,6 +2257,59 @@ fn validate_object_extent(
         ));
     }
     Ok(())
+}
+
+fn required_object_parity(
+    data_block_count: u64,
+    crypto_header: &CryptoHeaderFixed,
+) -> Result<u32, FormatError> {
+    let min_parity =
+        if crypto_header.volume_loss_tolerance > 0 || crypto_header.bit_rot_buffer_pct > 0 {
+            1
+        } else {
+            0
+        };
+    let mut parity = 0u64;
+    for _ in 0..100 {
+        let total = data_block_count
+            .checked_add(parity)
+            .ok_or(FormatError::InvalidArchive("parity total overflow"))?;
+        let by_volume = checked_u64_mul(
+            crypto_header.volume_loss_tolerance as u64,
+            ceil_div_u64(total, crypto_header.stripe_width as u64)?,
+            "volume-loss parity overflow",
+        )?;
+        let by_bitrot = ceil_div_u64(
+            checked_u64_mul(
+                total,
+                crypto_header.bit_rot_buffer_pct as u64,
+                "bit-rot parity overflow",
+            )?,
+            100,
+        )?;
+        let next = by_volume
+            .checked_add(by_bitrot)
+            .ok_or(FormatError::InvalidArchive("parity overflow"))?
+            .max(min_parity);
+        if next == parity {
+            return u32::try_from(next)
+                .map_err(|_| FormatError::InvalidArchive("parity count overflow"));
+        }
+        parity = next;
+    }
+    Err(FormatError::InvalidArchive(
+        "parity calculation did not converge",
+    ))
+}
+
+fn ceil_div_u64(numerator: u64, denominator: u64) -> Result<u64, FormatError> {
+    if denominator == 0 {
+        return Err(FormatError::InvalidArchive("division by zero"));
+    }
+    numerator
+        .checked_add(denominator - 1)
+        .ok_or(FormatError::InvalidArchive("ceiling division overflow"))
+        .map(|value| value / denominator)
 }
 
 fn frame_range_for_file<'b>(
@@ -2124,6 +2340,12 @@ fn metadata_limits(crypto_header: &CryptoHeaderFixed) -> MetadataLimits {
     MetadataLimits {
         block_size: crypto_header.block_size,
         max_path_length: crypto_header.max_path_length,
+        max_payload_data_shards: crypto_header.fec_data_shards,
+        max_payload_parity_shards: crypto_header.fec_parity_shards,
+        max_index_data_shards: crypto_header.index_fec_data_shards,
+        max_index_parity_shards: crypto_header.index_fec_parity_shards,
+        max_index_root_data_shards: crypto_header.index_root_fec_data_shards,
+        max_index_root_parity_shards: crypto_header.index_root_fec_parity_shards,
         ..MetadataLimits::default()
     }
 }
@@ -2226,6 +2448,87 @@ fn validate_file_extent_coverage_ranges(
     )
 }
 
+fn add_expected_directory_hint_rows(
+    map: &mut DirectoryHintMap,
+    shard_row_index: u32,
+    path: &[u8],
+    kind: TarEntryKind,
+) {
+    map.entry(Vec::new()).or_default().insert(shard_row_index);
+    for (idx, byte) in path.iter().enumerate() {
+        if *byte == b'/' {
+            map.entry(path[..idx].to_vec())
+                .or_default()
+                .insert(shard_row_index);
+        }
+    }
+    if kind == TarEntryKind::Directory {
+        map.entry(path.to_vec())
+            .or_default()
+            .insert(shard_row_index);
+    }
+}
+
+fn validate_directory_hint_tables_against_expected(
+    tables: &[DirectoryHintTable],
+    expected: &DirectoryHintMap,
+) -> Result<(), FormatError> {
+    let mut actual = Vec::new();
+    let mut previous_key: Option<([u8; 8], Vec<u8>)> = None;
+
+    for table in tables {
+        for entry_index in 0..table.entries.len() {
+            let path = table
+                .entry_path(entry_index)
+                .ok_or(FormatError::InvalidArchive(
+                    "DirectoryHintEntry path is missing",
+                ))?;
+            let key = (hash_prefix(path), path.to_vec());
+            if let Some(previous) = &previous_key {
+                if previous >= &key {
+                    return Err(FormatError::InvalidArchive(
+                        "DirectoryHintEntry rows are not globally sorted",
+                    ));
+                }
+            }
+            previous_key = Some(key);
+
+            let rows =
+                table
+                    .shard_rows_for_entry(entry_index)
+                    .ok_or(FormatError::InvalidArchive(
+                        "DirectoryHintEntry shard rows are missing",
+                    ))?;
+            actual.push((path.to_vec(), rows.to_vec()));
+        }
+    }
+
+    if actual != sorted_directory_hint_rows(expected) {
+        return Err(FormatError::InvalidArchive(
+            "directory hint map does not match decoded files",
+        ));
+    }
+    Ok(())
+}
+
+fn sorted_directory_hint_rows(map: &DirectoryHintMap) -> Vec<(Vec<u8>, Vec<u32>)> {
+    let mut rows = map
+        .iter()
+        .map(|(path, shard_rows)| {
+            (
+                path.clone(),
+                shard_rows.iter().copied().collect::<Vec<u32>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|(left_path, _), (right_path, _)| {
+        hash_prefix(left_path)
+            .cmp(&hash_prefix(right_path))
+            .then_with(|| left_path.cmp(right_path))
+    });
+    rows
+}
+
 fn validate_exact_coverage_ranges(
     ranges: &mut [(usize, usize)],
     expected_end: usize,
@@ -2317,10 +2620,8 @@ mod tests {
     use super::*;
     use crate::crypto::compute_hmac;
     use crate::format::{AeadAlgo, CompressionAlgo, FecAlgo, KdfAlgo};
-    use crate::writer::{
-        write_archive, write_archive_with_dictionary, write_empty_archive, RegularFile,
-        WriterOptions,
-    };
+    use crate::metadata::{DirectoryHintEntry, DirectoryHintTableHeader};
+    use crate::writer::{write_archive, write_archive_with_dictionary, RegularFile, WriterOptions};
 
     fn master_key() -> MasterKey {
         MasterKey::from_raw_key(&[0x42; 32]).unwrap()
@@ -2330,12 +2631,20 @@ mod tests {
         b"dir/dict.txt common words common words common words dictionary payload"
     }
 
+    fn single_stream_options() -> WriterOptions {
+        WriterOptions {
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            ..WriterOptions::default()
+        }
+    }
+
     #[test]
     fn opens_lists_verifies_and_extracts_one_file_archive() {
         let archive = write_archive(
             &[RegularFile::new("dir/hello.txt", b"hello m7")],
             &master_key(),
-            WriterOptions::default(),
+            single_stream_options(),
         )
         .unwrap();
         let opened = open_archive(&archive.bytes, &master_key()).unwrap();
@@ -2360,7 +2669,7 @@ mod tests {
         let archive = write_archive(
             &[RegularFile::new("dir/hello.txt", b"safe m8")],
             &master_key(),
-            WriterOptions::default(),
+            single_stream_options(),
         )
         .unwrap();
         let opened = open_archive(&archive.bytes, &master_key()).unwrap();
@@ -2386,7 +2695,7 @@ mod tests {
         let archive = write_archive(
             &[RegularFile::new("hello.txt", b"new")],
             &master_key(),
-            WriterOptions::default(),
+            single_stream_options(),
         )
         .unwrap();
         let opened = open_archive(&archive.bytes, &master_key()).unwrap();
@@ -2404,7 +2713,7 @@ mod tests {
 
     #[test]
     fn opens_and_verifies_empty_archive() {
-        let archive = write_empty_archive(&master_key()).unwrap();
+        let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
         let opened = open_archive(&archive.bytes, &master_key()).unwrap();
 
         assert!(opened.list_files().unwrap().is_empty());
@@ -2412,8 +2721,26 @@ mod tests {
     }
 
     #[test]
+    fn default_reader_options_allow_v36_trailing_garbage_scan() {
+        let archive = write_archive(
+            &[RegularFile::new("garbage-tolerant.txt", b"still intact")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut with_trailing_garbage = archive.bytes.clone();
+        with_trailing_garbage.extend_from_slice(b"ignored trailing bytes");
+
+        let opened = open_archive(&with_trailing_garbage, &master_key()).unwrap();
+        assert_eq!(
+            opened.extract_file("garbage-tolerant.txt").unwrap(),
+            Some(b"still intact".to_vec())
+        );
+    }
+
+    #[test]
     fn rejects_wrong_key_before_metadata_release() {
-        let archive = write_empty_archive(&master_key()).unwrap();
+        let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
         let wrong = MasterKey::from_raw_key(&[0x43; 32]).unwrap();
 
         assert_eq!(
@@ -2429,14 +2756,19 @@ mod tests {
         let mut archive = write_archive(
             &[RegularFile::new("file.txt", b"authenticated")],
             &master_key(),
-            WriterOptions::default(),
+            single_stream_options(),
         )
         .unwrap()
         .bytes;
         let volume = VolumeHeader::parse(&archive[..VOLUME_HEADER_LEN]).unwrap();
         let crypto_end = VOLUME_HEADER_LEN + usize::try_from(volume.crypto_header_length).unwrap();
+        let crypto = CryptoHeader::parse(
+            &archive[VOLUME_HEADER_LEN..crypto_end],
+            volume.crypto_header_length,
+        )
+        .unwrap();
+        let block_size = crypto.fixed.block_size as usize;
         archive[crypto_end + 16] ^= 1;
-        let block_size = 4096usize;
         let crc_offset = crypto_end + 16 + block_size;
         let crc = crc32c::crc32c(&archive[crypto_end..crc_offset]);
         archive[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
@@ -2453,7 +2785,7 @@ mod tests {
                 RegularFile::new("same.txt", b"newer"),
             ],
             &master_key(),
-            WriterOptions::default(),
+            single_stream_options(),
         )
         .unwrap();
         let opened = open_archive(&archive.bytes, &master_key()).unwrap();
@@ -2477,7 +2809,7 @@ mod tests {
         let archive = write_archive(
             &[RegularFile::new("dir/sidecar.txt", b"hello sidecar")],
             &master_key(),
-            WriterOptions::default(),
+            single_stream_options(),
         )
         .unwrap();
         let opened = open_archive_with_bootstrap_sidecar(
@@ -2509,7 +2841,7 @@ mod tests {
                 b"common words common words dictionary payload",
             )],
             &master_key(),
-            WriterOptions::default(),
+            single_stream_options(),
             dictionary(),
         )
         .unwrap();
@@ -2539,7 +2871,7 @@ mod tests {
                 b"common words common words dictionary payload",
             )],
             &master_key(),
-            WriterOptions::default(),
+            single_stream_options(),
             dictionary(),
         )
         .unwrap();
@@ -2570,7 +2902,7 @@ mod tests {
                 b"common words common words sidecar payload",
             )],
             &master_key(),
-            WriterOptions::default(),
+            single_stream_options(),
             dictionary(),
         )
         .unwrap();
@@ -2589,11 +2921,37 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_sidecar_treats_crc_failed_payload_block_as_erasure() {
+        let archive = write_archive(
+            &[RegularFile::new(
+                "sidecar-erasure.txt",
+                b"repair through sidecar",
+            )],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut corrupted = archive.bytes.clone();
+        corrupt_first_block_record_payload(&mut corrupted);
+
+        let opened = open_archive_with_bootstrap_sidecar(
+            &corrupted,
+            &archive.bootstrap_sidecar,
+            &master_key(),
+        )
+        .unwrap();
+        assert_eq!(
+            opened.extract_file("sidecar-erasure.txt").unwrap(),
+            Some(b"repair through sidecar".to_vec())
+        );
+    }
+
+    #[test]
     fn dictionary_sidecar_requires_dictionary_record_section() {
         let archive = write_archive_with_dictionary(
             &[RegularFile::new("dict-missing.txt", b"common words")],
             &master_key(),
-            WriterOptions::default(),
+            single_stream_options(),
             dictionary(),
         )
         .unwrap();
@@ -2621,7 +2979,7 @@ mod tests {
         let archive = write_archive_with_dictionary(
             &[RegularFile::new("dict-sidecar-kind.txt", b"common words")],
             &master_key(),
-            WriterOptions::default(),
+            single_stream_options(),
             dictionary(),
         )
         .unwrap();
@@ -2652,7 +3010,7 @@ mod tests {
         let archive = write_archive(
             &[RegularFile::new("file.txt", b"payload")],
             &master_key(),
-            WriterOptions::default(),
+            single_stream_options(),
         )
         .unwrap();
 
@@ -2675,7 +3033,7 @@ mod tests {
         let archive = write_archive(
             &[RegularFile::new("seq.txt", b"streaming")],
             &master_key(),
-            WriterOptions::default(),
+            single_stream_options(),
         )
         .unwrap();
 
@@ -2686,11 +3044,53 @@ mod tests {
     }
 
     #[test]
+    fn sequential_repairs_crc_failed_payload_data_when_parity_is_guaranteed() {
+        let archive = write_archive(
+            &[RegularFile::new("seq-erasure.txt", b"stream repair")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut corrupted = archive.bytes;
+        corrupt_first_block_record_payload(&mut corrupted);
+
+        let tar_stream = sequential_extract_tar_stream(&corrupted, &master_key()).unwrap();
+        let member = parse_tar_member_group(&tar_stream, 4096).unwrap();
+        assert_eq!(member.path, b"seq-erasure.txt");
+        assert_eq!(member.data, b"stream repair");
+    }
+
+    #[test]
+    fn sequential_rejects_crc_failed_payload_data_without_guaranteed_parity() {
+        let archive = write_archive(
+            &[RegularFile::new("seq-no-parity.txt", b"no repair")],
+            &master_key(),
+            WriterOptions {
+                bit_rot_buffer_pct: 0,
+                fec_parity_shards: 0,
+                index_fec_parity_shards: 0,
+                index_root_fec_parity_shards: 0,
+                ..single_stream_options()
+            },
+        )
+        .unwrap();
+        let mut corrupted = archive.bytes;
+        corrupt_first_block_record_payload(&mut corrupted);
+
+        assert_eq!(
+            sequential_extract_tar_stream(&corrupted, &master_key()).unwrap_err(),
+            FormatError::BadCrc {
+                structure: "BlockRecord"
+            }
+        );
+    }
+
+    #[test]
     fn sequential_rejects_when_terminal_authentication_fails() {
         let archive = write_archive(
             &[RegularFile::new("seq.txt", b"streaming")],
             &master_key(),
-            WriterOptions::default(),
+            single_stream_options(),
         )
         .unwrap();
         let mut corrupted = archive.bytes;
@@ -2706,8 +3106,20 @@ mod tests {
     }
 
     #[test]
+    fn sequential_zstd_stream_rejects_skippable_frame_segments() {
+        let skippable = [0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0];
+        let mut output = Vec::new();
+
+        assert_eq!(
+            decode_concatenated_zstd_frames(&skippable, None, &mut output).unwrap_err(),
+            FormatError::NotStandardZstdFrame
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn bootstrap_sidecar_rejects_bad_flags_and_trailing_bytes() {
-        let archive = write_archive(&[], &master_key(), WriterOptions::default()).unwrap();
+        let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
         let mut bad_flags = archive.bootstrap_sidecar.clone();
         rewrite_sidecar_header(&mut bad_flags, &master_key(), |header| {
             header.flags |= 0x08;
@@ -2729,7 +3141,7 @@ mod tests {
 
     #[test]
     fn bootstrap_sidecar_rejects_bad_manifest_footer_semantics() {
-        let archive = write_archive(&[], &master_key(), WriterOptions::default()).unwrap();
+        let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
         let mut wrong_volume = archive.bootstrap_sidecar.clone();
         mutate_sidecar_manifest(&mut wrong_volume, &master_key(), |footer| {
             footer.volume_index = 1;
@@ -2753,7 +3165,7 @@ mod tests {
 
     #[test]
     fn bootstrap_sidecar_rejects_dictionary_section_for_no_dictionary_archive() {
-        let archive = write_archive(&[], &master_key(), WriterOptions::default()).unwrap();
+        let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
         let mut with_dictionary = archive.bootstrap_sidecar.clone();
         let header =
             BootstrapSidecarHeader::parse(&with_dictionary[..BOOTSTRAP_SIDECAR_HEADER_LEN])
@@ -2780,7 +3192,7 @@ mod tests {
 
     #[test]
     fn bootstrap_sidecar_rejects_missing_duplicate_wrong_kind_and_wrong_last_flag() {
-        let archive = write_archive(&[], &master_key(), WriterOptions::default()).unwrap();
+        let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
         let mut missing = archive.bootstrap_sidecar.clone();
         let record_len = sidecar_record_len(&missing);
         let new_len = missing.len() - record_len;
@@ -2887,6 +3299,53 @@ mod tests {
     }
 
     #[test]
+    fn expected_directory_hint_rows_include_ancestors_and_directory_entries() {
+        let mut map = DirectoryHintMap::new();
+        add_expected_directory_hint_rows(&mut map, 2, b"foo/bar/baz.txt", TarEntryKind::Regular);
+        add_expected_directory_hint_rows(&mut map, 4, b"foo/bar", TarEntryKind::Directory);
+
+        assert_eq!(map.get(&Vec::new()), Some(&BTreeSet::from([2, 4])));
+        assert_eq!(map.get(&b"foo".to_vec()), Some(&BTreeSet::from([2, 4])));
+        assert_eq!(map.get(&b"foo/bar".to_vec()), Some(&BTreeSet::from([2, 4])));
+        assert!(!map.contains_key(&b"foo/bar/baz.txt".to_vec()));
+        assert!(!map.contains_key(&b"foobar".to_vec()));
+    }
+
+    #[test]
+    fn directory_hint_validation_requires_exact_global_map() {
+        let mut expected = DirectoryHintMap::new();
+        add_expected_directory_hint_rows(&mut expected, 0, b"foo/bar.txt", TarEntryKind::Regular);
+        add_expected_directory_hint_rows(&mut expected, 1, b"foo", TarEntryKind::Directory);
+        let rows = sorted_directory_hint_rows(&expected);
+        let table = directory_hint_table_from_rows(7, &rows, 2);
+
+        validate_directory_hint_tables_against_expected(&[table.clone()], &expected).unwrap();
+
+        let mut incomplete = expected.clone();
+        incomplete.get_mut(&b"foo".to_vec()).unwrap().remove(&1);
+        assert_eq!(
+            validate_directory_hint_tables_against_expected(&[table], &incomplete).unwrap_err(),
+            FormatError::InvalidArchive("directory hint map does not match decoded files")
+        );
+    }
+
+    #[test]
+    fn directory_hint_validation_rejects_global_order_mismatch() {
+        let mut expected = DirectoryHintMap::new();
+        expected.insert(Vec::new(), BTreeSet::from([0]));
+        expected.insert(b"alpha".to_vec(), BTreeSet::from([0]));
+        let rows = sorted_directory_hint_rows(&expected);
+        let first = directory_hint_table_from_rows(8, &rows[..1], 1);
+        let second = directory_hint_table_from_rows(9, &rows[1..], 1);
+
+        assert_eq!(
+            validate_directory_hint_tables_against_expected(&[second, first], &expected)
+                .unwrap_err(),
+            FormatError::InvalidArchive("DirectoryHintEntry rows are not globally sorted")
+        );
+    }
+
+    #[test]
     fn object_extent_rejects_parity_above_class_cap() {
         let crypto_header = CryptoHeaderFixed {
             length: 0,
@@ -2924,6 +3383,45 @@ mod tests {
     }
 
     #[test]
+    fn object_extent_rejects_parity_below_recoverability_requirement() {
+        let crypto_header = CryptoHeaderFixed {
+            length: 0,
+            compression_algo: CompressionAlgo::ZstdFramed,
+            aead_algo: AeadAlgo::AesGcmSiv256,
+            fec_algo: FecAlgo::ReedSolomonGF16,
+            kdf_algo: KdfAlgo::Raw,
+            chunk_size: 1024,
+            envelope_target_size: 4096,
+            block_size: 4096,
+            fec_data_shards: 1,
+            fec_parity_shards: 1,
+            index_fec_data_shards: 1,
+            index_fec_parity_shards: 1,
+            index_root_fec_data_shards: 1,
+            index_root_fec_parity_shards: 1,
+            stripe_width: 2,
+            volume_loss_tolerance: 1,
+            bit_rot_buffer_pct: 0,
+            has_dictionary: 0,
+            max_path_length: 4096,
+            expected_volume_size: 0,
+        };
+        let extent = ObjectExtent {
+            first_block_index: 0,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+        };
+
+        assert_eq!(
+            validate_object_extent(extent, &crypto_header, 1, 1).unwrap_err(),
+            FormatError::InvalidArchive(
+                "encrypted object has insufficient parity for recovery settings"
+            )
+        );
+    }
+
+    #[test]
     fn opens_complete_multi_volume_archive() {
         let files = [RegularFile::new("alpha.txt", b"hello from volume stripes")];
         let archive = write_archive(
@@ -2932,7 +3430,7 @@ mod tests {
             WriterOptions {
                 stripe_width: 2,
                 volume_loss_tolerance: 1,
-                ..WriterOptions::default()
+                ..single_stream_options()
             },
         )
         .unwrap();
@@ -2963,7 +3461,7 @@ mod tests {
             WriterOptions {
                 stripe_width: 2,
                 volume_loss_tolerance: 1,
-                ..WriterOptions::default()
+                ..single_stream_options()
             },
         )
         .unwrap();
@@ -2986,7 +3484,7 @@ mod tests {
             WriterOptions {
                 stripe_width: 2,
                 volume_loss_tolerance: 1,
-                ..WriterOptions::default()
+                ..single_stream_options()
             },
         )
         .unwrap();
@@ -3012,7 +3510,7 @@ mod tests {
             WriterOptions {
                 stripe_width: 2,
                 volume_loss_tolerance: 1,
-                ..WriterOptions::default()
+                ..single_stream_options()
             },
         )
         .unwrap();
@@ -3037,7 +3535,7 @@ mod tests {
             WriterOptions {
                 stripe_width: 2,
                 volume_loss_tolerance: 1,
-                ..WriterOptions::default()
+                ..single_stream_options()
             },
         )
         .unwrap();
@@ -3050,6 +3548,114 @@ mod tests {
             .unwrap_err(),
             FormatError::InvalidArchive("duplicate authenticated volume index")
         );
+    }
+
+    fn directory_hint_table_from_rows(
+        hint_shard_index: u64,
+        rows: &[(Vec<u8>, Vec<u32>)],
+        shard_count: u32,
+    ) -> DirectoryHintTable {
+        let mut entries = Vec::new();
+        let mut shard_row_indexes = Vec::new();
+        let mut string_pool = Vec::new();
+
+        for (path, rows) in rows {
+            let path_offset = if path.is_empty() {
+                0
+            } else {
+                let offset = string_pool.len() as u64;
+                string_pool.extend_from_slice(path);
+                offset
+            };
+            let shard_list_start_index = shard_row_indexes.len() as u32;
+            shard_row_indexes.extend_from_slice(rows);
+            entries.push(DirectoryHintEntry {
+                dir_hash: hash_prefix(path),
+                path_offset,
+                path_length: path.len() as u32,
+                shard_list_start_index,
+                shard_count: rows.len() as u32,
+            });
+        }
+
+        let table_bytes =
+            directory_hint_table_bytes(hint_shard_index, entries, shard_row_indexes, string_pool);
+        let locating = DirectoryHintShardEntry {
+            hint_shard_index,
+            first_dir_hash: hash_prefix(&rows.first().unwrap().0),
+            last_dir_hash: hash_prefix(&rows.last().unwrap().0),
+            first_block_index: 0,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+            decompressed_size: table_bytes.len() as u32,
+            entry_count: rows.len() as u64,
+        };
+        DirectoryHintTable::parse(
+            &table_bytes,
+            &locating,
+            shard_count,
+            MetadataLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn directory_hint_table_bytes(
+        hint_shard_index: u64,
+        entries: Vec<DirectoryHintEntry>,
+        shard_row_indexes: Vec<u32>,
+        string_pool: Vec<u8>,
+    ) -> Vec<u8> {
+        let header_len = DirectoryHintTableHeader {
+            version: 1,
+            hint_shard_index,
+            entry_count: 0,
+            entry_table_offset: 0,
+            shard_list_offset: 0,
+            string_pool_offset: 0,
+            string_pool_size: 0,
+        }
+        .to_bytes()
+        .len();
+        let entry_len = entries
+            .first()
+            .map(|entry| entry.to_bytes().len())
+            .unwrap_or(0);
+        let shard_list_offset = if entries.is_empty() {
+            0
+        } else {
+            header_len + entries.len() * entry_len
+        };
+        let string_pool_offset = if string_pool.is_empty() {
+            0
+        } else {
+            shard_list_offset + shard_row_indexes.len() * 4
+        };
+
+        let header = DirectoryHintTableHeader {
+            version: 1,
+            hint_shard_index,
+            entry_count: entries.len() as u64,
+            entry_table_offset: if entries.is_empty() {
+                0
+            } else {
+                header_len as u64
+            },
+            shard_list_offset: shard_list_offset as u64,
+            string_pool_offset: string_pool_offset as u64,
+            string_pool_size: string_pool.len() as u64,
+        };
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&header.to_bytes());
+        for entry in entries {
+            out.extend_from_slice(&entry.to_bytes());
+        }
+        for row in shard_row_indexes {
+            out.extend_from_slice(&row.to_le_bytes());
+        }
+        out.extend_from_slice(&string_pool);
+        out
     }
 
     fn corrupt_first_block_record_payload(volume: &mut [u8]) {
@@ -3142,7 +3748,9 @@ mod tests {
             BootstrapSidecarHeader::parse(&sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
         let record_len = sidecar_record_len(sidecar);
         let offset = header.index_root_records_offset as usize + record_index * record_len;
-        let mut record = BlockRecord::parse(&sidecar[offset..offset + record_len], 4096).unwrap();
+        let block_size = record_len - BLOCK_RECORD_FRAMING_LEN;
+        let mut record =
+            BlockRecord::parse(&sidecar[offset..offset + record_len], block_size).unwrap();
         mutate(&mut record);
         sidecar[offset..offset + record_len].copy_from_slice(&record.to_bytes());
     }
@@ -3156,7 +3764,9 @@ mod tests {
             BootstrapSidecarHeader::parse(&sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
         let record_len = sidecar_record_len(sidecar);
         let offset = header.dictionary_records_offset as usize + record_index * record_len;
-        let mut record = BlockRecord::parse(&sidecar[offset..offset + record_len], 4096).unwrap();
+        let block_size = record_len - BLOCK_RECORD_FRAMING_LEN;
+        let mut record =
+            BlockRecord::parse(&sidecar[offset..offset + record_len], block_size).unwrap();
         mutate(&mut record);
         sidecar[offset..offset + record_len].copy_from_slice(&record.to_bytes());
     }
@@ -3175,8 +3785,12 @@ mod tests {
     fn sidecar_record_len(sidecar: &[u8]) -> usize {
         let header =
             BootstrapSidecarHeader::parse(&sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
-        let index_record_count =
-            header.index_root_records_length as usize / (4096 + BLOCK_RECORD_FRAMING_LEN);
+        let footer_offset = header.manifest_footer_offset as usize;
+        let footer =
+            ManifestFooter::parse(&sidecar[footer_offset..footer_offset + MANIFEST_FOOTER_LEN])
+                .unwrap();
+        let index_record_count = footer.index_root_data_block_count as usize
+            + footer.index_root_parity_block_count as usize;
         header.index_root_records_length as usize / index_record_count
     }
 }

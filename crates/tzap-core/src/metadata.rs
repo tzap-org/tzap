@@ -21,6 +21,7 @@ pub const DIRECTORY_HINT_ENTRY_LEN: usize = 40;
 
 const FRAME_KNOWN_FLAGS: u32 = 0x0000_0003;
 const DEFAULT_MAX_HASH_COLLISION_SHARD_SCAN: usize = 16;
+const REED_SOLOMON_GF16_MAX_TOTAL_SHARDS: u64 = 65_535;
 const SHA256_EMPTY: [u8; 32] = [
     0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
     0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
@@ -35,6 +36,12 @@ pub struct MetadataLimits {
     pub max_directory_hint_shards: u32,
     pub max_files_per_index_shard: u32,
     pub max_entries_per_directory_hint_shard: u64,
+    pub max_payload_data_shards: u16,
+    pub max_payload_parity_shards: u16,
+    pub max_index_data_shards: u16,
+    pub max_index_parity_shards: u16,
+    pub max_index_root_data_shards: u16,
+    pub max_index_root_parity_shards: u16,
 }
 
 impl Default for MetadataLimits {
@@ -44,9 +51,15 @@ impl Default for MetadataLimits {
             max_path_length: 4096,
             max_hash_collision_shard_scan: DEFAULT_MAX_HASH_COLLISION_SHARD_SCAN,
             max_shard_count: 1_000_000,
-            max_directory_hint_shards: 65_535,
+            max_directory_hint_shards: 1_000_000,
             max_files_per_index_shard: 1_000_000,
             max_entries_per_directory_hint_shard: 1_000_000,
+            max_payload_data_shards: u16::MAX,
+            max_payload_parity_shards: u16::MAX,
+            max_index_data_shards: u16::MAX,
+            max_index_parity_shards: u16::MAX,
+            max_index_root_data_shards: u16::MAX,
+            max_index_root_parity_shards: u16::MAX,
         }
     }
 }
@@ -235,7 +248,7 @@ impl IndexRoot {
         if header.directory_hint_shard_count > limits.max_directory_hint_shards {
             return invalid(structure, "directory hint shard count exceeds resource cap");
         }
-        validate_dictionary_fields(&header, has_dictionary, limits.block_size)?;
+        validate_dictionary_fields(&header, has_dictionary, limits)?;
 
         let mut cursor = INDEX_ROOT_LEN;
         let shards = if header.shard_count == 0 {
@@ -794,6 +807,7 @@ impl DirectoryHintTable {
             &string_pool,
             locating_shard,
             index_root_shard_count,
+            limits.max_path_length,
         )?;
 
         Ok(Self {
@@ -982,6 +996,13 @@ fn parse_shard_entries(
             entry.encrypted_size,
             limits.block_size,
         )?;
+        validate_fec_class_extent(
+            "ShardEntry",
+            entry.data_block_count,
+            entry.parity_block_count,
+            limits.max_index_data_shards,
+            limits.max_index_parity_shards,
+        )?;
         if entry.first_path_hash > entry.last_path_hash {
             return invalid("ShardEntry", "first hash is greater than last hash");
         }
@@ -1031,6 +1052,13 @@ fn parse_directory_hint_shard_entries(
             entry.data_block_count,
             entry.encrypted_size,
             limits.block_size,
+        )?;
+        validate_fec_class_extent(
+            "DirectoryHintShardEntry",
+            entry.data_block_count,
+            entry.parity_block_count,
+            limits.max_index_data_shards,
+            limits.max_index_parity_shards,
         )?;
         if entry.first_dir_hash > entry.last_dir_hash {
             return invalid(
@@ -1167,7 +1195,7 @@ fn validate_index_root_totals(
 fn validate_dictionary_fields(
     header: &IndexRootHeader,
     has_dictionary: bool,
-    block_size: u32,
+    limits: MetadataLimits,
 ) -> Result<(), FormatError> {
     let all_zero = header.dictionary_first_block == 0
         && header.dictionary_data_block_count == 0
@@ -1201,7 +1229,14 @@ fn validate_dictionary_fields(
         "IndexRoot.dictionary",
         header.dictionary_data_block_count,
         header.dictionary_encrypted_size,
-        block_size,
+        limits.block_size,
+    )?;
+    validate_fec_class_extent(
+        "IndexRoot.dictionary",
+        header.dictionary_data_block_count,
+        header.dictionary_parity_block_count,
+        limits.max_index_root_data_shards,
+        limits.max_index_root_parity_shards,
     )
 }
 
@@ -1214,7 +1249,7 @@ fn validate_index_shard_tables(
     limits: MetadataLimits,
 ) -> Result<(Vec<Vec<u8>>, Vec<u64>), FormatError> {
     validate_frame_table(frames)?;
-    validate_envelope_table(envelopes, limits.block_size)?;
+    validate_envelope_table(envelopes, limits)?;
 
     let frame_by_index = frames
         .iter()
@@ -1383,7 +1418,7 @@ fn validate_frame_table(frames: &[FrameEntry]) -> Result<(), FormatError> {
 
 fn validate_envelope_table(
     envelopes: &[EnvelopeEntry],
-    block_size: u32,
+    limits: MetadataLimits,
 ) -> Result<(), FormatError> {
     for envelope in envelopes {
         if envelope.frame_count == 0 || envelope.plaintext_size == 0 {
@@ -1393,7 +1428,14 @@ fn validate_envelope_table(
             "EnvelopeEntry",
             envelope.data_block_count,
             envelope.encrypted_size,
-            block_size,
+            limits.block_size,
+        )?;
+        validate_fec_class_extent(
+            "EnvelopeEntry",
+            envelope.data_block_count,
+            envelope.parity_block_count,
+            limits.max_payload_data_shards,
+            limits.max_payload_parity_shards,
         )?;
     }
     for pair in envelopes.windows(2) {
@@ -1611,6 +1653,7 @@ fn validate_directory_hint_paths_and_lists(
     string_pool: &[u8],
     locating_shard: &DirectoryHintShardEntry,
     index_root_shard_count: u32,
+    max_path_length: u32,
 ) -> Result<Vec<Vec<u8>>, FormatError> {
     let mut paths = Vec::with_capacity(entries.len());
     let mut seen_paths = HashSet::new();
@@ -1630,7 +1673,7 @@ fn validate_directory_hint_paths_and_lists(
                 entry.path_length as u64,
                 "DirectoryHintEntry",
             )?;
-            validate_directory_path_bytes(path, u32::MAX)?;
+            validate_directory_path_bytes(path, max_path_length)?;
             path
         };
         if hash_prefix(path) != entry.dir_hash {
@@ -1844,6 +1887,29 @@ fn validate_encrypted_extent(
     Ok(())
 }
 
+fn validate_fec_class_extent(
+    structure: &'static str,
+    data_block_count: u32,
+    parity_block_count: u32,
+    data_shard_max: u16,
+    parity_shard_max: u16,
+) -> Result<(), FormatError> {
+    if data_block_count > data_shard_max as u32 {
+        return invalid(structure, "data_block_count exceeds class maximum");
+    }
+    if parity_block_count > parity_shard_max as u32 {
+        return invalid(structure, "parity_block_count exceeds class maximum");
+    }
+    let total = data_block_count as u64 + parity_block_count as u64;
+    if total > REED_SOLOMON_GF16_MAX_TOTAL_SHARDS {
+        return invalid(
+            structure,
+            "data_block_count + parity_block_count exceeds ReedSolomonGF16 limit",
+        );
+    }
+    Ok(())
+}
+
 fn frame_for_file<'a>(
     _file: &FileEntry,
     frame_by_index: &HashMap<u64, usize>,
@@ -2023,8 +2089,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_hash_collision_scan_cap_matches_v36() {
-        assert_eq!(MetadataLimits::default().max_hash_collision_shard_scan, 16);
+    fn default_reader_caps_match_v36() {
+        let limits = MetadataLimits::default();
+        assert_eq!(limits.max_shard_count, 1_000_000);
+        assert_eq!(limits.max_directory_hint_shards, 1_000_000);
+        assert_eq!(limits.max_files_per_index_shard, 1_000_000);
+        assert_eq!(limits.max_entries_per_directory_hint_shard, 1_000_000);
+        assert_eq!(limits.max_hash_collision_shard_scan, 16);
+    }
+
+    #[test]
+    fn index_root_rejects_shard_extent_above_crypto_header_class_limits() {
+        let path_hash = hash_prefix(b"a.txt");
+        let root = IndexRoot {
+            header: IndexRootHeader {
+                file_count: 1,
+                ..IndexRootHeader::empty()
+            },
+            shards: vec![ShardEntry {
+                shard_index: 0,
+                first_block_index: 1,
+                data_block_count: 1,
+                parity_block_count: 2,
+                encrypted_size: 4096,
+                decompressed_size: 64,
+                file_count: 1,
+                first_path_hash: path_hash,
+                last_path_hash: path_hash,
+            }],
+            directory_hint_shards: Vec::new(),
+        };
+        let mut limits = MetadataLimits::default();
+        limits.max_index_parity_shards = 1;
+
+        assert_eq!(
+            IndexRoot::parse(&root.to_bytes(), false, limits).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "ShardEntry",
+                reason: "parity_block_count exceeds class maximum",
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_fec_extent_rejects_reed_solomon_total_overflow() {
+        assert_eq!(
+            validate_fec_class_extent("EnvelopeEntry", 65_535, 1, u16::MAX, u16::MAX).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "EnvelopeEntry",
+                reason: "data_block_count + parity_block_count exceeds ReedSolomonGF16 limit",
+            }
+        );
     }
 
     #[test]
@@ -2133,6 +2248,51 @@ mod tests {
                 structure: "IndexRoot",
                 reason: "DirectoryHintShardEntry rows are not sorted"
             }
+        );
+    }
+
+    #[test]
+    fn directory_hint_paths_obey_configured_max_path_length() {
+        let path = b"toolong".to_vec();
+        let table = DirectoryHintTable {
+            header: DirectoryHintTableHeader {
+                version: 1,
+                hint_shard_index: 0,
+                entry_count: 0,
+                entry_table_offset: 0,
+                shard_list_offset: 0,
+                string_pool_offset: 0,
+                string_pool_size: 0,
+            },
+            entries: vec![DirectoryHintEntry {
+                dir_hash: hash_prefix(&path),
+                path_offset: 0,
+                path_length: path.len() as u32,
+                shard_list_start_index: 0,
+                shard_count: 1,
+            }],
+            shard_row_indexes: vec![0],
+            string_pool: path.clone(),
+            entry_paths: vec![path.clone()],
+        };
+        let bytes = table.to_bytes();
+        let locating = DirectoryHintShardEntry {
+            hint_shard_index: 0,
+            first_dir_hash: hash_prefix(&path),
+            last_dir_hash: hash_prefix(&path),
+            first_block_index: 0,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+            decompressed_size: bytes.len() as u32,
+            entry_count: 1,
+        };
+        let mut limits = MetadataLimits::default();
+        limits.max_path_length = 3;
+
+        assert_eq!(
+            DirectoryHintTable::parse(&bytes, &locating, 1, limits).unwrap_err(),
+            FormatError::UnsafeArchivePath
         );
     }
 

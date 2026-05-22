@@ -5,7 +5,11 @@ use crate::format::{
     AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, FormatError, KdfAlgo, BLOCK_RECORD_FRAMING_LEN,
     BOOTSTRAP_SIDECAR_HEADER_LEN, CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_EXTENSION_MAX_VALUE_LEN,
     CRYPTO_HEADER_FIXED_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, MANIFEST_FOOTER_LEN,
-    VOLUME_FORMAT_REV, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    READER_MAX_BLOCK_SIZE, READER_MAX_CHUNK_SIZE, READER_MAX_CRYPTO_HEADER_LEN,
+    READER_MAX_ENVELOPE_TARGET_SIZE, READER_MAX_FEC_CLASS_SHARDS,
+    READER_MAX_INDEX_FEC_CLASS_SHARDS, READER_MAX_INDEX_ROOT_FEC_CLASS_SHARDS,
+    READER_MAX_PATH_LENGTH, READER_MAX_STRIPE_WIDTH, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN,
+    VOLUME_TRAILER_LEN,
 };
 
 const TZAP_MAGIC: [u8; 4] = *b"TZAP";
@@ -82,6 +86,13 @@ impl VolumeHeader {
                 self.crypto_header_offset,
             ));
         }
+        if self.crypto_header_length > READER_MAX_CRYPTO_HEADER_LEN {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "CryptoHeader length",
+                cap: READER_MAX_CRYPTO_HEADER_LEN as u64,
+                actual: self.crypto_header_length as u64,
+            });
+        }
         Ok(())
     }
 
@@ -140,6 +151,13 @@ impl CryptoHeaderFixed {
                 volume: volume_crypto_header_length,
             });
         }
+        if length > READER_MAX_CRYPTO_HEADER_LEN {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "CryptoHeader length",
+                cap: READER_MAX_CRYPTO_HEADER_LEN as u64,
+                actual: length as u64,
+            });
+        }
 
         let header = Self {
             length,
@@ -185,6 +203,13 @@ impl CryptoHeaderFixed {
         if self.stripe_width == 0 {
             return Err(FormatError::ZeroStripeWidth);
         }
+        if self.stripe_width > READER_MAX_STRIPE_WIDTH {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "stripe_width",
+                cap: READER_MAX_STRIPE_WIDTH as u64,
+                actual: self.stripe_width as u64,
+            });
+        }
         if self.volume_loss_tolerance as u32 >= self.stripe_width {
             return Err(FormatError::VolumeLossToleranceOutOfRange {
                 volume_loss_tolerance: self.volume_loss_tolerance,
@@ -211,6 +236,24 @@ impl CryptoHeaderFixed {
                 field: "index_root_fec_data_shards",
             });
         }
+        validate_fec_class_shards(
+            "fec_data_shards + fec_parity_shards",
+            self.fec_data_shards,
+            self.fec_parity_shards,
+            READER_MAX_FEC_CLASS_SHARDS,
+        )?;
+        validate_fec_class_shards(
+            "index_fec_data_shards + index_fec_parity_shards",
+            self.index_fec_data_shards,
+            self.index_fec_parity_shards,
+            READER_MAX_INDEX_FEC_CLASS_SHARDS,
+        )?;
+        validate_fec_class_shards(
+            "index_root_fec_data_shards + index_root_fec_parity_shards",
+            self.index_root_fec_data_shards,
+            self.index_root_fec_parity_shards,
+            READER_MAX_INDEX_ROOT_FEC_CLASS_SHARDS,
+        )?;
         if self.chunk_size == 0 {
             return Err(FormatError::ZeroChunkSize);
         }
@@ -223,11 +266,39 @@ impl CryptoHeaderFixed {
                 envelope_target_size: self.envelope_target_size,
             });
         }
+        if self.chunk_size > READER_MAX_CHUNK_SIZE {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "chunk_size",
+                cap: READER_MAX_CHUNK_SIZE as u64,
+                actual: self.chunk_size as u64,
+            });
+        }
+        if self.envelope_target_size > READER_MAX_ENVELOPE_TARGET_SIZE {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "envelope_target_size",
+                cap: READER_MAX_ENVELOPE_TARGET_SIZE as u64,
+                actual: self.envelope_target_size as u64,
+            });
+        }
         if self.block_size < 4096 {
             return Err(FormatError::BlockSizeTooSmall(self.block_size));
         }
         if self.block_size % 2 != 0 {
             return Err(FormatError::OddBlockSize(self.block_size));
+        }
+        if self.block_size > READER_MAX_BLOCK_SIZE {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "block_size",
+                cap: READER_MAX_BLOCK_SIZE as u64,
+                actual: self.block_size as u64,
+            });
+        }
+        if self.max_path_length > READER_MAX_PATH_LENGTH {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "max_path_length",
+                cap: READER_MAX_PATH_LENGTH as u64,
+                actual: self.max_path_length as u64,
+            });
         }
         Ok(())
     }
@@ -257,6 +328,23 @@ impl CryptoHeaderFixed {
         write_u64(&mut bytes, 52, self.expected_volume_size);
         bytes
     }
+}
+
+fn validate_fec_class_shards(
+    field: &'static str,
+    data_shards: u16,
+    parity_shards: u16,
+    cap: u32,
+) -> Result<(), FormatError> {
+    let total = data_shards as u32 + parity_shards as u32;
+    if total > cap {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field,
+            cap: cap as u64,
+            actual: total as u64,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,6 +425,13 @@ pub struct CryptoHeader<'a> {
 impl<'a> CryptoHeader<'a> {
     pub fn parse(bytes: &'a [u8], volume_crypto_header_length: u32) -> Result<Self, FormatError> {
         let declared_len = volume_crypto_header_length as usize;
+        if volume_crypto_header_length > READER_MAX_CRYPTO_HEADER_LEN {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "CryptoHeader length",
+                cap: READER_MAX_CRYPTO_HEADER_LEN as u64,
+                actual: volume_crypto_header_length as u64,
+            });
+        }
         if bytes.len() != declared_len {
             return Err(FormatError::InvalidLength {
                 structure: "CryptoHeader",
@@ -992,6 +1087,19 @@ mod tests {
             VolumeHeader::parse(&bytes).unwrap_err(),
             FormatError::NonCanonicalCryptoHeaderOffset(129)
         );
+
+        let mut bytes = volume_header().to_bytes();
+        write_u32(&mut bytes, 52, READER_MAX_CRYPTO_HEADER_LEN + 1);
+        let crc = crc32c(&bytes[..124]);
+        write_u32(&mut bytes, 124, crc);
+        assert_eq!(
+            VolumeHeader::parse(&bytes).unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "CryptoHeader length",
+                cap: READER_MAX_CRYPTO_HEADER_LEN as u64,
+                actual: (READER_MAX_CRYPTO_HEADER_LEN + 1) as u64,
+            }
+        );
     }
 
     #[test]
@@ -1025,6 +1133,67 @@ mod tests {
             CryptoHeaderFixed::parse(&bytes, crypto_fixed().length).unwrap_err(),
             FormatError::NonZeroReserved {
                 structure: "CryptoHeaderFixed"
+            }
+        );
+    }
+
+    #[test]
+    fn crypto_header_fixed_rejects_reader_cap_excesses() {
+        let mut header = crypto_fixed();
+        header.chunk_size = READER_MAX_CHUNK_SIZE + 1;
+        header.envelope_target_size = header.chunk_size;
+        assert_eq!(
+            CryptoHeaderFixed::parse(&header.to_bytes(), header.length).unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "chunk_size",
+                cap: READER_MAX_CHUNK_SIZE as u64,
+                actual: (READER_MAX_CHUNK_SIZE + 1) as u64,
+            }
+        );
+
+        let mut header = crypto_fixed();
+        header.block_size = READER_MAX_BLOCK_SIZE + 2;
+        assert_eq!(
+            CryptoHeaderFixed::parse(&header.to_bytes(), header.length).unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "block_size",
+                cap: READER_MAX_BLOCK_SIZE as u64,
+                actual: (READER_MAX_BLOCK_SIZE + 2) as u64,
+            }
+        );
+
+        let mut header = crypto_fixed();
+        header.max_path_length = READER_MAX_PATH_LENGTH + 1;
+        assert_eq!(
+            CryptoHeaderFixed::parse(&header.to_bytes(), header.length).unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "max_path_length",
+                cap: READER_MAX_PATH_LENGTH as u64,
+                actual: (READER_MAX_PATH_LENGTH + 1) as u64,
+            }
+        );
+
+        let mut header = crypto_fixed();
+        header.fec_data_shards = READER_MAX_FEC_CLASS_SHARDS as u16;
+        header.fec_parity_shards = 1;
+        assert_eq!(
+            CryptoHeaderFixed::parse(&header.to_bytes(), header.length).unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "fec_data_shards + fec_parity_shards",
+                cap: READER_MAX_FEC_CLASS_SHARDS as u64,
+                actual: (READER_MAX_FEC_CLASS_SHARDS + 1) as u64,
+            }
+        );
+
+        let mut header = crypto_fixed();
+        header.index_fec_data_shards = READER_MAX_INDEX_FEC_CLASS_SHARDS as u16;
+        header.index_fec_parity_shards = 1;
+        assert_eq!(
+            CryptoHeaderFixed::parse(&header.to_bytes(), header.length).unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "index_fec_data_shards + index_fec_parity_shards",
+                cap: READER_MAX_INDEX_FEC_CLASS_SHARDS as u64,
+                actual: (READER_MAX_INDEX_FEC_CLASS_SHARDS + 1) as u64,
             }
         );
     }

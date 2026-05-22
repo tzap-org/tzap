@@ -10,7 +10,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use aes_gcm_siv::aead::{Aead, KeyInit as AeadKeyInit, Payload};
 
-use crate::format::{AeadAlgo, FormatError, KdfAlgo, MASTER_KEY_LEN, SUBKEY_LEN};
+use crate::format::{
+    AeadAlgo, FormatError, KdfAlgo, MASTER_KEY_LEN, READER_MAX_ARGON2ID_M_COST_KIB,
+    READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST, SUBKEY_LEN,
+};
 use crate::padding::{depad_suffix_padding, suffix_pad_for_aead};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -73,6 +76,10 @@ impl MasterKey {
             return Err(FormatError::KeyMaterialMismatch);
         };
 
+        let salt_length = u16::try_from(salt.len()).map_err(|_| {
+            FormatError::InvalidKdfParams("argon2id salt length must be 8..64 bytes")
+        })?;
+        validate_argon2id_bounds(*t_cost, *m_cost_kib, *parallelism, salt_length)?;
         let params = Params::new(*m_cost_kib, *t_cost, *parallelism, Some(MASTER_KEY_LEN))
             .map_err(|_| FormatError::InvalidKdfParams("argon2 params rejected"))?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -413,11 +420,7 @@ fn parse_argon2id_kdf_params(bytes: &[u8]) -> Result<(KdfParams, usize), FormatE
             "argon2id parallelism must be non-zero",
         ));
     }
-    if m_cost_kib < 8 * parallelism {
-        return Err(FormatError::InvalidKdfParams(
-            "argon2id memory must be at least 8 KiB per lane",
-        ));
-    }
+    validate_argon2id_bounds(t_cost, m_cost_kib, parallelism, salt_length)?;
 
     let total_len = ARGON2ID_FIXED_PARAMS_LEN + salt_length as usize;
     if bytes.len() < total_len {
@@ -432,6 +435,61 @@ fn parse_argon2id_kdf_params(bytes: &[u8]) -> Result<(KdfParams, usize), FormatE
         },
         total_len,
     ))
+}
+
+fn validate_argon2id_bounds(
+    t_cost: u32,
+    m_cost_kib: u32,
+    parallelism: u32,
+    salt_length: u16,
+) -> Result<(), FormatError> {
+    if salt_length < ARGON2ID_MIN_SALT_LEN || salt_length > ARGON2ID_MAX_SALT_LEN {
+        return Err(FormatError::InvalidKdfParams(
+            "argon2id salt length must be 8..64 bytes",
+        ));
+    }
+    if t_cost == 0 {
+        return Err(FormatError::InvalidKdfParams(
+            "argon2id t_cost must be non-zero",
+        ));
+    }
+    if t_cost > READER_MAX_ARGON2ID_T_COST {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "argon2id t_cost",
+            cap: READER_MAX_ARGON2ID_T_COST as u64,
+            actual: t_cost as u64,
+        });
+    }
+    if parallelism == 0 {
+        return Err(FormatError::InvalidKdfParams(
+            "argon2id parallelism must be non-zero",
+        ));
+    }
+    if parallelism > READER_MAX_ARGON2ID_PARALLELISM {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "argon2id parallelism",
+            cap: READER_MAX_ARGON2ID_PARALLELISM as u64,
+            actual: parallelism as u64,
+        });
+    }
+    if m_cost_kib > READER_MAX_ARGON2ID_M_COST_KIB {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "argon2id m_cost_kib",
+            cap: READER_MAX_ARGON2ID_M_COST_KIB as u64,
+            actual: m_cost_kib as u64,
+        });
+    }
+    let min_memory = parallelism
+        .checked_mul(8)
+        .ok_or(FormatError::InvalidKdfParams(
+            "argon2id memory requirement overflow",
+        ))?;
+    if m_cost_kib < min_memory {
+        return Err(FormatError::InvalidKdfParams(
+            "argon2id memory must be at least 8 KiB per lane",
+        ));
+    }
+    Ok(())
 }
 
 fn expand_subkey(hk: &Hkdf<Sha256>, info: &[u8]) -> Result<[u8; SUBKEY_LEN], FormatError> {
@@ -535,6 +593,45 @@ mod tests {
                 m_cost_kib: 8,
                 parallelism: 1,
                 salt: b"12345678".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_argon2id_params_above_reader_caps() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(KdfAlgo::Argon2id as u16).to_le_bytes());
+        bytes.extend_from_slice(&(READER_MAX_ARGON2ID_T_COST + 1).to_le_bytes());
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&8u16.to_le_bytes());
+        bytes.extend_from_slice(b"12345678");
+
+        assert_eq!(
+            KdfParams::parse(KdfAlgo::Argon2id, &bytes).unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "argon2id t_cost",
+                cap: READER_MAX_ARGON2ID_T_COST as u64,
+                actual: (READER_MAX_ARGON2ID_T_COST + 1) as u64,
+            }
+        );
+
+        let err = MasterKey::derive_from_passphrase(
+            &KdfParams::Argon2id {
+                t_cost: 1,
+                m_cost_kib: READER_MAX_ARGON2ID_M_COST_KIB + 1,
+                parallelism: 1,
+                salt: b"12345678".to_vec(),
+            },
+            "passphrase",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            FormatError::ReaderResourceLimitExceeded {
+                field: "argon2id m_cost_kib",
+                cap: READER_MAX_ARGON2ID_M_COST_KIB as u64,
+                actual: (READER_MAX_ARGON2ID_M_COST_KIB + 1) as u64,
             }
         );
     }
