@@ -7,8 +7,8 @@ use std::process::ExitCode;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rand::RngCore;
-use tzap_core::format::{FormatError, VOLUME_HEADER_LEN};
-use tzap_core::wire::{CryptoHeader, VolumeHeader};
+use tzap_core::format::{FormatError, CRYPTO_HEADER_FIXED_LEN, VOLUME_HEADER_LEN};
+use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
 use tzap_core::{
     open_archive, open_archive_volumes, open_archive_with_bootstrap_sidecar, write_archive,
     write_archive_with_dictionary, write_archive_with_dictionary_and_kdf, write_archive_with_kdf,
@@ -632,6 +632,21 @@ fn read_kdf_params_from_volume(bytes: &[u8]) -> Result<KdfParams> {
             "volume is too short for CryptoHeader"
         ))
     })?;
+    let fixed_bytes = crypto_header_bytes
+        .get(..CRYPTO_HEADER_FIXED_LEN)
+        .ok_or_else(|| {
+            anyhow!(FormatError::InvalidLength {
+                structure: "CryptoHeaderFixed",
+                expected: CRYPTO_HEADER_FIXED_LEN,
+                actual: crypto_header_bytes.len(),
+            })
+        })?;
+    let fixed = CryptoHeaderFixed::parse(fixed_bytes, volume_header.crypto_header_length)?;
+    if fixed.stripe_width != volume_header.stripe_width {
+        return Err(anyhow!(FormatError::InvalidArchive(
+            "VolumeHeader and CryptoHeader stripe_width differ"
+        )));
+    }
     let crypto_header =
         CryptoHeader::parse(crypto_header_bytes, volume_header.crypto_header_length)?;
     Ok(crypto_header.kdf_params)
@@ -752,5 +767,50 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
             label: "corrupt-archive",
             exit_code: EXIT_CORRUPT_ARCHIVE,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tzap_core::format::MASTER_KEY_LEN;
+
+    fn test_master_key() -> MasterKey {
+        MasterKey::from_raw_key(&[0x42; MASTER_KEY_LEN]).unwrap()
+    }
+
+    #[test]
+    fn read_kdf_params_rejects_stripe_width_mismatch_before_returning_kdf() {
+        let archive = write_archive_with_kdf(
+            &[RegularFile::new("file.txt", b"contents")],
+            &test_master_key(),
+            WriterOptions {
+                archive_uuid: Some([0x11; 16]),
+                session_id: Some([0x22; 16]),
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+            &KdfParams::Argon2id {
+                t_cost: 1,
+                m_cost_kib: 8,
+                parallelism: 1,
+                salt: vec![0x33; 8],
+            },
+        )
+        .unwrap();
+        let mut bytes = archive.bytes;
+        let mut volume_header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
+        volume_header.stripe_width += 1;
+        bytes[..VOLUME_HEADER_LEN].copy_from_slice(&volume_header.to_bytes());
+
+        let err = read_kdf_params_from_volume(&bytes).unwrap_err();
+
+        assert_eq!(
+            err.downcast_ref::<FormatError>(),
+            Some(&FormatError::InvalidArchive(
+                "VolumeHeader and CryptoHeader stripe_width differ"
+            ))
+        );
     }
 }

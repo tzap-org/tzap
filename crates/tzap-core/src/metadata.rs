@@ -296,7 +296,7 @@ impl IndexRoot {
                 "plaintext length does not match canonical cursor",
             );
         }
-        validate_index_root_totals(&header, &shards)?;
+        validate_index_root_totals(&header, &shards, has_dictionary)?;
 
         Ok(Self {
             header,
@@ -1153,6 +1153,7 @@ fn parse_directory_hint_entries(bytes: &[u8]) -> Result<Vec<DirectoryHintEntry>,
 fn validate_index_root_totals(
     header: &IndexRootHeader,
     shards: &[ShardEntry],
+    has_dictionary: bool,
 ) -> Result<(), FormatError> {
     if shards.is_empty() {
         if header.file_count != 0
@@ -1171,6 +1172,9 @@ fn validate_index_root_totals(
                 "IndexRoot",
                 "empty archive content hash is not SHA-256(empty)",
             );
+        }
+        if has_dictionary || !index_root_dictionary_fields_are_zero(header) {
+            return invalid("IndexRoot", "empty archive cannot use dictionary");
         }
         return Ok(());
     }
@@ -1197,14 +1201,8 @@ fn validate_dictionary_fields(
     has_dictionary: bool,
     limits: MetadataLimits,
 ) -> Result<(), FormatError> {
-    let all_zero = header.dictionary_first_block == 0
-        && header.dictionary_data_block_count == 0
-        && header.dictionary_parity_block_count == 0
-        && header.dictionary_encrypted_size == 0
-        && header.dictionary_decompressed_size == 0;
-
     if !has_dictionary {
-        if !all_zero {
+        if !index_root_dictionary_fields_are_zero(header) {
             return invalid(
                 "IndexRoot",
                 "dictionary fields are non-zero while has_dictionary is false",
@@ -1238,6 +1236,14 @@ fn validate_dictionary_fields(
         limits.max_index_root_data_shards,
         limits.max_index_root_parity_shards,
     )
+}
+
+fn index_root_dictionary_fields_are_zero(header: &IndexRootHeader) -> bool {
+    header.dictionary_first_block == 0
+        && header.dictionary_data_block_count == 0
+        && header.dictionary_parity_block_count == 0
+        && header.dictionary_encrypted_size == 0
+        && header.dictionary_decompressed_size == 0
 }
 
 fn validate_index_shard_tables(
@@ -2171,6 +2177,29 @@ mod tests {
             FormatError::InvalidMetadata {
                 structure: "IndexRoot",
                 reason: "dictionary data block count is zero while has_dictionary is true",
+            }
+        );
+    }
+
+    #[test]
+    fn index_root_rejects_empty_archive_with_dictionary_extent() {
+        let root = IndexRoot {
+            header: IndexRootHeader {
+                dictionary_first_block: 1,
+                dictionary_data_block_count: 1,
+                dictionary_encrypted_size: 4096,
+                dictionary_decompressed_size: 16,
+                ..IndexRootHeader::empty()
+            },
+            shards: Vec::new(),
+            directory_hint_shards: Vec::new(),
+        };
+
+        assert_eq!(
+            IndexRoot::parse(&root.to_bytes(), true, MetadataLimits::default()).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexRoot",
+                reason: "empty archive cannot use dictionary",
             }
         );
     }
