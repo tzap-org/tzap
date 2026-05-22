@@ -10,6 +10,7 @@ pub mod format;
 pub mod metadata;
 pub mod padding;
 pub mod reader;
+pub mod tar_model;
 pub mod wire;
 pub mod writer;
 
@@ -18,4 +19,5 @@ pub use format::{
     AeadAlgo, CompressionAlgo, FecAlgo, FormatError, KdfAlgo, FORMAT_VERSION, VOLUME_FORMAT_REV,
 };
 pub use reader::{open_archive, ArchiveEntry, OpenedArchive, ReaderOptions};
+pub use tar_model::{MetadataDiagnostic, SafeExtractionOptions, TarEntryKind};
 pub use writer::{RegularFile, WriterOptions};

@@ -13,6 +13,10 @@ use crate::metadata::{
     normalize_lookup_file_path, EnvelopeEntry, FileEntry, FrameEntry, IndexRoot, IndexShard,
     MetadataLimits, ShardEntry,
 };
+use crate::tar_model::{
+    parse_tar_member_group, restore_tar_member, MetadataDiagnostic, OwnedTarMember,
+    SafeExtractionOptions, TarEntryKind,
+};
 use crate::wire::{
     BlockRecord, CryptoHeader, CryptoHeaderFixed, ManifestFooter, VolumeHeader, VolumeTrailer,
 };
@@ -21,7 +25,6 @@ const TRAILER_HMAC_COVERED_LEN: usize = 96;
 const MANIFEST_HMAC_COVERED_LEN: usize = 104;
 const DEFAULT_MAX_VERIFY_TAR_SIZE: usize = 128 * 1024 * 1024;
 const DIRECTORY_HINT_REQUIRED_FILE_COUNT: u64 = 100_000;
-const TAR_BLOCK_LEN: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReaderOptions {
@@ -42,6 +45,15 @@ impl Default for ReaderOptions {
 pub struct ArchiveEntry {
     pub path: String,
     pub file_data_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedArchiveMember {
+    pub path: String,
+    pub kind: TarEntryKind,
+    pub data: Vec<u8>,
+    pub link_target: Option<String>,
+    pub diagnostics: Vec<MetadataDiagnostic>,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +221,22 @@ impl OpenedArchive {
     }
 
     pub fn extract_file(&self, path: &str) -> Result<Option<Vec<u8>>, FormatError> {
+        self.extract_member(path)?
+            .map(|member| {
+                if member.kind != TarEntryKind::Regular {
+                    return Err(FormatError::ReaderUnsupported(
+                        "extract_file returns only regular file payloads",
+                    ));
+                }
+                Ok(member.data)
+            })
+            .transpose()
+    }
+
+    pub fn extract_member(
+        &self,
+        path: &str,
+    ) -> Result<Option<ExtractedArchiveMember>, FormatError> {
         let normalized = normalize_lookup_file_path(path, self.crypto_header.max_path_length)?;
         let candidate_indexes = self
             .index_root
@@ -242,7 +270,18 @@ impl OpenedArchive {
         }
 
         winner
-            .map(|(shard, file_index, _)| self.extract_loaded_file(&shard, file_index))
+            .map(|(shard, file_index, _)| self.extract_loaded_member(&shard, file_index))
+            .transpose()
+    }
+
+    pub fn extract_file_to(
+        &self,
+        path: &str,
+        root: &std::path::Path,
+        options: SafeExtractionOptions,
+    ) -> Result<Option<Vec<MetadataDiagnostic>>, FormatError> {
+        self.extract_owned_tar_member(path)?
+            .map(|member| restore_tar_member(root, &member, options))
             .transpose()
     }
 
@@ -381,7 +420,7 @@ impl OpenedArchive {
                             "FileEntry tar member start is missing",
                         ))?;
                 file_extents.push((start, file.tar_member_group_size));
-                let _ = self.extract_loaded_file(shard, idx)?;
+                let _ = self.extract_loaded_member(shard, idx)?;
             }
         }
         validate_file_extent_coverage_ranges(&file_extents, tar_len)?;
@@ -450,11 +489,67 @@ impl OpenedArchive {
         Ok(plaintext)
     }
 
-    fn extract_loaded_file(
+    fn extract_owned_tar_member(&self, path: &str) -> Result<Option<OwnedTarMember>, FormatError> {
+        let normalized = normalize_lookup_file_path(path, self.crypto_header.max_path_length)?;
+        let candidate_indexes = self
+            .index_root
+            .candidate_shards_for_path(&normalized, self.metadata_limits())?;
+        let mut winner: Option<(IndexShard, usize, u64)> = None;
+
+        for row_index in candidate_indexes {
+            let locating =
+                self.index_root
+                    .shards
+                    .get(row_index)
+                    .ok_or(FormatError::InvalidArchive(
+                        "candidate shard row is out of bounds",
+                    ))?;
+            let shard = self.load_index_shard(locating)?;
+            if let Some(file_index) = shard.lookup_file_index(&normalized) {
+                let start =
+                    shard
+                        .tar_member_group_start(file_index)
+                        .ok_or(FormatError::InvalidArchive(
+                            "FileEntry tar member start is missing",
+                        ))?;
+                if winner
+                    .as_ref()
+                    .map(|(_, _, best_start)| start > *best_start)
+                    .unwrap_or(true)
+                {
+                    winner = Some((shard, file_index, start));
+                }
+            }
+        }
+
+        winner
+            .map(|(shard, file_index, _)| self.extract_loaded_owned_tar_member(&shard, file_index))
+            .transpose()
+    }
+
+    fn extract_loaded_member(
         &self,
         shard: &IndexShard,
         file_index: usize,
-    ) -> Result<Vec<u8>, FormatError> {
+    ) -> Result<ExtractedArchiveMember, FormatError> {
+        let member = self.extract_loaded_owned_tar_member(shard, file_index)?;
+        Ok(ExtractedArchiveMember {
+            path: utf8_path(&member.path)?,
+            kind: member.kind,
+            data: member.data,
+            link_target: member
+                .link_target
+                .map(|target| utf8_path(&target))
+                .transpose()?,
+            diagnostics: member.diagnostics,
+        })
+    }
+
+    fn extract_loaded_owned_tar_member(
+        &self,
+        shard: &IndexShard,
+        file_index: usize,
+    ) -> Result<OwnedTarMember, FormatError> {
         let file = shard
             .files
             .get(file_index)
@@ -498,7 +593,18 @@ impl OpenedArchive {
         let offset = file.offset_in_first_frame_plaintext as usize;
         let group_len = to_usize(file.tar_member_group_size, "FileEntry")?;
         let group = slice(&decoded, offset, group_len, "FileEntry")?;
-        parse_tar_regular_payload(group, expected_path, file)
+        let member = parse_tar_member_group(group, self.crypto_header.max_path_length)?;
+        if member.path != expected_path {
+            return Err(FormatError::InvalidArchive(
+                "tar member path does not match FileEntry path",
+            ));
+        }
+        if member.logical_size != file.file_data_size {
+            return Err(FormatError::InvalidArchive(
+                "tar member size does not match FileEntry file_data_size",
+            ));
+        }
+        Ok(member.to_owned_member())
     }
 
     fn metadata_limits(&self) -> MetadataLimits {
@@ -913,98 +1019,6 @@ fn frame_range_for_file<'b>(
     Ok(frames)
 }
 
-fn parse_tar_regular_payload(
-    group: &[u8],
-    expected_path: &[u8],
-    file: &FileEntry,
-) -> Result<Vec<u8>, FormatError> {
-    if group.len() < TAR_BLOCK_LEN {
-        return Err(FormatError::InvalidArchive(
-            "tar member group is smaller than one block",
-        ));
-    }
-    let header = &group[..TAR_BLOCK_LEN];
-    if header.iter().all(|byte| *byte == 0) {
-        return Err(FormatError::InvalidArchive("tar member header is empty"));
-    }
-    verify_tar_checksum(header)?;
-    let name = nul_trimmed(&header[0..100]);
-    if name != expected_path {
-        return Err(FormatError::InvalidArchive(
-            "tar member path does not match FileEntry path",
-        ));
-    }
-    if !matches!(header[156], 0 | b'0') {
-        return Err(FormatError::ReaderUnsupported(
-            "M7 reader extracts only regular file tar members",
-        ));
-    }
-    let size = parse_tar_octal(&header[124..136])?;
-    if size != file.file_data_size {
-        return Err(FormatError::InvalidArchive(
-            "tar member size does not match FileEntry file_data_size",
-        ));
-    }
-    let size = to_usize(size, "tar member")?;
-    let data_end = checked_add(TAR_BLOCK_LEN, size, "tar member")?;
-    let padded_end = checked_add(data_end, padding_to_512(size), "tar member")?;
-    if padded_end != group.len() {
-        return Err(FormatError::InvalidArchive(
-            "tar member group size does not match tar header size and padding",
-        ));
-    }
-    if group[data_end..].iter().any(|byte| *byte != 0) {
-        return Err(FormatError::InvalidArchive(
-            "tar member padding is non-zero",
-        ));
-    }
-    Ok(slice(group, TAR_BLOCK_LEN, size, "tar member")?.to_vec())
-}
-
-fn verify_tar_checksum(header: &[u8]) -> Result<(), FormatError> {
-    let stored = parse_tar_octal(&header[148..156])?;
-    let mut sum = 0u64;
-    for (idx, byte) in header.iter().enumerate() {
-        if (148..156).contains(&idx) {
-            sum += b' ' as u64;
-        } else {
-            sum += *byte as u64;
-        }
-    }
-    if stored != sum {
-        return Err(FormatError::InvalidArchive("tar header checksum mismatch"));
-    }
-    Ok(())
-}
-
-fn parse_tar_octal(field: &[u8]) -> Result<u64, FormatError> {
-    let mut value = 0u64;
-    let mut saw_digit = false;
-    for byte in field {
-        match *byte {
-            0 | b' ' if saw_digit => break,
-            0 | b' ' => {}
-            b'0'..=b'7' => {
-                saw_digit = true;
-                value = value
-                    .checked_mul(8)
-                    .and_then(|acc| acc.checked_add((*byte - b'0') as u64))
-                    .ok_or(FormatError::InvalidArchive("tar octal field overflow"))?;
-            }
-            _ => return Err(FormatError::InvalidArchive("malformed tar octal field")),
-        }
-    }
-    Ok(value)
-}
-
-fn nul_trimmed(bytes: &[u8]) -> &[u8] {
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(bytes.len());
-    &bytes[..end]
-}
-
 fn metadata_limits(crypto_header: &CryptoHeaderFixed) -> MetadataLimits {
     MetadataLimits {
         block_size: crypto_header.block_size,
@@ -1169,15 +1183,6 @@ fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
-fn padding_to_512(len: usize) -> usize {
-    let remainder = len % TAR_BLOCK_LEN;
-    if remainder == 0 {
-        0
-    } else {
-        TAR_BLOCK_LEN - remainder
-    }
-}
-
 fn slice<'b>(
     bytes: &'b [u8],
     offset: usize,
@@ -1239,6 +1244,53 @@ mod tests {
             Some(b"hello m7".to_vec())
         );
         assert_eq!(opened.extract_file("missing.txt").unwrap(), None);
+    }
+
+    #[test]
+    fn safe_extract_writes_regular_file_under_root() {
+        let archive = write_archive(
+            &[RegularFile::new("dir/hello.txt", b"safe m8")],
+            &master_key(),
+            WriterOptions::default(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        opened
+            .extract_file_to(
+                "dir/hello.txt",
+                tmp.path(),
+                SafeExtractionOptions::default(),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(tmp.path().join("dir").join("hello.txt")).unwrap(),
+            b"safe m8"
+        );
+    }
+
+    #[test]
+    fn safe_extract_rejects_overwriting_existing_file_by_default() {
+        let archive = write_archive(
+            &[RegularFile::new("hello.txt", b"new")],
+            &master_key(),
+            WriterOptions::default(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("hello.txt"), b"old").unwrap();
+
+        assert_eq!(
+            opened
+                .extract_file_to("hello.txt", tmp.path(), SafeExtractionOptions::default())
+                .unwrap_err(),
+            FormatError::UnsafeOverwrite
+        );
+        assert_eq!(std::fs::read(tmp.path().join("hello.txt")).unwrap(), b"old");
     }
 
     #[test]

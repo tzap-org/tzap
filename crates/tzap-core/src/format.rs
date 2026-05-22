@@ -427,6 +427,12 @@ pub enum FormatError {
     #[error("unsafe archive path")]
     UnsafeArchivePath,
 
+    #[error("unsafe extraction overwrite")]
+    UnsafeOverwrite,
+
+    #[error("filesystem extraction failed: {0}")]
+    FilesystemExtractionFailed(&'static str),
+
     #[error("writer unsupported case: {0}")]
     WriterUnsupported(&'static str),
 

@@ -361,17 +361,34 @@ Acceptance:
 
 ## Milestone 8: Safe Extraction And Tar Metadata Profile
 
+Status: complete.
+
 Purpose: make filesystem extraction conformant instead of library-default.
 
 Deliverables:
 
-- Path normalization and UTF-8 NFC checks.
-- Platform-escape rejection set.
-- No-follow ancestry checks.
-- Hardlink target validation.
-- Symlink escape behavior.
-- Supported PAX/GNU metadata profile.
-- Degraded metadata diagnostics.
+- Complete: path normalization and UTF-8 NFC checks are enforced for
+  FileEntry metadata, tar main-entry bindings, hardlink targets, and
+  caller lookup paths.
+- Complete: host-independent platform-escape rejection set covers absolute
+  paths, empty components, `.`, `..`, NUL, backslash, colon,
+  drive/UNC/device forms, and Windows device-name components.
+- Complete: owned tar-member-group parser in
+  `crates/tzap-core/src/tar_model.rs` handles ustar regular files,
+  directories, symlinks, hardlinks, local PAX `path`/`linkpath`/`size`,
+  GNU long name/link records, and rejects global PAX/global state records.
+- Complete: random extraction now validates tar member groups through the
+  owned tar model before reporting path/size content verification.
+- Complete: safe single-member filesystem restore API performs no-follow
+  ancestry checks, rejects final symlink overwrite, and rejects unsafe
+  default overwrite behavior.
+- Complete: hardlink restore requires a safe archive-internal target that
+  already exists as a non-directory regular file without following symlinks.
+- Complete: symlink targets are lexically checked so default extraction
+  rejects absolute or root-escaping links.
+- Complete: degraded metadata diagnostics are surfaced for unsupported
+  local PAX/GNU metadata keys while global PAX/GNU state remains a hard
+  reject.
 
 Acceptance:
 

@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Format version** | 1 |
-| **Document version** | 0.36 / 2026-05-22.6 (v0.36 bootstrap precedence clarifications) |
+| **Document version** | 0.36 / 2026-05-22.7 (v0.36 directory hint ordering clarification) |
 | **Status** | Draft for review, no implementation yet |
 | **Owner** | Frank Zhu |
 | **Maintainers** | Frank Zhu |
@@ -35,6 +35,11 @@ hints could be misapplied as though they were an exact regular-file index.
    terminal trailer/ManifestFooter authority; non-seekable random-access
    bootstrap uses only trusted sidecar data with the section rules in
    §12.3 and dictionary requirements in §12.4. (§12.4, §17.1, §17.3)
+5. **Directory hint shard ordering mirrors IndexShard ordering.**
+   DirectoryHintShardEntry sorting now includes `last_dir_hash` as the
+   equal-start tie-breaker, matching ShardEntry's range ordering and
+   keeping `hint_shard_index` free as an AEAD identity counter. (§15.8,
+   §28.1)
 
 ---
 
@@ -2061,16 +2066,20 @@ struct DirectoryHintShardEntry {
 ```
 
 DirectoryHintShardEntry records live in IndexRoot and are sorted by
-`(first_dir_hash, hint_shard_index)`, where `first_dir_hash` uses the
-bytewise hash-prefix ordering defined in §4 and `hint_shard_index` is
-compared as an unsigned integer. `hint_shard_index` values are stable
-AEAD identity counters for directory-hint shard objects; they need not
-equal IndexRoot row positions, but they MUST be unique across the
+`(first_dir_hash, last_dir_hash, hint_shard_index)` ascending, where the
+hash-prefix fields use the bytewise ordering defined in §4 and
+`hint_shard_index` is compared as an unsigned integer. The
+`last_dir_hash` tie-breaker is part of the canonical order; readers and
+writers MUST NOT order equal-`first_dir_hash` ranges by
+`hint_shard_index` alone. `hint_shard_index` values are stable AEAD
+identity counters for directory-hint shard objects; they need not equal
+IndexRoot row positions, but they MUST be unique across the
 DirectoryHintShardEntry table. Their hash ranges MUST be monotonic under
 the same bytewise ordering: for adjacent entries,
 `last_dir_hash ≤ next.first_dir_hash`; if the boundary hashes are equal,
 readers use the same upper-bound candidate-block lookup and scan cap as
-§15.4, and `last_dir_hash > next.first_dir_hash` is malformed. Each
+§15.4. Boundary equality does not permit wider interval overlap:
+`last_dir_hash > next.first_dir_hash` is malformed. Each
 DirectoryHintTable is the
 plaintext of one directory-hint shard object encrypted with
 `dir_hint_key`, AEAD domain `dirhint`, and counter
@@ -3757,6 +3766,13 @@ Additional v0.36 cases:
   and hints are used only for descendants. Mutate hints so a regular-file
   exact path is present only as a misleading directory hint and verify
   readers do not treat that hint as an exact-file authority.
+- **Directory hint equal-start ordering**: construct adjacent
+  DirectoryHintShardEntry ranges with the same `first_dir_hash`, such as
+  `[H, H]` followed by `[H, Z]`, and assign `hint_shard_index` values that
+  would invert that order if used as the sole tie-breaker. Verify writers
+  sort by `(first_dir_hash, last_dir_hash, hint_shard_index)`, readers
+  accept the canonical order, and readers reject the inverted order because
+  it violates `last_dir_hash ≤ next.first_dir_hash`.
 
 Additional v0.35 cases retained from the previous draft:
 

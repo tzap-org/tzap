@@ -1742,14 +1742,14 @@ fn candidate_interval_indexes<T>(
     Ok((start..end).collect())
 }
 
-fn validate_file_path_bytes(path: &[u8], max_path_length: u32) -> Result<(), FormatError> {
+pub fn validate_file_path_bytes(path: &[u8], max_path_length: u32) -> Result<(), FormatError> {
     if path.is_empty() || path.len() > max_path_length as usize {
         return Err(FormatError::UnsafeArchivePath);
     }
     validate_relative_path(path, false)
 }
 
-fn validate_directory_path_bytes(path: &[u8], max_path_length: u32) -> Result<(), FormatError> {
+pub fn validate_directory_path_bytes(path: &[u8], max_path_length: u32) -> Result<(), FormatError> {
     if path.len() > max_path_length as usize {
         return Err(FormatError::UnsafeArchivePath);
     }
