@@ -3,3 +3,4 @@
 .DS_Store
 /plugin-specs
 fuzz/target/
+/docs

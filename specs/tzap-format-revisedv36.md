@@ -4,7 +4,7 @@
 |---|---|
 | **Format version** | 1 |
 | **Document version** | 0.36 / 2026-05-22.7 (v0.36 directory hint ordering clarification) |
-| **Status** | Draft for review, no implementation yet |
+| **Status** | Ready for implementation |
 | **Owner** | Frank Zhu |
 | **Maintainers** | Frank Zhu |
 | **Last updated** | 2026-05-22 |
