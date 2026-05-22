@@ -15,7 +15,7 @@ use tzap_core::metadata::{
 };
 use tzap_core::reader::{open_archive, open_archive_volumes};
 use tzap_core::tar_model::parse_tar_member_group;
-use tzap_core::wire::VolumeHeader;
+use tzap_core::wire::{CryptoHeader, VolumeHeader};
 use tzap_core::writer::{write_archive, write_archive_with_dictionary, RegularFile, WriterOptions};
 
 fn master_key() -> MasterKey {
@@ -27,6 +27,8 @@ fn deterministic_options(seed: u8) -> WriterOptions {
         archive_uuid: Some([seed; 16]),
         session_id: Some([seed.wrapping_add(1); 16]),
         closed_at_ns: 123_456_789,
+        stripe_width: 1,
+        volume_loss_tolerance: 0,
         bit_rot_buffer_pct: 0,
         ..WriterOptions::default()
     }
@@ -90,15 +92,21 @@ fn mutation_fixture_generator_rejects_authentication_and_revision_mutations() {
     trailer_hmac[trailer_hmac_offset] ^= 0x01;
     assert_eq!(
         open_archive(&trailer_hmac, &master_key()).unwrap_err(),
-        FormatError::HmacMismatch {
-            structure: "VolumeTrailer"
-        }
+        FormatError::InvalidArchive("no authenticated VolumeTrailer found")
     );
 
     let mut payload_tamper = archive.bytes.clone();
-    let record_offset = header.crypto_header_offset as usize + header.crypto_header_length as usize;
+    let crypto_header_offset = header.crypto_header_offset as usize;
+    let crypto_header_end = crypto_header_offset + header.crypto_header_length as usize;
+    let crypto_header = CryptoHeader::parse(
+        &payload_tamper[crypto_header_offset..crypto_header_end],
+        header.crypto_header_length,
+    )
+    .unwrap();
+    let block_size = crypto_header.fixed.block_size as usize;
+    let record_offset = crypto_header_end;
     payload_tamper[record_offset + 16] ^= 0x55;
-    let crc_offset = record_offset + 16 + 4096;
+    let crc_offset = record_offset + 16 + block_size;
     let crc = crc32c::crc32c(&payload_tamper[record_offset..crc_offset]);
     payload_tamper[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
     assert_eq!(

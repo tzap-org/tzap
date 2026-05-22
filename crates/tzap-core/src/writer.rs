@@ -24,17 +24,22 @@ use crate::wire::{
 };
 
 const TAR_BLOCK_LEN: usize = 512;
-const DEFAULT_BLOCK_SIZE: u32 = 4096;
-const DEFAULT_CHUNK_SIZE: u32 = 1 << 20;
-const DEFAULT_ENVELOPE_TARGET_SIZE: u32 = 4 << 20;
-const DEFAULT_FEC_DATA_SHARDS: u16 = 64;
+const MAX_REED_SOLOMON_GF16_SHARDS: u64 = 65_535;
+const MIN_BLOCK_SIZE: u32 = 4096;
+const DEFAULT_BLOCK_SIZE: u32 = 64 * 1024;
+const DEFAULT_CHUNK_SIZE: u32 = 256 * 1024;
+const DEFAULT_ENVELOPE_TARGET_SIZE: u32 = 1024 * 1024;
+const DEFAULT_FEC_DATA_SHARDS: u16 = 224;
 const DEFAULT_FEC_PARITY_SHARDS: u16 = 1;
-const DEFAULT_INDEX_FEC_DATA_SHARDS: u16 = 64;
+const DEFAULT_INDEX_FEC_DATA_SHARDS: u16 = 16;
 const DEFAULT_INDEX_FEC_PARITY_SHARDS: u16 = 1;
-const DEFAULT_INDEX_ROOT_FEC_DATA_SHARDS: u16 = 64;
+const MIN_INDEX_ROOT_FEC_DATA_SHARDS: u16 = 16;
+const DEFAULT_INDEX_ROOT_FEC_DATA_SHARDS: u16 = MIN_INDEX_ROOT_FEC_DATA_SHARDS;
 const DEFAULT_INDEX_ROOT_FEC_PARITY_SHARDS: u16 = 1;
+const DEFAULT_STRIPE_WIDTH: u32 = 8;
+const DEFAULT_VOLUME_LOSS_TOLERANCE: u8 = 1;
 const DEFAULT_BIT_ROT_BUFFER_PCT: u8 = 5;
-const DEFAULT_MAX_FILES_PER_INDEX_SHARD: usize = 1_000_000;
+const DEFAULT_FILES_PER_INDEX_SHARD: usize = 10_000;
 const DIRECTORY_HINT_REQUIRED_FILE_COUNT: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,8 +71,8 @@ impl Default for WriterOptions {
             block_size: DEFAULT_BLOCK_SIZE,
             chunk_size: DEFAULT_CHUNK_SIZE,
             envelope_target_size: DEFAULT_ENVELOPE_TARGET_SIZE,
-            stripe_width: 1,
-            volume_loss_tolerance: 0,
+            stripe_width: DEFAULT_STRIPE_WIDTH,
+            volume_loss_tolerance: DEFAULT_VOLUME_LOSS_TOLERANCE,
             bit_rot_buffer_pct: DEFAULT_BIT_ROT_BUFFER_PCT,
             zstd_level: 3,
             aead_algo: AeadAlgo::AesGcmSiv256,
@@ -551,7 +556,7 @@ pub fn write_empty_archive(master_key: &MasterKey) -> Result<WrittenArchive, For
 }
 
 fn plan_writer_options(mut options: WriterOptions) -> Result<WriterOptions, FormatError> {
-    if options.block_size < DEFAULT_BLOCK_SIZE || options.block_size % 2 != 0 {
+    if options.block_size < MIN_BLOCK_SIZE || options.block_size % 2 != 0 {
         return Err(FormatError::WriterUnsupported(
             "M6 writer requires an even block size of at least 4096",
         ));
@@ -594,6 +599,9 @@ fn plan_writer_options(mut options: WriterOptions) -> Result<WriterOptions, Form
             "FEC data shard class maxima must be non-zero",
         ));
     }
+    options.index_root_fec_data_shards = options
+        .index_root_fec_data_shards
+        .max(MIN_INDEX_ROOT_FEC_DATA_SHARDS);
     options.fec_parity_shards = options.fec_parity_shards.max(compute_parity_u16(
         options.fec_data_shards as u64,
         options,
@@ -614,14 +622,14 @@ fn plan_writer_options(mut options: WriterOptions) -> Result<WriterOptions, Form
 }
 
 fn validate_m6_file_scope(file_count: usize) -> Result<(), FormatError> {
-    if file_count > DEFAULT_MAX_FILES_PER_INDEX_SHARD {
-        return Err(FormatError::WriterUnsupported(
-            "M6 writer supports only one IndexShard",
-        ));
-    }
     if file_count > DIRECTORY_HINT_REQUIRED_FILE_COUNT {
         return Err(FormatError::WriterUnsupported(
             "M6 writer does not emit required directory hint shards",
+        ));
+    }
+    if file_count > DEFAULT_FILES_PER_INDEX_SHARD {
+        return Err(FormatError::WriterUnsupported(
+            "M6 writer supports only one default-sized IndexShard",
         ));
     }
     Ok(())
@@ -705,7 +713,12 @@ fn serialize_kdf_params(params: &KdfParams) -> Result<Vec<u8>, FormatError> {
                     "parallelism must be non-zero",
                 ));
             }
-            if *m_cost_kib < parallelism.saturating_mul(8) {
+            let min_memory = parallelism
+                .checked_mul(8)
+                .ok_or(FormatError::InvalidKdfParams(
+                    "m_cost_kib requirement overflow",
+                ))?;
+            if *m_cost_kib < min_memory {
                 return Err(FormatError::InvalidKdfParams(
                     "m_cost_kib must be at least 8 * parallelism",
                 ));
@@ -736,22 +749,14 @@ fn build_tar_stream(
     let mut members = Vec::with_capacity(files.len());
     for file in files {
         let path = normalize_lookup_file_path(file.path, max_path_length)?;
-        if path.len() > 100 {
-            return Err(FormatError::WriterUnsupported(
-                "M6 regular-file writer supports ustar paths up to 100 bytes",
-            ));
-        }
         let start = stream.len() as u64;
-        let header =
-            build_ustar_regular_header(&path, file.contents.len() as u64, file.mode, file.mtime)?;
-        stream.extend_from_slice(&header);
-        stream.extend_from_slice(file.contents);
-        let data_padding = padding_to_512(file.contents.len());
-        stream.resize(stream.len() + data_padding, 0);
+        let member_group =
+            build_regular_file_member_group(&path, file.contents, file.mode, file.mtime)?;
+        stream.extend_from_slice(&member_group);
         members.push(TarMember {
             path,
             tar_member_group_start: start,
-            tar_member_group_size: (TAR_BLOCK_LEN + file.contents.len() + data_padding) as u64,
+            tar_member_group_size: member_group.len() as u64,
             file_data_size: file.contents.len() as u64,
         });
     }
@@ -1007,6 +1012,7 @@ fn encrypt_object(
             "encrypted object exceeds its parity shard class maximum",
         ));
     }
+    validate_object_shard_total(data_block_count, required_parity)?;
     let parity_count = required_parity as u16;
     let parity_shards = if parity_count == 0 {
         Vec::new()
@@ -1128,11 +1134,29 @@ fn compute_object_parity(
     class_parity_shard_max: u32,
 ) -> Result<u32, FormatError> {
     let computed = compute_parity(data_block_count, options)?;
-    if options.volume_loss_tolerance == 0 && options.bit_rot_buffer_pct == 0 {
-        Ok(computed.max(class_parity_shard_max))
-    } else {
-        Ok(computed)
+    if computed > class_parity_shard_max {
+        return Err(FormatError::WriterUnsupported(
+            "encrypted object exceeds its parity shard class maximum",
+        ));
     }
+    Ok(computed)
+}
+
+fn validate_object_shard_total(
+    data_block_count: u32,
+    parity_block_count: u32,
+) -> Result<(), FormatError> {
+    let total = checked_u64_add(
+        data_block_count as u64,
+        parity_block_count as u64,
+        "encrypted object shard total overflow",
+    )?;
+    if total > MAX_REED_SOLOMON_GF16_SHARDS {
+        return Err(FormatError::WriterUnsupported(
+            "encrypted object exceeds ReedSolomonGF16 shard limit",
+        ));
+    }
+    Ok(())
 }
 
 fn compute_parity_u16(
@@ -1267,11 +1291,78 @@ fn build_bootstrap_sidecar(
     Ok(sidecar)
 }
 
-fn build_ustar_regular_header(
+fn build_regular_file_member_group(
+    path: &[u8],
+    contents: &[u8],
+    mode: u32,
+    mtime: u64,
+) -> Result<Vec<u8>, FormatError> {
+    let mut out = Vec::new();
+    let header_path = if path_requires_pax(path) {
+        let pax_payload = build_pax_record("path", path)?;
+        let pax_header = build_ustar_header(
+            b"PaxHeaders/path",
+            pax_payload.len() as u64,
+            0o644,
+            mtime,
+            b'x',
+        )?;
+        out.extend_from_slice(&pax_header);
+        out.extend_from_slice(&pax_payload);
+        out.resize(out.len() + padding_to_512(pax_payload.len()), 0);
+        pax_ustar_fallback_path(path)
+    } else {
+        path.to_vec()
+    };
+
+    let header = build_ustar_header(&header_path, contents.len() as u64, mode, mtime, b'0')?;
+    out.extend_from_slice(&header);
+    out.extend_from_slice(contents);
+    out.resize(out.len() + padding_to_512(contents.len()), 0);
+    Ok(out)
+}
+
+fn path_requires_pax(path: &[u8]) -> bool {
+    path.len() > 100 || !path.is_ascii()
+}
+
+fn pax_ustar_fallback_path(path: &[u8]) -> Vec<u8> {
+    path.rsplit(|byte| *byte == b'/')
+        .next()
+        .filter(|component| !component.is_empty() && component.len() <= 100 && component.is_ascii())
+        .map(|component| component.to_vec())
+        .unwrap_or_else(|| b"pax-file".to_vec())
+}
+
+fn build_pax_record(key: &str, value: &[u8]) -> Result<Vec<u8>, FormatError> {
+    let body_len = checked_usize_add(key.len(), 1, "PAX record")?;
+    let body_len = checked_usize_add(body_len, value.len(), "PAX record")?;
+    let body_len = checked_usize_add(body_len, 1, "PAX record")?;
+    let mut digits = 1usize;
+    loop {
+        let len = checked_usize_add(digits, 1, "PAX record")?;
+        let len = checked_usize_add(len, body_len, "PAX record")?;
+        let next_digits = len.to_string().len();
+        if next_digits == digits {
+            let mut out = Vec::with_capacity(len);
+            out.extend_from_slice(len.to_string().as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(key.as_bytes());
+            out.push(b'=');
+            out.extend_from_slice(value);
+            out.push(b'\n');
+            return Ok(out);
+        }
+        digits = next_digits;
+    }
+}
+
+fn build_ustar_header(
     path: &[u8],
     size: u64,
     mode: u32,
     mtime: u64,
+    typeflag: u8,
 ) -> Result<[u8; TAR_BLOCK_LEN], FormatError> {
     if path.len() > 100 {
         return Err(FormatError::WriterUnsupported(
@@ -1286,7 +1377,7 @@ fn build_ustar_regular_header(
     write_tar_octal(&mut header[124..136], size)?;
     write_tar_octal(&mut header[136..148], mtime)?;
     header[148..156].fill(b' ');
-    header[156] = b'0';
+    header[156] = typeflag;
     header[257..263].copy_from_slice(b"ustar\0");
     header[263..265].copy_from_slice(b"00");
     let checksum = header.iter().map(|byte| *byte as u32).sum::<u32>() as u64;
@@ -1385,11 +1476,29 @@ fn checked_u64_add(lhs: u64, rhs: u64, field: &'static str) -> Result<u64, Forma
 mod tests {
     use super::*;
     use crate::crypto::{verify_hmac, Subkeys};
+    use crate::tar_model::parse_tar_member_group;
     use crate::wire::CryptoHeader;
 
     #[test]
+    fn writer_defaults_use_v36_sizing_and_parallel_mode() {
+        let options = WriterOptions::default();
+
+        assert_eq!(options.chunk_size, 256 * 1024);
+        assert_eq!(options.envelope_target_size, 1024 * 1024);
+        assert_eq!(options.block_size, 64 * 1024);
+        assert_eq!(options.stripe_width, 8);
+        assert_eq!(options.volume_loss_tolerance, 1);
+        assert_eq!(options.fec_data_shards, 224);
+        assert_eq!(options.index_fec_data_shards, 16);
+        assert_eq!(
+            options.index_root_fec_data_shards,
+            MIN_INDEX_ROOT_FEC_DATA_SHARDS
+        );
+        assert_eq!(options.bit_rot_buffer_pct, 5);
+    }
+
+    #[test]
     fn m6_scope_rejects_archives_that_require_directory_hints() {
-        assert!(validate_m6_file_scope(DIRECTORY_HINT_REQUIRED_FILE_COUNT).is_ok());
         assert_eq!(
             validate_m6_file_scope(DIRECTORY_HINT_REQUIRED_FILE_COUNT + 1).unwrap_err(),
             FormatError::WriterUnsupported(
@@ -1399,11 +1508,41 @@ mod tests {
     }
 
     #[test]
-    fn m6_scope_rejects_archives_that_need_multiple_index_shards() {
+    fn m6_scope_rejects_archives_that_need_multiple_default_sized_index_shards() {
+        assert!(validate_m6_file_scope(DEFAULT_FILES_PER_INDEX_SHARD).is_ok());
         assert_eq!(
-            validate_m6_file_scope(DEFAULT_MAX_FILES_PER_INDEX_SHARD + 1).unwrap_err(),
-            FormatError::WriterUnsupported("M6 writer supports only one IndexShard")
+            validate_m6_file_scope(DEFAULT_FILES_PER_INDEX_SHARD + 1).unwrap_err(),
+            FormatError::WriterUnsupported("M6 writer supports only one default-sized IndexShard")
         );
+    }
+
+    #[test]
+    fn regular_file_writer_uses_local_pax_path_for_long_and_non_ascii_paths() {
+        let long_path = format!("dir/{}.txt", "a".repeat(120));
+        let unicode_path = "unicode/e\u{301}.txt";
+        let files = [
+            RegularFile::new(&long_path, b"long path"),
+            RegularFile::new(unicode_path, b"unicode path"),
+        ];
+
+        let (tar_stream, members) = build_tar_stream(&files, 4096).unwrap();
+
+        for (member, expected_path, expected_data) in [
+            (&members[0], long_path.as_bytes(), b"long path".as_slice()),
+            (
+                &members[1],
+                "unicode/\u{e9}.txt".as_bytes(),
+                b"unicode path".as_slice(),
+            ),
+        ] {
+            let start = member.tar_member_group_start as usize;
+            let end = start + member.tar_member_group_size as usize;
+            let group = &tar_stream[start..end];
+            assert_eq!(group[156], b'x');
+            let parsed = parse_tar_member_group(group, 4096).unwrap();
+            assert_eq!(parsed.path, expected_path);
+            assert_eq!(parsed.data, expected_data);
+        }
     }
 
     #[test]
@@ -1452,7 +1591,7 @@ mod tests {
         let manifest_end = manifest_offset + MANIFEST_FOOTER_LEN;
         let manifest = ManifestFooter::parse(&bytes[manifest_offset..manifest_end]).unwrap();
         assert_eq!(manifest.is_authoritative, 1);
-        assert_eq!(manifest.total_volumes, 1);
+        assert_eq!(manifest.total_volumes, DEFAULT_STRIPE_WIDTH);
         verify_hmac(
             HmacDomain::ManifestFooter,
             &subkeys.mac_key,
@@ -1482,6 +1621,8 @@ mod tests {
     fn zero_parity_is_allowed_when_no_recovery_margin_is_requested() {
         let planned = plan_writer_options(WriterOptions {
             bit_rot_buffer_pct: 0,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
             fec_parity_shards: 0,
             index_fec_parity_shards: 0,
             index_root_fec_parity_shards: 0,
@@ -1493,5 +1634,55 @@ mod tests {
         assert_eq!(planned.index_fec_parity_shards, 0);
         assert_eq!(planned.index_root_fec_parity_shards, 0);
         assert_eq!(compute_parity(1, planned).unwrap(), 0);
+    }
+
+    #[test]
+    fn index_root_data_shard_maximum_obeys_v36_minimum() {
+        let planned = plan_writer_options(WriterOptions {
+            index_root_fec_data_shards: 1,
+            ..WriterOptions::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            planned.index_root_fec_data_shards,
+            MIN_INDEX_ROOT_FEC_DATA_SHARDS
+        );
+    }
+
+    #[test]
+    fn object_parity_uses_per_object_recurrence_even_with_larger_class_max() {
+        let options = WriterOptions {
+            bit_rot_buffer_pct: 0,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            fec_parity_shards: 1,
+            ..WriterOptions::default()
+        };
+
+        assert_eq!(compute_object_parity(1, options, 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn object_total_shards_obeys_reed_solomon_limit() {
+        assert!(validate_object_shard_total(65_535, 0).is_ok());
+        assert_eq!(
+            validate_object_shard_total(65_535, 1).unwrap_err(),
+            FormatError::WriterUnsupported("encrypted object exceeds ReedSolomonGF16 shard limit")
+        );
+    }
+
+    #[test]
+    fn argon2id_kdf_serialization_rejects_memory_requirement_overflow() {
+        assert_eq!(
+            serialize_kdf_params(&KdfParams::Argon2id {
+                t_cost: 1,
+                m_cost_kib: u32::MAX,
+                parallelism: u32::MAX,
+                salt: b"12345678".to_vec(),
+            })
+            .unwrap_err(),
+            FormatError::InvalidKdfParams("m_cost_kib requirement overflow")
+        );
     }
 }
