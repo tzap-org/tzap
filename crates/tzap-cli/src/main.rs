@@ -11,11 +11,14 @@ use tzap_core::format::{
     FormatError, CRYPTO_HEADER_FIXED_LEN, READER_MAX_ARGON2ID_M_COST_KIB,
     READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST, VOLUME_HEADER_LEN,
 };
+use tzap_core::metadata::normalize_lookup_file_path;
+use tzap_core::reader::ArchiveEntry;
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
 use tzap_core::{
     open_archive, open_archive_volumes, open_archive_with_bootstrap_sidecar, write_archive,
     write_archive_with_dictionary, write_archive_with_dictionary_and_kdf, write_archive_with_kdf,
-    KdfParams, MasterKey, OpenedArchive, RegularFile, SafeExtractionOptions, WriterOptions,
+    KdfParams, MasterKey, OpenedArchive, RegularFile, SafeExtractionOptions, TarEntryKind,
+    WriterOptions,
 };
 
 const EXIT_USAGE: u8 = 2;
@@ -123,6 +126,12 @@ enum Command {
         keyfile: Option<String>,
 
         #[arg(
+            long = "force",
+            help = "Overwrite existing output files and bootstrap sidecar."
+        )]
+        force: bool,
+
+        #[arg(
             long = "argon2-t-cost",
             value_name = "COUNT",
             default_value_t = DEFAULT_ARGON2_T_COST,
@@ -193,6 +202,12 @@ enum Command {
         block_size: String,
 
         #[arg(
+            long = "dry-run",
+            help = "Print a create plan and file summary without writing archive bytes."
+        )]
+        dry_run: bool,
+
+        #[arg(
             required = true,
             value_name = "PATH",
             help = "One or more input files or directories."
@@ -202,7 +217,7 @@ enum Command {
     #[command(
         about = "Extract files from an archive",
         long_about = "Extract one or many archive members into a directory, with safe-path protections enabled by default.",
-        after_help = "Examples:\n  tzap extract --keyfile key.hex -C out/ backup.tzap\n  tzap extract --keyfile key.hex backup.tzap file.txt\n  tzap extract --keyfile key.hex --stdout backup.tzap hello.txt > out.bin\n  tzap extract --password-stdin --overwrite backup.tzap target/\n  tzap extract --bootstrap backup.tzap.bootstrap -C out backup.tzap",
+        after_help = "Examples:\n  tzap extract --keyfile key.hex -C out/ backup.tzap\n  tzap extract --keyfile key.hex backup.tzap file.txt\n  tzap extract --keyfile key.hex --stdout backup.tzap hello.txt > out.bin\n  tzap extract --password-stdin --overwrite backup.tzap target/\n  tzap extract --dry-run -C out backup.tzap file.txt\n  tzap extract --bootstrap backup.tzap.bootstrap -C out backup.tzap",
         group(
             ArgGroup::new("open-key-source")
                 .required(true)
@@ -231,8 +246,18 @@ enum Command {
         )]
         directory: String,
 
-        #[arg(long = "stdout", help = "Write a single selected member to stdout.")]
+        #[arg(
+            long = "stdout",
+            conflicts_with = "dry_run",
+            help = "Write a single selected member to stdout."
+        )]
         stdout: bool,
+
+        #[arg(
+            long = "dry-run",
+            help = "Show what would be extracted without writing files."
+        )]
+        dry_run: bool,
 
         #[arg(long = "overwrite", help = "Allow overwriting existing output files.")]
         overwrite: bool,
@@ -433,6 +458,8 @@ fn run(cli: Cli) -> Result<()> {
             password_stdin,
             password,
             keyfile,
+            force,
+            dry_run,
             argon2_t_cost,
             argon2_m_cost_kib,
             argon2_parallelism,
@@ -459,6 +486,42 @@ fn run(cli: Cli) -> Result<()> {
             options.envelope_target_size = parse_size_u32(&envelope_size, "envelope-size")?;
             options.block_size = parse_size_u32(&block_size, "block-size")?;
 
+            ensure_create_output_paths_can_be_written(
+                &output,
+                volumes,
+                volume_size.is_some(),
+                bootstrap_out.as_deref(),
+                force,
+            )?;
+            validate_create_writer_options(&options)?;
+            let input_specs = collect_input_specs(&paths)?;
+            let bootstrap_output = bootstrap_out.clone();
+
+            if dry_run {
+                eprintln!("create dry-run summary:");
+                eprintln!("  files: {}", input_specs.len());
+                eprintln!(
+                    "  input bytes: {}",
+                    input_specs.iter().map(|entry| entry.size).sum::<u64>()
+                );
+                eprintln!(
+                    "  key mode: {}",
+                    create_key_mode_label(keyfile.as_deref(), password_stdin, password)
+                );
+                eprintln!(
+                    "  volume mode: {}",
+                    describe_planned_volume_mode(volumes, volume_size.as_deref())
+                );
+                eprintln!("  planned archive paths:");
+                for path in create_dry_run_output_paths(&output, volumes, volume_size.is_some()) {
+                    eprintln!("    {path}");
+                }
+                if let Some(bootstrap_path) = bootstrap_output {
+                    eprintln!("  bootstrap: {}", bootstrap_path);
+                }
+                return Ok(());
+            }
+
             let key = load_create_key(
                 keyfile.as_deref(),
                 password_stdin,
@@ -467,7 +530,7 @@ fn run(cli: Cli) -> Result<()> {
                 argon2_m_cost_kib,
                 argon2_parallelism,
             )?;
-            let inputs = collect_inputs(&paths)?;
+            let inputs = collect_inputs_from_specs(&input_specs)?;
             let regular_files = inputs
                 .iter()
                 .map(|file| RegularFile {
@@ -504,18 +567,33 @@ fn run(cli: Cli) -> Result<()> {
             }
             .context("failed to create archive")?;
 
+            let output_paths = create_output_paths(&output, archive.volumes.len());
+            if !force {
+                check_archive_paths_free_for_write(&output_paths)?;
+            }
+            if let Some(bootstrap_path) = &bootstrap_output {
+                if !force {
+                    check_output_path_free("bootstrap", Path::new(bootstrap_path))?;
+                }
+            }
+
             write_archive_outputs(&output, &archive.volumes)?;
             if let Some(path) = bootstrap_out {
                 fs::write(&path, &archive.bootstrap_sidecar)
                     .with_context(|| format!("failed to write bootstrap sidecar {path}"))?;
             }
             eprintln!(
-                "created {} file(s), {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
+                "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
                 regular_files.len(),
+                input_specs.iter().map(|entry| entry.size).sum::<u64>(),
+                archive.volumes.iter().map(|volume| volume.len() as u64).sum::<u64>(),
                 archive.volumes.len(),
                 volume_loss_tolerance,
                 bit_rot_buffer_pct
             );
+            if let Some(path) = bootstrap_output {
+                eprintln!("  bootstrap output: {}", path);
+            }
             Ok(())
         }
         Command::Extract {
@@ -523,6 +601,7 @@ fn run(cli: Cli) -> Result<()> {
             paths,
             directory,
             stdout,
+            dry_run,
             overwrite,
             password_stdin,
             password,
@@ -540,36 +619,73 @@ fn run(cli: Cli) -> Result<()> {
             let opened =
                 open_inputs_maybe_bootstrap(&volume_bytes, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {archive}"))?;
-            let paths = if paths.is_empty() {
-                opened
-                    .list_files()?
-                    .into_iter()
-                    .map(|entry| entry.path)
-                    .collect::<Vec<_>>()
-            } else {
-                paths
-            };
+            let all_entries = opened.list_files()?;
+            let (requested_paths, missing_paths) =
+                resolve_extract_paths(&all_entries, &paths, opened.crypto_header.max_path_length)?;
+            if !missing_paths.is_empty() {
+                for missing in missing_paths {
+                    eprintln!("missing archive path: {missing}");
+                }
+                return Err(anyhow!("missing requested archive paths"));
+            }
             if stdout {
-                if paths.len() != 1 {
+                if paths.is_empty() || requested_paths.len() != 1 {
                     bail!("--stdout requires exactly one archive path");
                 }
-                let contents = opened
-                    .extract_file(&paths[0])?
-                    .ok_or_else(|| anyhow!("path not found in archive: {}", paths[0]))?;
-                io::stdout().write_all(&contents)?;
+                let path = requested_paths[0].as_str();
+                let member = opened
+                    .extract_member(path)?
+                    .ok_or_else(|| anyhow!("path not found in archive: {path}"))?;
+                if member.kind != TarEntryKind::Regular {
+                    bail!("--stdout supports regular file members only");
+                }
+                for diagnostic in member.diagnostics {
+                    eprintln!(
+                        "tzap: degraded-metadata: {}: {}: {}",
+                        path, diagnostic.profile, diagnostic.message
+                    );
+                }
+                io::stdout().write_all(&member.data)?;
                 return Ok(());
             }
+
+            if dry_run {
+                eprintln!("extract dry-run summary:");
+                eprintln!("  destination: {}", directory);
+                eprintln!("  archive members:");
+                for path in &requested_paths {
+                    if let Some(size) = all_entries
+                        .iter()
+                        .find(|entry| entry.path == *path)
+                        .map(|entry| entry.file_data_size)
+                    {
+                        eprintln!("    {path} ({size} bytes)");
+                    } else {
+                        eprintln!("    {path}");
+                    }
+                }
+                return Ok(());
+            }
+
             let root = PathBuf::from(directory);
             fs::create_dir_all(&root).with_context(|| {
                 format!("failed to create extraction directory {}", root.display())
             })?;
+            let mut extracted_count = 0u64;
+            let mut degraded_metadata_count = 0u64;
             let options = SafeExtractionOptions {
                 overwrite_existing: overwrite,
             };
-            for path in paths {
+            for path in requested_paths {
                 let diagnostics = opened
                     .extract_file_to(&path, &root, options)?
                     .ok_or_else(|| anyhow!("path not found in archive: {path}"))?;
+                extracted_count = extracted_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("extracted path count overflow"))?;
+                degraded_metadata_count = degraded_metadata_count
+                    .checked_add(diagnostics.len() as u64)
+                    .ok_or_else(|| anyhow!("degraded metadata count overflow"))?;
                 for diagnostic in diagnostics {
                     eprintln!(
                         "tzap: degraded-metadata: {}: {}: {}",
@@ -577,6 +693,10 @@ fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
+            eprintln!(
+                "extracted {extracted_count} file(s), {degraded_metadata_count} degraded metadata items to {}",
+                root.display()
+            );
             Ok(())
         }
         Command::List {
@@ -662,6 +782,15 @@ struct InputFile {
 }
 
 #[derive(Debug)]
+struct InputSpec {
+    source: PathBuf,
+    archive_path: String,
+    mode: u32,
+    mtime: u64,
+    size: u64,
+}
+
+#[derive(Debug)]
 struct CreateKey {
     master_key: MasterKey,
     kdf_params: KdfParams,
@@ -674,7 +803,7 @@ struct Diagnostic {
     action: &'static str,
 }
 
-fn collect_inputs(paths: &[String]) -> Result<Vec<InputFile>> {
+fn collect_input_specs(paths: &[String]) -> Result<Vec<InputSpec>> {
     let mut out = Vec::new();
     for path in paths {
         let input = PathBuf::from(path);
@@ -683,14 +812,37 @@ fn collect_inputs(paths: &[String]) -> Result<Vec<InputFile>> {
             .and_then(OsStr::to_str)
             .ok_or_else(|| anyhow!("input path has no valid UTF-8 file name: {path}"))?
             .to_owned();
-        collect_one_input(&input, Path::new(&base), &mut out)
+        collect_one_input_spec(&input, Path::new(&base), &mut out)
             .with_context(|| format!("failed to collect input {path}"))?;
     }
     out.sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
     Ok(out)
 }
 
-fn collect_one_input(input: &Path, archive_path: &Path, out: &mut Vec<InputFile>) -> Result<()> {
+fn collect_input_files(specs: &[InputSpec]) -> Result<Vec<InputFile>> {
+    let mut out = Vec::new();
+    for spec in specs {
+        let contents = fs::read(&spec.source)
+            .with_context(|| format!("failed to read input {}", spec.source.display()))?;
+        out.push(InputFile {
+            archive_path: spec.archive_path.clone(),
+            contents,
+            mode: spec.mode,
+            mtime: spec.mtime,
+        });
+    }
+    Ok(out)
+}
+
+fn collect_inputs_from_specs(specs: &[InputSpec]) -> Result<Vec<InputFile>> {
+    collect_input_files(specs)
+}
+
+fn collect_one_input_spec(
+    input: &Path,
+    archive_path: &Path,
+    out: &mut Vec<InputSpec>,
+) -> Result<()> {
     let metadata = fs::symlink_metadata(input)
         .with_context(|| format!("failed to inspect input {}", input.display()))?;
     if metadata.file_type().is_symlink() {
@@ -706,7 +858,7 @@ fn collect_one_input(input: &Path, archive_path: &Path, out: &mut Vec<InputFile>
                 .file_name()
                 .into_string()
                 .map_err(|_| anyhow!("input path is not valid UTF-8"))?;
-            collect_one_input(&entry.path(), &archive_path.join(child_name), out)?;
+            collect_one_input_spec(&entry.path(), &archive_path.join(child_name), out)?;
         }
         return Ok(());
     }
@@ -714,15 +866,45 @@ fn collect_one_input(input: &Path, archive_path: &Path, out: &mut Vec<InputFile>
         bail!("unsupported input type {}", input.display());
     }
     let archive_path = archive_path_to_string(archive_path)?;
-    let contents =
-        fs::read(input).with_context(|| format!("failed to read input {}", input.display()))?;
-    out.push(InputFile {
+    out.push(InputSpec {
+        source: input.to_owned(),
         archive_path,
-        contents,
         mode: readonly_mode(&metadata),
         mtime: 0,
+        size: metadata.len(),
     });
     Ok(())
+}
+
+fn resolve_extract_paths(
+    all_entries: &[ArchiveEntry],
+    requested: &[String],
+    max_path_length: u32,
+) -> Result<(Vec<String>, Vec<String>)> {
+    if requested.is_empty() {
+        return Ok((
+            all_entries.iter().map(|entry| entry.path.clone()).collect(),
+            Vec::new(),
+        ));
+    }
+
+    let available = all_entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut resolved = Vec::with_capacity(requested.len());
+    let mut missing = Vec::new();
+    for path in requested {
+        let normalized = normalize_lookup_file_path(path, max_path_length)?;
+        let normalized =
+            String::from_utf8(normalized).map_err(|_| anyhow!(FormatError::UnsafeArchivePath))?;
+        if available.contains(normalized.as_str()) {
+            resolved.push(normalized);
+        } else {
+            missing.push(path.clone());
+        }
+    }
+    Ok((resolved, missing))
 }
 
 fn archive_path_to_string(path: &Path) -> Result<String> {
@@ -771,6 +953,209 @@ fn write_archive_outputs(output: &str, volumes: &[Vec<u8>]) -> Result<()> {
     Ok(())
 }
 
+fn ensure_create_output_paths_can_be_written(
+    output: &str,
+    volumes: Option<u32>,
+    has_volume_size: bool,
+    bootstrap_out: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    if let Some(volumes) = volumes {
+        if volumes == 0 {
+            bail!("--volumes must be at least 1");
+        }
+        if !force && volumes == 1 {
+            check_output_path_free("archive output", Path::new(output))?;
+        }
+        if !force && volumes > 1 {
+            let paths = create_output_paths(output, volumes as usize);
+            check_archive_paths_free_for_write(&paths)?;
+        }
+        if let Some(path) = bootstrap_out {
+            if !force {
+                check_output_path_free("bootstrap output", Path::new(path))?;
+            }
+        }
+        return Ok(());
+    }
+    if has_volume_size {
+        if !force {
+            check_output_path_collisions_for_volume_size_output(output)?;
+            if let Some(path) = bootstrap_out {
+                check_output_path_free("bootstrap output", Path::new(path))?;
+            }
+        }
+        return Ok(());
+    }
+    if !force {
+        check_output_path_free("archive output", Path::new(output))?;
+        if let Some(path) = bootstrap_out {
+            check_output_path_free("bootstrap output", Path::new(path))?;
+        }
+    }
+    Ok(())
+}
+
+fn check_output_path_collisions_for_volume_size_output(output: &str) -> Result<()> {
+    check_output_path_free("archive output", Path::new(output))?;
+    let output_path = Path::new(output);
+    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let base = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("output path has invalid UTF-8: {output}"))?;
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to inspect output directory {}", parent.display())
+            })
+        }
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if looks_like_numbered_volume(&name, base) {
+            bail!("output path collision: {output}.* already exists; use --force to overwrite");
+        }
+    }
+    Ok(())
+}
+
+fn looks_like_numbered_volume(path_name: &str, base: &str) -> bool {
+    let Some(suffix) = path_name.strip_prefix(base) else {
+        return false;
+    };
+    if !suffix.starts_with('.') {
+        return false;
+    }
+    let suffix = &suffix[1..];
+    if suffix.len() != 3 {
+        return false;
+    }
+    suffix.bytes().all(|byte| matches!(byte, b'0'..=b'9'))
+}
+
+fn check_archive_paths_free_for_write(paths: &[PathBuf]) -> Result<()> {
+    for path in paths {
+        check_output_path_free("archive output", path)?;
+    }
+    Ok(())
+}
+
+fn validate_create_writer_options(options: &WriterOptions) -> Result<()> {
+    if options.block_size < 4096 || options.block_size % 2 != 0 {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "M6 writer requires an even block size of at least 4096",
+        )));
+    }
+    if options.stripe_width == 0 {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "stripe_width must be non-zero",
+        )));
+    }
+    let effective_stripe_width = if options.target_volume_size.is_some() {
+        options
+            .stripe_width
+            .max(options.volume_loss_tolerance as u32 + 1)
+    } else {
+        options.stripe_width
+    };
+    if options.volume_loss_tolerance as u32 >= effective_stripe_width {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "volume_loss_tolerance must be less than stripe_width",
+        )));
+    }
+    if effective_stripe_width == 1 && options.volume_loss_tolerance != 0 {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "single-volume archives cannot tolerate volume loss",
+        )));
+    }
+    if matches!(options.target_volume_size, Some(0)) {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "target_volume_size must be non-zero",
+        )));
+    }
+    if options.bit_rot_buffer_pct > 100 {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "bit_rot_buffer_pct must be at most 100",
+        )));
+    }
+    if options.chunk_size == 0 || options.chunk_size > options.envelope_target_size {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "chunk_size must be non-zero and no larger than envelope_target_size",
+        )));
+    }
+    Ok(())
+}
+
+fn check_output_path_free(label: &str, path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    if path.exists() {
+        bail!(
+            "{label} already exists: {}; use --force to overwrite",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn create_output_paths(output: &str, volume_count: usize) -> Vec<PathBuf> {
+    if volume_count == 1 {
+        vec![PathBuf::from(output)]
+    } else {
+        (0..volume_count)
+            .map(|index| PathBuf::from(format!("{output}.{index:03}")))
+            .collect()
+    }
+}
+
+fn create_dry_run_output_paths(
+    output: &str,
+    volumes: Option<u32>,
+    has_volume_size: bool,
+) -> Vec<String> {
+    if let Some(volumes) = volumes {
+        return create_output_paths(output, volumes as usize)
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect();
+    }
+    if has_volume_size {
+        return vec![
+            format!("{output} (if one volume is emitted)"),
+            format!("{output}.000, {output}.001, ... (if split)"),
+        ];
+    }
+    vec![output.to_owned()]
+}
+
+fn describe_planned_volume_mode(volumes: Option<u32>, volume_size: Option<&str>) -> String {
+    if let Some(volumes) = volumes {
+        return format!("{volumes} explicit volume(s) requested");
+    }
+    if let Some(size) = volume_size {
+        return format!("volume-size mode, target size {size}");
+    }
+    format!("single volume")
+}
+
+fn create_key_mode_label(keyfile: Option<&str>, password_stdin: bool, password: bool) -> String {
+    if password_stdin {
+        return "password-stdin".to_string();
+    }
+    if password {
+        return "password".to_string();
+    }
+    if keyfile.is_some() {
+        return "keyfile".to_string();
+    }
+    "unknown".to_string()
+}
+
 fn read_volume_inputs(primary: &str, additional: &[String]) -> Result<Vec<Vec<u8>>> {
     let mut paths = Vec::with_capacity(additional.len() + 1);
     paths.push(primary.to_owned());
@@ -788,7 +1173,10 @@ fn open_inputs_maybe_bootstrap(
 ) -> Result<OpenedArchive> {
     if volume_bytes.len() > 1 {
         if bootstrap.is_some() {
-            bail!("--bootstrap is only supported with a single archive input in this CLI pass");
+            return Err(anyhow!(FormatError::ReaderUnsupported(
+                "bootstrap is not supported with multi-volume extraction",
+            ))
+            .into());
         }
         let borrowed = volume_bytes.iter().map(Vec::as_slice).collect::<Vec<_>>();
         return open_archive_volumes(&borrowed, master_key).map_err(Into::into);
@@ -1199,7 +1587,8 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
             action: "add --overwrite if overwriting existing files is intended",
         },
         FormatError::ReaderUnsupported(message) | FormatError::WriterUnsupported(message)
-            if message.contains("bootstrap") =>
+            if message.contains("bootstrap sidecar")
+                || message.contains("dictionary bootstrap required") =>
         {
             Diagnostic {
                 label: "missing-bootstrap",

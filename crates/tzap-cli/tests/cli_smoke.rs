@@ -99,6 +99,8 @@ fn cli_create_help_includes_examples_and_flags() {
     assert!(stdout.contains("--chunk-size <SIZE>"));
     assert!(stdout.contains("--envelope-size <SIZE>"));
     assert!(stdout.contains("--block-size <SIZE>"));
+    assert!(stdout.contains("--force"));
+    assert!(stdout.contains("--dry-run"));
 }
 
 #[test]
@@ -117,6 +119,7 @@ fn cli_extract_help_includes_examples_and_flags() {
     assert!(stdout.contains("Examples:"));
     assert!(stdout.contains("--directory"));
     assert!(stdout.contains("--stdout"));
+    assert!(stdout.contains("--dry-run"));
     assert!(stdout.contains("--overwrite"));
     assert!(stdout.contains("--password"));
     assert!(stdout.contains("--bootstrap"));
@@ -393,7 +396,10 @@ fn cli_create_list_verify_and_extract_with_keyfile() {
         ])
         .assert()
         .success()
-        .stderr(predicate::str::contains("created 1 file(s), 1 volume(s)"));
+        .stderr(predicate::str::contains("created 1 file(s), 16 bytes in, "))
+        .stderr(predicate::str::contains(
+            "1 volume(s), volume-loss tolerance 0, bit-rot buffer 5%",
+        ));
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -982,6 +988,787 @@ fn cli_create_and_verify_multi_volume_archive() {
 }
 
 #[test]
+fn cli_create_directory_tree_is_deterministic_and_includes_nested_files() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input_root = temp.path().join("input-dir");
+    let archive = temp.path().join("tree.tzap");
+
+    fs::create_dir(&input_root).unwrap();
+    fs::create_dir(input_root.join("zeta")).unwrap();
+    fs::write(input_root.join(".hidden"), b"hidden\n").unwrap();
+    fs::write(input_root.join("b.txt"), b"root B\n").unwrap();
+    fs::write(input_root.join("a.txt"), b"root A\n").unwrap();
+    fs::write(input_root.join("zeta").join("c.txt"), b"nested C\n").unwrap();
+    fs::write(input_root.join("zeta").join("a.txt"), b"nested A\n").unwrap();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input_root.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let listing = String::from_utf8_lossy(&output);
+
+    let base = input_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap();
+    let expected = format!("{base}/a.txt\n{base}/b.txt\n{base}/zeta/a.txt\n{base}/zeta/c.txt\n");
+    let expected = format!("{base}/.hidden\n{expected}");
+    assert_eq!(listing, expected);
+}
+
+#[test]
+fn cli_create_omits_empty_directories_by_default() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input_root = temp.path().join("input");
+    let archive = temp.path().join("empty-dir.tzap");
+
+    fs::create_dir_all(input_root.join("empty")).unwrap();
+    fs::write(input_root.join("keep.txt"), b"keep\n").unwrap();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input_root.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        String::from_utf8_lossy(&output),
+        format!("input/keep.txt\n"),
+    );
+}
+
+#[test]
+fn cli_create_supports_unicode_archive_paths() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let archive = temp.path().join("unicode.tzap");
+    let input = temp.path().join("你好-ファイル.txt");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"hello unicode\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            input.file_name().and_then(|name| name.to_str()).unwrap(),
+        ));
+}
+
+#[test]
+fn cli_extract_selected_path_uses_core_unicode_normalization() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let archive = temp.path().join("unicode-selection.tzap");
+    let input = temp.path().join("café.txt");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"normalized payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--stdout",
+            archive.to_str().unwrap(),
+            "cafe\u{301}.txt",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::eq(b"normalized payload\n".to_vec()));
+}
+
+#[test]
+fn cli_create_supports_long_archive_paths() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input_root = temp.path().join("archive-root");
+    let archive = temp.path().join("long.tzap");
+
+    let segment = "segment_".to_owned() + &"a".repeat(50);
+    let long_file = input_root
+        .join(&segment)
+        .join(&("nested_".to_owned() + &"b".repeat(50)))
+        .join("long-path-".to_owned() + &"c".repeat(32));
+    fs::create_dir_all(long_file.parent().unwrap()).unwrap();
+    fs::write(&long_file, b"long path payload\n").unwrap();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input_root.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let archive_member = long_file
+        .strip_prefix(&input_root)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&archive_member));
+
+    assert!(archive_member.len() >= 100);
+}
+
+#[test]
+fn cli_create_handles_empty_file() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("empty.txt");
+    let archive = temp.path().join("empty.tzap");
+    let output = temp.path().join("out");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            output.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "empty.txt",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(output.join("empty.txt")).unwrap(), b"");
+}
+
+#[test]
+fn cli_create_supports_binary_files() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("blob.bin");
+    let archive = temp.path().join("binary.tzap");
+    let output = temp.path().join("out");
+
+    let payload: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, &payload).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            output.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "blob.bin",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(output.join("blob.bin")).unwrap(), payload);
+}
+
+#[test]
+fn cli_create_with_dictionary_file_succeeds() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let dictionary = temp.path().join("dictionary.txt");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("dict.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&dictionary, b"example dictionary bytes").unwrap();
+    fs::write(&input, b"dictionary test payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--dictionary",
+            dictionary.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.txt\n"));
+}
+
+#[test]
+fn cli_create_with_password_stdin_reports_key_mode_and_can_be_verified() {
+    let temp = tempdir().unwrap();
+    let input = temp.path().join("secret.txt");
+    let archive = temp.path().join("password.tzap");
+    let pass = "stage2 password\n";
+
+    fs::write(&input, b"hello from password mode\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--password-stdin",
+            "--argon2-t-cost",
+            "1",
+            "--argon2-m-cost-kib",
+            "8",
+            "--argon2-parallelism",
+            "1",
+            "--dry-run",
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .write_stdin(pass)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("key mode: password-stdin"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--password-stdin",
+            "--argon2-t-cost",
+            "1",
+            "--argon2-m-cost-kib",
+            "8",
+            "--argon2-parallelism",
+            "1",
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .write_stdin(pass)
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["verify", "--password-stdin", archive.to_str().unwrap()])
+        .write_stdin(pass)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK"));
+}
+
+#[test]
+fn cli_create_dry_run_prints_summary_and_writes_nothing() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("dry.tzap");
+    let bootstrap = temp.path().join("dry.tzap.bootstrap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"dry run payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap-out",
+            bootstrap.to_str().unwrap(),
+            "--dry-run",
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("create dry-run summary:"))
+        .stderr(predicate::str::contains("files: 1"))
+        .stderr(predicate::str::contains("input bytes: 16"))
+        .stderr(predicate::str::contains("key mode: keyfile"))
+        .stderr(predicate::str::contains("planned archive paths:"))
+        .stderr(predicate::str::contains("bootstrap"));
+
+    assert!(!archive.exists());
+    assert!(!bootstrap.exists());
+}
+
+#[test]
+fn cli_create_rejects_existing_output_without_force() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let output = temp.path().join("sample.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"hello from tzap\n").unwrap();
+    fs::write(&output, b"existing\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("already exists"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--force",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn cli_create_rejects_existing_multi_volume_outputs_without_force() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("striped.txt");
+    let output = temp.path().join("striped.tzap");
+    let output_volume_0 = output.with_file_name(format!(
+        "{}.000",
+        output.file_name().unwrap().to_string_lossy()
+    ));
+    let output_volume_1 = output.with_file_name(format!(
+        "{}.001",
+        output.file_name().unwrap().to_string_lossy()
+    ));
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"multi-volume payload\n").unwrap();
+    fs::write(&output_volume_0, b"collision\n").unwrap();
+    fs::write(&output_volume_1, b"collision\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volumes",
+            "2",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("already exists"));
+}
+
+#[test]
+fn cli_create_rejects_existing_bootstrap_output_without_force() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let output = temp.path().join("sample.tzap");
+    let bootstrap = temp.path().join("sample.tzap.bootstrap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"hello from tzap\n").unwrap();
+    fs::write(&bootstrap, b"existing bootstrap\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap-out",
+            bootstrap.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("already exists"));
+}
+
+#[test]
+fn cli_create_rejects_volume_size_output_collisions_for_dotted_base() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("sized.bin");
+    let output = temp.path().join("sized.tzap");
+    let collision = output.with_file_name(format!(
+        "{}.000",
+        output.file_name().unwrap().to_string_lossy()
+    ));
+    let mut data = Vec::with_capacity(64 * 1024);
+    for i in 0..(64 * 1024) {
+        data.push((i % 251) as u8);
+    }
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, &data).unwrap();
+    fs::write(&collision, b"collision\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volume-size",
+            "8K",
+            "--block-size",
+            "4K",
+            "--chunk-size",
+            "4K",
+            "--envelope-size",
+            "128K",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("output path collision"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_create_rejects_char_device_input_type() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let output = temp.path().join("char.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "/dev/null",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("unsupported input type"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_create_rejects_symlink_input() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let output = temp.path().join("symlink.tzap");
+    let target = temp.path().join("target.txt");
+    let link = temp.path().join("link.txt");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&target, b"target\n").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            link.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "refusing to archive symlink input",
+        ));
+}
+
+#[test]
+fn cli_create_rejects_volumes_zero() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let output = temp.path().join("sample.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"hello\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volumes",
+            "0",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("--volumes must be at least 1"));
+}
+
+#[test]
+fn cli_create_rejects_volume_loss_tolerance_out_of_range() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let output = temp.path().join("sample.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"hello\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volume-loss-tolerance",
+            "2",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains("unsupported-feature"));
+}
+
+#[test]
+fn cli_create_rejects_chunk_size_larger_than_envelope_size() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let output = temp.path().join("sample.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"hello\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--chunk-size",
+            "4M",
+            "--envelope-size",
+            "1M",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains("unsupported-feature"));
+}
+
+#[test]
+fn cli_create_rejects_size_overflow() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let output = temp.path().join("sample.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"hello\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volume-size",
+            "18446744073709551615K",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("size overflow"));
+}
+
+#[test]
+fn cli_create_rejects_unsupported_writer_scope() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let output = temp.path().join("sample.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"hello\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--block-size",
+            "3",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains("unsupported-feature"));
+}
+
+#[test]
 fn cli_create_with_volume_size_splits_archive_by_target_size() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
@@ -1464,4 +2251,1098 @@ fn cli_verify_with_password_prompt_and_stdin_fallback() {
         .assert()
         .success()
         .stdout(predicate::str::contains("OK"));
+}
+
+#[test]
+fn cli_extract_all_files_to_default_directory() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input_root = temp.path().join("input");
+    let input = input_root.join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+    let output_dir = temp.path().join("extract");
+    let payload = b"destination default\n";
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::create_dir_all(&input_root).unwrap();
+    fs::write(&input, payload).unwrap();
+    fs::create_dir(&output_dir).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .current_dir(&output_dir)
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "../sample.tzap",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(output_dir.join("hello.txt")).unwrap(), payload);
+}
+
+#[test]
+fn cli_extract_all_files_to_specified_directory() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input_root = temp.path().join("input-dir");
+    let archive = temp.path().join("tree.tzap");
+    let output = temp.path().join("out");
+    let expected = b"tree extraction\n";
+
+    fs::create_dir_all(&input_root).unwrap();
+    fs::write(input_root.join("a.txt"), expected).unwrap();
+    fs::write(input_root.join("b.txt"), b"skip this\n").unwrap();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input_root.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(output.join("input-dir").join("a.txt")).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn cli_extract_selected_file_paths() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input_root = temp.path().join("input");
+    let archive = temp.path().join("selected.tzap");
+    let output = temp.path().join("out");
+
+    fs::create_dir_all(&input_root).unwrap();
+    fs::write(input_root.join("a.txt"), b"a\n").unwrap();
+    fs::write(input_root.join("b.txt"), b"b\n").unwrap();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input_root.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "input/a.txt",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(output.join("input").join("a.txt")).unwrap(),
+        b"a\n"
+    );
+    assert!(!output.join("input").join("b.txt").exists());
+}
+
+#[test]
+fn cli_extract_multiple_selected_file_paths() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input_root = temp.path().join("input");
+    let archive = temp.path().join("selected.tzap");
+    let output = temp.path().join("out");
+
+    fs::create_dir_all(&input_root).unwrap();
+    fs::write(input_root.join("a.txt"), b"a\n").unwrap();
+    fs::write(input_root.join("b.txt"), b"b\n").unwrap();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input_root.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "input/a.txt",
+            "input/b.txt",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(output.join("input").join("a.txt")).unwrap(),
+        b"a\n"
+    );
+    assert_eq!(
+        fs::read(output.join("input").join("b.txt")).unwrap(),
+        b"b\n"
+    );
+}
+
+#[test]
+fn cli_extract_to_stdout_with_valid_single_file() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+    let payload = b"stdout payload\n";
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, payload).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--stdout",
+            archive.to_str().unwrap(),
+            "hello.txt",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::eq(payload.to_vec()));
+}
+
+#[test]
+fn cli_extract_with_overwrite_enabled() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+    let output = temp.path().join("out");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"updated payload\n").unwrap();
+    fs::create_dir(&output).unwrap();
+    fs::write(output.join("hello.txt"), b"already there").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .code(13)
+        .stderr(predicate::str::contains("unsafe-path"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--overwrite",
+            "--directory",
+            output.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "hello.txt",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(output.join("hello.txt")).unwrap(),
+        b"updated payload\n"
+    );
+}
+
+#[test]
+fn cli_extract_with_passphrase_is_supported_and_safe() {
+    let temp = tempdir().unwrap();
+    let input = temp.path().join("secret.txt");
+    let archive = temp.path().join("password.tzap");
+    let output = temp.path().join("out");
+    let passphrase = "extract-passphrase\n";
+
+    fs::write(&input, b"passphrase payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--password-stdin",
+            "--argon2-t-cost",
+            "1",
+            "--argon2-m-cost-kib",
+            "8",
+            "--argon2-parallelism",
+            "1",
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .write_stdin(passphrase)
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--password-stdin",
+            "--directory",
+            output.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "secret.txt",
+        ])
+        .write_stdin(passphrase)
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(output.join("secret.txt")).unwrap(),
+        b"passphrase payload\n"
+    );
+}
+
+#[test]
+fn cli_extract_with_bootstrap_sidecar() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+    let bootstrap = temp.path().join("sample.tzap.bootstrap");
+    let output = temp.path().join("out");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"bootstrap payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap-out",
+            bootstrap.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap",
+            bootstrap.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "hello.txt",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(output.join("hello.txt")).unwrap(),
+        b"bootstrap payload\n"
+    );
+}
+
+#[test]
+fn cli_extract_multi_volume_archive() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let output_base = temp.path().join("multi.tzap");
+    let output = temp.path().join("out");
+    let v0 = output_base.with_file_name(format!(
+        "{}.000",
+        output_base.file_name().unwrap().to_string_lossy()
+    ));
+    let v1 = output_base.with_file_name(format!(
+        "{}.001",
+        output_base.file_name().unwrap().to_string_lossy()
+    ));
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"multi-volume payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volumes",
+            "2",
+            "--volume-loss-tolerance",
+            "1",
+            "-o",
+            output_base.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            v0.to_str().unwrap(),
+            "--volume",
+            v1.to_str().unwrap(),
+            "hello.txt",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("extracted 1 file(s)"));
+
+    assert_eq!(
+        fs::read(output.join("hello.txt")).unwrap(),
+        b"multi-volume payload\n"
+    );
+}
+
+#[test]
+fn cli_extract_recovers_when_one_volume_is_missing_but_tolerance_allows_it() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("payload.bin");
+    let output_base = temp.path().join("recoverable.tzap");
+    let output = temp.path().join("out");
+    let mut data = vec![0u8; 64 * 1024];
+    for idx in 0..data.len() {
+        data[idx] = (idx % 251) as u8;
+    }
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, &data).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volumes",
+            "3",
+            "--volume-loss-tolerance",
+            "1",
+            "-o",
+            output_base.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let v0 = output_base.with_file_name(format!(
+        "{}.000",
+        output_base.file_name().unwrap().to_string_lossy()
+    ));
+    let v1 = output_base.with_file_name(format!(
+        "{}.001",
+        output_base.file_name().unwrap().to_string_lossy()
+    ));
+    let v2 = output_base.with_file_name(format!(
+        "{}.002",
+        output_base.file_name().unwrap().to_string_lossy()
+    ));
+
+    fs::remove_file(&v1).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            v0.to_str().unwrap(),
+            "--volume",
+            v2.to_str().unwrap(),
+            "payload.bin",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(output.join("payload.bin")).unwrap(), data);
+}
+
+#[test]
+fn cli_extract_reports_missing_archive_path_and_lists_missing_paths() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "missing.txt",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "missing archive path: missing.txt",
+        ));
+}
+
+#[test]
+fn cli_extract_stdout_requires_exactly_one_path() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--stdout",
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "--stdout requires exactly one archive path",
+        ));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--stdout",
+            archive.to_str().unwrap(),
+            "hello.txt",
+            "hello.txt",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "--stdout requires exactly one archive path",
+        ));
+}
+
+#[test]
+fn cli_extract_dry_run_conflicts_with_stdout() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--dry-run",
+            "--stdout",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "hello.txt",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn cli_extract_wrong_key_fails_with_stable_category() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let bad_key = temp.path().join("bad.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&bad_key, BAD_KEY_HEX).unwrap();
+    fs::write(&input, b"payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            bad_key.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "hello.txt",
+        ])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("wrong-key"));
+}
+
+#[test]
+fn cli_extract_corrupt_archive_reports_corruption() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let mut bytes = fs::read(&archive).unwrap();
+    let footer_start = bytes.len() - MANIFEST_FOOTER_LEN;
+    bytes[footer_start] ^= 0x01;
+    fs::write(&archive, bytes).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "hello.txt",
+        ])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("corrupt-archive"));
+}
+
+#[test]
+fn cli_extract_without_overwrite_when_destination_exists_is_rejected() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+    let output = temp.path().join("out");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"payload\n").unwrap();
+    fs::create_dir(&output).unwrap();
+    fs::write(output.join("hello.txt"), b"existing\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "hello.txt",
+        ])
+        .assert()
+        .code(13)
+        .stderr(predicate::str::contains("unsafe-path"));
+}
+
+#[test]
+fn cli_extract_unsafe_path_is_rejected_for_stdout() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--stdout",
+            archive.to_str().unwrap(),
+            "../outside.txt",
+        ])
+        .assert()
+        .code(13)
+        .stderr(predicate::str::contains("unsafe-path"));
+}
+
+#[test]
+fn cli_extract_missing_bootstrap_file_is_an_io_error() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+    let missing = temp.path().join("sample.tzap.bootstrap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap-out",
+            missing.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    fs::remove_file(&missing).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap",
+            missing.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "hello.txt",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("failed to read bootstrap sidecar"));
+}
+
+#[test]
+fn cli_extract_rejects_bootstrap_with_multi_volume_with_unsupported_error() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("multi.tzap");
+    let bootstrap = temp.path().join("multi.tzap.bootstrap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volumes",
+            "2",
+            "--bootstrap-out",
+            bootstrap.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap",
+            bootstrap.to_str().unwrap(),
+            archive.with_extension("tzap.000").to_str().unwrap(),
+            "--volume",
+            archive.with_extension("tzap.001").to_str().unwrap(),
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains("unsupported-feature"));
+}
+
+#[test]
+fn cli_extract_missing_volume_tolerates_recovery_when_loss_tolerance_allows() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let output_base = temp.path().join("recoverable.tzap");
+    let output = temp.path().join("out");
+    let v0 = output_base.with_file_name(format!(
+        "{}.000",
+        output_base.file_name().unwrap().to_string_lossy()
+    ));
+    let v1 = output_base.with_file_name(format!(
+        "{}.001",
+        output_base.file_name().unwrap().to_string_lossy()
+    ));
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"recovery check\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volumes",
+            "2",
+            "--volume-loss-tolerance",
+            "1",
+            "-o",
+            output_base.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    fs::remove_file(&v1).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            v0.to_str().unwrap(),
+            "hello.txt",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("extracted 1 file(s)"));
+}
+
+#[test]
+fn cli_extract_missing_volume_without_tolerance_is_reported_as_corruption() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let output_base = temp.path().join("unrecoverable.tzap");
+    let output = temp.path().join("out");
+    let v0 = output_base.with_file_name(format!(
+        "{}.000",
+        output_base.file_name().unwrap().to_string_lossy()
+    ));
+    let v1 = output_base.with_file_name(format!(
+        "{}.001",
+        output_base.file_name().unwrap().to_string_lossy()
+    ));
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, vec![0x42u8; 1_000_000]).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volumes",
+            "2",
+            "--bit-rot-buffer-pct",
+            "0",
+            "-o",
+            output_base.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    fs::remove_file(&v0).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            v1.to_str().unwrap(),
+            "hello.txt",
+        ])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("corrupt-archive"));
+}
+
+#[test]
+fn cli_extract_dry_run_prints_planned_members_and_rejects_missing_selection() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--dry-run",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            temp.path().join("out").to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "hello.txt",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("extract dry-run summary"))
+        .stderr(predicate::str::contains("hello.txt"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--dry-run",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "missing.txt",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "missing archive path: missing.txt",
+        ));
+}
+
+#[test]
+fn cli_extract_summary_reports_counts() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input_root = temp.path().join("input");
+    let archive = temp.path().join("sample.tzap");
+    let output = temp.path().join("out");
+
+    fs::create_dir_all(&input_root).unwrap();
+    fs::write(input_root.join("a.txt"), b"a\n").unwrap();
+    fs::write(input_root.join("b.txt"), b"b\n").unwrap();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input_root.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "input/a.txt",
+            "input/b.txt",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("extracted 2 file(s)"));
 }
