@@ -238,7 +238,7 @@ Risk:
 
 ## Milestone 5: Metadata Model And Index Validation
 
-Status: implementation complete; validation run pending.
+Status: complete.
 
 Purpose: make the encrypted index structures real and searchable.
 
@@ -258,6 +258,8 @@ Deliverables:
   exact shard-local frame/envelope sets and minimal FileEntry frame ranges.
 - Complete: removed the unused `reed-solomon-erasure` dependency after M4
   implemented the exact GF(2^16) Cauchy profile directly.
+- Complete: tests for empty IndexRoot parsing, single-shard file lookup, and
+  resource-cap-bound hash-prefix scans.
 
 Acceptance:
 
@@ -269,7 +271,7 @@ Acceptance:
 
 ## Milestone 6: Minimal Conformant Archive Writer
 
-Status: implementation complete; validation run pending.
+Status: complete.
 
 Purpose: produce the first spec-conformant archive for a narrow case.
 
@@ -295,6 +297,10 @@ Deliverables:
 - Complete: full HMAC/AEAD/suffix-padding/ReedSolomonGF16 path for payload,
   IndexShard, and IndexRoot objects.
 - Complete: valid empty archive construction path.
+- Complete: explicit M6 rejection guard for archives that would require
+  directory hint shards or more than one IndexShard.
+- Complete: writer smoke tests for empty archive bootstrap structures and M6
+  scope guards.
 
 Acceptance:
 

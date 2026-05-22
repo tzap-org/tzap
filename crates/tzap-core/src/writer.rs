@@ -29,6 +29,8 @@ const DEFAULT_INDEX_FEC_DATA_SHARDS: u16 = 64;
 const DEFAULT_INDEX_FEC_PARITY_SHARDS: u16 = 1;
 const DEFAULT_INDEX_ROOT_FEC_DATA_SHARDS: u16 = 64;
 const DEFAULT_INDEX_ROOT_FEC_PARITY_SHARDS: u16 = 1;
+const DEFAULT_MAX_FILES_PER_INDEX_SHARD: usize = 1_000_000;
+const DIRECTORY_HINT_REQUIRED_FILE_COUNT: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterOptions {
@@ -129,6 +131,7 @@ pub fn write_archive(
     options: WriterOptions,
 ) -> Result<WrittenArchive, FormatError> {
     validate_options(options)?;
+    validate_m6_file_scope(files.len())?;
 
     let archive_uuid = options
         .archive_uuid
@@ -321,6 +324,20 @@ fn validate_options(options: WriterOptions) -> Result<(), FormatError> {
     {
         return Err(FormatError::WriterUnsupported(
             "M6 writer keeps ReedSolomonGF16 parity enabled",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_m6_file_scope(file_count: usize) -> Result<(), FormatError> {
+    if file_count > DEFAULT_MAX_FILES_PER_INDEX_SHARD {
+        return Err(FormatError::WriterUnsupported(
+            "M6 writer supports only one IndexShard",
+        ));
+    }
+    if file_count > DIRECTORY_HINT_REQUIRED_FILE_COUNT {
+        return Err(FormatError::WriterUnsupported(
+            "M6 writer does not emit required directory hint shards",
         ));
     }
     Ok(())
@@ -850,4 +867,88 @@ fn checked_usize_add(lhs: usize, rhs: usize, field: &'static str) -> Result<usiz
 fn checked_u64_add(lhs: u64, rhs: u64, field: &'static str) -> Result<u64, FormatError> {
     lhs.checked_add(rhs)
         .ok_or(FormatError::WriterUnsupported(field))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::{verify_hmac, Subkeys};
+    use crate::wire::CryptoHeader;
+
+    #[test]
+    fn m6_scope_rejects_archives_that_require_directory_hints() {
+        assert!(validate_m6_file_scope(DIRECTORY_HINT_REQUIRED_FILE_COUNT).is_ok());
+        assert_eq!(
+            validate_m6_file_scope(DIRECTORY_HINT_REQUIRED_FILE_COUNT + 1).unwrap_err(),
+            FormatError::WriterUnsupported(
+                "M6 writer does not emit required directory hint shards"
+            )
+        );
+    }
+
+    #[test]
+    fn m6_scope_rejects_archives_that_need_multiple_index_shards() {
+        assert_eq!(
+            validate_m6_file_scope(DEFAULT_MAX_FILES_PER_INDEX_SHARD + 1).unwrap_err(),
+            FormatError::WriterUnsupported("M6 writer supports only one IndexShard")
+        );
+    }
+
+    #[test]
+    fn writes_empty_archive_with_authentic_bootstrap_structures() {
+        let master_key = MasterKey::from_raw_key(&[7u8; 32]).unwrap();
+        let archive = write_empty_archive(&master_key).unwrap();
+        let bytes = archive.bytes;
+
+        let volume_header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
+        assert_eq!(volume_header.archive_uuid, archive.archive_uuid);
+        assert_eq!(volume_header.session_id, archive.session_id);
+
+        let crypto_start = VOLUME_HEADER_LEN;
+        let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
+        let crypto_header = CryptoHeader::parse(
+            &bytes[crypto_start..crypto_end],
+            volume_header.crypto_header_length,
+        )
+        .unwrap();
+        let subkeys =
+            Subkeys::derive(&master_key, &archive.archive_uuid, &archive.session_id).unwrap();
+        verify_hmac(
+            HmacDomain::CryptoHeader,
+            &subkeys.mac_key,
+            &archive.archive_uuid,
+            &archive.session_id,
+            crypto_header.hmac_covered_bytes,
+            &crypto_header.header_hmac,
+        )
+        .unwrap();
+
+        let trailer_offset = bytes.len() - VOLUME_TRAILER_LEN;
+        let trailer = VolumeTrailer::parse(&bytes[trailer_offset..]).unwrap();
+        assert_eq!(trailer.bytes_written, bytes.len() as u64);
+        verify_hmac(
+            HmacDomain::VolumeTrailer,
+            &subkeys.mac_key,
+            &archive.archive_uuid,
+            &archive.session_id,
+            &bytes[trailer_offset..trailer_offset + 96],
+            &trailer.trailer_hmac,
+        )
+        .unwrap();
+
+        let manifest_offset = trailer.manifest_footer_offset as usize;
+        let manifest_end = manifest_offset + MANIFEST_FOOTER_LEN;
+        let manifest = ManifestFooter::parse(&bytes[manifest_offset..manifest_end]).unwrap();
+        assert_eq!(manifest.is_authoritative, 1);
+        assert_eq!(manifest.total_volumes, 1);
+        verify_hmac(
+            HmacDomain::ManifestFooter,
+            &subkeys.mac_key,
+            &archive.archive_uuid,
+            &archive.session_id,
+            &bytes[manifest_offset..manifest_offset + 104],
+            &manifest.manifest_hmac,
+        )
+        .unwrap();
+    }
 }

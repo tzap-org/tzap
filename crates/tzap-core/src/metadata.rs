@@ -20,6 +20,7 @@ pub const DIRECTORY_HINT_TABLE_LEN: usize = 72;
 pub const DIRECTORY_HINT_ENTRY_LEN: usize = 40;
 
 const FRAME_KNOWN_FLAGS: u32 = 0x0000_0003;
+const DEFAULT_MAX_HASH_COLLISION_SHARD_SCAN: usize = 16;
 const SHA256_EMPTY: [u8; 32] = [
     0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
     0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
@@ -41,7 +42,7 @@ impl Default for MetadataLimits {
         Self {
             block_size: 4096,
             max_path_length: 4096,
-            max_hash_collision_shard_scan: 64,
+            max_hash_collision_shard_scan: DEFAULT_MAX_HASH_COLLISION_SHARD_SCAN,
             max_shard_count: 1_000_000,
             max_directory_hint_shards: 65_535,
             max_files_per_index_shard: 1_000_000,
@@ -338,10 +339,11 @@ impl IndexRoot {
     pub fn candidate_shards_for_path(
         &self,
         normalized_path: &[u8],
+        limits: MetadataLimits,
     ) -> Result<Vec<usize>, FormatError> {
         self.candidate_shard_indexes_for_hash(
             hash_prefix(normalized_path),
-            MetadataLimits::default().max_hash_collision_shard_scan,
+            limits.max_hash_collision_shard_scan,
         )
     }
 }
@@ -2010,4 +2012,139 @@ fn to_usize(value: u64, structure: &'static str) -> Result<usize, FormatError> {
 
 fn invalid<T>(structure: &'static str, reason: &'static str) -> Result<T, FormatError> {
     Err(FormatError::InvalidMetadata { structure, reason })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_hash_collision_scan_cap_matches_v36() {
+        assert_eq!(MetadataLimits::default().max_hash_collision_shard_scan, 16);
+    }
+
+    #[test]
+    fn parses_valid_empty_index_root() {
+        let root = IndexRoot {
+            header: IndexRootHeader::empty(),
+            shards: Vec::new(),
+            directory_hint_shards: Vec::new(),
+        };
+
+        let bytes = root.to_bytes();
+        let parsed = IndexRoot::parse(&bytes, false, MetadataLimits::default()).unwrap();
+
+        assert_eq!(parsed.header.file_count, 0);
+        assert!(parsed.shards.is_empty());
+        assert!(parsed.directory_hint_shards.is_empty());
+    }
+
+    #[test]
+    fn candidate_path_lookup_uses_supplied_collision_cap() {
+        let path = b"same-prefix.txt";
+        let hash = hash_prefix(path);
+        let root = IndexRoot {
+            header: IndexRootHeader::empty(),
+            shards: (0..3)
+                .map(|idx| ShardEntry {
+                    shard_index: idx,
+                    first_block_index: idx,
+                    data_block_count: 1,
+                    parity_block_count: 1,
+                    encrypted_size: 4096,
+                    decompressed_size: 256,
+                    file_count: 1,
+                    first_path_hash: hash,
+                    last_path_hash: hash,
+                })
+                .collect(),
+            directory_hint_shards: Vec::new(),
+        };
+
+        let mut limits = MetadataLimits::default();
+        limits.max_hash_collision_shard_scan = 0;
+        assert_eq!(
+            root.candidate_shards_for_path(path, limits).unwrap_err(),
+            FormatError::HashPrefixCollisionRunExceeded
+        );
+
+        limits.max_hash_collision_shard_scan = 2;
+        assert_eq!(
+            root.candidate_shards_for_path(path, limits).unwrap(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn parses_single_shard_and_finds_final_file_entry() {
+        let path = b"file.txt";
+        let path_hash = hash_prefix(path);
+        let file = FileEntry {
+            path_hash,
+            path_offset: 0,
+            path_length: path.len() as u32,
+            first_frame_index: 0,
+            frame_count: 1,
+            offset_in_first_frame_plaintext: 0,
+            tar_member_group_size: 512,
+            file_data_size: 0,
+            flags: 0,
+        };
+        let frame = FrameEntry {
+            frame_index: 0,
+            envelope_index: 0,
+            offset_in_envelope: 0,
+            compressed_size: 128,
+            decompressed_size: 512,
+            flags: 0,
+            tar_stream_offset: 0,
+        };
+        let envelope = EnvelopeEntry {
+            envelope_index: 0,
+            first_block_index: 0,
+            data_block_count: 1,
+            parity_block_count: 1,
+            encrypted_size: 4096,
+            plaintext_size: 128,
+            first_frame_index: 0,
+            frame_count: 1,
+        };
+        let shard = IndexShard {
+            header: IndexShardHeader {
+                version: 1,
+                shard_index: 7,
+                file_count: 0,
+                frame_count: 0,
+                envelope_count: 0,
+                file_table_offset: 0,
+                frame_table_offset: 0,
+                envelope_table_offset: 0,
+                string_pool_offset: 0,
+                string_pool_size: 0,
+            },
+            files: vec![file],
+            frames: vec![frame],
+            envelopes: vec![envelope],
+            string_pool: path.to_vec(),
+            file_paths: Vec::new(),
+            file_tar_member_group_starts: Vec::new(),
+        };
+        let locating = ShardEntry {
+            shard_index: 7,
+            first_block_index: 10,
+            data_block_count: 1,
+            parity_block_count: 1,
+            encrypted_size: 4096,
+            decompressed_size: shard.to_bytes().len() as u32,
+            file_count: 1,
+            first_path_hash: path_hash,
+            last_path_hash: path_hash,
+        };
+
+        let parsed =
+            IndexShard::parse(&shard.to_bytes(), &locating, MetadataLimits::default()).unwrap();
+
+        assert_eq!(parsed.lookup_file_index(path), Some(0));
+        assert_eq!(parsed.file_path(0), Some(path.as_slice()));
+    }
 }
