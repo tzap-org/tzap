@@ -45,8 +45,11 @@ enum Command {
         #[arg(short = 'o', long = "output")]
         output: String,
 
-        #[arg(long = "volumes", default_value_t = 1)]
-        volumes: u32,
+        #[arg(long = "volumes", conflicts_with = "volume_size")]
+        volumes: Option<u32>,
+
+        #[arg(long = "volume-size", conflicts_with = "volumes")]
+        volume_size: Option<String>,
 
         #[arg(long = "volume-loss-tolerance", default_value_t = 0)]
         volume_loss_tolerance: u8,
@@ -191,6 +194,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Create {
             output,
             volumes,
+            volume_size,
             volume_loss_tolerance,
             bit_rot_buffer_pct,
             password_stdin,
@@ -207,7 +211,13 @@ fn run(cli: Cli) -> Result<()> {
             paths,
         } => {
             let mut options = WriterOptions::default();
-            options.stripe_width = volumes;
+            options.stripe_width = volumes.unwrap_or(1);
+            options.target_volume_size = volume_size
+                .as_deref()
+                .map(|value| {
+                    parse_size(value).with_context(|| format!("invalid volume-size: {value}"))
+                })
+                .transpose()?;
             options.volume_loss_tolerance = volume_loss_tolerance;
             options.bit_rot_buffer_pct = bit_rot_buffer_pct;
             options.zstd_level = compression_level;

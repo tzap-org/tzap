@@ -24,8 +24,7 @@ The implementation currently targets the v0.36 format specification:
 - **Instant targeted restores.** Jump straight to a photo inside a 10 TB archive
   without unpacking the rest.
 - **Splittable.** Break archives into practical volumes for drives, discs, or
-  cloud objects; the format supports size planning and the CLI supports volume
-  count today.
+  cloud objects by volume count or target volume size.
 - **Cloud-streaming friendly.** Designed for single-pass append-only writes,
   S3-style storage, multipart uploads, and pipe-like workflows.
 - **Reference implementation.** Clean Rust core, thin CLI, readable spec, tests,
@@ -130,7 +129,7 @@ tzap create \
 
 ## Multi-volume archives
 
-Split an archive into multiple volumes:
+Split an archive by volume count:
 
 ```sh
 tzap create \
@@ -148,6 +147,16 @@ backup.tzap.000
 backup.tzap.001
 backup.tzap.002
 backup.tzap.003
+```
+
+Or split by target volume size:
+
+```sh
+tzap create \
+  --keyfile tzap.key \
+  --volume-size 4G \
+  -o backup.tzap \
+  ./backup
 ```
 
 Verify the volume set:
@@ -219,6 +228,7 @@ Important `create` options:
 - `--keyfile <path>`: read a 32-byte raw key or 64-character hex key
 - `--password-stdin`: derive the archive key from a passphrase with Argon2id
 - `--volumes <n>`: write a striped multi-volume archive
+- `--volume-size <size>`: choose the number of volumes from a target size
 - `--volume-loss-tolerance <n>`: add enough parity for volume-loss recovery
 - `--bit-rot-buffer-pct <n>`: reserve additional FEC for accidental corruption
 - `--dictionary <path>`: include a zstd dictionary

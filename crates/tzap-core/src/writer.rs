@@ -7,7 +7,7 @@ use crate::crypto::{
 };
 use crate::fec::encode_parity_gf16;
 use crate::format::{
-    AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, FormatError, KdfAlgo,
+    AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, FormatError, KdfAlgo, BLOCK_RECORD_FRAMING_LEN,
     BOOTSTRAP_SIDECAR_HEADER_LEN, CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_HEADER_FIXED_LEN,
     CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, MANIFEST_FOOTER_LEN, VOLUME_FORMAT_REV,
     VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
@@ -54,6 +54,7 @@ pub struct WriterOptions {
     pub index_root_fec_data_shards: u16,
     pub index_root_fec_parity_shards: u16,
     pub max_path_length: u32,
+    pub target_volume_size: Option<u64>,
     pub archive_uuid: Option<[u8; 16]>,
     pub session_id: Option<[u8; 16]>,
     pub closed_at_ns: i64,
@@ -77,6 +78,7 @@ impl Default for WriterOptions {
             index_root_fec_data_shards: DEFAULT_INDEX_ROOT_FEC_DATA_SHARDS,
             index_root_fec_parity_shards: DEFAULT_INDEX_ROOT_FEC_PARITY_SHARDS,
             max_path_length: 4096,
+            target_volume_size: None,
             archive_uuid: None,
             session_id: None,
             closed_at_ns: 0,
@@ -217,15 +219,53 @@ fn write_archive_inner(
     dictionary: Option<&[u8]>,
     kdf_params: &KdfParams,
 ) -> Result<WrittenArchive, FormatError> {
-    let options = plan_writer_options(options)?;
+    let mut requested_options = options;
+    if requested_options.target_volume_size.is_some() {
+        requested_options.stripe_width = requested_options
+            .stripe_width
+            .max(requested_options.volume_loss_tolerance as u32 + 1);
+    }
     validate_m6_file_scope(files.len())?;
 
-    let archive_uuid = options
+    let archive_uuid = requested_options
         .archive_uuid
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
-    let session_id = options
+    let session_id = requested_options
         .session_id
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
+    loop {
+        let planned_options = plan_writer_options(requested_options)?;
+        let archive = write_archive_once(
+            files,
+            master_key,
+            planned_options,
+            dictionary,
+            kdf_params,
+            archive_uuid,
+            session_id,
+        )?;
+
+        let Some(target_volume_size) = planned_options.target_volume_size else {
+            return Ok(archive);
+        };
+        let required_stripe_width =
+            required_stripe_width_for_target(&archive, planned_options, target_volume_size)?;
+        if required_stripe_width <= planned_options.stripe_width {
+            return Ok(archive);
+        }
+        requested_options.stripe_width = required_stripe_width;
+    }
+}
+
+fn write_archive_once(
+    files: &[RegularFile<'_>],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    dictionary: Option<&[u8]>,
+    kdf_params: &KdfParams,
+    archive_uuid: [u8; 16],
+    session_id: [u8; 16],
+) -> Result<WrittenArchive, FormatError> {
     let subkeys = Subkeys::derive(master_key, &archive_uuid, &session_id)?;
     let crypto_header = build_crypto_header(
         options,
@@ -448,6 +488,64 @@ fn write_archive_inner(
     })
 }
 
+fn required_stripe_width_for_target(
+    archive: &WrittenArchive,
+    options: WriterOptions,
+    target_volume_size: u64,
+) -> Result<u32, FormatError> {
+    let max_volume_size = archive
+        .volumes
+        .iter()
+        .map(|volume| volume.len() as u64)
+        .max()
+        .unwrap_or(0);
+    if max_volume_size <= target_volume_size {
+        return Ok(options.stripe_width);
+    }
+
+    let first_volume = archive
+        .volumes
+        .first()
+        .ok_or(FormatError::WriterInvariant("no volumes emitted"))?;
+    let volume_header = VolumeHeader::parse(
+        first_volume
+            .get(..VOLUME_HEADER_LEN)
+            .ok_or(FormatError::WriterInvariant("truncated emitted volume"))?,
+    )?;
+    let fixed_volume_overhead = VOLUME_HEADER_LEN as u64
+        + volume_header.crypto_header_length as u64
+        + MANIFEST_FOOTER_LEN as u64
+        + VOLUME_TRAILER_LEN as u64;
+    if target_volume_size <= fixed_volume_overhead {
+        return Err(FormatError::WriterUnsupported(
+            "volume-size is too small for per-volume metadata",
+        ));
+    }
+
+    let block_record_len = options.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
+    let records_per_volume = (target_volume_size - fixed_volume_overhead) / block_record_len;
+    if records_per_volume == 0 {
+        return Err(FormatError::WriterUnsupported(
+            "volume-size is too small for the configured block-size",
+        ));
+    }
+
+    let total_records = archive.volumes.iter().try_fold(0u64, |total, volume| {
+        let volume_len = volume.len() as u64;
+        if volume_len < fixed_volume_overhead {
+            return Err(FormatError::WriterInvariant("emitted volume too short"));
+        }
+        let record_bytes = volume_len - fixed_volume_overhead;
+        total
+            .checked_add(record_bytes / block_record_len)
+            .ok_or(FormatError::WriterUnsupported("volume count overflow"))
+    })?;
+    let required = ceil_div(total_records, records_per_volume)?
+        .max(options.volume_loss_tolerance as u64 + 1)
+        .max(1);
+    u32::try_from(required).map_err(|_| FormatError::WriterUnsupported("volume count"))
+}
+
 pub fn write_empty_archive(master_key: &MasterKey) -> Result<WrittenArchive, FormatError> {
     write_archive(&[], master_key, WriterOptions::default())
 }
@@ -471,6 +569,11 @@ fn plan_writer_options(mut options: WriterOptions) -> Result<WriterOptions, Form
     if options.stripe_width == 1 && options.volume_loss_tolerance != 0 {
         return Err(FormatError::WriterUnsupported(
             "single-volume archives cannot tolerate volume loss",
+        ));
+    }
+    if matches!(options.target_volume_size, Some(0)) {
+        return Err(FormatError::WriterUnsupported(
+            "target_volume_size must be non-zero",
         ));
     }
     if options.bit_rot_buffer_pct > 100 {
@@ -564,7 +667,7 @@ fn build_crypto_header(
         bit_rot_buffer_pct: options.bit_rot_buffer_pct,
         has_dictionary: if has_dictionary { 1 } else { 0 },
         max_path_length: options.max_path_length,
-        expected_volume_size: 0,
+        expected_volume_size: options.target_volume_size.unwrap_or(0),
     };
 
     let mut bytes = fixed.to_bytes().to_vec();
