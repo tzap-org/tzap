@@ -33,6 +33,7 @@ const DEFAULT_INDEX_FEC_DATA_SHARDS: u16 = 64;
 const DEFAULT_INDEX_FEC_PARITY_SHARDS: u16 = 1;
 const DEFAULT_INDEX_ROOT_FEC_DATA_SHARDS: u16 = 64;
 const DEFAULT_INDEX_ROOT_FEC_PARITY_SHARDS: u16 = 1;
+const DEFAULT_BIT_ROT_BUFFER_PCT: u8 = 5;
 const DEFAULT_MAX_FILES_PER_INDEX_SHARD: usize = 1_000_000;
 const DIRECTORY_HINT_REQUIRED_FILE_COUNT: usize = 100_000;
 
@@ -41,6 +42,9 @@ pub struct WriterOptions {
     pub block_size: u32,
     pub chunk_size: u32,
     pub envelope_target_size: u32,
+    pub stripe_width: u32,
+    pub volume_loss_tolerance: u8,
+    pub bit_rot_buffer_pct: u8,
     pub zstd_level: i32,
     pub aead_algo: AeadAlgo,
     pub fec_data_shards: u16,
@@ -61,6 +65,9 @@ impl Default for WriterOptions {
             block_size: DEFAULT_BLOCK_SIZE,
             chunk_size: DEFAULT_CHUNK_SIZE,
             envelope_target_size: DEFAULT_ENVELOPE_TARGET_SIZE,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: DEFAULT_BIT_ROT_BUFFER_PCT,
             zstd_level: 3,
             aead_algo: AeadAlgo::AesGcmSiv256,
             fec_data_shards: DEFAULT_FEC_DATA_SHARDS,
@@ -99,6 +106,7 @@ impl<'a> RegularFile<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrittenArchive {
     pub bytes: Vec<u8>,
+    pub volumes: Vec<Vec<u8>>,
     pub bootstrap_sidecar: Vec<u8>,
     pub archive_uuid: [u8; 16],
     pub session_id: [u8; 16],
@@ -168,7 +176,7 @@ fn write_archive_inner(
     options: WriterOptions,
     dictionary: Option<&[u8]>,
 ) -> Result<WrittenArchive, FormatError> {
-    validate_options(options)?;
+    let options = plan_writer_options(options)?;
     validate_m6_file_scope(files.len())?;
 
     let archive_uuid = options
@@ -311,52 +319,73 @@ fn write_archive_inner(
     )?;
     block_records.extend(index_root_extent.records.clone());
 
-    let volume_header = VolumeHeader {
-        format_version: FORMAT_VERSION,
-        volume_format_rev: VOLUME_FORMAT_REV,
-        volume_index: 0,
-        stripe_width: 1,
-        archive_uuid,
-        session_id,
-        crypto_header_offset: VOLUME_HEADER_LEN as u32,
-        crypto_header_length: u32_len(crypto_header.len(), "CryptoHeader")?,
-        header_crc32c: 0,
-    };
-
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&volume_header.to_bytes());
-    bytes.extend_from_slice(&crypto_header);
+    let stripe_width = options.stripe_width as usize;
+    let mut striped_records = vec![Vec::<BlockRecord>::new(); stripe_width];
     for record in &block_records {
-        bytes.extend_from_slice(&record.to_bytes());
+        let volume_index = (record.block_index % options.stripe_width as u64) as usize;
+        striped_records[volume_index].push(record.clone());
     }
 
-    let manifest_footer_offset = bytes.len() as u64;
-    let manifest_footer = build_manifest_footer(
-        &subkeys,
-        archive_uuid,
-        session_id,
-        &index_root_extent,
-        index_root_plaintext.len(),
-    )?;
-    bytes.extend_from_slice(&manifest_footer);
+    let mut volumes = Vec::with_capacity(stripe_width);
+    let mut volume_zero_manifest = [0u8; MANIFEST_FOOTER_LEN];
+    for (volume_index, records) in striped_records.iter().enumerate() {
+        let volume_index = u32::try_from(volume_index)
+            .map_err(|_| FormatError::WriterUnsupported("volume_index"))?;
+        let volume_header = VolumeHeader {
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV,
+            volume_index,
+            stripe_width: options.stripe_width,
+            archive_uuid,
+            session_id,
+            crypto_header_offset: VOLUME_HEADER_LEN as u32,
+            crypto_header_length: u32_len(crypto_header.len(), "CryptoHeader")?,
+            header_crc32c: 0,
+        };
 
-    let bytes_written = bytes.len() as u64;
-    let trailer = build_volume_trailer(
-        &subkeys,
-        archive_uuid,
-        session_id,
-        block_records.len() as u64,
-        bytes_written,
-        manifest_footer_offset,
-        options.closed_at_ns,
-    );
-    bytes.extend_from_slice(&trailer);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&volume_header.to_bytes());
+        bytes.extend_from_slice(&crypto_header);
+        for record in records {
+            bytes.extend_from_slice(&record.to_bytes());
+        }
+
+        let manifest_footer_offset = bytes.len() as u64;
+        let manifest_footer = build_manifest_footer(
+            &subkeys,
+            archive_uuid,
+            session_id,
+            volume_index,
+            options.stripe_width,
+            &index_root_extent,
+            index_root_plaintext.len(),
+        )?;
+        bytes.extend_from_slice(&manifest_footer);
+
+        let bytes_written = bytes.len() as u64;
+        let trailer = build_volume_trailer(
+            &subkeys,
+            archive_uuid,
+            session_id,
+            volume_index,
+            records.len() as u64,
+            bytes_written,
+            manifest_footer_offset,
+            options.closed_at_ns,
+        );
+        bytes.extend_from_slice(&trailer);
+
+        if volume_index == 0 {
+            volume_zero_manifest = manifest_footer;
+        }
+        volumes.push(bytes);
+    }
 
     let bootstrap_sidecar = build_bootstrap_sidecar(
         &subkeys,
         archive_uuid,
         session_id,
-        &manifest_footer,
+        &volume_zero_manifest,
         &index_root_extent.records,
         dictionary_extent
             .as_ref()
@@ -366,7 +395,11 @@ fn write_archive_inner(
     let _ = index_shard_extent;
 
     Ok(WrittenArchive {
-        bytes,
+        bytes: volumes
+            .first()
+            .cloned()
+            .ok_or(FormatError::WriterInvariant("no volumes emitted"))?,
+        volumes,
         bootstrap_sidecar,
         archive_uuid,
         session_id,
@@ -377,10 +410,30 @@ pub fn write_empty_archive(master_key: &MasterKey) -> Result<WrittenArchive, For
     write_archive(&[], master_key, WriterOptions::default())
 }
 
-fn validate_options(options: WriterOptions) -> Result<(), FormatError> {
+fn plan_writer_options(mut options: WriterOptions) -> Result<WriterOptions, FormatError> {
     if options.block_size < DEFAULT_BLOCK_SIZE || options.block_size % 2 != 0 {
         return Err(FormatError::WriterUnsupported(
             "M6 writer requires an even block size of at least 4096",
+        ));
+    }
+    if options.stripe_width == 0 {
+        return Err(FormatError::WriterUnsupported(
+            "stripe_width must be non-zero",
+        ));
+    }
+    if options.volume_loss_tolerance as u32 >= options.stripe_width {
+        return Err(FormatError::WriterUnsupported(
+            "volume_loss_tolerance must be less than stripe_width",
+        ));
+    }
+    if options.stripe_width == 1 && options.volume_loss_tolerance != 0 {
+        return Err(FormatError::WriterUnsupported(
+            "single-volume archives cannot tolerate volume loss",
+        ));
+    }
+    if options.bit_rot_buffer_pct > 100 {
+        return Err(FormatError::WriterUnsupported(
+            "bit_rot_buffer_pct must be at most 100",
         ));
     }
     if options.chunk_size == 0 || options.chunk_size > options.envelope_target_size {
@@ -396,15 +449,23 @@ fn validate_options(options: WriterOptions) -> Result<(), FormatError> {
             "FEC data shard class maxima must be non-zero",
         ));
     }
-    if options.fec_parity_shards == 0
-        || options.index_fec_parity_shards == 0
-        || options.index_root_fec_parity_shards == 0
-    {
-        return Err(FormatError::WriterUnsupported(
-            "M6 writer keeps ReedSolomonGF16 parity enabled",
-        ));
-    }
-    Ok(())
+    options.fec_parity_shards = options.fec_parity_shards.max(compute_parity_u16(
+        options.fec_data_shards as u64,
+        options,
+        "fec_parity_shards",
+    )?);
+    options.index_fec_parity_shards = options.index_fec_parity_shards.max(compute_parity_u16(
+        options.index_fec_data_shards as u64,
+        options,
+        "index_fec_parity_shards",
+    )?);
+    options.index_root_fec_parity_shards =
+        options.index_root_fec_parity_shards.max(compute_parity_u16(
+            options.index_root_fec_data_shards as u64,
+            options,
+            "index_root_fec_parity_shards",
+        )?);
+    Ok(options)
 }
 
 fn validate_m6_file_scope(file_count: usize) -> Result<(), FormatError> {
@@ -444,9 +505,9 @@ fn build_crypto_header(
         index_fec_parity_shards: options.index_fec_parity_shards,
         index_root_fec_data_shards: options.index_root_fec_data_shards,
         index_root_fec_parity_shards: options.index_root_fec_parity_shards,
-        stripe_width: 1,
-        volume_loss_tolerance: 0,
-        bit_rot_buffer_pct: 0,
+        stripe_width: options.stripe_width,
+        volume_loss_tolerance: options.volume_loss_tolerance,
+        bit_rot_buffer_pct: options.bit_rot_buffer_pct,
         has_dictionary: if has_dictionary { 1 } else { 0 },
         max_path_length: options.max_path_length,
         expected_volume_size: 0,
@@ -697,7 +758,7 @@ fn encrypt_object(
     data_kind: BlockKind,
     parity_kind: BlockKind,
     data_shard_max: u16,
-    parity_count: u16,
+    class_parity_shard_max: u16,
     next_block_index: &mut u64,
     options: WriterOptions,
     archive_uuid: &[u8; 16],
@@ -736,6 +797,17 @@ fn encrypt_object(
             "encrypted object exceeds its data shard class maximum",
         ));
     }
+    let required_parity = compute_object_parity(
+        data_block_count as u64,
+        options,
+        class_parity_shard_max as u32,
+    )?;
+    if required_parity > class_parity_shard_max as u32 {
+        return Err(FormatError::WriterUnsupported(
+            "encrypted object exceeds its parity shard class maximum",
+        ));
+    }
+    let parity_count = required_parity as u16;
     let parity_shards = if parity_count == 0 {
         Vec::new()
     } else {
@@ -787,15 +859,17 @@ fn build_manifest_footer(
     subkeys: &Subkeys,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
+    volume_index: u32,
+    total_volumes: u32,
     index_root_extent: &EncryptedObject,
     index_root_decompressed_size: usize,
 ) -> Result<[u8; MANIFEST_FOOTER_LEN], FormatError> {
     let mut footer = ManifestFooter {
         archive_uuid,
         session_id,
-        volume_index: 0,
+        volume_index,
         is_authoritative: 1,
-        total_volumes: 1,
+        total_volumes,
         index_root_first_block: index_root_extent.first_block_index,
         index_root_data_block_count: index_root_extent.data_block_count,
         index_root_parity_block_count: index_root_extent.parity_block_count,
@@ -819,6 +893,7 @@ fn build_volume_trailer(
     subkeys: &Subkeys,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
+    volume_index: u32,
     block_count: u64,
     bytes_written: u64,
     manifest_footer_offset: u64,
@@ -827,7 +902,7 @@ fn build_volume_trailer(
     let mut trailer = VolumeTrailer {
         archive_uuid,
         session_id,
-        volume_index: 0,
+        volume_index,
         block_count,
         bytes_written,
         manifest_footer_offset,
@@ -845,6 +920,81 @@ fn build_volume_trailer(
     );
     bytes = trailer.to_bytes();
     bytes
+}
+
+fn compute_object_parity(
+    data_block_count: u64,
+    options: WriterOptions,
+    class_parity_shard_max: u32,
+) -> Result<u32, FormatError> {
+    let computed = compute_parity(data_block_count, options)?;
+    if options.volume_loss_tolerance == 0 && options.bit_rot_buffer_pct == 0 {
+        Ok(computed.max(class_parity_shard_max))
+    } else {
+        Ok(computed)
+    }
+}
+
+fn compute_parity_u16(
+    data_block_count: u64,
+    options: WriterOptions,
+    field: &'static str,
+) -> Result<u16, FormatError> {
+    let parity = compute_parity(data_block_count, options)?;
+    u16::try_from(parity).map_err(|_| FormatError::WriterUnsupported(field))
+}
+
+fn compute_parity(data_block_count: u64, options: WriterOptions) -> Result<u32, FormatError> {
+    let min_parity = if options.volume_loss_tolerance > 0 || options.bit_rot_buffer_pct > 0 {
+        1u64
+    } else {
+        0u64
+    };
+    let mut parity = 0u64;
+    for _ in 0..100 {
+        let total = data_block_count
+            .checked_add(parity)
+            .ok_or(FormatError::WriterUnsupported("parity total overflow"))?;
+        let by_volume = checked_u64_mul(
+            options.volume_loss_tolerance as u64,
+            ceil_div(total, options.stripe_width as u64)?,
+            "volume-loss parity overflow",
+        )?;
+        let by_bitrot = ceil_div(
+            checked_u64_mul(
+                total,
+                options.bit_rot_buffer_pct as u64,
+                "bit-rot parity overflow",
+            )?,
+            100,
+        )?;
+        let next = by_volume
+            .checked_add(by_bitrot)
+            .ok_or(FormatError::WriterUnsupported("parity overflow"))?
+            .max(min_parity);
+        if next == parity {
+            return u32::try_from(next).map_err(|_| FormatError::WriterUnsupported("parity count"));
+        }
+        parity = next;
+    }
+    Err(FormatError::WriterUnsupported(
+        "parity calculation did not converge",
+    ))
+}
+
+fn ceil_div(numerator: u64, denominator: u64) -> Result<u64, FormatError> {
+    if denominator == 0 {
+        return Err(FormatError::WriterUnsupported("division by zero"));
+    }
+    numerator
+        .checked_add(denominator - 1)
+        .ok_or(FormatError::WriterUnsupported("ceiling division overflow"))
+        .map(|value| value / denominator)
+}
+
+fn checked_u64_mul(lhs: u64, rhs: u64, field: &'static str) -> Result<u64, FormatError> {
+    lhs.checked_mul(rhs)
+        .ok_or(FormatError::WriterUnsupported(field))
 }
 
 fn build_bootstrap_sidecar(
@@ -1112,5 +1262,36 @@ mod tests {
             &manifest.manifest_hmac,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn parity_auto_scaling_matches_v36_examples() {
+        let options = WriterOptions {
+            fec_data_shards: 224,
+            stripe_width: 8,
+            volume_loss_tolerance: 1,
+            bit_rot_buffer_pct: 5,
+            ..WriterOptions::default()
+        };
+
+        assert_eq!(compute_parity(224, options).unwrap(), 48);
+        assert_eq!(compute_parity(17, options).unwrap(), 5);
+    }
+
+    #[test]
+    fn zero_parity_is_allowed_when_no_recovery_margin_is_requested() {
+        let planned = plan_writer_options(WriterOptions {
+            bit_rot_buffer_pct: 0,
+            fec_parity_shards: 0,
+            index_fec_parity_shards: 0,
+            index_root_fec_parity_shards: 0,
+            ..WriterOptions::default()
+        })
+        .unwrap();
+
+        assert_eq!(planned.fec_parity_shards, 0);
+        assert_eq!(planned.index_fec_parity_shards, 0);
+        assert_eq!(planned.index_root_fec_parity_shards, 0);
+        assert_eq!(compute_parity(1, planned).unwrap(), 0);
     }
 }

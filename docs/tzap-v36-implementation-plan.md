@@ -477,16 +477,27 @@ Completed implementation:
 
 ## Milestone 11: Multi-Volume Striping And Recovery
 
+Status: complete.
+
 Purpose: implement the multi-volume archive model and volume-loss recovery.
 
 Deliverables:
 
-- Block-to-volume striping.
-- Concurrent/forward-only volume writing.
-- Multi-volume open.
-- Duplicate volume-index rejection.
-- Volume-loss parity planning.
-- Object repair using available volumes.
+- Complete: writer-side block-to-volume striping with
+  `volume_index = block_index mod stripe_width`.
+- Complete: per-volume forward-only byte streams with replicated
+  VolumeHeader/CryptoHeader, per-volume BlockRecord subsets,
+  authoritative ManifestFooter copies, and VolumeTrailer copies.
+- Complete: multi-volume seekable open API that authenticates each supplied
+  volume, rejects mixed archive/session IDs, rejects differing CryptoHeader
+  copies, and rejects duplicate authenticated volume indexes by default.
+- Complete: complete-set global block coverage validation for duplicate,
+  missing, or non-dense global BlockRecord indexes.
+- Complete: §27 parity auto-scaling helper for volume-loss and bit-rot
+  planning, with checked u64 arithmetic and 100-iteration convergence cap.
+- Complete: object loading now tracks missing data/parity shards by
+  object-local shard index and repairs through ReedSolomonGF16 when enough
+  available shards remain.
 
 Acceptance:
 

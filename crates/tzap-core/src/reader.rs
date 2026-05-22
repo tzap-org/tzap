@@ -89,6 +89,13 @@ pub fn open_archive<'a>(
     OpenedArchive::open_with_options(bytes, master_key, ReaderOptions::default())
 }
 
+pub fn open_archive_volumes(
+    volumes: &[&[u8]],
+    master_key: &MasterKey,
+) -> Result<OpenedArchive, FormatError> {
+    OpenedArchive::open_volumes_with_options(volumes, master_key, ReaderOptions::default())
+}
+
 pub fn open_archive_with_bootstrap_sidecar(
     bytes: &[u8],
     bootstrap_sidecar: &[u8],
@@ -128,109 +135,97 @@ impl OpenedArchive {
         master_key: &MasterKey,
         options: ReaderOptions,
     ) -> Result<Self, FormatError> {
-        if bytes.len() < VOLUME_HEADER_LEN + VOLUME_TRAILER_LEN {
-            return Err(FormatError::InvalidLength {
-                structure: "archive",
-                expected: VOLUME_HEADER_LEN + VOLUME_TRAILER_LEN,
-                actual: bytes.len(),
-            });
+        Self::open_volumes_with_options(&[bytes], master_key, options)
+    }
+
+    pub fn open_volumes_with_options(
+        volumes: &[&[u8]],
+        master_key: &MasterKey,
+        options: ReaderOptions,
+    ) -> Result<Self, FormatError> {
+        if volumes.is_empty() {
+            return Err(FormatError::InvalidArchive("no volumes supplied"));
         }
 
-        let volume_header = VolumeHeader::parse(slice(bytes, 0, VOLUME_HEADER_LEN, "archive")?)?;
-        let crypto_start = volume_header.crypto_header_offset as usize;
-        let crypto_len = volume_header.crypto_header_length as usize;
-        let crypto_end = checked_add(crypto_start, crypto_len, "CryptoHeader")?;
-        let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
-        let parsed_crypto = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length)?;
-        let subkeys = Subkeys::derive(
-            master_key,
-            &volume_header.archive_uuid,
-            &volume_header.session_id,
-        )?;
-        verify_hmac(
-            HmacDomain::CryptoHeader,
-            &subkeys.mac_key,
-            &volume_header.archive_uuid,
-            &volume_header.session_id,
-            parsed_crypto.hmac_covered_bytes,
-            &parsed_crypto.header_hmac,
-        )?;
-        parsed_crypto.validate_extension_semantics()?;
-        validate_m7_supported_volume(&volume_header, &parsed_crypto.fixed)?;
+        let mut first: Option<ParsedSeekableVolume> = None;
+        let mut seen_volume_indexes = BTreeSet::new();
+        let mut blocks = BTreeMap::new();
+        let mut erased_block_indices = BTreeSet::new();
 
-        let (trailer_offset, volume_trailer) =
-            locate_trailer(bytes, &subkeys, &volume_header, options)?;
-        validate_trailer_identity(&volume_header, &volume_trailer)?;
+        for volume_bytes in volumes {
+            let parsed = parse_seekable_volume(volume_bytes, master_key, options)?;
+            if !seen_volume_indexes.insert(parsed.volume_header.volume_index) {
+                return Err(FormatError::InvalidArchive(
+                    "duplicate authenticated volume index",
+                ));
+            }
 
-        let manifest_offset = to_usize(volume_trailer.manifest_footer_offset, "ManifestFooter")?;
-        let manifest_end = checked_add(manifest_offset, MANIFEST_FOOTER_LEN, "ManifestFooter")?;
-        if manifest_end != trailer_offset {
-            return Err(FormatError::InvalidArchive(
-                "ManifestFooter does not end at selected trailer",
-            ));
+            if let Some(first) = &first {
+                validate_volume_set_member(first, &parsed)?;
+            }
+
+            for (block_index, record) in &parsed.blocks {
+                if blocks.insert(*block_index, record.clone()).is_some() {
+                    return Err(FormatError::InvalidArchive("duplicate BlockRecord index"));
+                }
+            }
+            for block_index in &parsed.erased_block_indices {
+                erased_block_indices.insert(*block_index);
+            }
+
+            if first.is_none() {
+                first = Some(parsed);
+            }
         }
-        let manifest_bytes = slice(
-            bytes,
-            manifest_offset,
-            MANIFEST_FOOTER_LEN,
-            "ManifestFooter",
-        )?;
-        let manifest_footer = ManifestFooter::parse(manifest_bytes)?;
-        validate_manifest_footer(&volume_header, &manifest_footer, &subkeys, manifest_bytes)?;
-        manifest_footer.validate_index_root_extent(parsed_crypto.fixed.block_size)?;
 
-        let blocks = parse_block_region(
-            bytes,
-            crypto_end,
-            manifest_offset,
-            parsed_crypto.fixed.block_size as usize,
-            &volume_header,
-            &volume_trailer,
-        )?;
+        let first = first.ok_or(FormatError::InvalidArchive("no volumes supplied"))?;
+        if seen_volume_indexes.len() == first.crypto_header.stripe_width as usize {
+            validate_complete_global_block_coverage(&blocks, &erased_block_indices)?;
+        }
 
-        let limits = metadata_limits(&parsed_crypto.fixed);
+        let limits = metadata_limits(&first.crypto_header);
         let index_root_plaintext = load_metadata_object_from_parts(
             &blocks,
-            &subkeys,
-            &volume_header,
-            &parsed_crypto.fixed,
+            &first.subkeys,
+            &first.volume_header,
+            &first.crypto_header,
             ObjectExtent {
-                first_block_index: manifest_footer.index_root_first_block,
-                data_block_count: manifest_footer.index_root_data_block_count,
-                parity_block_count: manifest_footer.index_root_parity_block_count,
-                encrypted_size: manifest_footer.index_root_encrypted_size,
+                first_block_index: first.manifest_footer.index_root_first_block,
+                data_block_count: first.manifest_footer.index_root_data_block_count,
+                parity_block_count: first.manifest_footer.index_root_parity_block_count,
+                encrypted_size: first.manifest_footer.index_root_encrypted_size,
             },
             BlockKind::IndexRootData,
             BlockKind::IndexRootParity,
-            &subkeys.index_root_key,
-            &subkeys.index_nonce_seed,
+            &first.subkeys.index_root_key,
+            &first.subkeys.index_nonce_seed,
             b"idxroot",
             0,
-            parsed_crypto.fixed.index_root_fec_data_shards,
-            parsed_crypto.fixed.index_root_fec_parity_shards,
-            manifest_footer.index_root_decompressed_size,
+            first.crypto_header.index_root_fec_data_shards,
+            first.crypto_header.index_root_fec_parity_shards,
+            first.manifest_footer.index_root_decompressed_size,
         )?;
         let index_root = IndexRoot::parse(
             &index_root_plaintext,
-            parsed_crypto.fixed.has_dictionary != 0,
+            first.crypto_header.has_dictionary != 0,
             limits,
         )?;
         let payload_dictionary = load_archive_dictionary(
             &blocks,
-            &subkeys,
-            &volume_header,
-            &parsed_crypto.fixed,
+            &first.subkeys,
+            &first.volume_header,
+            &first.crypto_header,
             &index_root,
         )?;
 
         Ok(Self {
             options,
-            subkeys,
+            subkeys: first.subkeys,
             blocks,
-            volume_header,
-            crypto_header: parsed_crypto.fixed,
-            manifest_footer,
-            volume_trailer,
+            volume_header: first.volume_header,
+            crypto_header: first.crypto_header,
+            manifest_footer: first.manifest_footer,
+            volume_trailer: first.volume_trailer,
             index_root,
             payload_dictionary,
         })
@@ -847,6 +842,183 @@ impl OpenedArchive {
     }
 }
 
+#[derive(Debug)]
+struct ParsedSeekableVolume {
+    volume_header: VolumeHeader,
+    crypto_header: CryptoHeaderFixed,
+    crypto_header_bytes: Vec<u8>,
+    subkeys: Subkeys,
+    manifest_footer: ManifestFooter,
+    volume_trailer: VolumeTrailer,
+    blocks: BTreeMap<u64, BlockRecord>,
+    erased_block_indices: BTreeSet<u64>,
+}
+
+fn parse_seekable_volume(
+    bytes: &[u8],
+    master_key: &MasterKey,
+    options: ReaderOptions,
+) -> Result<ParsedSeekableVolume, FormatError> {
+    if bytes.len() < VOLUME_HEADER_LEN + VOLUME_TRAILER_LEN {
+        return Err(FormatError::InvalidLength {
+            structure: "archive",
+            expected: VOLUME_HEADER_LEN + VOLUME_TRAILER_LEN,
+            actual: bytes.len(),
+        });
+    }
+
+    let volume_header = VolumeHeader::parse(slice(bytes, 0, VOLUME_HEADER_LEN, "archive")?)?;
+    let crypto_start = volume_header.crypto_header_offset as usize;
+    let crypto_len = volume_header.crypto_header_length as usize;
+    let crypto_end = checked_add(crypto_start, crypto_len, "CryptoHeader")?;
+    let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
+    let parsed_crypto = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length)?;
+    let subkeys = Subkeys::derive(
+        master_key,
+        &volume_header.archive_uuid,
+        &volume_header.session_id,
+    )?;
+    verify_hmac(
+        HmacDomain::CryptoHeader,
+        &subkeys.mac_key,
+        &volume_header.archive_uuid,
+        &volume_header.session_id,
+        parsed_crypto.hmac_covered_bytes,
+        &parsed_crypto.header_hmac,
+    )?;
+    parsed_crypto.validate_extension_semantics()?;
+    validate_seekable_supported_volume(&volume_header, &parsed_crypto.fixed)?;
+
+    let (trailer_offset, volume_trailer) =
+        locate_trailer(bytes, &subkeys, &volume_header, options)?;
+    validate_trailer_identity(&volume_header, &volume_trailer)?;
+
+    let manifest_offset = to_usize(volume_trailer.manifest_footer_offset, "ManifestFooter")?;
+    let manifest_end = checked_add(manifest_offset, MANIFEST_FOOTER_LEN, "ManifestFooter")?;
+    if manifest_end != trailer_offset {
+        return Err(FormatError::InvalidArchive(
+            "ManifestFooter does not end at selected trailer",
+        ));
+    }
+    let manifest_bytes = slice(
+        bytes,
+        manifest_offset,
+        MANIFEST_FOOTER_LEN,
+        "ManifestFooter",
+    )?;
+    let manifest_footer = ManifestFooter::parse(manifest_bytes)?;
+    validate_manifest_footer(&volume_header, &manifest_footer, &subkeys, manifest_bytes)?;
+    manifest_footer.validate_index_root_extent(parsed_crypto.fixed.block_size)?;
+
+    let block_region = parse_block_region(
+        bytes,
+        crypto_end,
+        manifest_offset,
+        parsed_crypto.fixed.block_size as usize,
+        &volume_header,
+        &volume_trailer,
+    )?;
+
+    Ok(ParsedSeekableVolume {
+        volume_header,
+        crypto_header: parsed_crypto.fixed,
+        crypto_header_bytes: crypto_bytes.to_vec(),
+        subkeys,
+        manifest_footer,
+        volume_trailer,
+        blocks: block_region.blocks,
+        erased_block_indices: block_region.erased_block_indices,
+    })
+}
+
+fn validate_seekable_supported_volume(
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+) -> Result<(), FormatError> {
+    if crypto_header.stripe_width != volume_header.stripe_width {
+        return Err(FormatError::InvalidArchive(
+            "VolumeHeader and CryptoHeader stripe_width differ",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_volume_set_member(
+    first: &ParsedSeekableVolume,
+    candidate: &ParsedSeekableVolume,
+) -> Result<(), FormatError> {
+    if candidate.volume_header.archive_uuid != first.volume_header.archive_uuid
+        || candidate.volume_header.session_id != first.volume_header.session_id
+    {
+        return Err(FormatError::InvalidArchive(
+            "mixed archive or session IDs in volume set",
+        ));
+    }
+    if candidate.crypto_header_bytes != first.crypto_header_bytes
+        || candidate.crypto_header != first.crypto_header
+    {
+        return Err(FormatError::InvalidArchive("CryptoHeader copies differ"));
+    }
+    if !manifest_bootstrap_fields_match(&first.manifest_footer, &candidate.manifest_footer) {
+        return Err(FormatError::InvalidArchive(
+            "ManifestFooter bootstrap fields differ",
+        ));
+    }
+    Ok(())
+}
+
+fn manifest_bootstrap_fields_match(left: &ManifestFooter, right: &ManifestFooter) -> bool {
+    left.archive_uuid == right.archive_uuid
+        && left.session_id == right.session_id
+        && left.is_authoritative == right.is_authoritative
+        && left.total_volumes == right.total_volumes
+        && left.index_root_first_block == right.index_root_first_block
+        && left.index_root_data_block_count == right.index_root_data_block_count
+        && left.index_root_parity_block_count == right.index_root_parity_block_count
+        && left.index_root_encrypted_size == right.index_root_encrypted_size
+        && left.index_root_decompressed_size == right.index_root_decompressed_size
+}
+
+fn validate_complete_global_block_coverage(
+    blocks: &BTreeMap<u64, BlockRecord>,
+    erased_block_indices: &BTreeSet<u64>,
+) -> Result<(), FormatError> {
+    let mut expected = 0u64;
+    let mut block_iter = blocks.keys().copied().peekable();
+    let mut erasure_iter = erased_block_indices.iter().copied().peekable();
+
+    loop {
+        let next_block = block_iter.peek().copied();
+        let next_erasure = erasure_iter.peek().copied();
+        let next = match (next_block, next_erasure) {
+            (Some(block), Some(erasure)) if block == erasure => {
+                return Err(FormatError::InvalidArchive(
+                    "BlockRecord index is both present and erased",
+                ));
+            }
+            (Some(block), Some(erasure)) => block.min(erasure),
+            (Some(block), None) => block,
+            (None, Some(erasure)) => erasure,
+            (None, None) => return Ok(()),
+        };
+
+        if next != expected {
+            return Err(FormatError::InvalidArchive(
+                "complete volume set has missing global blocks",
+            ));
+        }
+        if next_block == Some(next) {
+            block_iter.next();
+        }
+        if next_erasure == Some(next) {
+            erasure_iter.next();
+        }
+        expected = expected
+            .checked_add(1)
+            .ok_or(FormatError::InvalidArchive("global block index overflow"))?;
+    }
+}
+
 fn locate_trailer(
     bytes: &[u8],
     subkeys: &Subkeys,
@@ -906,23 +1078,6 @@ fn parse_authenticated_trailer(
         &trailer.trailer_hmac,
     )?;
     Ok(trailer)
-}
-
-fn validate_m7_supported_volume(
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
-) -> Result<(), FormatError> {
-    if volume_header.stripe_width != 1 || volume_header.volume_index != 0 {
-        return Err(FormatError::ReaderUnsupported(
-            "M7 reader supports only single-volume archives",
-        ));
-    }
-    if crypto_header.stripe_width != volume_header.stripe_width {
-        return Err(FormatError::InvalidArchive(
-            "VolumeHeader and CryptoHeader stripe_width differ",
-        ));
-    }
-    Ok(())
 }
 
 fn validate_m9_supported_volume(
@@ -1272,6 +1427,12 @@ fn validate_manifest_footer(
     )
 }
 
+#[derive(Debug)]
+struct ParsedBlockRegion {
+    blocks: BTreeMap<u64, BlockRecord>,
+    erased_block_indices: BTreeSet<u64>,
+}
+
 fn parse_block_region(
     bytes: &[u8],
     start: usize,
@@ -1279,7 +1440,7 @@ fn parse_block_region(
     block_size: usize,
     volume_header: &VolumeHeader,
     trailer: &VolumeTrailer,
-) -> Result<BTreeMap<u64, BlockRecord>, FormatError> {
+) -> Result<ParsedBlockRegion, FormatError> {
     if end < start {
         return Err(FormatError::InvalidArchive(
             "ManifestFooter starts before BlockRecord region",
@@ -1302,32 +1463,59 @@ fn parse_block_region(
     }
 
     let mut blocks = BTreeMap::new();
-    let mut previous_index = None;
+    let mut erased_block_indices = BTreeSet::new();
     for idx in 0..observed_count {
         let offset = start + idx * record_len;
-        let record =
-            BlockRecord::parse(slice(bytes, offset, record_len, "BlockRecord")?, block_size)?;
-        if record.block_index % volume_header.stripe_width as u64
-            != volume_header.volume_index as u64
-        {
-            return Err(FormatError::InvalidArchive(
-                "BlockRecord index does not belong to this volume",
-            ));
-        }
-        if let Some(previous) = previous_index {
-            if record.block_index != previous + volume_header.stripe_width as u64 {
-                return Err(FormatError::InvalidArchive(
-                    "BlockRecords are not strictly consecutive",
-                ));
+        let expected_block_index = checked_u64_add(
+            volume_header.volume_index as u64,
+            checked_u64_mul(
+                idx as u64,
+                volume_header.stripe_width as u64,
+                "BlockRecord index overflow",
+            )?,
+            "BlockRecord index overflow",
+        )?;
+        let raw = slice(bytes, offset, record_len, "BlockRecord")?;
+        match BlockRecord::parse(raw, block_size) {
+            Ok(record) => {
+                if record.block_index != expected_block_index {
+                    return Err(FormatError::InvalidArchive(
+                        "BlockRecord index does not match volume position",
+                    ));
+                }
+                if blocks.insert(record.block_index, record).is_some() {
+                    return Err(FormatError::InvalidArchive("duplicate BlockRecord index"));
+                }
             }
-        }
-        previous_index = Some(record.block_index);
-        if blocks.insert(record.block_index, record).is_some() {
-            return Err(FormatError::InvalidArchive("duplicate BlockRecord index"));
+            Err(err) if block_record_error_is_recoverable_erasure(&err) => {
+                if !erased_block_indices.insert(expected_block_index) {
+                    return Err(FormatError::InvalidArchive(
+                        "duplicate erased BlockRecord index",
+                    ));
+                }
+            }
+            Err(err) => return Err(err),
         }
     }
 
-    Ok(blocks)
+    Ok(ParsedBlockRegion {
+        blocks,
+        erased_block_indices,
+    })
+}
+
+fn block_record_error_is_recoverable_erasure(error: &FormatError) -> bool {
+    match error {
+        FormatError::BadCrc { structure }
+        | FormatError::BadMagic { structure }
+        | FormatError::NonZeroReserved { structure } => *structure == "BlockRecord",
+        _ => false,
+    }
+}
+
+fn checked_u64_mul(lhs: u64, rhs: u64, reason: &'static str) -> Result<u64, FormatError> {
+    lhs.checked_mul(rhs)
+        .ok_or(FormatError::InvalidArchive(reason))
 }
 
 fn parse_stream_block_prefix(
@@ -1341,7 +1529,7 @@ fn parse_stream_block_prefix(
         .ok_or(FormatError::InvalidArchive("BlockRecord length overflow"))?;
     let mut blocks = BTreeMap::new();
     let mut offset = start;
-    let mut observed_count = 0u64;
+    let mut observed_block_count = 0u64;
     let mut previous_index = None;
 
     while bytes.get(offset..offset + 4) == Some(b"TZBK") {
@@ -1366,12 +1554,12 @@ fn parse_stream_block_prefix(
             return Err(FormatError::InvalidArchive("duplicate BlockRecord index"));
         }
         offset = checked_add(offset, record_len, "BlockRecord")?;
-        observed_count = observed_count
+        observed_block_count = observed_block_count
             .checked_add(1)
             .ok_or(FormatError::InvalidArchive("BlockRecord count overflow"))?;
     }
 
-    Ok((blocks, offset, observed_count))
+    Ok((blocks, offset, observed_block_count))
 }
 
 fn parse_terminal_material(
@@ -1805,21 +1993,22 @@ fn load_decrypted_object_from_parts(
 
     for offset in 0..data_count {
         let block_index = checked_u64_add(extent.first_block_index, offset as u64, "object")?;
-        let record = blocks
-            .get(&block_index)
-            .ok_or(FormatError::InvalidArchive("object data block is missing"))?;
-        if record.kind != data_kind {
-            return Err(FormatError::InvalidArchive(
-                "object data block has unexpected kind",
-            ));
+        if let Some(record) = blocks.get(&block_index) {
+            if record.kind != data_kind {
+                return Err(FormatError::InvalidArchive(
+                    "object data block has unexpected kind",
+                ));
+            }
+            let should_be_last = offset + 1 == data_count;
+            if record.is_last_data() != should_be_last {
+                return Err(FormatError::InvalidArchive(
+                    "object last-data flag is not on the final data block",
+                ));
+            }
+            data_shards.push(Some(record.payload.clone()));
+        } else {
+            data_shards.push(None);
         }
-        let should_be_last = offset + 1 == data_count;
-        if record.is_last_data() != should_be_last {
-            return Err(FormatError::InvalidArchive(
-                "object last-data flag is not on the final data block",
-            ));
-        }
-        data_shards.push(Some(record.payload.clone()));
     }
 
     for offset in 0..parity_count {
@@ -1828,20 +2017,21 @@ fn load_decrypted_object_from_parts(
             data_count as u64 + offset as u64,
             "object",
         )?;
-        let record = blocks.get(&block_index).ok_or(FormatError::InvalidArchive(
-            "object parity block is missing",
-        ))?;
-        if record.kind != parity_kind {
-            return Err(FormatError::InvalidArchive(
-                "object parity block has unexpected kind",
-            ));
+        if let Some(record) = blocks.get(&block_index) {
+            if record.kind != parity_kind {
+                return Err(FormatError::InvalidArchive(
+                    "object parity block has unexpected kind",
+                ));
+            }
+            if record.is_last_data() {
+                return Err(FormatError::InvalidArchive(
+                    "object parity block has last-data flag",
+                ));
+            }
+            parity_shards.push(Some(record.payload.clone()));
+        } else {
+            parity_shards.push(None);
         }
-        if record.is_last_data() {
-            return Err(FormatError::InvalidArchive(
-                "object parity block has last-data flag",
-            ));
-        }
-        parity_shards.push(Some(record.payload.clone()));
     }
 
     let repaired = repair_data_gf16(&data_shards, &parity_shards, block_size)?;
@@ -2731,6 +2921,167 @@ mod tests {
             validate_object_extent(extent, &crypto_header, 1, 1).unwrap_err(),
             FormatError::InvalidArchive("encrypted object exceeds its class parity-shard maximum")
         );
+    }
+
+    #[test]
+    fn opens_complete_multi_volume_archive() {
+        let files = [RegularFile::new("alpha.txt", b"hello from volume stripes")];
+        let archive = write_archive(
+            &files,
+            &master_key(),
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 1,
+                ..WriterOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(archive.volumes.len(), 2);
+
+        let volume_refs = archive
+            .volumes
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        let opened = open_archive_volumes(&volume_refs, &master_key()).unwrap();
+
+        assert_eq!(opened.volume_header.stripe_width, 2);
+        assert_eq!(opened.list_files().unwrap()[0].path, "alpha.txt");
+        assert_eq!(
+            opened.extract_file("alpha.txt").unwrap(),
+            Some(b"hello from volume stripes".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn recovers_from_one_missing_volume_when_parity_allows() {
+        let files = [RegularFile::new("alpha.txt", b"recover me")];
+        let archive = write_archive(
+            &files,
+            &master_key(),
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 1,
+                ..WriterOptions::default()
+            },
+        )
+        .unwrap();
+
+        let recovered =
+            open_archive_volumes(&[archive.volumes[1].as_slice()], &master_key()).unwrap();
+        assert_eq!(
+            recovered.extract_file("alpha.txt").unwrap(),
+            Some(b"recover me".to_vec())
+        );
+        recovered.verify().unwrap();
+    }
+
+    #[test]
+    fn recovers_from_crc_corrupted_block_when_parity_allows() {
+        let files = [RegularFile::new("alpha.txt", b"repair corrupt block")];
+        let archive = write_archive(
+            &files,
+            &master_key(),
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 1,
+                ..WriterOptions::default()
+            },
+        )
+        .unwrap();
+        let mut volumes = archive.volumes.clone();
+        corrupt_first_block_record_payload(&mut volumes[0]);
+
+        let volume_refs = volumes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let recovered = open_archive_volumes(&volume_refs, &master_key()).unwrap();
+
+        assert_eq!(
+            recovered.extract_file("alpha.txt").unwrap(),
+            Some(b"repair corrupt block".to_vec())
+        );
+        recovered.verify().unwrap();
+    }
+
+    #[test]
+    fn rejects_block_record_at_wrong_stripe_position() {
+        let files = [RegularFile::new("alpha.txt", b"wrong stripe")];
+        let archive = write_archive(
+            &files,
+            &master_key(),
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 1,
+                ..WriterOptions::default()
+            },
+        )
+        .unwrap();
+        let mut volumes = archive.volumes.clone();
+        mutate_first_block_record(&mut volumes[0], |record| {
+            record.block_index += 2;
+        });
+
+        let volume_refs = volumes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert_eq!(
+            open_archive_volumes(&volume_refs, &master_key()).unwrap_err(),
+            FormatError::InvalidArchive("BlockRecord index does not match volume position")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_authenticated_volume_indexes() {
+        let files = [RegularFile::new("alpha.txt", b"duplicates")];
+        let archive = write_archive(
+            &files,
+            &master_key(),
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 1,
+                ..WriterOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            open_archive_volumes(
+                &[archive.volumes[0].as_slice(), archive.volumes[0].as_slice()],
+                &master_key()
+            )
+            .unwrap_err(),
+            FormatError::InvalidArchive("duplicate authenticated volume index")
+        );
+    }
+
+    fn corrupt_first_block_record_payload(volume: &mut [u8]) {
+        let (record_offset, _) = first_block_record(volume);
+        volume[record_offset + 16] ^= 0x55;
+    }
+
+    fn mutate_first_block_record(volume: &mut [u8], mutate: impl FnOnce(&mut BlockRecord)) {
+        let (record_offset, record_len) = first_block_record(volume);
+        let block_size = record_len - BLOCK_RECORD_FRAMING_LEN;
+        let mut record = BlockRecord::parse(
+            &volume[record_offset..record_offset + record_len],
+            block_size,
+        )
+        .unwrap();
+        mutate(&mut record);
+        volume[record_offset..record_offset + record_len].copy_from_slice(&record.to_bytes());
+    }
+
+    fn first_block_record(volume: &[u8]) -> (usize, usize) {
+        let volume_header = VolumeHeader::parse(&volume[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_start = volume_header.crypto_header_offset as usize;
+        let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
+        let crypto_header = CryptoHeader::parse(
+            &volume[crypto_start..crypto_end],
+            volume_header.crypto_header_length,
+        )
+        .unwrap();
+        let record_offset = crypto_end;
+        let record_len = crypto_header.fixed.block_size as usize + BLOCK_RECORD_FRAMING_LEN;
+        assert!(volume.len() >= record_offset + record_len);
+        (record_offset, record_len)
     }
 
     fn rewrite_sidecar_header(
