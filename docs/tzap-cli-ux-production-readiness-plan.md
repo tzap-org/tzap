@@ -631,7 +631,7 @@ cargo test -p tzap --test cli_smoke --locked extract
 
 ## Milestone 7: List Command Production UX
 
-Status: not started.
+Status: complete.
 
 Purpose: make archive inspection useful for humans and scripts.
 
@@ -706,7 +706,7 @@ cargo test -p tzap --test cli_smoke --locked list
 
 ## Milestone 8: Verify Command Production UX
 
-Status: not started.
+Status: complete.
 
 Purpose: make verification trustworthy for local users and CI systems.
 
@@ -776,7 +776,7 @@ cargo test -p tzap --test cli_smoke --locked verify
 
 ## Milestone 9: Output Modes And Logging
 
-Status: not started.
+Status: complete.
 
 Purpose: make stdout/stderr behavior predictable.
 
@@ -804,6 +804,9 @@ Tasks:
    inconsistently.
 3. Make JSON and quiet modes conflict where needed.
 4. Add tests that stdout contains only the expected content.
+   - implement global `--quiet` in all commands
+   - prevent success summaries from leaking when `--quiet` is enabled
+   - keep JSON and binary extraction paths stdout-only unless explicitly requested
 
 Required tests:
 
@@ -813,6 +816,14 @@ Required tests:
 - `verify --quiet` success emits no stdout.
 - `create --quiet` suppresses success summary.
 - Errors still emit stderr under `--quiet`.
+
+Implemented in this milestone:
+
+- global `--quiet` and `--verbose` flags were added to CLI parsing
+- verify `--quiet` and `--json` are now mutually exclusive
+- list/verify/create/extract/keygen output paths now flow through shared success-output helpers
+- added dedicated `cli_smoke` coverage for these behaviors
+- `keygen` success output is now suppressed by `--quiet` while keeping `--stdout` data output unchanged
 
 Acceptance criteria:
 
@@ -1044,7 +1055,7 @@ List command:
 - [x] `--bootstrap <FILE>`
 - [x] `--volume <FILE>`
 - [x] `--long`
-- [ ] `--json` if added
+- [x] `--json` if added
 
 Verify command:
 
@@ -1053,8 +1064,8 @@ Verify command:
 - [x] `--password` if added
 - [x] `--keyfile <KEYFILE>`
 - [x] `--bootstrap <FILE>`
-- [ ] `--quiet` if added
-- [ ] `--json` if added
+- [x] `--quiet` if added
+- [x] `--json` if added
 
 Keygen command if added:
 

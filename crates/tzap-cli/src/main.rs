@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use rand::RngCore;
+use serde_json::json;
 use tzap_core::format::{
     FormatError, CRYPTO_HEADER_FIXED_LEN, READER_MAX_ARGON2ID_M_COST_KIB,
     READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST, VOLUME_HEADER_LEN,
@@ -46,6 +47,12 @@ const DEFAULT_ARGON2_SALT_LEN: usize = 16;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    #[arg(long = "quiet", global = true, help = "Suppress success summaries.")]
+    quiet: bool,
+
+    #[arg(long = "verbose", global = true, help = "Enable verbose diagnostics.")]
+    verbose: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -299,7 +306,7 @@ enum Command {
     #[command(
         about = "List archive contents",
         long_about = "List archive members in plain format by default.",
-        after_help = "Examples:\n  tzap list --keyfile key.hex backup.tzap\n  tzap list --keyfile key.hex --long backup.tzap\n  tzap list --password-stdin --bootstrap backup.tzap.bootstrap backup.tzap",
+        after_help = "Examples:\n  tzap list --keyfile key.hex backup.tzap\n  tzap list --keyfile key.hex --long backup.tzap\n  tzap list --keyfile key.hex --json backup.tzap\n  tzap list --password-stdin --bootstrap backup.tzap.bootstrap backup.tzap",
         group(
             ArgGroup::new("open-key-source")
                 .required(true)
@@ -344,13 +351,20 @@ enum Command {
         #[arg(long = "volume", value_name = "FILE", help = "Additional volume path.")]
         volumes: Vec<String>,
 
-        #[arg(long = "long", help = "Use verbose listing output.")]
+        #[arg(long = "long", conflicts_with = "json", help = "Use verbose listing output.")]
         long: bool,
+
+        #[arg(
+            long = "json",
+            conflicts_with = "long",
+            help = "Emit stable machine-readable JSON output."
+        )]
+        json: bool,
     },
     #[command(
         about = "Verify archive integrity",
         long_about = "Verify archive signatures and checksum integrity. No payload changes are made.",
-        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex backup.tzap backup.tzap.001\n  tzap verify --password-stdin backup.tzap",
+        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex backup.tzap backup.tzap.001\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile backup.tzap\n  tzap verify --quiet --keyfile backup.tzap\n\nFor multi-volume archives, the first positional argument is the primary archive.\nAdditional positionals are optional extra volumes.",
         group(
             ArgGroup::new("open-key-source")
                 .required(true)
@@ -395,6 +409,13 @@ enum Command {
             help = "Use bootstrap sidecar FILE."
         )]
         bootstrap: Option<String>,
+
+        #[arg(
+            long = "json",
+            conflicts_with = "quiet",
+            help = "Emit stable machine-readable JSON output."
+        )]
+        json: bool,
     },
     #[command(
         about = "Generate a random raw key",
@@ -432,15 +453,22 @@ fn main() -> ExitCode {
             return ExitCode::from(code);
         }
     };
+    if cli.quiet && matches!(&cli.command, Command::Verify { json: true, .. }) {
+        eprintln!("error: --quiet cannot be used with --json for verify");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let is_verify_json = matches!(&cli.command, Command::Verify { json: true, .. });
 
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let diagnostic = classify_error(&err);
-            if diagnostic.action.is_empty() {
-                eprintln!("tzap: {}: {err:#}", diagnostic.label);
-            } else {
-                eprintln!("tzap: {}: {err:#}: {}", diagnostic.label, diagnostic.action);
+            if !is_verify_json {
+                if diagnostic.action.is_empty() {
+                    eprintln!("tzap: {}: {err:#}", diagnostic.label);
+                } else {
+                    eprintln!("tzap: {}: {err:#}: {}", diagnostic.label, diagnostic.action);
+                }
             }
             ExitCode::from(diagnostic.exit_code)
         }
@@ -448,6 +476,7 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    let quiet = cli.quiet;
     match cli.command {
         Command::Create {
             output,
@@ -582,7 +611,7 @@ fn run(cli: Cli) -> Result<()> {
                 fs::write(&path, &archive.bootstrap_sidecar)
                     .with_context(|| format!("failed to write bootstrap sidecar {path}"))?;
             }
-            eprintln!(
+            let summary = format!(
                 "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
                 regular_files.len(),
                 input_specs.iter().map(|entry| entry.size).sum::<u64>(),
@@ -591,8 +620,9 @@ fn run(cli: Cli) -> Result<()> {
                 volume_loss_tolerance,
                 bit_rot_buffer_pct
             );
+            emit_success_summary(quiet, &summary)?;
             if let Some(path) = bootstrap_output {
-                eprintln!("  bootstrap output: {}", path);
+                emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
             }
             Ok(())
         }
@@ -693,10 +723,13 @@ fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
-            eprintln!(
-                "extracted {extracted_count} file(s), {degraded_metadata_count} degraded metadata items to {}",
-                root.display()
-            );
+            emit_success_summary(
+                quiet,
+                &format!(
+                    "extracted {extracted_count} file(s), {degraded_metadata_count} degraded metadata items to {}",
+                    root.display()
+                ),
+            )?;
             Ok(())
         }
         Command::List {
@@ -707,6 +740,7 @@ fn run(cli: Cli) -> Result<()> {
             bootstrap,
             volumes,
             long,
+            json,
         } => {
             let volume_bytes = read_volume_inputs(&archive, &volumes)?;
             let master_key = load_open_key(
@@ -718,14 +752,60 @@ fn run(cli: Cli) -> Result<()> {
             let opened =
                 open_inputs_maybe_bootstrap(&volume_bytes, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {archive}"))?;
-            for entry in opened.list_files()? {
-                if long {
-                    println!("{}\t{}", entry.file_data_size, entry.path);
-                } else {
-                    println!("{}", entry.path);
+            let entries = opened.list_files()?;
+            for entry in &entries {
+                for diagnostic in &entry.diagnostics {
+                    eprintln!(
+                        "tzap: degraded-metadata: {}: {}: {}",
+                        entry.path, diagnostic.profile, diagnostic.message
+                    );
                 }
             }
-            Ok(())
+            if json {
+                let files = entries
+                    .iter()
+                    .map(|entry| {
+                        let kind = match entry.kind {
+                            TarEntryKind::Regular => "file",
+                            TarEntryKind::Directory => "directory",
+                            TarEntryKind::Symlink => "symlink",
+                            TarEntryKind::Hardlink => "hardlink",
+                        };
+                        json!({
+                            "path": &entry.path,
+                            "kind": kind,
+                            "size": entry.file_data_size,
+                            "mode": entry.mode,
+                            "mtime": entry.mtime,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({ "files": files })).context(
+                        "failed to encode list output as JSON"
+                    )?
+                );
+                Ok(())
+            } else {
+                for entry in entries {
+                    if long {
+                        let kind = match entry.kind {
+                            TarEntryKind::Regular => "file",
+                            TarEntryKind::Directory => "directory",
+                            TarEntryKind::Symlink => "symlink",
+                            TarEntryKind::Hardlink => "hardlink",
+                        };
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}",
+                            entry.file_data_size, kind, entry.mode, entry.mtime, entry.path
+                        );
+                    } else {
+                        println!("{}", entry.path);
+                    }
+                }
+                Ok(())
+            }
         }
         Command::Verify {
             archives,
@@ -733,10 +813,12 @@ fn run(cli: Cli) -> Result<()> {
             password,
             keyfile,
             bootstrap,
+            json,
         } => {
             let first = archives
                 .first()
                 .ok_or_else(|| anyhow!("at least one archive volume is required"))?;
+            let archive_paths = archives.to_vec();
             let volume_bytes = read_volume_inputs(first, &archives[1..])?;
             let master_key = load_open_key(
                 keyfile.as_deref(),
@@ -745,13 +827,86 @@ fn run(cli: Cli) -> Result<()> {
                 &volume_bytes[0],
             )?;
             let opened =
-                open_inputs_maybe_bootstrap(&volume_bytes, &master_key, bootstrap.as_deref())
-                    .with_context(|| format!("failed to open archive {first}"))?;
-            opened
+                match open_inputs_maybe_bootstrap(&volume_bytes, &master_key, bootstrap.as_deref())
+                    .with_context(|| format!("failed to open archive {first}"))
+                {
+                    Ok(opened) => opened,
+                    Err(err) => {
+                        if json {
+                            let diagnostic = classify_error(&err);
+                            let payload = json!({
+                                "ok": false,
+                                "archives": archive_paths,
+                                "error": {
+                                    "label": diagnostic.label,
+                                    "action": diagnostic.action,
+                                    "message": err.to_string(),
+                                },
+                            });
+                            let _ = println!(
+                                "{}",
+                                serde_json::to_string(&payload).context(
+                                    "failed to encode verify error output as JSON"
+                                )?
+                            );
+                        }
+                        return Err(err);
+                    }
+                };
+            let result = opened
                 .verify()
-                .with_context(|| format!("failed to verify archive {first}"))?;
-            println!("{}: OK", archives.join(" "));
-            Ok(())
+                .with_context(|| format!("failed to verify archive {first}"));
+            let volume_count = opened.manifest_footer.total_volumes;
+            let file_count = opened.index_root.header.file_count;
+            match result {
+                Ok(()) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&json!({
+                                "ok": true,
+                                "archives": archive_paths,
+                                "volume_count": volume_count,
+                                "file_count": file_count,
+                            }))
+                            .context("failed to encode verify output as JSON")?
+                        );
+                        return Ok(());
+                    }
+                    emit_success_stdout(
+                        quiet,
+                        &format!(
+                            "{}: OK ({} volume(s), {} file(s))",
+                            first,
+                            volume_count,
+                            file_count
+                        ),
+                    )?;
+                    Ok(())
+                }
+                Err(err) => {
+                    if json {
+                        let diagnostic = classify_error(&err);
+                        let payload = json!({
+                            "ok": false,
+                            "archives": archive_paths,
+                            "volume_count": volume_count,
+                            "file_count": file_count,
+                            "error": {
+                                "label": diagnostic.label,
+                                "action": diagnostic.action,
+                                "message": err.to_string(),
+                            },
+                        });
+                        let _ = println!(
+                            "{}",
+                            serde_json::to_string(&payload)
+                                .context("failed to encode verify error output as JSON")?
+                        );
+                    }
+                    Err(err)
+                }
+            }
         }
         Command::Keygen {
             output,
@@ -767,10 +922,29 @@ fn run(cli: Cli) -> Result<()> {
             }
             let output = output.expect("--output required by clap");
             write_keyfile(&output, &key_hex, force).context("failed to write keyfile")?;
-            eprintln!("wrote keyfile to {}", output);
+            emit_success_summary(
+                quiet,
+                &format!("wrote keyfile to {}", output),
+            )?;
             Ok(())
         }
     }
+}
+
+fn emit_success_summary(quiet: bool, message: &str) -> io::Result<()> {
+    if quiet {
+        return Ok(());
+    }
+    eprintln!("{message}");
+    Ok(())
+}
+
+fn emit_success_stdout(quiet: bool, message: &str) -> io::Result<()> {
+    if quiet {
+        return Ok(());
+    }
+    println!("{message}");
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1550,6 +1724,13 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
             exit_code: EXIT_UNSUPPORTED_REVISION,
             action: "use the matching tzap version for this archive",
         },
+        FormatError::BadMagic { structure: "VolumeHeader" }
+        | FormatError::BadMagic { structure: "VolumeTrailer" }
+        | FormatError::BadMagic { structure: "ManifestFooter" } => Diagnostic {
+            label: "corrupt-header",
+            exit_code: EXIT_CORRUPT_ARCHIVE,
+            action: "verify the archive header/trailer bytes and source file path",
+        },
         FormatError::HmacMismatch {
             structure: "CryptoHeader",
         }
@@ -1557,17 +1738,60 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
         | FormatError::InvalidRawMasterKeyLength => Diagnostic {
             label: "wrong-key",
             exit_code: EXIT_WRONG_KEY,
-            action: "check the archive's key source (passphrase/raw key)",
+            action: "confirm the archive key source (passphrase/raw key)",
         },
-        FormatError::HmacMismatch { .. } | FormatError::AeadFailure => Diagnostic {
-            label: "corrupt-archive",
+        FormatError::FecTooFewAvailableShards => Diagnostic {
+            label: "missing-volume",
             exit_code: EXIT_CORRUPT_ARCHIVE,
-            action: "verify archive integrity and source",
+            action: "add the missing archive volume(s) or confirm volume-loss tolerance",
+        },
+        FormatError::InvalidArchive(message)
+            if message == "complete volume set has missing global blocks" =>
+        {
+            Diagnostic {
+                label: "missing-volume",
+                exit_code: EXIT_CORRUPT_ARCHIVE,
+                action: "add the missing archive volume(s) or confirm volume-loss tolerance",
+            }
+        }
+        FormatError::HmacMismatch { .. } | FormatError::AeadFailure => Diagnostic {
+            label: "corrupt-payload",
+            exit_code: EXIT_CORRUPT_ARCHIVE,
+            action: "verify archive payload integrity",
+        },
+        FormatError::BadCrc { structure: "VolumeHeader" }
+        | FormatError::BadCrc { structure: "VolumeTrailer" }
+        | FormatError::BadCrc { structure: "ManifestFooter" }
+        | FormatError::InvalidMetadata { structure: "ManifestFooter", .. }
+        | FormatError::InvalidMetadata { structure: "VolumeHeader", .. } => Diagnostic {
+            label: "corrupt-header",
+            exit_code: EXIT_CORRUPT_ARCHIVE,
+            action: "inspect archive metadata and source file path",
+        },
+        FormatError::BadCrc { structure } => Diagnostic {
+            label: "corrupt-payload",
+            exit_code: EXIT_CORRUPT_ARCHIVE,
+            action: "verify payload integrity",
         },
         FormatError::InvalidKdfParams(message) => Diagnostic {
             label: "invalid-arguments",
             exit_code: EXIT_USAGE,
             action: message,
+        },
+        FormatError::InvalidMetadata { structure, .. } => Diagnostic {
+            label: if *structure == "IndexRoot" || *structure == "FrameEntry" || *structure == "EnvelopeEntry"
+            {
+                "corrupt-payload"
+            } else {
+                "corrupt-header"
+            },
+            exit_code: EXIT_CORRUPT_ARCHIVE,
+            action: if *structure == "IndexRoot" || *structure == "FrameEntry" || *structure == "EnvelopeEntry"
+            {
+                "inspect archive metadata tables and payload"
+            } else {
+                "inspect archive header metadata"
+            },
         },
         FormatError::ReaderResourceLimitExceeded { field, .. } => Diagnostic {
             label: "invalid-arguments",
