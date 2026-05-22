@@ -18,6 +18,9 @@ pub use crypto::{HmacDomain, KdfParams, MasterKey, Subkeys};
 pub use format::{
     AeadAlgo, CompressionAlgo, FecAlgo, FormatError, KdfAlgo, FORMAT_VERSION, VOLUME_FORMAT_REV,
 };
-pub use reader::{open_archive, ArchiveEntry, OpenedArchive, ReaderOptions};
+pub use reader::{
+    open_archive, open_archive_with_bootstrap_sidecar, open_non_seekable_archive,
+    sequential_extract_tar_stream, ArchiveEntry, OpenedArchive, ReaderOptions,
+};
 pub use tar_model::{MetadataDiagnostic, SafeExtractionOptions, TarEntryKind};
 pub use writer::{RegularFile, WriterOptions};

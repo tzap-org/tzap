@@ -3,7 +3,7 @@ use std::io::{self, Write};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use tzap_core::{open_archive, MasterKey};
+use tzap_core::{open_archive, open_archive_with_bootstrap_sidecar, MasterKey};
 
 #[derive(Debug, Parser)]
 #[command(name = "tzap")]
@@ -90,11 +90,10 @@ fn main() -> Result<()> {
             keyfile,
             bootstrap,
         } => {
-            reject_bootstrap(&bootstrap)?;
             let master_key = load_master_key(keyfile.as_deref(), password_stdin)?;
             let archive_bytes =
                 fs::read(&archive).with_context(|| format!("failed to read archive {archive}"))?;
-            let opened = open_archive(&archive_bytes, &master_key)
+            let opened = open_archive_maybe_bootstrap(&archive_bytes, &master_key, &bootstrap)
                 .with_context(|| format!("failed to open archive {archive}"))?;
             let contents = opened
                 .extract_file(&path)?
@@ -109,11 +108,10 @@ fn main() -> Result<()> {
             bootstrap,
             long,
         } => {
-            reject_bootstrap(&bootstrap)?;
             let master_key = load_master_key(keyfile.as_deref(), password_stdin)?;
             let archive_bytes =
                 fs::read(&archive).with_context(|| format!("failed to read archive {archive}"))?;
-            let opened = open_archive(&archive_bytes, &master_key)
+            let opened = open_archive_maybe_bootstrap(&archive_bytes, &master_key, &bootstrap)
                 .with_context(|| format!("failed to open archive {archive}"))?;
             for entry in opened.list_files()? {
                 if long {
@@ -130,12 +128,11 @@ fn main() -> Result<()> {
             keyfile,
             bootstrap,
         } => {
-            reject_bootstrap(&bootstrap)?;
             let master_key = load_master_key(keyfile.as_deref(), password_stdin)?;
             for archive in archives {
                 let archive_bytes = fs::read(&archive)
                     .with_context(|| format!("failed to read archive {archive}"))?;
-                let opened = open_archive(&archive_bytes, &master_key)
+                let opened = open_archive_maybe_bootstrap(&archive_bytes, &master_key, &bootstrap)
                     .with_context(|| format!("failed to open archive {archive}"))?;
                 opened
                     .verify()
@@ -147,11 +144,18 @@ fn main() -> Result<()> {
     }
 }
 
-fn reject_bootstrap(bootstrap: &Option<String>) -> Result<()> {
-    if bootstrap.is_some() {
-        bail!("bootstrap sidecars are implemented in milestone 9, not milestone 7");
+fn open_archive_maybe_bootstrap(
+    archive_bytes: &[u8],
+    master_key: &MasterKey,
+    bootstrap: &Option<String>,
+) -> Result<tzap_core::OpenedArchive> {
+    if let Some(path) = bootstrap {
+        let sidecar =
+            fs::read(path).with_context(|| format!("failed to read bootstrap sidecar {path}"))?;
+        open_archive_with_bootstrap_sidecar(archive_bytes, &sidecar, master_key).map_err(Into::into)
+    } else {
+        open_archive(archive_bytes, master_key).map_err(Into::into)
     }
-    Ok(())
 }
 
 fn load_master_key(keyfile: Option<&str>, password_stdin: bool) -> Result<MasterKey> {

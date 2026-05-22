@@ -6,8 +6,8 @@ use crate::compression::decompress_exact_zstd_frame;
 use crate::crypto::{decrypt_padded_aead_object, verify_hmac, HmacDomain, MasterKey, Subkeys};
 use crate::fec::repair_data_gf16;
 use crate::format::{
-    BlockKind, FormatError, BLOCK_RECORD_FRAMING_LEN, MANIFEST_FOOTER_LEN, VOLUME_HEADER_LEN,
-    VOLUME_TRAILER_LEN,
+    BlockKind, FormatError, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN,
+    MANIFEST_FOOTER_LEN, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::metadata::{
     normalize_lookup_file_path, EnvelopeEntry, FileEntry, FrameEntry, IndexRoot, IndexShard,
@@ -18,11 +18,13 @@ use crate::tar_model::{
     SafeExtractionOptions, TarEntryKind,
 };
 use crate::wire::{
-    BlockRecord, CryptoHeader, CryptoHeaderFixed, ManifestFooter, VolumeHeader, VolumeTrailer,
+    BlockRecord, BootstrapSidecarHeader, CryptoHeader, CryptoHeaderFixed, ManifestFooter,
+    VolumeHeader, VolumeTrailer,
 };
 
 const TRAILER_HMAC_COVERED_LEN: usize = 96;
 const MANIFEST_HMAC_COVERED_LEN: usize = 104;
+const SIDECAR_HMAC_COVERED_LEN: usize = 92;
 const DEFAULT_MAX_VERIFY_TAR_SIZE: usize = 128 * 1024 * 1024;
 const DIRECTORY_HINT_REQUIRED_FILE_COUNT: u64 = 100_000;
 
@@ -81,6 +83,39 @@ pub fn open_archive<'a>(
     master_key: &MasterKey,
 ) -> Result<OpenedArchive, FormatError> {
     OpenedArchive::open_with_options(bytes, master_key, ReaderOptions::default())
+}
+
+pub fn open_archive_with_bootstrap_sidecar(
+    bytes: &[u8],
+    bootstrap_sidecar: &[u8],
+    master_key: &MasterKey,
+) -> Result<OpenedArchive, FormatError> {
+    OpenedArchive::open_with_bootstrap_sidecar_options(
+        bytes,
+        bootstrap_sidecar,
+        master_key,
+        ReaderOptions::default(),
+    )
+}
+
+pub fn open_non_seekable_archive(
+    bytes: &[u8],
+    master_key: &MasterKey,
+    bootstrap_sidecar: Option<&[u8]>,
+) -> Result<OpenedArchive, FormatError> {
+    match bootstrap_sidecar {
+        Some(sidecar) => open_archive_with_bootstrap_sidecar(bytes, sidecar, master_key),
+        None => Err(FormatError::ReaderUnsupported(
+            "non-seekable random access requires a bootstrap sidecar",
+        )),
+    }
+}
+
+pub fn sequential_extract_tar_stream(
+    bytes: &[u8],
+    master_key: &MasterKey,
+) -> Result<Vec<u8>, FormatError> {
+    sequential_extract_tar_stream_with_options(bytes, master_key, ReaderOptions::default())
 }
 
 impl OpenedArchive {
@@ -180,6 +215,115 @@ impl OpenedArchive {
             volume_header,
             crypto_header: parsed_crypto.fixed,
             manifest_footer,
+            volume_trailer,
+            index_root,
+        })
+    }
+
+    pub fn open_with_bootstrap_sidecar_options(
+        bytes: &[u8],
+        bootstrap_sidecar: &[u8],
+        master_key: &MasterKey,
+        options: ReaderOptions,
+    ) -> Result<Self, FormatError> {
+        if bytes.len() < VOLUME_HEADER_LEN {
+            return Err(FormatError::InvalidLength {
+                structure: "archive",
+                expected: VOLUME_HEADER_LEN,
+                actual: bytes.len(),
+            });
+        }
+
+        let volume_header = VolumeHeader::parse(slice(bytes, 0, VOLUME_HEADER_LEN, "archive")?)?;
+        let crypto_start = volume_header.crypto_header_offset as usize;
+        let crypto_len = volume_header.crypto_header_length as usize;
+        let crypto_end = checked_add(crypto_start, crypto_len, "CryptoHeader")?;
+        let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
+        let parsed_crypto = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length)?;
+        let subkeys = Subkeys::derive(
+            master_key,
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+        )?;
+        verify_hmac(
+            HmacDomain::CryptoHeader,
+            &subkeys.mac_key,
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+            parsed_crypto.hmac_covered_bytes,
+            &parsed_crypto.header_hmac,
+        )?;
+        parsed_crypto.validate_extension_semantics()?;
+        validate_m9_supported_volume(&volume_header, &parsed_crypto.fixed)?;
+
+        let sidecar = parse_trusted_bootstrap_sidecar(
+            bootstrap_sidecar,
+            &volume_header,
+            &parsed_crypto.fixed,
+            &subkeys,
+        )?;
+
+        let (mut blocks, terminal_offset, observed_block_count) = parse_stream_block_prefix(
+            bytes,
+            crypto_end,
+            parsed_crypto.fixed.block_size as usize,
+            &volume_header,
+        )?;
+        for record in sidecar.index_root_records {
+            if let Some(existing) = blocks.insert(record.block_index, record.clone()) {
+                if existing != record {
+                    return Err(FormatError::InvalidArchive(
+                        "bootstrap sidecar conflicts with volume BlockRecord",
+                    ));
+                }
+            }
+        }
+
+        let (terminal_manifest, volume_trailer) = parse_terminal_material(
+            bytes,
+            terminal_offset,
+            observed_block_count,
+            &subkeys,
+            &volume_header,
+            parsed_crypto.fixed.block_size,
+        )?;
+        if terminal_manifest != sidecar.manifest_footer {
+            return Err(FormatError::InvalidArchive(
+                "bootstrap sidecar conflicts with terminal ManifestFooter",
+            ));
+        }
+
+        let limits = metadata_limits(&parsed_crypto.fixed);
+        let index_root_plaintext = load_metadata_object_from_parts(
+            &blocks,
+            &subkeys,
+            &volume_header,
+            &parsed_crypto.fixed,
+            ObjectExtent {
+                first_block_index: sidecar.manifest_footer.index_root_first_block,
+                data_block_count: sidecar.manifest_footer.index_root_data_block_count,
+                parity_block_count: sidecar.manifest_footer.index_root_parity_block_count,
+                encrypted_size: sidecar.manifest_footer.index_root_encrypted_size,
+            },
+            BlockKind::IndexRootData,
+            BlockKind::IndexRootParity,
+            &subkeys.index_root_key,
+            &subkeys.index_nonce_seed,
+            b"idxroot",
+            0,
+            parsed_crypto.fixed.index_root_fec_data_shards,
+            parsed_crypto.fixed.index_root_fec_parity_shards,
+            sidecar.manifest_footer.index_root_decompressed_size,
+        )?;
+        let index_root = IndexRoot::parse(&index_root_plaintext, false, limits)?;
+
+        Ok(Self {
+            options,
+            subkeys,
+            blocks,
+            volume_header,
+            crypto_header: parsed_crypto.fixed,
+            manifest_footer: sidecar.manifest_footer,
             volume_trailer,
             index_root,
         })
@@ -725,6 +869,287 @@ fn validate_m7_supported_volume(
     Ok(())
 }
 
+fn validate_m9_supported_volume(
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+) -> Result<(), FormatError> {
+    if volume_header.stripe_width != 1 || volume_header.volume_index != 0 {
+        return Err(FormatError::ReaderUnsupported(
+            "M9 reader supports only single-volume archives",
+        ));
+    }
+    if crypto_header.stripe_width != volume_header.stripe_width {
+        return Err(FormatError::InvalidArchive(
+            "VolumeHeader and CryptoHeader stripe_width differ",
+        ));
+    }
+    if crypto_header.has_dictionary != 0 {
+        return Err(FormatError::ReaderUnsupported(
+            "M9 sidecar bootstrap does not support dictionary archives yet",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct TrustedBootstrapSidecar {
+    manifest_footer: ManifestFooter,
+    index_root_records: Vec<BlockRecord>,
+}
+
+fn parse_trusted_bootstrap_sidecar(
+    bytes: &[u8],
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+    subkeys: &Subkeys,
+) -> Result<TrustedBootstrapSidecar, FormatError> {
+    let header_bytes = slice(
+        bytes,
+        0,
+        BOOTSTRAP_SIDECAR_HEADER_LEN,
+        "BootstrapSidecarHeader",
+    )?;
+    let header = BootstrapSidecarHeader::parse(header_bytes)?;
+    if header.archive_uuid != volume_header.archive_uuid
+        || header.session_id != volume_header.session_id
+    {
+        return Err(FormatError::InvalidArchive(
+            "bootstrap sidecar identity does not match VolumeHeader",
+        ));
+    }
+    verify_hmac(
+        HmacDomain::BootstrapSidecar,
+        &subkeys.mac_key,
+        &volume_header.archive_uuid,
+        &volume_header.session_id,
+        &header_bytes[..SIDECAR_HMAC_COVERED_LEN],
+        &header.sidecar_hmac,
+    )?;
+    header.validate_packed_layout(bytes.len() as u64)?;
+    validate_sidecar_size_cap(&header, crypto_header, bytes.len() as u64)?;
+
+    if !header.has_manifest_footer() || !header.has_index_root_records() {
+        return Err(FormatError::ReaderUnsupported(
+            "non-seekable bootstrap sidecar requires ManifestFooter and IndexRoot sections",
+        ));
+    }
+    if header.has_dictionary_records() {
+        if crypto_header.has_dictionary == 0 {
+            return Err(FormatError::InvalidArchive(
+                "bootstrap sidecar has dictionary records while has_dictionary is false",
+            ));
+        }
+        return Err(FormatError::ReaderUnsupported(
+            "M9 sidecar bootstrap does not support dictionary records yet",
+        ));
+    }
+
+    let manifest_offset = to_usize(header.manifest_footer_offset, "BootstrapSidecarHeader")?;
+    let manifest_bytes = slice(
+        bytes,
+        manifest_offset,
+        MANIFEST_FOOTER_LEN,
+        "ManifestFooter",
+    )?;
+    let manifest_footer = ManifestFooter::parse(manifest_bytes)?;
+    validate_sidecar_manifest_footer(
+        volume_header,
+        crypto_header,
+        &manifest_footer,
+        subkeys,
+        manifest_bytes,
+    )?;
+    manifest_footer.validate_index_root_extent(crypto_header.block_size)?;
+
+    let index_root_records = parse_sidecar_block_records(
+        bytes,
+        header.index_root_records_offset,
+        header.index_root_records_length,
+        crypto_header.block_size as usize,
+        ObjectExtent {
+            first_block_index: manifest_footer.index_root_first_block,
+            data_block_count: manifest_footer.index_root_data_block_count,
+            parity_block_count: manifest_footer.index_root_parity_block_count,
+            encrypted_size: manifest_footer.index_root_encrypted_size,
+        },
+        BlockKind::IndexRootData,
+        BlockKind::IndexRootParity,
+        "IndexRoot",
+    )?;
+
+    Ok(TrustedBootstrapSidecar {
+        manifest_footer,
+        index_root_records,
+    })
+}
+
+fn validate_sidecar_manifest_footer(
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+    footer: &ManifestFooter,
+    subkeys: &Subkeys,
+    raw: &[u8],
+) -> Result<(), FormatError> {
+    if footer.archive_uuid != volume_header.archive_uuid
+        || footer.session_id != volume_header.session_id
+    {
+        return Err(FormatError::InvalidArchive(
+            "sidecar ManifestFooter identity does not match VolumeHeader",
+        ));
+    }
+    if footer.volume_index != 0 {
+        return Err(FormatError::InvalidArchive(
+            "sidecar ManifestFooter volume_index must be zero",
+        ));
+    }
+    if footer.total_volumes != crypto_header.stripe_width {
+        return Err(FormatError::InvalidArchive(
+            "sidecar ManifestFooter total_volumes does not match stripe_width",
+        ));
+    }
+    if footer.is_authoritative != 1 {
+        return Err(FormatError::InvalidArchive(
+            "sidecar ManifestFooter is not authoritative",
+        ));
+    }
+    verify_hmac(
+        HmacDomain::ManifestFooter,
+        &subkeys.mac_key,
+        &volume_header.archive_uuid,
+        &volume_header.session_id,
+        &raw[..MANIFEST_HMAC_COVERED_LEN],
+        &footer.manifest_hmac,
+    )
+}
+
+fn validate_sidecar_size_cap(
+    header: &BootstrapSidecarHeader,
+    crypto_header: &CryptoHeaderFixed,
+    file_size: u64,
+) -> Result<(), FormatError> {
+    let record_len = crypto_header.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
+    let max_index_records = crypto_header.index_root_fec_data_shards as u64
+        + crypto_header.index_root_fec_parity_shards as u64;
+    if header.index_root_records_length % record_len != 0 {
+        return Err(FormatError::InvalidArchive(
+            "bootstrap sidecar IndexRoot records length is not aligned",
+        ));
+    }
+    if header.index_root_records_length / record_len > max_index_records {
+        return Err(FormatError::InvalidArchive(
+            "bootstrap sidecar IndexRoot records exceed resource cap",
+        ));
+    }
+    if header.dictionary_records_length % record_len != 0 {
+        return Err(FormatError::InvalidArchive(
+            "bootstrap sidecar dictionary records length is not aligned",
+        ));
+    }
+    if header.dictionary_records_length / record_len > max_index_records {
+        return Err(FormatError::InvalidArchive(
+            "bootstrap sidecar dictionary records exceed resource cap",
+        ));
+    }
+
+    let mut cap = BOOTSTRAP_SIDECAR_HEADER_LEN as u64;
+    if header.has_manifest_footer() {
+        cap = cap
+            .checked_add(MANIFEST_FOOTER_LEN as u64)
+            .ok_or(FormatError::InvalidArchive(
+                "bootstrap sidecar cap overflow",
+            ))?;
+    }
+    if header.has_index_root_records() {
+        cap =
+            cap.checked_add(max_index_records * record_len)
+                .ok_or(FormatError::InvalidArchive(
+                    "bootstrap sidecar cap overflow",
+                ))?;
+    }
+    if header.has_dictionary_records() {
+        cap =
+            cap.checked_add(max_index_records * record_len)
+                .ok_or(FormatError::InvalidArchive(
+                    "bootstrap sidecar cap overflow",
+                ))?;
+    }
+    if file_size > cap {
+        return Err(FormatError::InvalidArchive(
+            "bootstrap sidecar exceeds resource cap",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_sidecar_block_records(
+    sidecar_bytes: &[u8],
+    offset: u64,
+    length: u64,
+    block_size: usize,
+    extent: ObjectExtent,
+    data_kind: BlockKind,
+    parity_kind: BlockKind,
+    structure: &'static str,
+) -> Result<Vec<BlockRecord>, FormatError> {
+    let record_len = block_size
+        .checked_add(BLOCK_RECORD_FRAMING_LEN)
+        .ok_or(FormatError::InvalidArchive("BlockRecord length overflow"))?;
+    if length % record_len as u64 != 0 {
+        return Err(FormatError::InvalidArchive(
+            "sidecar BlockRecord section is not aligned",
+        ));
+    }
+    let expected_count = extent.data_block_count as usize + extent.parity_block_count as usize;
+    let actual_count = usize::try_from(length / record_len as u64)
+        .map_err(|_| FormatError::InvalidArchive("sidecar BlockRecord count overflow"))?;
+    if actual_count != expected_count {
+        return Err(FormatError::InvalidArchive(
+            "sidecar BlockRecord section does not match declared extent",
+        ));
+    }
+    let start = to_usize(offset, "BootstrapSidecarHeader")?;
+    let raw = slice(
+        sidecar_bytes,
+        start,
+        to_usize(length, "BootstrapSidecarHeader")?,
+        "BootstrapSidecarHeader",
+    )?;
+    let mut records = Vec::with_capacity(expected_count);
+
+    for idx in 0..expected_count {
+        let record = BlockRecord::parse(
+            slice(raw, idx * record_len, record_len, "BlockRecord")?,
+            block_size,
+        )?;
+        let expected_block_index =
+            checked_u64_add(extent.first_block_index, idx as u64, structure)?;
+        if record.block_index != expected_block_index {
+            return Err(FormatError::InvalidArchive(
+                "sidecar BlockRecord section has missing or duplicate blocks",
+            ));
+        }
+        let expected_kind = if idx < extent.data_block_count as usize {
+            data_kind
+        } else {
+            parity_kind
+        };
+        if record.kind != expected_kind {
+            return Err(FormatError::InvalidArchive(
+                "sidecar BlockRecord section has wrong kind",
+            ));
+        }
+        let should_be_last = idx + 1 == extent.data_block_count as usize;
+        if idx < extent.data_block_count as usize && record.is_last_data() != should_be_last {
+            return Err(FormatError::InvalidArchive(
+                "sidecar BlockRecord section has wrong last-data flag",
+            ));
+        }
+        records.push(record);
+    }
+
+    Ok(records)
+}
+
 fn validate_trailer_identity(
     volume_header: &VolumeHeader,
     trailer: &VolumeTrailer,
@@ -830,6 +1255,363 @@ fn parse_block_region(
     }
 
     Ok(blocks)
+}
+
+fn parse_stream_block_prefix(
+    bytes: &[u8],
+    start: usize,
+    block_size: usize,
+    volume_header: &VolumeHeader,
+) -> Result<(BTreeMap<u64, BlockRecord>, usize, u64), FormatError> {
+    let record_len = block_size
+        .checked_add(BLOCK_RECORD_FRAMING_LEN)
+        .ok_or(FormatError::InvalidArchive("BlockRecord length overflow"))?;
+    let mut blocks = BTreeMap::new();
+    let mut offset = start;
+    let mut observed_count = 0u64;
+    let mut previous_index = None;
+
+    while bytes.get(offset..offset + 4) == Some(b"TZBK") {
+        let record =
+            BlockRecord::parse(slice(bytes, offset, record_len, "BlockRecord")?, block_size)?;
+        if record.block_index % volume_header.stripe_width as u64
+            != volume_header.volume_index as u64
+        {
+            return Err(FormatError::InvalidArchive(
+                "BlockRecord index does not belong to this volume",
+            ));
+        }
+        if let Some(previous) = previous_index {
+            if record.block_index != previous + volume_header.stripe_width as u64 {
+                return Err(FormatError::InvalidArchive(
+                    "BlockRecords are not strictly consecutive",
+                ));
+            }
+        }
+        previous_index = Some(record.block_index);
+        if blocks.insert(record.block_index, record).is_some() {
+            return Err(FormatError::InvalidArchive("duplicate BlockRecord index"));
+        }
+        offset = checked_add(offset, record_len, "BlockRecord")?;
+        observed_count = observed_count
+            .checked_add(1)
+            .ok_or(FormatError::InvalidArchive("BlockRecord count overflow"))?;
+    }
+
+    Ok((blocks, offset, observed_count))
+}
+
+fn parse_terminal_material(
+    bytes: &[u8],
+    manifest_offset: usize,
+    observed_block_count: u64,
+    subkeys: &Subkeys,
+    volume_header: &VolumeHeader,
+    block_size: u32,
+) -> Result<(ManifestFooter, VolumeTrailer), FormatError> {
+    let manifest_end = checked_add(manifest_offset, MANIFEST_FOOTER_LEN, "ManifestFooter")?;
+    let trailer_end = checked_add(manifest_end, VOLUME_TRAILER_LEN, "VolumeTrailer")?;
+    if trailer_end != bytes.len() {
+        return Err(FormatError::InvalidArchive(
+            "terminal ManifestFooter/VolumeTrailer is not packed at stream end",
+        ));
+    }
+
+    let manifest_bytes = slice(
+        bytes,
+        manifest_offset,
+        MANIFEST_FOOTER_LEN,
+        "ManifestFooter",
+    )?;
+    let manifest_footer = ManifestFooter::parse(manifest_bytes)?;
+    validate_manifest_footer(volume_header, &manifest_footer, subkeys, manifest_bytes)?;
+    manifest_footer.validate_index_root_extent(block_size)?;
+
+    let trailer = parse_authenticated_trailer(bytes, manifest_end, subkeys, volume_header)?;
+    validate_trailer_identity(volume_header, &trailer)?;
+    if trailer.manifest_footer_offset != manifest_offset as u64 {
+        return Err(FormatError::InvalidArchive(
+            "VolumeTrailer ManifestFooter offset does not match observed stream offset",
+        ));
+    }
+    if trailer.manifest_footer_length != MANIFEST_FOOTER_LEN as u32 {
+        return Err(FormatError::InvalidManifestFooterLength(
+            trailer.manifest_footer_length,
+        ));
+    }
+    if trailer.bytes_written != manifest_end as u64 {
+        return Err(FormatError::InvalidArchive(
+            "VolumeTrailer bytes_written does not match observed trailer offset",
+        ));
+    }
+    if trailer.block_count != observed_block_count {
+        return Err(FormatError::InvalidArchive(
+            "VolumeTrailer block_count does not match observed stream",
+        ));
+    }
+
+    Ok((manifest_footer, trailer))
+}
+
+#[derive(Debug, Default)]
+struct PendingSequentialEnvelope {
+    data_shards: Vec<Option<Vec<u8>>>,
+    parity_shards: Vec<Option<Vec<u8>>>,
+    saw_last_data: bool,
+}
+
+impl PendingSequentialEnvelope {
+    fn is_empty(&self) -> bool {
+        self.data_shards.is_empty() && self.parity_shards.is_empty()
+    }
+}
+
+fn sequential_extract_tar_stream_with_options(
+    bytes: &[u8],
+    master_key: &MasterKey,
+    _options: ReaderOptions,
+) -> Result<Vec<u8>, FormatError> {
+    if bytes.len() < VOLUME_HEADER_LEN {
+        return Err(FormatError::InvalidLength {
+            structure: "archive",
+            expected: VOLUME_HEADER_LEN,
+            actual: bytes.len(),
+        });
+    }
+
+    let volume_header = VolumeHeader::parse(slice(bytes, 0, VOLUME_HEADER_LEN, "archive")?)?;
+    let crypto_start = volume_header.crypto_header_offset as usize;
+    let crypto_len = volume_header.crypto_header_length as usize;
+    let crypto_end = checked_add(crypto_start, crypto_len, "CryptoHeader")?;
+    let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
+    let parsed_crypto = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length)?;
+    let subkeys = Subkeys::derive(
+        master_key,
+        &volume_header.archive_uuid,
+        &volume_header.session_id,
+    )?;
+    verify_hmac(
+        HmacDomain::CryptoHeader,
+        &subkeys.mac_key,
+        &volume_header.archive_uuid,
+        &volume_header.session_id,
+        parsed_crypto.hmac_covered_bytes,
+        &parsed_crypto.header_hmac,
+    )?;
+    parsed_crypto.validate_extension_semantics()?;
+    validate_sequential_supported_volume(&volume_header, &parsed_crypto.fixed)?;
+
+    let block_size = parsed_crypto.fixed.block_size as usize;
+    let record_len = block_size
+        .checked_add(BLOCK_RECORD_FRAMING_LEN)
+        .ok_or(FormatError::InvalidArchive("BlockRecord length overflow"))?;
+    let mut offset = crypto_end;
+    let mut observed_block_count = 0u64;
+    let mut previous_index = None;
+    let mut metadata_seen = false;
+    let mut pending = PendingSequentialEnvelope::default();
+    let mut next_envelope_index = 0u64;
+    let mut tar_stream = Vec::new();
+
+    while bytes.get(offset..offset + 4) == Some(b"TZBK") {
+        let record =
+            BlockRecord::parse(slice(bytes, offset, record_len, "BlockRecord")?, block_size)?;
+        if record.block_index % volume_header.stripe_width as u64
+            != volume_header.volume_index as u64
+        {
+            return Err(FormatError::InvalidArchive(
+                "BlockRecord index does not belong to this volume",
+            ));
+        }
+        if let Some(previous) = previous_index {
+            if record.block_index != previous + volume_header.stripe_width as u64 {
+                return Err(FormatError::InvalidArchive(
+                    "BlockRecords are not strictly consecutive",
+                ));
+            }
+        }
+        previous_index = Some(record.block_index);
+        observed_block_count = observed_block_count
+            .checked_add(1)
+            .ok_or(FormatError::InvalidArchive("BlockRecord count overflow"))?;
+
+        match record.kind {
+            BlockKind::PayloadData => {
+                if metadata_seen {
+                    return Err(FormatError::InvalidArchive(
+                        "payload BlockRecord appears after metadata",
+                    ));
+                }
+                if pending.saw_last_data {
+                    finalize_sequential_envelope(
+                        &mut pending,
+                        &parsed_crypto.fixed,
+                        &subkeys,
+                        &volume_header,
+                        &mut next_envelope_index,
+                        &mut tar_stream,
+                    )?;
+                }
+                let is_last_data = record.is_last_data();
+                pending.data_shards.push(Some(record.payload));
+                if is_last_data {
+                    pending.saw_last_data = true;
+                }
+                if pending.data_shards.len() > parsed_crypto.fixed.fec_data_shards as usize {
+                    return Err(FormatError::InvalidArchive(
+                        "sequential payload envelope exceeds data-shard cap",
+                    ));
+                }
+            }
+            BlockKind::PayloadParity => {
+                if metadata_seen {
+                    return Err(FormatError::InvalidArchive(
+                        "payload parity BlockRecord appears after metadata",
+                    ));
+                }
+                if pending.data_shards.is_empty() || !pending.saw_last_data {
+                    return Err(FormatError::InvalidArchive(
+                        "payload parity appears before envelope data is complete",
+                    ));
+                }
+                pending.parity_shards.push(Some(record.payload));
+                if pending.parity_shards.len() > parsed_crypto.fixed.fec_parity_shards as usize {
+                    return Err(FormatError::InvalidArchive(
+                        "sequential payload envelope exceeds parity-shard cap",
+                    ));
+                }
+            }
+            _ => {
+                if !pending.is_empty() {
+                    finalize_sequential_envelope(
+                        &mut pending,
+                        &parsed_crypto.fixed,
+                        &subkeys,
+                        &volume_header,
+                        &mut next_envelope_index,
+                        &mut tar_stream,
+                    )?;
+                }
+                metadata_seen = true;
+            }
+        }
+
+        offset = checked_add(offset, record_len, "BlockRecord")?;
+    }
+
+    if !pending.is_empty() {
+        finalize_sequential_envelope(
+            &mut pending,
+            &parsed_crypto.fixed,
+            &subkeys,
+            &volume_header,
+            &mut next_envelope_index,
+            &mut tar_stream,
+        )?;
+    }
+
+    parse_terminal_material(
+        bytes,
+        offset,
+        observed_block_count,
+        &subkeys,
+        &volume_header,
+        parsed_crypto.fixed.block_size,
+    )?;
+    Ok(tar_stream)
+}
+
+fn validate_sequential_supported_volume(
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+) -> Result<(), FormatError> {
+    if volume_header.stripe_width != 1 || volume_header.volume_index != 0 {
+        return Err(FormatError::ReaderUnsupported(
+            "M9 sequential reader supports only single-volume archives",
+        ));
+    }
+    if crypto_header.stripe_width != volume_header.stripe_width {
+        return Err(FormatError::InvalidArchive(
+            "VolumeHeader and CryptoHeader stripe_width differ",
+        ));
+    }
+    if crypto_header.has_dictionary != 0 {
+        return Err(FormatError::ReaderUnsupported(
+            "dictionary bootstrap required for non-seekable sequential extraction",
+        ));
+    }
+    Ok(())
+}
+
+fn finalize_sequential_envelope(
+    pending: &mut PendingSequentialEnvelope,
+    crypto_header: &CryptoHeaderFixed,
+    subkeys: &Subkeys,
+    volume_header: &VolumeHeader,
+    next_envelope_index: &mut u64,
+    tar_stream: &mut Vec<u8>,
+) -> Result<(), FormatError> {
+    if !pending.saw_last_data {
+        return Err(FormatError::InvalidArchive(
+            "sequential payload envelope is missing last-data flag",
+        ));
+    }
+    if pending.data_shards.len() > crypto_header.fec_data_shards as usize {
+        return Err(FormatError::InvalidArchive(
+            "sequential payload envelope exceeds data-shard cap",
+        ));
+    }
+    if pending.parity_shards.len() > crypto_header.fec_parity_shards as usize {
+        return Err(FormatError::InvalidArchive(
+            "sequential payload envelope exceeds parity-shard cap",
+        ));
+    }
+
+    let repaired = repair_data_gf16(
+        &pending.data_shards,
+        &pending.parity_shards,
+        crypto_header.block_size as usize,
+    )?;
+    let mut encrypted = Vec::with_capacity(repaired.len() * crypto_header.block_size as usize);
+    for shard in repaired {
+        encrypted.extend_from_slice(&shard);
+    }
+    let plaintext = decrypt_padded_aead_object(
+        crypto_header.aead_algo,
+        &subkeys.enc_key,
+        &subkeys.nonce_seed,
+        b"envelope",
+        &volume_header.archive_uuid,
+        &volume_header.session_id,
+        *next_envelope_index,
+        &encrypted,
+    )?;
+    decode_concatenated_zstd_frames(&plaintext, tar_stream)?;
+    *next_envelope_index = next_envelope_index
+        .checked_add(1)
+        .ok_or(FormatError::InvalidArchive("envelope counter overflow"))?;
+    *pending = PendingSequentialEnvelope::default();
+    Ok(())
+}
+
+fn decode_concatenated_zstd_frames(
+    plaintext: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<(), FormatError> {
+    let mut cursor = 0usize;
+    while cursor < plaintext.len() {
+        let frame_len = zstd_safe::find_frame_compressed_size(&plaintext[cursor..])
+            .map_err(|_| FormatError::InvalidZstdFrame)?;
+        if frame_len == 0 {
+            return Err(FormatError::InvalidZstdFrame);
+        }
+        let end = checked_add(cursor, frame_len, "zstd frame")?;
+        let decoded = zstd::stream::decode_all(&plaintext[cursor..end])
+            .map_err(|_| FormatError::ZstdDecompressionFailure)?;
+        output.extend_from_slice(&decoded);
+        cursor = end;
+    }
+    Ok(())
 }
 
 fn load_metadata_object_from_parts(
@@ -1214,6 +1996,7 @@ fn to_usize(value: u64, structure: &'static str) -> Result<usize, FormatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::compute_hmac;
     use crate::format::{AeadAlgo, CompressionAlgo, FecAlgo, KdfAlgo};
     use crate::writer::{write_archive, write_empty_archive, RegularFile, WriterOptions};
 
@@ -1364,6 +2147,227 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_sidecar_opens_lists_verifies_and_extracts() {
+        let archive = write_archive(
+            &[RegularFile::new("dir/sidecar.txt", b"hello sidecar")],
+            &master_key(),
+            WriterOptions::default(),
+        )
+        .unwrap();
+        let opened = open_archive_with_bootstrap_sidecar(
+            &archive.bytes,
+            &archive.bootstrap_sidecar,
+            &master_key(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            opened.list_files().unwrap(),
+            vec![ArchiveEntry {
+                path: "dir/sidecar.txt".to_string(),
+                file_data_size: 13
+            }]
+        );
+        assert_eq!(
+            opened.extract_file("dir/sidecar.txt").unwrap(),
+            Some(b"hello sidecar".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn non_seekable_random_access_requires_sidecar() {
+        let archive = write_archive(
+            &[RegularFile::new("file.txt", b"payload")],
+            &master_key(),
+            WriterOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            open_non_seekable_archive(&archive.bytes, &master_key(), None).unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "non-seekable random access requires a bootstrap sidecar"
+            )
+        );
+        assert!(open_non_seekable_archive(
+            &archive.bytes,
+            &master_key(),
+            Some(&archive.bootstrap_sidecar)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn sequential_extracts_dictionary_free_tar_stream() {
+        let archive = write_archive(
+            &[RegularFile::new("seq.txt", b"streaming")],
+            &master_key(),
+            WriterOptions::default(),
+        )
+        .unwrap();
+
+        let tar_stream = sequential_extract_tar_stream(&archive.bytes, &master_key()).unwrap();
+        let member = parse_tar_member_group(&tar_stream, 4096).unwrap();
+        assert_eq!(member.path, b"seq.txt");
+        assert_eq!(member.data, b"streaming");
+    }
+
+    #[test]
+    fn sequential_rejects_when_terminal_authentication_fails() {
+        let archive = write_archive(
+            &[RegularFile::new("seq.txt", b"streaming")],
+            &master_key(),
+            WriterOptions::default(),
+        )
+        .unwrap();
+        let mut corrupted = archive.bytes;
+        let trailer_hmac_offset = corrupted.len() - VOLUME_TRAILER_LEN + TRAILER_HMAC_COVERED_LEN;
+        corrupted[trailer_hmac_offset] ^= 0x01;
+
+        assert_eq!(
+            sequential_extract_tar_stream(&corrupted, &master_key()).unwrap_err(),
+            FormatError::HmacMismatch {
+                structure: "VolumeTrailer"
+            }
+        );
+    }
+
+    #[test]
+    fn bootstrap_sidecar_rejects_bad_flags_and_trailing_bytes() {
+        let archive = write_archive(&[], &master_key(), WriterOptions::default()).unwrap();
+        let mut bad_flags = archive.bootstrap_sidecar.clone();
+        rewrite_sidecar_header(&mut bad_flags, &master_key(), |header| {
+            header.flags |= 0x08;
+        });
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &bad_flags, &master_key())
+                .unwrap_err(),
+            FormatError::UnknownBootstrapSidecarFlags(0x0b)
+        );
+
+        let mut trailing = archive.bootstrap_sidecar.clone();
+        trailing.push(0);
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &trailing, &master_key())
+                .unwrap_err(),
+            FormatError::NonCanonicalBootstrapSidecarLayout
+        );
+    }
+
+    #[test]
+    fn bootstrap_sidecar_rejects_bad_manifest_footer_semantics() {
+        let archive = write_archive(&[], &master_key(), WriterOptions::default()).unwrap();
+        let mut wrong_volume = archive.bootstrap_sidecar.clone();
+        mutate_sidecar_manifest(&mut wrong_volume, &master_key(), |footer| {
+            footer.volume_index = 1;
+        });
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &wrong_volume, &master_key())
+                .unwrap_err(),
+            FormatError::InvalidArchive("sidecar ManifestFooter volume_index must be zero")
+        );
+
+        let mut non_authoritative = archive.bootstrap_sidecar.clone();
+        mutate_sidecar_manifest(&mut non_authoritative, &master_key(), |footer| {
+            footer.is_authoritative = 0;
+        });
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &non_authoritative, &master_key())
+                .unwrap_err(),
+            FormatError::InvalidArchive("sidecar ManifestFooter is not authoritative")
+        );
+    }
+
+    #[test]
+    fn bootstrap_sidecar_rejects_dictionary_section_for_no_dictionary_archive() {
+        let archive = write_archive(&[], &master_key(), WriterOptions::default()).unwrap();
+        let mut with_dictionary = archive.bootstrap_sidecar.clone();
+        let header =
+            BootstrapSidecarHeader::parse(&with_dictionary[..BOOTSTRAP_SIDECAR_HEADER_LEN])
+                .unwrap();
+        let record_len = sidecar_record_len(&with_dictionary);
+        let first_record = header.index_root_records_offset as usize;
+        let copied_record = with_dictionary[first_record..first_record + record_len].to_vec();
+        let dictionary_offset = with_dictionary.len() as u64;
+        with_dictionary.extend_from_slice(&copied_record);
+        rewrite_sidecar_header(&mut with_dictionary, &master_key(), |header| {
+            header.flags |= 0x04;
+            header.dictionary_records_offset = dictionary_offset;
+            header.dictionary_records_length = record_len as u64;
+        });
+
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &with_dictionary, &master_key())
+                .unwrap_err(),
+            FormatError::InvalidArchive(
+                "bootstrap sidecar has dictionary records while has_dictionary is false"
+            )
+        );
+    }
+
+    #[test]
+    fn bootstrap_sidecar_rejects_missing_duplicate_wrong_kind_and_wrong_last_flag() {
+        let archive = write_archive(&[], &master_key(), WriterOptions::default()).unwrap();
+        let mut missing = archive.bootstrap_sidecar.clone();
+        let record_len = sidecar_record_len(&missing);
+        let new_len = missing.len() - record_len;
+        missing.truncate(new_len);
+        rewrite_sidecar_header(&mut missing, &master_key(), |header| {
+            header.index_root_records_length -= record_len as u64;
+        });
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &missing, &master_key())
+                .unwrap_err(),
+            FormatError::InvalidArchive(
+                "sidecar BlockRecord section does not match declared extent"
+            )
+        );
+
+        let mut duplicate = archive.bootstrap_sidecar.clone();
+        mutate_sidecar_index_record(&mut duplicate, 1, |record| {
+            record.block_index -= 1;
+        });
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &duplicate, &master_key())
+                .unwrap_err(),
+            FormatError::InvalidArchive(
+                "sidecar BlockRecord section has missing or duplicate blocks"
+            )
+        );
+
+        let mut misordered = archive.bootstrap_sidecar.clone();
+        swap_sidecar_index_records(&mut misordered, 0, 1);
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &misordered, &master_key())
+                .unwrap_err(),
+            FormatError::InvalidArchive(
+                "sidecar BlockRecord section has missing or duplicate blocks"
+            )
+        );
+
+        let mut wrong_kind = archive.bootstrap_sidecar.clone();
+        mutate_sidecar_index_record(&mut wrong_kind, 0, |record| {
+            record.kind = BlockKind::PayloadData;
+        });
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &wrong_kind, &master_key())
+                .unwrap_err(),
+            FormatError::InvalidArchive("sidecar BlockRecord section has wrong kind")
+        );
+
+        let mut wrong_last = archive.bootstrap_sidecar.clone();
+        mutate_sidecar_index_record(&mut wrong_last, 0, |record| {
+            record.flags = 0;
+        });
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &wrong_last, &master_key())
+                .unwrap_err(),
+            FormatError::InvalidArchive("sidecar BlockRecord section has wrong last-data flag")
+        );
+    }
+
+    #[test]
     fn verify_helper_rejects_envelope_frame_coverage_gap() {
         let frames = BTreeMap::from([(
             0,
@@ -1445,5 +2449,88 @@ mod tests {
             validate_object_extent(extent, &crypto_header, 1, 1).unwrap_err(),
             FormatError::InvalidArchive("encrypted object exceeds its class parity-shard maximum")
         );
+    }
+
+    fn rewrite_sidecar_header(
+        sidecar: &mut [u8],
+        master_key: &MasterKey,
+        mutate: impl FnOnce(&mut BootstrapSidecarHeader),
+    ) {
+        let mut header =
+            BootstrapSidecarHeader::parse(&sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
+        mutate(&mut header);
+        header.sidecar_hmac = [0u8; 32];
+        let mut header_bytes = header.to_bytes();
+        let subkeys =
+            Subkeys::derive(master_key, &header.archive_uuid, &header.session_id).unwrap();
+        header.sidecar_hmac = compute_hmac(
+            HmacDomain::BootstrapSidecar,
+            &subkeys.mac_key,
+            &header.archive_uuid,
+            &header.session_id,
+            &header_bytes[..SIDECAR_HMAC_COVERED_LEN],
+        );
+        header_bytes = header.to_bytes();
+        sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN].copy_from_slice(&header_bytes);
+    }
+
+    fn mutate_sidecar_manifest(
+        sidecar: &mut [u8],
+        master_key: &MasterKey,
+        mutate: impl FnOnce(&mut ManifestFooter),
+    ) {
+        let header =
+            BootstrapSidecarHeader::parse(&sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
+        let offset = header.manifest_footer_offset as usize;
+        let mut footer =
+            ManifestFooter::parse(&sidecar[offset..offset + MANIFEST_FOOTER_LEN]).unwrap();
+        mutate(&mut footer);
+        footer.manifest_hmac = [0u8; 32];
+        let mut footer_bytes = footer.to_bytes();
+        let subkeys =
+            Subkeys::derive(master_key, &footer.archive_uuid, &footer.session_id).unwrap();
+        footer.manifest_hmac = compute_hmac(
+            HmacDomain::ManifestFooter,
+            &subkeys.mac_key,
+            &footer.archive_uuid,
+            &footer.session_id,
+            &footer_bytes[..MANIFEST_HMAC_COVERED_LEN],
+        );
+        footer_bytes = footer.to_bytes();
+        sidecar[offset..offset + MANIFEST_FOOTER_LEN].copy_from_slice(&footer_bytes);
+    }
+
+    fn mutate_sidecar_index_record(
+        sidecar: &mut [u8],
+        record_index: usize,
+        mutate: impl FnOnce(&mut BlockRecord),
+    ) {
+        let header =
+            BootstrapSidecarHeader::parse(&sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
+        let record_len = sidecar_record_len(sidecar);
+        let offset = header.index_root_records_offset as usize + record_index * record_len;
+        let mut record = BlockRecord::parse(&sidecar[offset..offset + record_len], 4096).unwrap();
+        mutate(&mut record);
+        sidecar[offset..offset + record_len].copy_from_slice(&record.to_bytes());
+    }
+
+    fn swap_sidecar_index_records(sidecar: &mut [u8], left: usize, right: usize) {
+        let header =
+            BootstrapSidecarHeader::parse(&sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
+        let record_len = sidecar_record_len(sidecar);
+        let left_offset = header.index_root_records_offset as usize + left * record_len;
+        let right_offset = header.index_root_records_offset as usize + right * record_len;
+        for idx in 0..record_len {
+            sidecar.swap(left_offset + idx, right_offset + idx);
+        }
+    }
+
+    fn sidecar_record_len(sidecar: &[u8]) -> usize {
+        let header =
+            BootstrapSidecarHeader::parse(&sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
+        let manifest_end = header.index_root_records_offset as usize;
+        let record_bytes = sidecar.len() - manifest_end;
+        let record_count = header.index_root_records_length as usize / (4096 + 20);
+        record_bytes / record_count
     }
 }

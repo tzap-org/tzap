@@ -398,6 +398,8 @@ Acceptance:
 
 ## Milestone 9: Bootstrap Sidecar And Non-Seekable Sequential Read
 
+Status: complete.
+
 Purpose: implement the v0.36 bootstrap decision matrix.
 
 Deliverables:
@@ -418,6 +420,23 @@ Acceptance:
 - Sidecar mutation tests reject bad flags, gaps, padding, trailing bytes,
   wrong volume index, non-authoritative footer, missing blocks, duplicate
   blocks, wrong kinds, and wrong last-data flag.
+
+Completed implementation:
+
+- Added writer-side bootstrap sidecar emission for the current
+  single-volume, dictionary-free reference writer.
+- Added authenticated sidecar bootstrap opening with packed cursor,
+  sidecar HMAC, sidecar ManifestFooter HMAC/identity, and exact IndexRoot
+  BlockRecord validation.
+- Added a non-seekable random-access entry point that requires a bootstrap
+  sidecar.
+- Added dictionary-free sequential tar-stream extraction with payload
+  envelope authentication, concatenated zstd frame decoding, metadata block
+  skipping, and terminal ManifestFooter/VolumeTrailer authentication.
+- Wired CLI `--bootstrap` for list, verify, and single-file extract.
+- Added mutation coverage for sidecar flags, trailing bytes, sidecar footer
+  semantics, missing blocks, duplicate blocks, wrong kinds, and wrong
+  last-data flags.
 
 ## Milestone 10: Dictionary Support
 

@@ -8,8 +8,9 @@ use crate::crypto::{
 use crate::fec::encode_parity_gf16;
 use crate::format::{
     AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, FormatError, KdfAlgo,
-    CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_HEADER_FIXED_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION,
-    MANIFEST_FOOTER_LEN, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    BOOTSTRAP_SIDECAR_HEADER_LEN, CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_HEADER_FIXED_LEN,
+    CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, MANIFEST_FOOTER_LEN, VOLUME_FORMAT_REV,
+    VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, EnvelopeEntry, FileEntry, FrameEntry, IndexRoot,
@@ -17,7 +18,10 @@ use crate::metadata::{
     FRAME_ENTRY_LEN, INDEX_SHARD_HEADER_LEN,
 };
 use crate::padding::suffix_pad_for_aead;
-use crate::wire::{BlockRecord, CryptoHeaderFixed, ManifestFooter, VolumeHeader, VolumeTrailer};
+use crate::wire::{
+    BlockRecord, BootstrapSidecarHeader, CryptoHeaderFixed, ManifestFooter, VolumeHeader,
+    VolumeTrailer,
+};
 
 const TAR_BLOCK_LEN: usize = 512;
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
@@ -95,6 +99,7 @@ impl<'a> RegularFile<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrittenArchive {
     pub bytes: Vec<u8>,
+    pub bootstrap_sidecar: Vec<u8>,
     pub archive_uuid: [u8; 16],
     pub session_id: [u8; 16],
 }
@@ -282,10 +287,19 @@ pub fn write_archive(
     );
     bytes.extend_from_slice(&trailer);
 
+    let bootstrap_sidecar = build_bootstrap_sidecar(
+        &subkeys,
+        archive_uuid,
+        session_id,
+        &manifest_footer,
+        &index_root_extent.records,
+    )?;
+
     let _ = index_shard_extent;
 
     Ok(WrittenArchive {
         bytes,
+        bootstrap_sidecar,
         archive_uuid,
         session_id,
     })
@@ -749,6 +763,51 @@ fn build_volume_trailer(
     );
     bytes = trailer.to_bytes();
     bytes
+}
+
+fn build_bootstrap_sidecar(
+    subkeys: &Subkeys,
+    archive_uuid: [u8; 16],
+    session_id: [u8; 16],
+    manifest_footer: &[u8; MANIFEST_FOOTER_LEN],
+    index_root_records: &[BlockRecord],
+) -> Result<Vec<u8>, FormatError> {
+    let index_records_len = index_root_records.iter().try_fold(0usize, |sum, record| {
+        checked_usize_add(sum, record.to_bytes().len(), "bootstrap sidecar")
+    })?;
+    let manifest_offset = BOOTSTRAP_SIDECAR_HEADER_LEN as u64;
+    let index_root_offset = manifest_offset + MANIFEST_FOOTER_LEN as u64;
+    let mut header = BootstrapSidecarHeader {
+        archive_uuid,
+        session_id,
+        flags: 0x03,
+        manifest_footer_offset: manifest_offset,
+        manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
+        index_root_records_offset: index_root_offset,
+        index_root_records_length: index_records_len as u64,
+        dictionary_records_offset: 0,
+        dictionary_records_length: 0,
+        sidecar_hmac: [0u8; 32],
+        header_crc32c: 0,
+    };
+    let mut header_bytes = header.to_bytes();
+    header.sidecar_hmac = compute_hmac(
+        HmacDomain::BootstrapSidecar,
+        &subkeys.mac_key,
+        &archive_uuid,
+        &session_id,
+        &header_bytes[..92],
+    );
+    header_bytes = header.to_bytes();
+
+    let mut sidecar =
+        Vec::with_capacity(BOOTSTRAP_SIDECAR_HEADER_LEN + MANIFEST_FOOTER_LEN + index_records_len);
+    sidecar.extend_from_slice(&header_bytes);
+    sidecar.extend_from_slice(manifest_footer);
+    for record in index_root_records {
+        sidecar.extend_from_slice(&record.to_bytes());
+    }
+    Ok(sidecar)
 }
 
 fn build_ustar_regular_header(
