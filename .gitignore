@@ -4,4 +4,7 @@
 .claude/
 /plugin-specs
 fuzz/target/
-/docs
+/docs/*
+!/docs/tzap-cli-reference.md
+!/docs/tzap-cli-ux-production-readiness-plan.md
+!/docs/tzap-v36-implementation-plan.md

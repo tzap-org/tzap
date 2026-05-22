@@ -832,48 +832,29 @@ Acceptance criteria:
 
 ## Milestone 10: Cross-Platform CI And Release Builds
 
-Status: not started.
+Status: done.
 
 Purpose: prove the CLI behaves on Linux, macOS, and Windows.
 
-Current state:
+Implemented in this milestone:
 
-- CI workflow runs on Ubuntu only.
-- Release workflow builds Linux, macOS, and Windows artifacts on tag push.
+- CI now runs `fmt`, `check`, and full workspace tests on:
+  - `ubuntu-latest`
+  - `macos-latest`
+  - `windows-latest`
+- `cargo fmt --all -- --check` runs on Linux runner only.
+- Release workflow now builds each required target artifact:
+  - `tzap-vX.Y.Z-linux-x86_64.tar.gz`
+  - `tzap-vX.Y.Z-macos-x86_64.tar.gz`
+  - `tzap-vX.Y.Z-macos-aarch64.tar.gz`
+  - `tzap-vX.Y.Z-windows-x86_64.zip`
+- Release packaging now emits per-platform SHA-256 checksum files and merges them into a `SHA256SUMS` manifest.
+- Release packaging now runs post-build smoke tests (`tzap --version`, `tzap --help`) before upload.
 
-Tasks:
+Completed notes:
 
-1. Update `.github/workflows/ci.yml` to use an OS matrix:
-   - `ubuntu-latest`
-   - `macos-latest`
-   - `windows-latest`
-2. Run on each OS:
-   - `cargo fmt --all -- --check` on one OS only, or all if cheap
-   - `cargo check --workspace --all-targets --locked`
-   - `cargo test --workspace --locked`
-3. Gate platform-sensitive tests:
-   - symlink creation
-   - Unix modes
-   - Windows reserved device names
-   - line endings where relevant
-4. Update `.github/workflows/release.yml` artifact names:
-   - `tzap-vX.Y.Z-linux-x86_64.tar.gz`
-   - `tzap-vX.Y.Z-macos-aarch64.tar.gz`
-   - `tzap-vX.Y.Z-macos-x86_64.tar.gz`
-   - `tzap-vX.Y.Z-windows-x86_64.zip`
-5. Decide whether to add Linux ARM64. Recommended after CLI UX stabilizes.
-6. Add checksums:
-   - generate `SHA256SUMS`
-   - upload it with release assets
-7. Add a post-build smoke test in release workflow:
-   - run `tzap --version`
-   - run `tzap --help`
-
-Required tests:
-
-- CI green on Linux, macOS, and Windows.
-- Release workflow packages the expected binary name on each OS.
-- Artifact names include OS and architecture.
+- Existing OS-gated tests are preserved and now exercised in CI matrix runs.
+- Release artifacts are uploaded with matching checksum sidecar files.
 
 Acceptance criteria:
 
@@ -882,7 +863,7 @@ Acceptance criteria:
 
 ## Milestone 11: Documentation And README
 
-Status: not started.
+Status: done.
 
 Purpose: make the public docs match the polished CLI.
 

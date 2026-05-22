@@ -351,7 +351,11 @@ enum Command {
         #[arg(long = "volume", value_name = "FILE", help = "Additional volume path.")]
         volumes: Vec<String>,
 
-        #[arg(long = "long", conflicts_with = "json", help = "Use verbose listing output.")]
+        #[arg(
+            long = "long",
+            conflicts_with = "json",
+            help = "Use verbose listing output."
+        )]
         long: bool,
 
         #[arg(
@@ -364,7 +368,7 @@ enum Command {
     #[command(
         about = "Verify archive integrity",
         long_about = "Verify archive signatures and checksum integrity. No payload changes are made.",
-        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex backup.tzap backup.tzap.001\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile backup.tzap\n  tzap verify --quiet --keyfile backup.tzap\n\nFor multi-volume archives, the first positional argument is the primary archive.\nAdditional positionals are optional extra volumes.",
+        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex backup.tzap backup.tzap.001\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives, the first positional argument is the primary archive.\nAdditional positionals are optional extra volumes.",
         group(
             ArgGroup::new("open-key-source")
                 .required(true)
@@ -782,9 +786,8 @@ fn run(cli: Cli) -> Result<()> {
                     .collect::<Vec<_>>();
                 println!(
                     "{}",
-                    serde_json::to_string(&json!({ "files": files })).context(
-                        "failed to encode list output as JSON"
-                    )?
+                    serde_json::to_string(&json!({ "files": files }))
+                        .context("failed to encode list output as JSON")?
                 );
                 Ok(())
             } else {
@@ -819,13 +822,29 @@ fn run(cli: Cli) -> Result<()> {
                 .first()
                 .ok_or_else(|| anyhow!("at least one archive volume is required"))?;
             let archive_paths = archives.to_vec();
-            let volume_bytes = read_volume_inputs(first, &archives[1..])?;
-            let master_key = load_open_key(
+            let volume_bytes = match read_volume_inputs(first, &archives[1..]) {
+                Ok(volume_bytes) => volume_bytes,
+                Err(err) => {
+                    if json {
+                        emit_verify_json_error(&archive_paths, None, None, &err)?;
+                    }
+                    return Err(err);
+                }
+            };
+            let master_key = match load_open_key(
                 keyfile.as_deref(),
                 password_stdin,
                 password,
                 &volume_bytes[0],
-            )?;
+            ) {
+                Ok(master_key) => master_key,
+                Err(err) => {
+                    if json {
+                        emit_verify_json_error(&archive_paths, None, None, &err)?;
+                    }
+                    return Err(err);
+                }
+            };
             let opened =
                 match open_inputs_maybe_bootstrap(&volume_bytes, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {first}"))
@@ -833,22 +852,7 @@ fn run(cli: Cli) -> Result<()> {
                     Ok(opened) => opened,
                     Err(err) => {
                         if json {
-                            let diagnostic = classify_error(&err);
-                            let payload = json!({
-                                "ok": false,
-                                "archives": archive_paths,
-                                "error": {
-                                    "label": diagnostic.label,
-                                    "action": diagnostic.action,
-                                    "message": err.to_string(),
-                                },
-                            });
-                            let _ = println!(
-                                "{}",
-                                serde_json::to_string(&payload).context(
-                                    "failed to encode verify error output as JSON"
-                                )?
-                            );
+                            emit_verify_json_error(&archive_paths, None, None, &err)?;
                         }
                         return Err(err);
                     }
@@ -877,32 +881,19 @@ fn run(cli: Cli) -> Result<()> {
                         quiet,
                         &format!(
                             "{}: OK ({} volume(s), {} file(s))",
-                            first,
-                            volume_count,
-                            file_count
+                            first, volume_count, file_count
                         ),
                     )?;
                     Ok(())
                 }
                 Err(err) => {
                     if json {
-                        let diagnostic = classify_error(&err);
-                        let payload = json!({
-                            "ok": false,
-                            "archives": archive_paths,
-                            "volume_count": volume_count,
-                            "file_count": file_count,
-                            "error": {
-                                "label": diagnostic.label,
-                                "action": diagnostic.action,
-                                "message": err.to_string(),
-                            },
-                        });
-                        let _ = println!(
-                            "{}",
-                            serde_json::to_string(&payload)
-                                .context("failed to encode verify error output as JSON")?
-                        );
+                        emit_verify_json_error(
+                            &archive_paths,
+                            Some(volume_count as u64),
+                            Some(file_count),
+                            &err,
+                        )?;
                     }
                     Err(err)
                 }
@@ -922,10 +913,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let output = output.expect("--output required by clap");
             write_keyfile(&output, &key_hex, force).context("failed to write keyfile")?;
-            emit_success_summary(
-                quiet,
-                &format!("wrote keyfile to {}", output),
-            )?;
+            emit_success_summary(quiet, &format!("wrote keyfile to {}", output))?;
             Ok(())
         }
     }
@@ -944,6 +932,35 @@ fn emit_success_stdout(quiet: bool, message: &str) -> io::Result<()> {
         return Ok(());
     }
     println!("{message}");
+    Ok(())
+}
+
+fn emit_verify_json_error(
+    archives: &[String],
+    volume_count: Option<u64>,
+    file_count: Option<u64>,
+    err: &anyhow::Error,
+) -> Result<()> {
+    let diagnostic = classify_error(err);
+    let mut payload = json!({
+        "ok": false,
+        "archives": archives,
+        "error": {
+            "label": diagnostic.label,
+            "action": diagnostic.action,
+            "message": err.to_string(),
+        },
+    });
+    if let Some(volume_count) = volume_count {
+        payload["volume_count"] = json!(volume_count);
+    }
+    if let Some(file_count) = file_count {
+        payload["file_count"] = json!(file_count);
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&payload).context("failed to encode verify error output as JSON")?
+    );
     Ok(())
 }
 
@@ -1746,7 +1763,7 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
             action: "add the missing archive volume(s) or confirm volume-loss tolerance",
         },
         FormatError::InvalidArchive(message)
-            if message == "complete volume set has missing global blocks" =>
+            if *message == "complete volume set has missing global blocks" =>
         {
             Diagnostic {
                 label: "missing-volume",
@@ -1768,7 +1785,7 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
             exit_code: EXIT_CORRUPT_ARCHIVE,
             action: "inspect archive metadata and source file path",
         },
-        FormatError::BadCrc { structure } => Diagnostic {
+        FormatError::BadCrc { structure: _ } => Diagnostic {
             label: "corrupt-payload",
             exit_code: EXIT_CORRUPT_ARCHIVE,
             action: "verify payload integrity",

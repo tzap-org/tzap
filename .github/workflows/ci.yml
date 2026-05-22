@@ -12,7 +12,17 @@ permissions:
 jobs:
   rust:
     name: Rust
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            run_fmt: true
+          - os: macos-latest
+            run_fmt: false
+          - os: windows-latest
+            run_fmt: false
 
     steps:
       - name: Checkout
@@ -27,6 +37,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
+        if: ${{ matrix.run_fmt }}
         run: cargo fmt --all -- --check
 
       - name: Check workspace

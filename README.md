@@ -17,6 +17,7 @@ and recovery in one practical format.
 
 The implementation currently targets the v0.36 format specification:
 [specs/tzap-format-revisedv36.md](specs/tzap-format-revisedv36.md).
+See the full command guide in [docs/tzap-cli-reference.md](docs/tzap-cli-reference.md).
 
 ## Why tzap
 
@@ -68,45 +69,142 @@ From GitHub:
 cargo install --git https://github.com/frankmanzhu/tzap tzap
 ```
 
+## Install from GitHub release
+
+From published assets:
+
+```sh
+VERSION=vX.Y.Z
+case "$(uname -s)" in
+  Linux) OS=linux ;;
+  Darwin) OS=macos ;;
+  *)
+    echo "unsupported OS: $(uname -s)"
+    exit 1
+    ;;
+esac
+
+ARCH_RAW=$(uname -m)
+case "$ARCH_RAW" in
+  x86_64) ARCH=x86_64 ;;
+  arm64 | aarch64) ARCH=aarch64 ;;
+  *)
+    echo "unsupported architecture: ${ARCH_RAW}"
+    exit 1
+    ;;
+esac
+
+if [ "$OS" = linux ] && [ "$ARCH" = aarch64 ]; then
+  echo "no Linux aarch64 release artifact is published yet"
+  exit 1
+fi
+
+ASSET="tzap-${VERSION}-${OS}-${ARCH}.tar.gz"
+# On Windows, pick the ".zip" artifact name from the table below.
+curl -L -o tzap.tar.gz \
+  "https://github.com/frankmanzhu/tzap/releases/download/${VERSION}/${ASSET}"
+tar -xzf tzap.tar.gz
+chmod +x tzap
+./tzap --version
+```
+
+Supported target artifacts:
+
+| Platform | Artifact |
+| --- | --- |
+| Linux x86_64 | `tzap-vX.Y.Z-linux-x86_64.tar.gz` |
+| macOS x86_64 | `tzap-vX.Y.Z-macos-x86_64.tar.gz` |
+| macOS aarch64 | `tzap-vX.Y.Z-macos-aarch64.tar.gz` |
+| Windows x86_64 | `tzap-vX.Y.Z-windows-x86_64.zip` |
+
 tzap requires Rust 1.82 or newer.
 
-## Quick start
+## Quick start (passphrase mode)
 
-Create a raw 256-bit key:
-
-```sh
-openssl rand -hex 32 > tzap.key
-```
-
-Create an archive:
+Create and verify a backup archive from a passphrase:
 
 ```sh
-tzap create --keyfile tzap.key -o project.tzap ./project
+export TZAP_PASSPHRASE='correct horse battery staple'
+printf '%s\n' "$TZAP_PASSPHRASE" | \
+  tzap create --password-stdin \
+  -o backup.tzap \
+  ./project
 ```
 
-Verify it:
+Run a safety-aware inspection flow:
 
 ```sh
-tzap verify --keyfile tzap.key project.tzap
+printf '%s\n' "$TZAP_PASSPHRASE" | tzap list --password-stdin backup.tzap
+printf '%s\n' "$TZAP_PASSPHRASE" | tzap verify --password-stdin backup.tzap
 ```
 
-List files:
+Extract content:
 
 ```sh
-tzap list --keyfile tzap.key --long project.tzap
+printf '%s\n' "$TZAP_PASSPHRASE" | \
+  tzap extract --password-stdin --directory restored backup.tzap
 ```
 
-Extract everything:
+And extract a single file:
 
 ```sh
-tzap extract --keyfile tzap.key -C restored project.tzap
+printf '%s\n' "$TZAP_PASSPHRASE" | \
+  tzap extract --password-stdin --stdout backup.tzap project/readme.txt
 ```
 
-Extract one file to stdout:
+## Quick start (raw key)
 
 ```sh
-tzap extract --keyfile tzap.key --stdout project.tzap project/notes.txt
+tzap keygen --output project.key
+tzap create --keyfile project.key -o project.tzap ./project
+tzap verify --keyfile project.key project.tzap
+tzap list --keyfile project.key project.tzap
+tzap extract --keyfile project.key -C restored project.tzap
 ```
+
+## Multi-volume workflow (recoverable)
+
+```sh
+tzap create --keyfile project.key --volumes 3 --volume-loss-tolerance 1 -o project.tzap ./project
+tzap verify --keyfile project.key project.tzap.000 project.tzap.001 project.tzap.002
+tzap extract --keyfile project.key project.tzap.000 --volume project.tzap.002 --directory restored project
+```
+
+If one volume is missing and tolerance allows, verification and extraction still work:
+
+```sh
+tzap verify --keyfile project.key project.tzap.000 project.tzap.002
+tzap extract --keyfile project.key --volume project.tzap.002 project.tzap.000 --directory restored project
+```
+
+## Safety notes
+
+- `tzap` does not overwrite existing files by default. Use `--overwrite` when restore should replace files.
+- Archive members are safe-checked before write; unsafe paths such as `../evil.txt` are rejected.
+- Use `--password-stdin` for non-interactive workflows and `--password` for interactive prompt mode.
+- Format and wire behavior align with the published v0.36 specification at
+  [specs/tzap-format-revisedv36.md](specs/tzap-format-revisedv36.md).
+
+## Exit codes
+
+| Exit code | Label | Meaning |
+| --- | --- | --- |
+| 0 | success | Command completed successfully |
+| 1 | error | Unexpected runtime or internal error |
+| 2 | usage | Invalid args / command-line usage |
+| 3 | io-error | Filesystem I/O or permission problem |
+| 10 | wrong-key | Wrong passphrase or key for archive |
+| 11 | corrupt-archive | Archive integrity or payload problem |
+| 12 | unsupported-revision | Unsupported archive revision |
+| 13 | unsafe-path | Unsafe extraction path |
+| 14 | missing-bootstrap | Bootstrap sidecar required |
+| 16 | unsupported-feature | Unsupported archive feature or writer shape |
+
+## Known limitations
+
+- Some large writer shapes are rejected as unsupported (for example invalid block/chunk combinations).
+- Bootstrap sidecars are not supported with multi-volume open input sets.
+- Multi-volume recovery is limited by tolerance settings and FEC profile.
 
 ## Password mode
 

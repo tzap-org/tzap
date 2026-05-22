@@ -908,16 +908,16 @@ mod tests {
     fn safe_restore_requires_hardlink_target_to_be_existing_regular_file() {
         let tmp = tempdir().unwrap();
         fs::write(tmp.path().join("target.txt"), b"target").unwrap();
-            let member = OwnedTarMember {
-                path: b"linked.txt".to_vec(),
-                kind: TarEntryKind::Hardlink,
-                data: Vec::new(),
-                link_target: Some(b"target.txt".to_vec()),
-                mode: 0o644,
-                mtime: 0,
-                logical_size: 0,
-                diagnostics: Vec::new(),
-            };
+        let member = OwnedTarMember {
+            path: b"linked.txt".to_vec(),
+            kind: TarEntryKind::Hardlink,
+            data: Vec::new(),
+            link_target: Some(b"target.txt".to_vec()),
+            mode: 0o644,
+            mtime: 0,
+            logical_size: 0,
+            diagnostics: Vec::new(),
+        };
 
         restore_tar_member(tmp.path(), &member, SafeExtractionOptions::default()).unwrap();
         assert_eq!(fs::read(tmp.path().join("linked.txt")).unwrap(), b"target");

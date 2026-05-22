@@ -2,11 +2,11 @@ use std::fs;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use serde_json::Value;
 use tempfile::tempdir;
 use tzap_core::format::{
     BOOTSTRAP_SIDECAR_HEADER_LEN, MANIFEST_FOOTER_LEN, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
-use serde_json::Value;
 use tzap_core::wire::{BootstrapSidecarHeader, VolumeHeader};
 use tzap_core::{crypto::compute_hmac, HmacDomain, MasterKey, Subkeys};
 
@@ -439,6 +439,7 @@ fn cli_verify_json_success_reports_machine_readable_summary() {
         .args([
             "verify",
             "--keyfile",
+            keyfile.to_str().unwrap(),
             "--json",
             archive.to_str().unwrap(),
         ])
@@ -492,7 +493,9 @@ fn cli_verify_quiet_conflicts_with_json_mode() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("cannot be used with --json"));
+        .stderr(
+            predicate::str::contains("cannot be used with").and(predicate::str::contains("--json")),
+        );
 }
 
 #[test]
@@ -870,7 +873,9 @@ fn cli_extract_with_global_quiet_still_emits_errors_to_stderr() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("missing archive path: missing.txt"));
+        .stderr(predicate::str::contains(
+            "missing archive path: missing.txt",
+        ));
 }
 
 #[test]
@@ -1561,6 +1566,8 @@ fn cli_verify_missing_unrecoverable_volume_reports_missing_volume() {
             keyfile.to_str().unwrap(),
             "--volumes",
             "2",
+            "--bit-rot-buffer-pct",
+            "0",
             "-o",
             output_base.to_str().unwrap(),
             input.to_str().unwrap(),
@@ -2271,6 +2278,29 @@ fn cli_create_rejects_symlink_input() {
         ));
 }
 
+#[cfg(windows)]
+#[test]
+fn cli_create_rejects_windows_reserved_device_path_input() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let output = temp.path().join("reserved.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "CON",
+        ])
+        .assert()
+        .failure();
+}
+
 #[test]
 fn cli_create_rejects_volumes_zero() {
     let temp = tempdir().unwrap();
@@ -2911,7 +2941,12 @@ fn cli_list_one_file_archive_with_keyfile() {
 
     Command::cargo_bin("tzap")
         .unwrap()
-        .args(["list", "--keyfile", keyfile.to_str().unwrap(), archive.to_str().unwrap()])
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
         .assert()
         .success()
         .stdout(predicate::eq("secret.txt\n"));
@@ -2952,6 +2987,49 @@ fn cli_list_with_long_output_includes_kind_mode_mtime() {
         .assert()
         .success()
         .stdout(predicate::eq("6\tfile\t420\t0\tpayload.bin\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_list_with_long_output_preserves_unix_mode_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+    let input = temp.path().join("script.sh");
+    let archive = temp.path().join("script.tzap");
+    let keyfile = temp.path().join("key.hex");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"echo hello\n").unwrap();
+    let mut permissions = fs::metadata(&input).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&input, permissions).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--long",
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::eq("11\tfile\t448\t0\tscript.sh\n"));
 }
 
 #[test]
@@ -2998,7 +3076,7 @@ fn cli_list_outputs_stable_json() {
     let file = &files[0];
     assert_eq!(file.get("path").unwrap().as_str().unwrap(), "json.txt");
     assert_eq!(file.get("kind").unwrap().as_str().unwrap(), "file");
-    assert_eq!(file.get("size").unwrap().as_u64().unwrap(), 11);
+    assert_eq!(file.get("size").unwrap().as_u64().unwrap(), 12);
     assert_eq!(file.get("mode").unwrap().as_u64().unwrap(), 420);
     assert_eq!(file.get("mtime").unwrap().as_u64().unwrap(), 0);
 }
@@ -3028,7 +3106,12 @@ fn cli_list_supports_empty_archive() {
 
     Command::cargo_bin("tzap")
         .unwrap()
-        .args(["list", "--keyfile", keyfile.to_str().unwrap(), archive.to_str().unwrap()])
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
         .assert()
         .success()
         .stdout(predicate::eq(""));
@@ -3140,7 +3223,12 @@ fn cli_list_wrong_key_is_reported_with_stable_category() {
 
     Command::cargo_bin("tzap")
         .unwrap()
-        .args(["list", "--keyfile", bad_keyfile.to_str().unwrap(), archive.to_str().unwrap()])
+        .args([
+            "list",
+            "--keyfile",
+            bad_keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
         .assert()
         .code(10)
         .stderr(predicate::str::contains("wrong-key"));
@@ -3176,7 +3264,12 @@ fn cli_list_corrupt_archive_reports_corruption() {
 
     Command::cargo_bin("tzap")
         .unwrap()
-        .args(["list", "--keyfile", keyfile.to_str().unwrap(), archive.to_str().unwrap()])
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
         .assert()
         .code(11)
         .stderr(predicate::str::contains("corrupt-payload"));
@@ -3192,7 +3285,12 @@ fn cli_list_missing_archive_path_is_io_error() {
 
     Command::cargo_bin("tzap")
         .unwrap()
-        .args(["list", "--keyfile", keyfile.to_str().unwrap(), missing.to_str().unwrap()])
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            missing.to_str().unwrap(),
+        ])
         .assert()
         .code(3)
         .stderr(predicate::str::contains("failed to read archive"));
@@ -4370,4 +4468,46 @@ fn cli_extract_summary_reports_counts() {
         .assert()
         .success()
         .stderr(predicate::str::contains("extracted 2 file(s)"));
+}
+
+#[test]
+fn cli_extract_preserves_crlf_payload_bytes() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("payload.txt");
+    let archive = temp.path().join("payload.tzap");
+    let output = temp.path().join("out");
+    let expected = b"line1\r\nline2\r\n";
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, expected).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "payload.txt",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(output.join("payload.txt")).unwrap(), expected);
 }

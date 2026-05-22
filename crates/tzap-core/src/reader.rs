@@ -425,11 +425,12 @@ impl OpenedArchive {
                 }
             }
         }
-        Ok(final_entries
+        final_entries
             .into_iter()
             .map(|(path, winner)| {
                 let shard = &shards[winner.shard_index];
-                let member = self.decode_loaded_owned_tar_member(shard, winner.file_index, false)?;
+                let member =
+                    self.decode_loaded_owned_tar_member(shard, winner.file_index, false)?;
                 Ok(ArchiveEntry {
                     path,
                     file_data_size: winner.file_data_size,
@@ -439,7 +440,7 @@ impl OpenedArchive {
                     diagnostics: member.diagnostics,
                 })
             })
-            .collect())
+            .collect()
     }
 
     pub fn extract_file(&self, path: &str) -> Result<Option<Vec<u8>>, FormatError> {
