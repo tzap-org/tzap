@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::compression::compress_zstd_frame;
+use crate::compression::{compress_zstd_frame, compress_zstd_frame_with_dictionary};
 use crate::crypto::{
     aead_encrypt, build_aad, compute_hmac, derive_nonce, HmacDomain, MasterKey, Subkeys,
 };
@@ -135,6 +135,39 @@ pub fn write_archive(
     master_key: &MasterKey,
     options: WriterOptions,
 ) -> Result<WrittenArchive, FormatError> {
+    write_archive_inner(files, master_key, options, None)
+}
+
+pub fn write_archive_with_dictionary(
+    files: &[RegularFile<'_>],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    dictionary: &[u8],
+) -> Result<WrittenArchive, FormatError> {
+    if dictionary.is_empty() {
+        return Err(FormatError::WriterUnsupported(
+            "dictionary archives require a non-empty dictionary",
+        ));
+    }
+    if files.is_empty() {
+        return Err(FormatError::WriterUnsupported(
+            "dictionary archives require at least one file",
+        ));
+    }
+    if dictionary.len() > u32::MAX as usize {
+        return Err(FormatError::WriterUnsupported(
+            "dictionary decompressed size exceeds u32",
+        ));
+    }
+    write_archive_inner(files, master_key, options, Some(dictionary))
+}
+
+fn write_archive_inner(
+    files: &[RegularFile<'_>],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    dictionary: Option<&[u8]>,
+) -> Result<WrittenArchive, FormatError> {
     validate_options(options)?;
     validate_m6_file_scope(files.len())?;
 
@@ -145,7 +178,13 @@ pub fn write_archive(
         .session_id
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
     let subkeys = Subkeys::derive(master_key, &archive_uuid, &session_id)?;
-    let crypto_header = build_crypto_header(options, &subkeys, &archive_uuid, &session_id)?;
+    let crypto_header = build_crypto_header(
+        options,
+        dictionary.is_some(),
+        &subkeys,
+        &archive_uuid,
+        &session_id,
+    )?;
 
     let mut next_block_index = 0u64;
     let mut block_records = Vec::new();
@@ -157,7 +196,7 @@ pub fn write_archive(
         (None, Vec::new(), 0u64)
     } else {
         let (payload_plaintext, frames) =
-            build_payload_envelope(&tar_stream, &tar_members, options)?;
+            build_payload_envelope(&tar_stream, &tar_members, options, dictionary)?;
         let object = encrypt_object(
             &payload_plaintext,
             &subkeys.enc_key,
@@ -219,6 +258,29 @@ pub fn write_archive(
         (Some(object), vec![shard_entry], frames.len() as u64, 1u64)
     };
 
+    let dictionary_extent = if let Some(dictionary) = dictionary {
+        let compressed_dictionary = compress_zstd_frame(dictionary, options.zstd_level)?;
+        let object = encrypt_object(
+            &compressed_dictionary,
+            &subkeys.dictionary_key,
+            &subkeys.index_nonce_seed,
+            b"dict",
+            0,
+            BlockKind::DictionaryData,
+            BlockKind::DictionaryParity,
+            options.index_root_fec_data_shards,
+            options.index_root_fec_parity_shards,
+            &mut next_block_index,
+            options,
+            &archive_uuid,
+            &session_id,
+        )?;
+        block_records.extend(object.records.clone());
+        Some((object, dictionary.len() as u32))
+    } else {
+        None
+    };
+
     let index_root_plaintext = build_index_root_plaintext(
         &shard_entries,
         frame_count,
@@ -227,6 +289,9 @@ pub fn write_archive(
         payload_block_count,
         tar_total_size,
         content_sha256,
+        dictionary_extent
+            .as_ref()
+            .map(|(object, decompressed_size)| (object, *decompressed_size)),
     );
     let compressed_index_root = compress_zstd_frame(&index_root_plaintext, options.zstd_level)?;
     let index_root_extent = encrypt_object(
@@ -293,6 +358,9 @@ pub fn write_archive(
         session_id,
         &manifest_footer,
         &index_root_extent.records,
+        dictionary_extent
+            .as_ref()
+            .map(|(object, _)| object.records.as_slice()),
     )?;
 
     let _ = index_shard_extent;
@@ -355,6 +423,7 @@ fn validate_m6_file_scope(file_count: usize) -> Result<(), FormatError> {
 
 fn build_crypto_header(
     options: WriterOptions,
+    has_dictionary: bool,
     subkeys: &Subkeys,
     archive_uuid: &[u8; 16],
     session_id: &[u8; 16],
@@ -378,7 +447,7 @@ fn build_crypto_header(
         stripe_width: 1,
         volume_loss_tolerance: 0,
         bit_rot_buffer_pct: 0,
-        has_dictionary: 0,
+        has_dictionary: if has_dictionary { 1 } else { 0 },
         max_path_length: options.max_path_length,
         expected_volume_size: 0,
     };
@@ -432,6 +501,7 @@ fn build_payload_envelope(
     tar_stream: &[u8],
     members: &[TarMember],
     options: WriterOptions,
+    dictionary: Option<&[u8]>,
 ) -> Result<(Vec<u8>, Vec<PayloadFrame>), FormatError> {
     let mut plaintext = Vec::new();
     let mut frames = Vec::with_capacity(members.len());
@@ -443,7 +513,11 @@ fn build_payload_envelope(
             .ok_or(FormatError::WriterInvariant(
                 "tar member range is out of bounds",
             ))?;
-        let frame = compress_zstd_frame(member_bytes, options.zstd_level)?;
+        let frame = if let Some(dictionary) = dictionary {
+            compress_zstd_frame_with_dictionary(member_bytes, options.zstd_level, dictionary)?
+        } else {
+            compress_zstd_frame(member_bytes, options.zstd_level)?
+        };
         let offset = u32_len(plaintext.len(), "FrameEntry.offset_in_envelope")?;
         plaintext.extend_from_slice(&frame);
         frames.push(PayloadFrame {
@@ -590,6 +664,7 @@ fn build_index_root_plaintext(
     payload_block_count: u64,
     tar_total_size: u64,
     content_sha256: [u8; 32],
+    dictionary_extent: Option<(&EncryptedObject, u32)>,
 ) -> Vec<u8> {
     let mut header = IndexRootHeader::empty();
     header.frame_count = frame_count;
@@ -598,6 +673,13 @@ fn build_index_root_plaintext(
     header.payload_block_count = payload_block_count;
     header.tar_total_size = tar_total_size;
     header.content_sha256 = content_sha256;
+    if let Some((dictionary, decompressed_size)) = dictionary_extent {
+        header.dictionary_first_block = dictionary.first_block_index;
+        header.dictionary_data_block_count = dictionary.data_block_count;
+        header.dictionary_parity_block_count = dictionary.parity_block_count;
+        header.dictionary_encrypted_size = dictionary.encrypted_size;
+        header.dictionary_decompressed_size = decompressed_size;
+    }
     let root = IndexRoot {
         header,
         shards: shard_entries.to_vec(),
@@ -771,22 +853,38 @@ fn build_bootstrap_sidecar(
     session_id: [u8; 16],
     manifest_footer: &[u8; MANIFEST_FOOTER_LEN],
     index_root_records: &[BlockRecord],
+    dictionary_records: Option<&[BlockRecord]>,
 ) -> Result<Vec<u8>, FormatError> {
     let index_records_len = index_root_records.iter().try_fold(0usize, |sum, record| {
         checked_usize_add(sum, record.to_bytes().len(), "bootstrap sidecar")
     })?;
+    let dictionary_records_len = dictionary_records
+        .unwrap_or(&[])
+        .iter()
+        .try_fold(0usize, |sum, record| {
+            checked_usize_add(sum, record.to_bytes().len(), "bootstrap sidecar")
+        })?;
     let manifest_offset = BOOTSTRAP_SIDECAR_HEADER_LEN as u64;
     let index_root_offset = manifest_offset + MANIFEST_FOOTER_LEN as u64;
+    let dictionary_offset = if dictionary_records.is_some() {
+        index_root_offset + index_records_len as u64
+    } else {
+        0
+    };
     let mut header = BootstrapSidecarHeader {
         archive_uuid,
         session_id,
-        flags: 0x03,
+        flags: if dictionary_records.is_some() {
+            0x07
+        } else {
+            0x03
+        },
         manifest_footer_offset: manifest_offset,
         manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
         index_root_records_offset: index_root_offset,
         index_root_records_length: index_records_len as u64,
-        dictionary_records_offset: 0,
-        dictionary_records_length: 0,
+        dictionary_records_offset: dictionary_offset,
+        dictionary_records_length: dictionary_records_len as u64,
         sidecar_hmac: [0u8; 32],
         header_crc32c: 0,
     };
@@ -800,12 +898,21 @@ fn build_bootstrap_sidecar(
     );
     header_bytes = header.to_bytes();
 
-    let mut sidecar =
-        Vec::with_capacity(BOOTSTRAP_SIDECAR_HEADER_LEN + MANIFEST_FOOTER_LEN + index_records_len);
+    let mut sidecar = Vec::with_capacity(
+        BOOTSTRAP_SIDECAR_HEADER_LEN
+            + MANIFEST_FOOTER_LEN
+            + index_records_len
+            + dictionary_records_len,
+    );
     sidecar.extend_from_slice(&header_bytes);
     sidecar.extend_from_slice(manifest_footer);
     for record in index_root_records {
         sidecar.extend_from_slice(&record.to_bytes());
+    }
+    if let Some(dictionary_records) = dictionary_records {
+        for record in dictionary_records {
+            sidecar.extend_from_slice(&record.to_bytes());
+        }
     }
     Ok(sidecar)
 }

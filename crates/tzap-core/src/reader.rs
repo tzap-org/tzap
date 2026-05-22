@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Read;
 
 use sha2::{Digest, Sha256};
 
-use crate::compression::decompress_exact_zstd_frame;
+use crate::compression::{
+    decompress_exact_zstd_frame, decompress_exact_zstd_frame_with_dictionary,
+};
 use crate::crypto::{decrypt_padded_aead_object, verify_hmac, HmacDomain, MasterKey, Subkeys};
 use crate::fec::repair_data_gf16;
 use crate::format::{
@@ -68,6 +71,7 @@ pub struct OpenedArchive {
     pub manifest_footer: ManifestFooter,
     pub volume_trailer: VolumeTrailer,
     pub index_root: IndexRoot,
+    payload_dictionary: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -206,7 +210,18 @@ impl OpenedArchive {
             parsed_crypto.fixed.index_root_fec_parity_shards,
             manifest_footer.index_root_decompressed_size,
         )?;
-        let index_root = IndexRoot::parse(&index_root_plaintext, false, limits)?;
+        let index_root = IndexRoot::parse(
+            &index_root_plaintext,
+            parsed_crypto.fixed.has_dictionary != 0,
+            limits,
+        )?;
+        let payload_dictionary = load_archive_dictionary(
+            &blocks,
+            &subkeys,
+            &volume_header,
+            &parsed_crypto.fixed,
+            &index_root,
+        )?;
 
         Ok(Self {
             options,
@@ -217,6 +232,7 @@ impl OpenedArchive {
             manifest_footer,
             volume_trailer,
             index_root,
+            payload_dictionary,
         })
     }
 
@@ -269,15 +285,7 @@ impl OpenedArchive {
             parsed_crypto.fixed.block_size as usize,
             &volume_header,
         )?;
-        for record in sidecar.index_root_records {
-            if let Some(existing) = blocks.insert(record.block_index, record.clone()) {
-                if existing != record {
-                    return Err(FormatError::InvalidArchive(
-                        "bootstrap sidecar conflicts with volume BlockRecord",
-                    ));
-                }
-            }
-        }
+        insert_sidecar_records(&mut blocks, sidecar.index_root_records)?;
 
         let (terminal_manifest, volume_trailer) = parse_terminal_material(
             bytes,
@@ -315,7 +323,37 @@ impl OpenedArchive {
             parsed_crypto.fixed.index_root_fec_parity_shards,
             sidecar.manifest_footer.index_root_decompressed_size,
         )?;
-        let index_root = IndexRoot::parse(&index_root_plaintext, false, limits)?;
+        let index_root = IndexRoot::parse(
+            &index_root_plaintext,
+            parsed_crypto.fixed.has_dictionary != 0,
+            limits,
+        )?;
+        if parsed_crypto.fixed.has_dictionary != 0 {
+            let (offset, length) =
+                sidecar
+                    .dictionary_records_section
+                    .ok_or(FormatError::ReaderUnsupported(
+                        "dictionary bootstrap required",
+                    ))?;
+            let dictionary_records = parse_sidecar_block_records(
+                bootstrap_sidecar,
+                offset,
+                length,
+                parsed_crypto.fixed.block_size as usize,
+                dictionary_extent_from_index_root(&index_root)?,
+                BlockKind::DictionaryData,
+                BlockKind::DictionaryParity,
+                "dictionary",
+            )?;
+            insert_sidecar_records(&mut blocks, dictionary_records)?;
+        }
+        let payload_dictionary = load_archive_dictionary(
+            &blocks,
+            &subkeys,
+            &volume_header,
+            &parsed_crypto.fixed,
+            &index_root,
+        )?;
 
         Ok(Self {
             options,
@@ -326,6 +364,7 @@ impl OpenedArchive {
             manifest_footer: sidecar.manifest_footer,
             volume_trailer,
             index_root,
+            payload_dictionary,
         })
     }
 
@@ -528,8 +567,7 @@ impl OpenedArchive {
                 frame.compressed_size as usize,
                 "FrameEntry",
             )?;
-            let decoded =
-                decompress_exact_zstd_frame(compressed, frame.decompressed_size as usize)?;
+            let decoded = self.decompress_payload_frame(compressed, frame.decompressed_size)?;
             let start = to_usize(frame.tar_stream_offset, "tar stream")?;
             let end = checked_add(start, decoded.len(), "tar stream")?;
             if end > tar_stream.len() {
@@ -728,10 +766,9 @@ impl OpenedArchive {
                 frame.compressed_size as usize,
                 "FrameEntry",
             )?;
-            decoded.extend_from_slice(&decompress_exact_zstd_frame(
-                compressed,
-                frame.decompressed_size as usize,
-            )?);
+            decoded.extend_from_slice(
+                &self.decompress_payload_frame(compressed, frame.decompressed_size)?,
+            );
         }
 
         let offset = file.offset_in_first_frame_plaintext as usize;
@@ -755,6 +792,22 @@ impl OpenedArchive {
         metadata_limits(&self.crypto_header)
     }
 
+    fn decompress_payload_frame(
+        &self,
+        compressed: &[u8],
+        decompressed_size: u32,
+    ) -> Result<Vec<u8>, FormatError> {
+        if let Some(dictionary) = &self.payload_dictionary {
+            decompress_exact_zstd_frame_with_dictionary(
+                compressed,
+                decompressed_size as usize,
+                dictionary,
+            )
+        } else {
+            decompress_exact_zstd_frame(compressed, decompressed_size as usize)
+        }
+    }
+
     fn validate_encrypted_object_block_ranges(
         &self,
         envelopes: &BTreeMap<u64, EnvelopeEntry>,
@@ -772,6 +825,14 @@ impl OpenedArchive {
                 shard.data_block_count,
                 shard.parity_block_count,
                 "IndexShard",
+            )?);
+        }
+        if self.crypto_header.has_dictionary != 0 {
+            ranges.push(object_block_range(
+                self.index_root.header.dictionary_first_block,
+                self.index_root.header.dictionary_data_block_count,
+                self.index_root.header.dictionary_parity_block_count,
+                "dictionary",
             )?);
         }
         for envelope in envelopes.values() {
@@ -861,11 +922,6 @@ fn validate_m7_supported_volume(
             "VolumeHeader and CryptoHeader stripe_width differ",
         ));
     }
-    if crypto_header.has_dictionary != 0 {
-        return Err(FormatError::ReaderUnsupported(
-            "M7 reader does not support dictionary archives",
-        ));
-    }
     Ok(())
 }
 
@@ -883,11 +939,6 @@ fn validate_m9_supported_volume(
             "VolumeHeader and CryptoHeader stripe_width differ",
         ));
     }
-    if crypto_header.has_dictionary != 0 {
-        return Err(FormatError::ReaderUnsupported(
-            "M9 sidecar bootstrap does not support dictionary archives yet",
-        ));
-    }
     Ok(())
 }
 
@@ -895,6 +946,7 @@ fn validate_m9_supported_volume(
 struct TrustedBootstrapSidecar {
     manifest_footer: ManifestFooter,
     index_root_records: Vec<BlockRecord>,
+    dictionary_records_section: Option<(u64, u64)>,
 }
 
 fn parse_trusted_bootstrap_sidecar(
@@ -939,8 +991,9 @@ fn parse_trusted_bootstrap_sidecar(
                 "bootstrap sidecar has dictionary records while has_dictionary is false",
             ));
         }
+    } else if crypto_header.has_dictionary != 0 {
         return Err(FormatError::ReaderUnsupported(
-            "M9 sidecar bootstrap does not support dictionary records yet",
+            "dictionary bootstrap required",
         ));
     }
 
@@ -980,7 +1033,27 @@ fn parse_trusted_bootstrap_sidecar(
     Ok(TrustedBootstrapSidecar {
         manifest_footer,
         index_root_records,
+        dictionary_records_section: header.has_dictionary_records().then_some((
+            header.dictionary_records_offset,
+            header.dictionary_records_length,
+        )),
     })
+}
+
+fn insert_sidecar_records(
+    blocks: &mut BTreeMap<u64, BlockRecord>,
+    records: Vec<BlockRecord>,
+) -> Result<(), FormatError> {
+    for record in records {
+        if let Some(existing) = blocks.insert(record.block_index, record.clone()) {
+            if existing != record {
+                return Err(FormatError::InvalidArchive(
+                    "bootstrap sidecar conflicts with volume BlockRecord",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_sidecar_manifest_footer(
@@ -1586,7 +1659,7 @@ fn finalize_sequential_envelope(
         *next_envelope_index,
         &encrypted,
     )?;
-    decode_concatenated_zstd_frames(&plaintext, tar_stream)?;
+    decode_concatenated_zstd_frames(&plaintext, None, tar_stream)?;
     *next_envelope_index = next_envelope_index
         .checked_add(1)
         .ok_or(FormatError::InvalidArchive("envelope counter overflow"))?;
@@ -1596,6 +1669,7 @@ fn finalize_sequential_envelope(
 
 fn decode_concatenated_zstd_frames(
     plaintext: &[u8],
+    dictionary: Option<&[u8]>,
     output: &mut Vec<u8>,
 ) -> Result<(), FormatError> {
     let mut cursor = 0usize;
@@ -1606,12 +1680,67 @@ fn decode_concatenated_zstd_frames(
             return Err(FormatError::InvalidZstdFrame);
         }
         let end = checked_add(cursor, frame_len, "zstd frame")?;
-        let decoded = zstd::stream::decode_all(&plaintext[cursor..end])
-            .map_err(|_| FormatError::ZstdDecompressionFailure)?;
+        let decoded = if let Some(dictionary) = dictionary {
+            let mut decoder =
+                zstd::stream::Decoder::with_dictionary(&plaintext[cursor..end], dictionary)
+                    .map_err(|_| FormatError::ZstdDecompressionFailure)?;
+            let mut decoded = Vec::new();
+            decoder
+                .read_to_end(&mut decoded)
+                .map_err(|_| FormatError::ZstdDecompressionFailure)?;
+            decoded
+        } else {
+            zstd::stream::decode_all(&plaintext[cursor..end])
+                .map_err(|_| FormatError::ZstdDecompressionFailure)?
+        };
         output.extend_from_slice(&decoded);
         cursor = end;
     }
     Ok(())
+}
+
+fn load_archive_dictionary(
+    blocks: &BTreeMap<u64, BlockRecord>,
+    subkeys: &Subkeys,
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+    index_root: &IndexRoot,
+) -> Result<Option<Vec<u8>>, FormatError> {
+    if crypto_header.has_dictionary == 0 {
+        return Ok(None);
+    }
+    let plaintext = load_metadata_object_from_parts(
+        blocks,
+        subkeys,
+        volume_header,
+        crypto_header,
+        dictionary_extent_from_index_root(index_root)?,
+        BlockKind::DictionaryData,
+        BlockKind::DictionaryParity,
+        &subkeys.dictionary_key,
+        &subkeys.index_nonce_seed,
+        b"dict",
+        0,
+        crypto_header.index_root_fec_data_shards,
+        crypto_header.index_root_fec_parity_shards,
+        index_root.header.dictionary_decompressed_size,
+    )?;
+    Ok(Some(plaintext))
+}
+
+fn dictionary_extent_from_index_root(index_root: &IndexRoot) -> Result<ObjectExtent, FormatError> {
+    if index_root.header.dictionary_data_block_count == 0
+        || index_root.header.dictionary_encrypted_size == 0
+        || index_root.header.dictionary_decompressed_size == 0
+    {
+        return Err(FormatError::InvalidArchive("dictionary bootstrap required"));
+    }
+    Ok(ObjectExtent {
+        first_block_index: index_root.header.dictionary_first_block,
+        data_block_count: index_root.header.dictionary_data_block_count,
+        parity_block_count: index_root.header.dictionary_parity_block_count,
+        encrypted_size: index_root.header.dictionary_encrypted_size,
+    })
 }
 
 fn load_metadata_object_from_parts(
@@ -1998,10 +2127,17 @@ mod tests {
     use super::*;
     use crate::crypto::compute_hmac;
     use crate::format::{AeadAlgo, CompressionAlgo, FecAlgo, KdfAlgo};
-    use crate::writer::{write_archive, write_empty_archive, RegularFile, WriterOptions};
+    use crate::writer::{
+        write_archive, write_archive_with_dictionary, write_empty_archive, RegularFile,
+        WriterOptions,
+    };
 
     fn master_key() -> MasterKey {
         MasterKey::from_raw_key(&[0x42; 32]).unwrap()
+    }
+
+    fn dictionary() -> &'static [u8] {
+        b"dir/dict.txt common words common words common words dictionary payload"
     }
 
     #[test]
@@ -2173,6 +2309,152 @@ mod tests {
             Some(b"hello sidecar".to_vec())
         );
         opened.verify().unwrap();
+    }
+
+    #[test]
+    fn dictionary_archive_opens_lists_verifies_and_extracts_seekable() {
+        let archive = write_archive_with_dictionary(
+            &[RegularFile::new(
+                "dir/dict.txt",
+                b"common words common words dictionary payload",
+            )],
+            &master_key(),
+            WriterOptions::default(),
+            dictionary(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+
+        assert_eq!(opened.crypto_header.has_dictionary, 1);
+        assert!(opened.index_root.header.dictionary_data_block_count > 0);
+        assert_eq!(
+            opened.list_files().unwrap(),
+            vec![ArchiveEntry {
+                path: "dir/dict.txt".to_string(),
+                file_data_size: 44
+            }]
+        );
+        assert_eq!(
+            opened.extract_file("dir/dict.txt").unwrap(),
+            Some(b"common words common words dictionary payload".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn dictionary_object_tamper_fails_before_payload_decompression() {
+        let archive = write_archive_with_dictionary(
+            &[RegularFile::new(
+                "dir/dict.txt",
+                b"common words common words dictionary payload",
+            )],
+            &master_key(),
+            WriterOptions::default(),
+            dictionary(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let volume_header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_end = VOLUME_HEADER_LEN + volume_header.crypto_header_length as usize;
+        let record_len = opened.crypto_header.block_size as usize + BLOCK_RECORD_FRAMING_LEN;
+        let dictionary_offset =
+            crypto_end + opened.index_root.header.dictionary_first_block as usize * record_len;
+
+        let mut tampered = archive.bytes.clone();
+        tampered[dictionary_offset + 16] ^= 0x01;
+        let crc_offset = dictionary_offset + 16 + opened.crypto_header.block_size as usize;
+        let crc = crc32c::crc32c(&tampered[dictionary_offset..crc_offset]);
+        tampered[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
+
+        assert_eq!(
+            open_archive(&tampered, &master_key()).unwrap_err(),
+            FormatError::AeadFailure
+        );
+    }
+
+    #[test]
+    fn dictionary_archive_bootstraps_from_sidecar_for_non_seekable_open() {
+        let archive = write_archive_with_dictionary(
+            &[RegularFile::new(
+                "dict-sidecar.txt",
+                b"common words common words sidecar payload",
+            )],
+            &master_key(),
+            WriterOptions::default(),
+            dictionary(),
+        )
+        .unwrap();
+        let opened = open_non_seekable_archive(
+            &archive.bytes,
+            &master_key(),
+            Some(&archive.bootstrap_sidecar),
+        )
+        .unwrap();
+
+        assert_eq!(
+            opened.extract_file("dict-sidecar.txt").unwrap(),
+            Some(b"common words common words sidecar payload".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn dictionary_sidecar_requires_dictionary_record_section() {
+        let archive = write_archive_with_dictionary(
+            &[RegularFile::new("dict-missing.txt", b"common words")],
+            &master_key(),
+            WriterOptions::default(),
+            dictionary(),
+        )
+        .unwrap();
+        let header = BootstrapSidecarHeader::parse(
+            &archive.bootstrap_sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN],
+        )
+        .unwrap();
+        let mut missing_dictionary =
+            archive.bootstrap_sidecar[..header.dictionary_records_offset as usize].to_vec();
+        rewrite_sidecar_header(&mut missing_dictionary, &master_key(), |header| {
+            header.flags &= !0x04;
+            header.dictionary_records_offset = 0;
+            header.dictionary_records_length = 0;
+        });
+
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &missing_dictionary, &master_key())
+                .unwrap_err(),
+            FormatError::ReaderUnsupported("dictionary bootstrap required")
+        );
+    }
+
+    #[test]
+    fn dictionary_sidecar_records_are_validated_against_dictionary_extent() {
+        let archive = write_archive_with_dictionary(
+            &[RegularFile::new("dict-sidecar-kind.txt", b"common words")],
+            &master_key(),
+            WriterOptions::default(),
+            dictionary(),
+        )
+        .unwrap();
+
+        let mut wrong_kind = archive.bootstrap_sidecar.clone();
+        mutate_sidecar_dictionary_record(&mut wrong_kind, 0, |record| {
+            record.kind = BlockKind::IndexRootData;
+        });
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &wrong_kind, &master_key())
+                .unwrap_err(),
+            FormatError::InvalidArchive("sidecar BlockRecord section has wrong kind")
+        );
+
+        let mut wrong_last = archive.bootstrap_sidecar.clone();
+        mutate_sidecar_dictionary_record(&mut wrong_last, 0, |record| {
+            record.flags = 0;
+        });
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &wrong_last, &master_key())
+                .unwrap_err(),
+            FormatError::InvalidArchive("sidecar BlockRecord section has wrong last-data flag")
+        );
     }
 
     #[test]
@@ -2514,6 +2796,20 @@ mod tests {
         sidecar[offset..offset + record_len].copy_from_slice(&record.to_bytes());
     }
 
+    fn mutate_sidecar_dictionary_record(
+        sidecar: &mut [u8],
+        record_index: usize,
+        mutate: impl FnOnce(&mut BlockRecord),
+    ) {
+        let header =
+            BootstrapSidecarHeader::parse(&sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
+        let record_len = sidecar_record_len(sidecar);
+        let offset = header.dictionary_records_offset as usize + record_index * record_len;
+        let mut record = BlockRecord::parse(&sidecar[offset..offset + record_len], 4096).unwrap();
+        mutate(&mut record);
+        sidecar[offset..offset + record_len].copy_from_slice(&record.to_bytes());
+    }
+
     fn swap_sidecar_index_records(sidecar: &mut [u8], left: usize, right: usize) {
         let header =
             BootstrapSidecarHeader::parse(&sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
@@ -2528,9 +2824,8 @@ mod tests {
     fn sidecar_record_len(sidecar: &[u8]) -> usize {
         let header =
             BootstrapSidecarHeader::parse(&sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
-        let manifest_end = header.index_root_records_offset as usize;
-        let record_bytes = sidecar.len() - manifest_end;
-        let record_count = header.index_root_records_length as usize / (4096 + 20);
-        record_bytes / record_count
+        let index_record_count =
+            header.index_root_records_length as usize / (4096 + BLOCK_RECORD_FRAMING_LEN);
+        header.index_root_records_length as usize / index_record_count
     }
 }

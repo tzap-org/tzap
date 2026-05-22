@@ -6,12 +6,42 @@ pub fn compress_zstd_frame(plaintext: &[u8], level: i32) -> Result<Vec<u8>, Form
     zstd::bulk::compress(plaintext, level).map_err(|_| FormatError::ZstdCompressionFailure)
 }
 
+pub fn compress_zstd_frame_with_dictionary(
+    plaintext: &[u8],
+    level: i32,
+    dictionary: &[u8],
+) -> Result<Vec<u8>, FormatError> {
+    zstd::bulk::Compressor::with_dictionary(level, dictionary)
+        .and_then(|mut compressor| compressor.compress(plaintext))
+        .map_err(|_| FormatError::ZstdCompressionFailure)
+}
+
 pub fn decompress_exact_zstd_frame(
     compressed: &[u8],
     expected_decompressed_size: usize,
 ) -> Result<Vec<u8>, FormatError> {
     validate_exact_zstd_frame(compressed)?;
     let decompressed = zstd::bulk::decompress(compressed, expected_decompressed_size)
+        .map_err(|_| FormatError::ZstdDecompressionFailure)?;
+    if decompressed.len() != expected_decompressed_size {
+        return Err(FormatError::ZstdDecompressedSizeMismatch {
+            expected: expected_decompressed_size,
+            actual: decompressed.len(),
+        });
+    }
+    Ok(decompressed)
+}
+
+pub fn decompress_exact_zstd_frame_with_dictionary(
+    compressed: &[u8],
+    expected_decompressed_size: usize,
+    dictionary: &[u8],
+) -> Result<Vec<u8>, FormatError> {
+    validate_exact_zstd_frame(compressed)?;
+    let decompressed = zstd::bulk::Decompressor::with_dictionary(dictionary)
+        .and_then(|mut decompressor| {
+            decompressor.decompress(compressed, expected_decompressed_size)
+        })
         .map_err(|_| FormatError::ZstdDecompressionFailure)?;
     if decompressed.len() != expected_decompressed_size {
         return Err(FormatError::ZstdDecompressedSizeMismatch {
@@ -84,5 +114,16 @@ mod tests {
                 actual: 7
             }
         );
+    }
+
+    #[test]
+    fn compresses_and_decompresses_exact_dictionary_frame() {
+        let dictionary = b"common prefix common prefix common prefix";
+        let plaintext = b"common prefix payload";
+        let compressed = compress_zstd_frame_with_dictionary(plaintext, 3, dictionary).unwrap();
+        let decompressed =
+            decompress_exact_zstd_frame_with_dictionary(&compressed, plaintext.len(), dictionary)
+                .unwrap();
+        assert_eq!(decompressed, plaintext);
     }
 }

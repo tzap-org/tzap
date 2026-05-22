@@ -2044,6 +2044,44 @@ mod tests {
     }
 
     #[test]
+    fn index_root_rejects_has_dictionary_with_zero_dictionary_fields() {
+        let root = IndexRoot {
+            header: IndexRootHeader::empty(),
+            shards: Vec::new(),
+            directory_hint_shards: Vec::new(),
+        };
+
+        assert_eq!(
+            IndexRoot::parse(&root.to_bytes(), true, MetadataLimits::default()).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexRoot",
+                reason: "dictionary data block count is zero while has_dictionary is true",
+            }
+        );
+    }
+
+    #[test]
+    fn index_root_rejects_dictionary_fields_when_crypto_header_has_no_dictionary() {
+        let mut root = IndexRoot {
+            header: IndexRootHeader::empty(),
+            shards: Vec::new(),
+            directory_hint_shards: Vec::new(),
+        };
+        root.header.dictionary_first_block = 1;
+        root.header.dictionary_data_block_count = 1;
+        root.header.dictionary_encrypted_size = 4096;
+        root.header.dictionary_decompressed_size = 16;
+
+        assert_eq!(
+            IndexRoot::parse(&root.to_bytes(), false, MetadataLimits::default()).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexRoot",
+                reason: "dictionary fields are non-zero while has_dictionary is false",
+            }
+        );
+    }
+
+    #[test]
     fn rejects_directory_hint_rows_sorted_by_old_v36_key_only() {
         let h = [0x10; 8];
         let z = [0x20; 8];

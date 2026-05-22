@@ -23,4 +23,6 @@ pub use reader::{
     sequential_extract_tar_stream, ArchiveEntry, OpenedArchive, ReaderOptions,
 };
 pub use tar_model::{MetadataDiagnostic, SafeExtractionOptions, TarEntryKind};
-pub use writer::{RegularFile, WriterOptions};
+pub use writer::{
+    write_archive, write_archive_with_dictionary, write_empty_archive, RegularFile, WriterOptions,
+};

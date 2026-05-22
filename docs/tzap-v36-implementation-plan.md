@@ -440,6 +440,8 @@ Completed implementation:
 
 ## Milestone 10: Dictionary Support
 
+Status: complete.
+
 Purpose: implement zstd dictionary archives exactly as v0.36 defines them.
 
 Deliverables:
@@ -458,6 +460,20 @@ Acceptance:
 - Rejects `has_dictionary = 1` with missing/zero dictionary fields.
 - Non-seekable dictionary archive rejects without required sidecar or buffers
   until dictionary bootstrap is complete.
+
+Completed implementation:
+
+- Added dictionary zstd frame helpers while keeping metadata compression
+  dictionary-free.
+- Added writer-side dictionary object emission using `dictionary_key`,
+  `index_nonce_seed`, domain `dict`, and dictionary BlockRecord kinds 6/7.
+- Added `IndexRoot` dictionary extent population and `CryptoHeader`
+  `has_dictionary = 1` emission.
+- Added bootstrap sidecar dictionary BlockRecord copies and reader-side
+  validation against the authenticated IndexRoot dictionary extent.
+- Added seekable and sidecar reader dictionary loading before any payload
+  frame decompression.
+- Added dictionary archive list/extract/verify regression coverage.
 
 ## Milestone 11: Multi-Volume Striping And Recovery
 
