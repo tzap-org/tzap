@@ -5,9 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use rand::RngCore;
-use tzap_core::format::{FormatError, CRYPTO_HEADER_FIXED_LEN, VOLUME_HEADER_LEN};
+use tzap_core::format::{
+    FormatError, CRYPTO_HEADER_FIXED_LEN, READER_MAX_ARGON2ID_M_COST_KIB,
+    READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST, VOLUME_HEADER_LEN,
+};
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
 use tzap_core::{
     open_archive, open_archive_volumes, open_archive_with_bootstrap_sidecar, write_archive,
@@ -33,7 +36,10 @@ const DEFAULT_ARGON2_SALT_LEN: usize = 16;
 #[derive(Debug, Parser)]
 #[command(name = "tzap")]
 #[command(version)]
-#[command(about = "tzap archive tool")]
+#[command(about = "Create, list, verify, and extract v36 archives")]
+#[command(
+    long_about = "Create, list, verify, and extract v36 archives.\n\nUsage is centered on an explicit key source per command: either `--keyfile` for raw-key archives, `--password` for interactive prompt, or `--password-stdin` for scripted passphrase input.\n\nSize suffixes accepted by size flags:\n  0-9 (bytes), K/KB/KiB, M/MB/MiB, G/GB/GiB.\n\nMulti-volume output naming for this CLI:\n  - one volume: --output writes exactly that path\n  - multiple volumes: --output writes --output.000, --output.001, ...\n\nExit codes:\n  2  usage / argument error\n  3  I/O failure (missing file, permission denied, etc.)\n  10 wrong key\n  11 archive corruption or integrity mismatch\n  12 unsupported archive revision / format version\n  13 unsafe extraction attempt\n  14 missing required bootstrap metadata\n  16 unsupported feature in this CLI/core version\n  1  generic failure\n\nSubcommands:\n  create   Build a new archive\n  extract  Extract files from an archive\n  list     List archive contents\n  verify   Validate archive integrity\n  keygen   Generate a random raw keyfile"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -41,131 +47,354 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(
+        about = "Create a new archive",
+        long_about = "Create a new archive from files and directories.\n\nThe command writes one output path for single-volume archives, or a base path plus `.000`, `.001`, ... suffixes for multi-volume archives.",
+        after_help = "Examples:\n  tzap create --keyfile key.hex -o backup.tzap file.txt\n  tzap create --password -o backup.tzap file.txt\n  tzap create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8192 -o backup.tzap file.txt\n  tzap create --keyfile key.hex -o backup.tzap --volumes 3 dir/\n  tzap create --keyfile key.hex --volume-size 64M --volume-loss-tolerance 1 -o backup.tzap dir/\n  tzap create --keyfile key.hex --bootstrap-out backup.tzap.bootstrap file.txt",
+        group(
+            ArgGroup::new("create-key-source")
+                .required(true)
+                .args(["password_stdin", "password", "keyfile"])
+        )
+    )]
     Create {
-        #[arg(short = 'o', long = "output")]
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "ARCHIVE",
+            help = "Write output to ARCHIVE (single volume) or base path for multi-volume output."
+        )]
         output: String,
 
-        #[arg(long = "volumes", conflicts_with = "volume_size")]
+        #[arg(
+            long = "volumes",
+            value_name = "COUNT",
+            conflicts_with = "volume_size",
+            help = "Create exactly COUNT output volumes."
+        )]
         volumes: Option<u32>,
 
-        #[arg(long = "volume-size", conflicts_with = "volumes")]
+        #[arg(
+            long = "volume-size",
+            value_name = "SIZE",
+            conflicts_with = "volumes",
+            help = "Create as many fixed-size output volumes as needed."
+        )]
         volume_size: Option<String>,
 
-        #[arg(long = "volume-loss-tolerance", default_value_t = 0)]
+        #[arg(
+            long = "volume-loss-tolerance",
+            value_name = "COUNT",
+            help = "Allowed missing-volume recovery tolerance for multi-volume archives.",
+            default_value_t = 0
+        )]
         volume_loss_tolerance: u8,
 
-        #[arg(long = "bit-rot-buffer-pct", default_value_t = 5)]
+        #[arg(
+            long = "bit-rot-buffer-pct",
+            value_name = "PERCENT",
+            default_value_t = 5,
+            help = "Percent of archive reserved for bit-rot recovery structures."
+        )]
         bit_rot_buffer_pct: u8,
 
         #[arg(
             long = "password-stdin",
             conflicts_with = "keyfile",
-            help = "Read passphrase from stdin; one trailing LF or CRLF is stripped before NFC normalization"
+            conflicts_with = "password",
+            value_name = "STDIN",
+            help = "Read passphrase from stdin; one trailing LF or CRLF is stripped."
         )]
         password_stdin: bool,
 
-        #[arg(long = "keyfile")]
+        #[arg(
+            long = "password",
+            conflicts_with = "keyfile",
+            conflicts_with = "password_stdin",
+            help = "Read passphrase from an interactive prompt."
+        )]
+        password: bool,
+
+        #[arg(
+            long = "keyfile",
+            value_name = "KEYFILE",
+            help = "Use a raw key from KEYFILE."
+        )]
         keyfile: Option<String>,
 
-        #[arg(long = "argon2-t-cost", default_value_t = DEFAULT_ARGON2_T_COST)]
+        #[arg(
+            long = "argon2-t-cost",
+            value_name = "COUNT",
+            default_value_t = DEFAULT_ARGON2_T_COST,
+            help = "Argon2 iterations when deriving from passphrase."
+        )]
         argon2_t_cost: u32,
 
-        #[arg(long = "argon2-m-cost-kib", default_value_t = DEFAULT_ARGON2_M_COST_KIB)]
+        #[arg(
+            long = "argon2-m-cost-kib",
+            value_name = "KIB",
+            default_value_t = DEFAULT_ARGON2_M_COST_KIB,
+            help = "Argon2 memory cost (KiB) when deriving from passphrase."
+        )]
         argon2_m_cost_kib: u32,
 
-        #[arg(long = "argon2-parallelism", default_value_t = DEFAULT_ARGON2_PARALLELISM)]
+        #[arg(
+            long = "argon2-parallelism",
+            value_name = "COUNT",
+            default_value_t = DEFAULT_ARGON2_PARALLELISM,
+            help = "Argon2 parallelism when deriving from passphrase."
+        )]
         argon2_parallelism: u32,
 
-        #[arg(long = "dictionary")]
+        #[arg(
+            long = "dictionary",
+            value_name = "FILE",
+            help = "Read compression dictionary from FILE."
+        )]
         dictionary: Option<String>,
 
-        #[arg(long = "bootstrap-out")]
+        #[arg(
+            long = "bootstrap-out",
+            value_name = "FILE",
+            help = "Write bootstrap recovery sidecar to FILE."
+        )]
         bootstrap_out: Option<String>,
 
-        #[arg(long = "compression-level", default_value_t = 3)]
+        #[arg(
+            long = "compression-level",
+            value_name = "LEVEL",
+            default_value_t = 3,
+            help = "zstd compression level."
+        )]
         compression_level: i32,
 
-        #[arg(long = "chunk-size", default_value = "256K")]
+        #[arg(
+            long = "chunk-size",
+            value_name = "SIZE",
+            default_value = "256K",
+            help = "Compression chunk size."
+        )]
         chunk_size: String,
 
-        #[arg(long = "envelope-size", default_value = "1M")]
+        #[arg(
+            long = "envelope-size",
+            value_name = "SIZE",
+            default_value = "1M",
+            help = "Archive envelope size."
+        )]
         envelope_size: String,
 
-        #[arg(long = "block-size", default_value = "64K")]
+        #[arg(
+            long = "block-size",
+            value_name = "SIZE",
+            default_value = "64K",
+            help = "Block size for archive payload layout."
+        )]
         block_size: String,
 
-        #[arg(required = true)]
+        #[arg(
+            required = true,
+            value_name = "PATH",
+            help = "One or more input files or directories."
+        )]
         paths: Vec<String>,
     },
+    #[command(
+        about = "Extract files from an archive",
+        long_about = "Extract one or many archive members into a directory, with safe-path protections enabled by default.",
+        after_help = "Examples:\n  tzap extract --keyfile key.hex -C out/ backup.tzap\n  tzap extract --keyfile key.hex backup.tzap file.txt\n  tzap extract --keyfile key.hex --stdout backup.tzap hello.txt > out.bin\n  tzap extract --password-stdin --overwrite backup.tzap target/\n  tzap extract --bootstrap backup.tzap.bootstrap -C out backup.tzap",
+        group(
+            ArgGroup::new("open-key-source")
+                .required(true)
+                .args(["password_stdin", "password", "keyfile"])
+        )
+    )]
     Extract {
+        #[arg(
+            value_name = "ARCHIVE",
+            help = "Primary archive input. Use additional --volume for extra volumes."
+        )]
         archive: String,
 
-        #[arg(value_name = "PATH")]
+        #[arg(
+            value_name = "PATH",
+            help = "Optional archive member paths to extract."
+        )]
         paths: Vec<String>,
 
-        #[arg(short = 'C', long = "directory", default_value = ".")]
+        #[arg(
+            short = 'C',
+            long = "directory",
+            value_name = "DIR",
+            default_value = ".",
+            help = "Destination directory for extracted files."
+        )]
         directory: String,
 
-        #[arg(long = "stdout")]
+        #[arg(long = "stdout", help = "Write a single selected member to stdout.")]
         stdout: bool,
 
-        #[arg(long = "overwrite")]
+        #[arg(long = "overwrite", help = "Allow overwriting existing output files.")]
         overwrite: bool,
 
         #[arg(
             long = "password-stdin",
             conflicts_with = "keyfile",
-            help = "Read passphrase from stdin; one trailing LF or CRLF is stripped before NFC normalization"
+            conflicts_with = "password",
+            value_name = "STDIN",
+            help = "Read passphrase from stdin; one trailing LF or CRLF is stripped."
         )]
         password_stdin: bool,
 
-        #[arg(long = "keyfile")]
+        #[arg(
+            long = "password",
+            conflicts_with = "keyfile",
+            conflicts_with = "password_stdin",
+            help = "Read passphrase from an interactive prompt."
+        )]
+        password: bool,
+
+        #[arg(
+            long = "keyfile",
+            value_name = "KEYFILE",
+            help = "Use a raw key from KEYFILE."
+        )]
         keyfile: Option<String>,
 
-        #[arg(long = "bootstrap")]
+        #[arg(
+            long = "bootstrap",
+            value_name = "FILE",
+            help = "Use bootstrap sidecar FILE."
+        )]
         bootstrap: Option<String>,
 
-        #[arg(long = "volume")]
+        #[arg(long = "volume", value_name = "FILE", help = "Additional volume path.")]
         volumes: Vec<String>,
     },
+    #[command(
+        about = "List archive contents",
+        long_about = "List archive members in plain format by default.",
+        after_help = "Examples:\n  tzap list --keyfile key.hex backup.tzap\n  tzap list --keyfile key.hex --long backup.tzap\n  tzap list --password-stdin --bootstrap backup.tzap.bootstrap backup.tzap",
+        group(
+            ArgGroup::new("open-key-source")
+                .required(true)
+                .args(["password_stdin", "password", "keyfile"])
+        )
+    )]
     List {
+        #[arg(value_name = "ARCHIVE", help = "Archive to inspect.")]
         archive: String,
 
         #[arg(
             long = "password-stdin",
             conflicts_with = "keyfile",
-            help = "Read passphrase from stdin; one trailing LF or CRLF is stripped before NFC normalization"
+            conflicts_with = "password",
+            value_name = "STDIN",
+            help = "Read passphrase from stdin; one trailing LF or CRLF is stripped."
         )]
         password_stdin: bool,
 
-        #[arg(long = "keyfile")]
+        #[arg(
+            long = "password",
+            conflicts_with = "keyfile",
+            conflicts_with = "password_stdin",
+            help = "Read passphrase from an interactive prompt."
+        )]
+        password: bool,
+
+        #[arg(
+            long = "keyfile",
+            value_name = "KEYFILE",
+            help = "Use a raw key from KEYFILE."
+        )]
         keyfile: Option<String>,
 
-        #[arg(long = "bootstrap")]
+        #[arg(
+            long = "bootstrap",
+            value_name = "FILE",
+            help = "Use bootstrap sidecar FILE."
+        )]
         bootstrap: Option<String>,
 
-        #[arg(long = "volume")]
+        #[arg(long = "volume", value_name = "FILE", help = "Additional volume path.")]
         volumes: Vec<String>,
 
-        #[arg(long = "long")]
+        #[arg(long = "long", help = "Use verbose listing output.")]
         long: bool,
     },
+    #[command(
+        about = "Verify archive integrity",
+        long_about = "Verify archive signatures and checksum integrity. No payload changes are made.",
+        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex backup.tzap backup.tzap.001\n  tzap verify --password-stdin backup.tzap",
+        group(
+            ArgGroup::new("open-key-source")
+                .required(true)
+                .args(["password_stdin", "password", "keyfile"])
+        )
+    )]
     Verify {
-        #[arg(required = true)]
+        #[arg(
+            required = true,
+            value_name = "ARCHIVE",
+            help = "Primary archive followed by optional additional volumes."
+        )]
         archives: Vec<String>,
 
         #[arg(
             long = "password-stdin",
             conflicts_with = "keyfile",
-            help = "Read passphrase from stdin; one trailing LF or CRLF is stripped before NFC normalization"
+            conflicts_with = "password",
+            value_name = "STDIN",
+            help = "Read passphrase from stdin; one trailing LF or CRLF is stripped."
         )]
         password_stdin: bool,
 
-        #[arg(long = "keyfile")]
+        #[arg(
+            long = "password",
+            conflicts_with = "keyfile",
+            conflicts_with = "password_stdin",
+            help = "Read passphrase from an interactive prompt."
+        )]
+        password: bool,
+
+        #[arg(
+            long = "keyfile",
+            value_name = "KEYFILE",
+            help = "Use a raw key from KEYFILE."
+        )]
         keyfile: Option<String>,
 
-        #[arg(long = "bootstrap")]
+        #[arg(
+            long = "bootstrap",
+            value_name = "FILE",
+            help = "Use bootstrap sidecar FILE."
+        )]
         bootstrap: Option<String>,
+    },
+    #[command(
+        about = "Generate a random raw key",
+        long_about = "Generate a random 32-byte raw key and write it as 64 lowercase hex characters.\n\nBy default, --output refuses to overwrite an existing file.\nUse --force if you want to replace it.\n\nUse --stdout to print the key to stdout instead.",
+        group(
+            ArgGroup::new("keygen-output")
+                .required(true)
+                .args(["output", "stdout"])
+        )
+    )]
+    Keygen {
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "KEYFILE",
+            conflicts_with = "stdout",
+            help = "Write the generated key to KEYFILE."
+        )]
+        output: Option<String>,
+
+        #[arg(long = "stdout", help = "Write the generated key to stdout.")]
+        stdout: bool,
+
+        #[arg(long = "force", help = "Overwrite an existing output keyfile.")]
+        force: bool,
     },
 }
 
@@ -183,7 +412,11 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let diagnostic = classify_error(&err);
-            eprintln!("tzap: {}: {err:#}", diagnostic.label);
+            if diagnostic.action.is_empty() {
+                eprintln!("tzap: {}: {err:#}", diagnostic.label);
+            } else {
+                eprintln!("tzap: {}: {err:#}: {}", diagnostic.label, diagnostic.action);
+            }
             ExitCode::from(diagnostic.exit_code)
         }
     }
@@ -198,6 +431,7 @@ fn run(cli: Cli) -> Result<()> {
             volume_loss_tolerance,
             bit_rot_buffer_pct,
             password_stdin,
+            password,
             keyfile,
             argon2_t_cost,
             argon2_m_cost_kib,
@@ -228,6 +462,7 @@ fn run(cli: Cli) -> Result<()> {
             let key = load_create_key(
                 keyfile.as_deref(),
                 password_stdin,
+                password,
                 argon2_t_cost,
                 argon2_m_cost_kib,
                 argon2_parallelism,
@@ -290,12 +525,18 @@ fn run(cli: Cli) -> Result<()> {
             stdout,
             overwrite,
             password_stdin,
+            password,
             keyfile,
             bootstrap,
             volumes,
         } => {
             let volume_bytes = read_volume_inputs(&archive, &volumes)?;
-            let master_key = load_open_key(keyfile.as_deref(), password_stdin, &volume_bytes[0])?;
+            let master_key = load_open_key(
+                keyfile.as_deref(),
+                password_stdin,
+                password,
+                &volume_bytes[0],
+            )?;
             let opened =
                 open_inputs_maybe_bootstrap(&volume_bytes, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {archive}"))?;
@@ -341,13 +582,19 @@ fn run(cli: Cli) -> Result<()> {
         Command::List {
             archive,
             password_stdin,
+            password,
             keyfile,
             bootstrap,
             volumes,
             long,
         } => {
             let volume_bytes = read_volume_inputs(&archive, &volumes)?;
-            let master_key = load_open_key(keyfile.as_deref(), password_stdin, &volume_bytes[0])?;
+            let master_key = load_open_key(
+                keyfile.as_deref(),
+                password_stdin,
+                password,
+                &volume_bytes[0],
+            )?;
             let opened =
                 open_inputs_maybe_bootstrap(&volume_bytes, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {archive}"))?;
@@ -363,6 +610,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Verify {
             archives,
             password_stdin,
+            password,
             keyfile,
             bootstrap,
         } => {
@@ -370,7 +618,12 @@ fn run(cli: Cli) -> Result<()> {
                 .first()
                 .ok_or_else(|| anyhow!("at least one archive volume is required"))?;
             let volume_bytes = read_volume_inputs(first, &archives[1..])?;
-            let master_key = load_open_key(keyfile.as_deref(), password_stdin, &volume_bytes[0])?;
+            let master_key = load_open_key(
+                keyfile.as_deref(),
+                password_stdin,
+                password,
+                &volume_bytes[0],
+            )?;
             let opened =
                 open_inputs_maybe_bootstrap(&volume_bytes, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {first}"))?;
@@ -378,6 +631,23 @@ fn run(cli: Cli) -> Result<()> {
                 .verify()
                 .with_context(|| format!("failed to verify archive {first}"))?;
             println!("{}: OK", archives.join(" "));
+            Ok(())
+        }
+        Command::Keygen {
+            output,
+            stdout,
+            force,
+        } => {
+            let bytes = generate_random_key_material()?;
+            let key_hex = format!("{}\n", encode_hex(&bytes));
+            if stdout {
+                print!("{}", key_hex);
+                io::stdout().flush()?;
+                return Ok(());
+            }
+            let output = output.expect("--output required by clap");
+            write_keyfile(&output, &key_hex, force).context("failed to write keyfile")?;
+            eprintln!("wrote keyfile to {}", output);
             Ok(())
         }
     }
@@ -401,6 +671,7 @@ struct CreateKey {
 struct Diagnostic {
     label: &'static str,
     exit_code: u8,
+    action: &'static str,
 }
 
 fn collect_inputs(paths: &[String]) -> Result<Vec<InputFile>> {
@@ -532,15 +803,61 @@ fn open_inputs_maybe_bootstrap(
     }
 }
 
+fn generate_random_key_material() -> Result<[u8; 32]> {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    Ok(bytes)
+}
+
+fn write_keyfile(path: &str, key_hex: &str, force: bool) -> Result<()> {
+    if !force && Path::new(path).exists() {
+        bail!("keyfile already exists: {path}; use --force to overwrite");
+    }
+    if force {
+        fs::write(path, key_hex).with_context(|| format!("failed to write keyfile {path}"))?;
+        return Ok(());
+    }
+    fs::write(path, key_hex)
+        .map(|_| ())
+        .with_context(|| format!("failed to write keyfile {path}"))
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = std::fmt::Write::write_fmt(&mut output, format_args!("{:02x}", byte));
+    }
+    output
+}
+
 fn load_create_key(
     keyfile: Option<&str>,
     password_stdin: bool,
+    password: bool,
     t_cost: u32,
     m_cost_kib: u32,
     parallelism: u32,
 ) -> Result<CreateKey> {
     if password_stdin {
         let passphrase = read_passphrase_stdin()?;
+        validate_argon2_params(t_cost, m_cost_kib, parallelism)?;
+        let mut salt = vec![0u8; DEFAULT_ARGON2_SALT_LEN];
+        rand::thread_rng().fill_bytes(&mut salt);
+        let kdf_params = KdfParams::Argon2id {
+            t_cost,
+            m_cost_kib,
+            parallelism,
+            salt,
+        };
+        let master_key = MasterKey::derive_from_passphrase(&kdf_params, &passphrase)?;
+        return Ok(CreateKey {
+            master_key,
+            kdf_params,
+        });
+    }
+    if password {
+        let passphrase = read_passphrase_interactive_create()?;
+        validate_argon2_params(t_cost, m_cost_kib, parallelism)?;
         let mut salt = vec![0u8; DEFAULT_ARGON2_SALT_LEN];
         rand::thread_rng().fill_bytes(&mut salt);
         let kdf_params = KdfParams::Argon2id {
@@ -564,25 +881,75 @@ fn load_create_key(
 fn load_open_key(
     keyfile: Option<&str>,
     password_stdin: bool,
+    password: bool,
     first_volume: &[u8],
 ) -> Result<MasterKey> {
     if password_stdin {
         let passphrase = read_passphrase_stdin()?;
         let kdf_params = read_kdf_params_from_volume(first_volume)?;
-        return match kdf_params {
-            KdfParams::Argon2id { .. } => {
-                MasterKey::derive_from_passphrase(&kdf_params, &passphrase).map_err(Into::into)
-            }
-            KdfParams::Raw => Err(anyhow!(FormatError::KeyMaterialMismatch)
-                .context("raw-key archives require --keyfile, not --password-stdin")),
-        };
+        return derive_key_from_passphrase(&kdf_params, &passphrase);
+    }
+    if password {
+        let passphrase = read_passphrase_interactive_open()?;
+        let kdf_params = read_kdf_params_from_volume(first_volume)?;
+        return derive_key_from_passphrase(&kdf_params, &passphrase);
     }
     load_raw_master_key(keyfile)
 }
 
+fn derive_key_from_passphrase(kdf_params: &KdfParams, passphrase: &str) -> Result<MasterKey> {
+    match kdf_params {
+        KdfParams::Argon2id { .. } => {
+            MasterKey::derive_from_passphrase(kdf_params, passphrase).map_err(Into::into)
+        }
+        KdfParams::Raw => Err(anyhow!(FormatError::KeyMaterialMismatch)
+            .context("raw-key archives require --keyfile, not passphrase input")),
+    }
+}
+
+fn validate_argon2_params(t_cost: u32, m_cost_kib: u32, parallelism: u32) -> Result<()> {
+    if t_cost == 0 {
+        return Err(anyhow!(FormatError::InvalidKdfParams(
+            "argon2 t_cost must be at least 1",
+        )));
+    }
+    if t_cost > READER_MAX_ARGON2ID_T_COST {
+        return Err(anyhow!(FormatError::InvalidKdfParams(
+            "argon2 t_cost exceeds reader maximum",
+        )));
+    }
+    if parallelism == 0 {
+        return Err(anyhow!(FormatError::InvalidKdfParams(
+            "argon2 parallelism must be at least 1",
+        )));
+    }
+    if parallelism > READER_MAX_ARGON2ID_PARALLELISM {
+        return Err(anyhow!(FormatError::InvalidKdfParams(
+            "argon2 parallelism exceeds reader maximum",
+        )));
+    }
+    if m_cost_kib > READER_MAX_ARGON2ID_M_COST_KIB {
+        return Err(anyhow!(FormatError::InvalidKdfParams(
+            "argon2 memory cost exceeds reader maximum",
+        )));
+    }
+    let min_memory = parallelism.checked_mul(8).ok_or_else(|| {
+        anyhow!(FormatError::InvalidKdfParams(
+            "argon2 memory per lane computation overflows",
+        ))
+    })?;
+    if m_cost_kib < min_memory {
+        return Err(anyhow!(FormatError::InvalidKdfParams(
+            "argon2 memory must be at least 8 KiB per lane",
+        )));
+    }
+    Ok(())
+}
+
 fn load_raw_master_key(keyfile: Option<&str>) -> Result<MasterKey> {
-    let keyfile =
-        keyfile.ok_or_else(|| anyhow!("either --keyfile or --password-stdin is required"))?;
+    let keyfile = keyfile.ok_or_else(|| {
+        anyhow!("no key source provided; use --password-stdin, --password, or --keyfile PATH")
+    })?;
     let bytes = fs::read(keyfile).with_context(|| format!("failed to read keyfile {keyfile}"))?;
     if bytes.len() == 32 {
         return MasterKey::from_raw_key(&bytes).map_err(Into::into);
@@ -605,6 +972,58 @@ fn read_passphrase_stdin() -> Result<String> {
     let mut passphrase = String::new();
     io::stdin()
         .read_to_string(&mut passphrase)
+        .context("failed to read passphrase from stdin")?;
+    if passphrase.ends_with('\n') {
+        passphrase.pop();
+        if passphrase.ends_with('\r') {
+            passphrase.pop();
+        }
+    }
+    if passphrase.is_empty() {
+        bail!("passphrase must not be empty");
+    }
+    Ok(passphrase)
+}
+
+fn read_passphrase_interactive_create() -> Result<String> {
+    loop {
+        let first = read_passphrase_interactive("Passphrase: ")?;
+        let second = read_passphrase_interactive("Confirm passphrase: ")?;
+        if first == second {
+            return Ok(first);
+        }
+        eprintln!("Passphrases do not match; try again.");
+    }
+}
+
+fn read_passphrase_interactive_open() -> Result<String> {
+    read_passphrase_interactive("Passphrase: ")
+}
+
+fn read_passphrase_interactive(prompt: &str) -> Result<String> {
+    let passphrase = match read_passphrase_hidden(prompt) {
+        Ok(passphrase) => passphrase,
+        Err(err) => {
+            let _ = err;
+            eprint!("{prompt}");
+            io::stdout().flush()?;
+            read_passphrase_stdin_fallback()?
+        }
+    };
+    if passphrase.is_empty() {
+        bail!("passphrase must not be empty");
+    }
+    Ok(passphrase)
+}
+
+fn read_passphrase_hidden(prompt: &str) -> Result<String> {
+    Ok(rpassword::prompt_password(prompt)?)
+}
+
+fn read_passphrase_stdin_fallback() -> Result<String> {
+    let mut passphrase = String::new();
+    io::stdin()
+        .read_line(&mut passphrase)
         .context("failed to read passphrase from stdin")?;
     if passphrase.ends_with('\n') {
         passphrase.pop();
@@ -667,15 +1086,19 @@ fn parse_size(value: &str) -> Result<u64> {
         .unwrap_or(trimmed.len());
     let (digits, suffix) = trimmed.split_at(split_at);
     if digits.is_empty() {
-        bail!("size is missing digits");
+        bail!("invalid size '{value}': missing size digits");
     }
-    let number = digits.parse::<u64>()?;
+    let number = digits
+        .parse::<u64>()
+        .with_context(|| format!("invalid size '{trimmed}': bad digit sequence"))?;
     let multiplier = match suffix.to_ascii_lowercase().as_str() {
         "" => 1,
         "k" | "kb" | "kib" => 1024,
         "m" | "mb" | "mib" => 1024 * 1024,
         "g" | "gb" | "gib" => 1024 * 1024 * 1024,
-        _ => bail!("unsupported size suffix {suffix}"),
+        _ => bail!(
+            "invalid size '{trimmed}': unsupported suffix '{suffix}'; supported: K/KB/KiB, M/MB/MiB, G/GB/GiB"
+        ),
     };
     number
         .checked_mul(multiplier)
@@ -707,10 +1130,12 @@ fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 | io::ErrorKind::AlreadyExists => Diagnostic {
                     label: "io-error",
                     exit_code: EXIT_IO,
+                    action: "check file paths and permissions",
                 },
                 _ => Diagnostic {
                     label: "io-error",
                     exit_code: EXIT_IO,
+                    action: "check filesystem state",
                 },
             };
         }
@@ -718,6 +1143,7 @@ fn classify_error(err: &anyhow::Error) -> Diagnostic {
     Diagnostic {
         label: "error",
         exit_code: EXIT_GENERIC,
+        action: "",
     }
 }
 
@@ -734,6 +1160,7 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
         | FormatError::UnsupportedBootstrapSidecarVersion(_) => Diagnostic {
             label: "unsupported-revision",
             exit_code: EXIT_UNSUPPORTED_REVISION,
+            action: "use the matching tzap version for this archive",
         },
         FormatError::HmacMismatch {
             structure: "CryptoHeader",
@@ -742,14 +1169,34 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
         | FormatError::InvalidRawMasterKeyLength => Diagnostic {
             label: "wrong-key",
             exit_code: EXIT_WRONG_KEY,
+            action: "check the archive's key source (passphrase/raw key)",
         },
         FormatError::HmacMismatch { .. } | FormatError::AeadFailure => Diagnostic {
             label: "corrupt-archive",
             exit_code: EXIT_CORRUPT_ARCHIVE,
+            action: "verify archive integrity and source",
         },
-        FormatError::UnsafeArchivePath | FormatError::UnsafeOverwrite => Diagnostic {
+        FormatError::InvalidKdfParams(message) => Diagnostic {
+            label: "invalid-arguments",
+            exit_code: EXIT_USAGE,
+            action: message,
+        },
+        FormatError::ReaderResourceLimitExceeded { field, .. } => Diagnostic {
+            label: "invalid-arguments",
+            exit_code: EXIT_USAGE,
+            action: match field {
+                _ => "check argon2 flags (--argon2-t-cost, --argon2-m-cost-kib, --argon2-parallelism)",
+            },
+        },
+        FormatError::UnsafeArchivePath => Diagnostic {
             label: "unsafe-path",
             exit_code: EXIT_UNSAFE_PATH,
+            action: "archive contains unsafe paths; extract paths should be reviewed first",
+        },
+        FormatError::UnsafeOverwrite => Diagnostic {
+            label: "unsafe-path",
+            exit_code: EXIT_UNSAFE_PATH,
+            action: "add --overwrite if overwriting existing files is intended",
         },
         FormatError::ReaderUnsupported(message) | FormatError::WriterUnsupported(message)
             if message.contains("bootstrap") =>
@@ -757,15 +1204,18 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
             Diagnostic {
                 label: "missing-bootstrap",
                 exit_code: EXIT_MISSING_BOOTSTRAP,
+                action: "use --bootstrap with a matching sidecar",
             }
         }
         FormatError::ReaderUnsupported(_) | FormatError::WriterUnsupported(_) => Diagnostic {
             label: "unsupported-feature",
             exit_code: EXIT_UNSUPPORTED_FEATURE,
+            action: "use a supported archive shape or upgrade tzap",
         },
         _ => Diagnostic {
             label: "corrupt-archive",
             exit_code: EXIT_CORRUPT_ARCHIVE,
+            action: "verify archive integrity and source",
         },
     }
 }

@@ -11,6 +11,10 @@ description = "Rust reference implementation of the tzap archive format specific
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.82"
+repository = "https://github.com/frankmanzhu/tzap"
+keywords = ["fast", "secure", "self-healing", "splittable", "seekable", "streaming", "resilient", "archive", "zip", "zstd"]
+documentation = "https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv36.md"
+readme = "README.md"
 
 [workspace.dependencies]
 aes-gcm = "0.10"
