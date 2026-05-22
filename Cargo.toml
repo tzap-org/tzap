@@ -25,7 +25,6 @@ hex = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
 rand = "0.8"
-reed-solomon-erasure = "6"
 rpassword = "7"
 sha2 = "0.10"
 subtle = "2"
@@ -35,6 +34,7 @@ unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4"] }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 zstd = "0.13"
+zstd-safe = "7"
 
 [workspace.dependencies.assert_cmd]
 version = "2"

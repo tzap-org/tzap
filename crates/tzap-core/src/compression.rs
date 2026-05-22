@@ -1,0 +1,88 @@
+use crate::format::FormatError;
+
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+pub fn compress_zstd_frame(plaintext: &[u8], level: i32) -> Result<Vec<u8>, FormatError> {
+    zstd::bulk::compress(plaintext, level).map_err(|_| FormatError::ZstdCompressionFailure)
+}
+
+pub fn decompress_exact_zstd_frame(
+    compressed: &[u8],
+    expected_decompressed_size: usize,
+) -> Result<Vec<u8>, FormatError> {
+    validate_exact_zstd_frame(compressed)?;
+    let decompressed = zstd::bulk::decompress(compressed, expected_decompressed_size)
+        .map_err(|_| FormatError::ZstdDecompressionFailure)?;
+    if decompressed.len() != expected_decompressed_size {
+        return Err(FormatError::ZstdDecompressedSizeMismatch {
+            expected: expected_decompressed_size,
+            actual: decompressed.len(),
+        });
+    }
+    Ok(decompressed)
+}
+
+pub fn validate_exact_zstd_frame(compressed: &[u8]) -> Result<(), FormatError> {
+    if compressed.is_empty() {
+        return Err(FormatError::EmptyZstdFrame);
+    }
+    if compressed.len() < 4 || compressed[0..4] != ZSTD_MAGIC {
+        return Err(FormatError::NotStandardZstdFrame);
+    }
+    let frame_size = zstd_safe::find_frame_compressed_size(compressed)
+        .map_err(|_| FormatError::InvalidZstdFrame)?;
+    if frame_size != compressed.len() {
+        return Err(FormatError::TrailingBytesAfterZstdFrame);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compresses_and_decompresses_exact_frame() {
+        let plaintext = b"metadata object payload";
+        let compressed = compress_zstd_frame(plaintext, 3).unwrap();
+        let decompressed = decompress_exact_zstd_frame(&compressed, plaintext.len()).unwrap();
+        assert_eq!(decompressed, plaintext);
+    }
+
+    #[test]
+    fn rejects_trailing_concatenated_and_skippable_frames() {
+        let plaintext = b"payload";
+        let mut compressed = compress_zstd_frame(plaintext, 1).unwrap();
+        compressed.push(0);
+        assert_eq!(
+            decompress_exact_zstd_frame(&compressed, plaintext.len()).unwrap_err(),
+            FormatError::TrailingBytesAfterZstdFrame
+        );
+
+        let one = compress_zstd_frame(plaintext, 1).unwrap();
+        let mut concatenated = one.clone();
+        concatenated.extend_from_slice(&one);
+        assert_eq!(
+            decompress_exact_zstd_frame(&concatenated, plaintext.len()).unwrap_err(),
+            FormatError::TrailingBytesAfterZstdFrame
+        );
+
+        let skippable = [0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0];
+        assert_eq!(
+            validate_exact_zstd_frame(&skippable).unwrap_err(),
+            FormatError::NotStandardZstdFrame
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_decompressed_size() {
+        let compressed = compress_zstd_frame(b"payload", 1).unwrap();
+        assert_eq!(
+            decompress_exact_zstd_frame(&compressed, 100).unwrap_err(),
+            FormatError::ZstdDecompressedSizeMismatch {
+                expected: 100,
+                actual: 7
+            }
+        );
+    }
+}

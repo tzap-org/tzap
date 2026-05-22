@@ -12,6 +12,8 @@ pub const BLOCK_RECORD_FRAMING_LEN: usize = 20;
 pub const CRYPTO_HEADER_HMAC_LEN: usize = 32;
 pub const CRYPTO_EXTENSION_HEADER_LEN: usize = 6;
 pub const CRYPTO_EXTENSION_MAX_VALUE_LEN: u32 = 256;
+pub const MASTER_KEY_LEN: usize = 32;
+pub const SUBKEY_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -303,4 +305,131 @@ pub enum FormatError {
 
     #[error("bytes follow extension terminator")]
     BytesAfterExtensionTerminator,
+
+    #[error("CryptoHeader is too short: minimum {min}, actual {actual}")]
+    CryptoHeaderTooShort { min: usize, actual: usize },
+
+    #[error("KdfParams algo_tag {actual} does not match expected {expected}")]
+    KdfAlgoTagMismatch { expected: u16, actual: u16 },
+
+    #[error("KdfParams are truncated")]
+    TruncatedKdfParams,
+
+    #[error("invalid KdfParams: {0}")]
+    InvalidKdfParams(&'static str),
+
+    #[error("key material does not match KDF mode")]
+    KeyMaterialMismatch,
+
+    #[error("raw master key must be exactly 32 bytes")]
+    InvalidRawMasterKeyLength,
+
+    #[error("Argon2id derivation failed")]
+    Argon2idFailure,
+
+    #[error("HKDF expansion failed")]
+    HkdfExpandFailure,
+
+    #[error("HMAC verification failed for {structure}")]
+    HmacMismatch { structure: &'static str },
+
+    #[error("forbidden CryptoHeader extension tag 0x{0:04x}")]
+    ForbiddenExtensionTag(u16),
+
+    #[error("unknown critical CryptoHeader extension tag 0x{0:04x}")]
+    UnknownCriticalExtension(u16),
+
+    #[error("duplicate known CryptoHeader extension tag 0x{0:04x}")]
+    DuplicateKnownExtension(u16),
+
+    #[error("malformed known CryptoHeader extension tag 0x{0:04x}")]
+    MalformedKnownExtension(u16),
+
+    #[error("padding input is empty")]
+    EmptyPaddedPlaintext,
+
+    #[error("invalid suffix padding")]
+    InvalidSuffixPadding,
+
+    #[error("non-zero suffix padding bytes")]
+    NonZeroPaddingBytes,
+
+    #[error("padding arithmetic overflow")]
+    PaddingOverflow,
+
+    #[error("AEAD operation failed")]
+    AeadFailure,
+
+    #[error("nonce/AAD domain is too long")]
+    DomainTooLong,
+
+    #[error("invalid nonce length for {algo:?}: expected {expected}, actual {actual}")]
+    InvalidNonceLength {
+        algo: AeadAlgo,
+        expected: usize,
+        actual: usize,
+    },
+
+    #[error("invalid AEAD key length")]
+    InvalidAeadKeyLength,
+
+    #[error("zstd compression failed")]
+    ZstdCompressionFailure,
+
+    #[error("zstd frame is empty")]
+    EmptyZstdFrame,
+
+    #[error("zstd frame is not a standard non-skippable frame")]
+    NotStandardZstdFrame,
+
+    #[error("zstd frame is truncated or corrupt")]
+    InvalidZstdFrame,
+
+    #[error("zstd frame has trailing bytes after the first complete frame")]
+    TrailingBytesAfterZstdFrame,
+
+    #[error("zstd decompression failed")]
+    ZstdDecompressionFailure,
+
+    #[error("zstd decompressed size mismatch: expected {expected}, actual {actual}")]
+    ZstdDecompressedSizeMismatch { expected: usize, actual: usize },
+
+    #[error("FEC object must contain at least one data shard")]
+    FecZeroDataShards,
+
+    #[error("FEC object total shard count {0} exceeds ReedSolomonGF16 limit")]
+    FecTooManyShards(usize),
+
+    #[error("FEC shard size must be even")]
+    FecOddShardSize,
+
+    #[error("FEC shards have inconsistent sizes")]
+    FecInconsistentShardSize,
+
+    #[error("FEC repair has too few available shards")]
+    FecTooFewAvailableShards,
+
+    #[error("FEC repair matrix is singular")]
+    FecSingularMatrix,
+
+    #[error("invalid metadata in {structure}: {reason}")]
+    InvalidMetadata {
+        structure: &'static str,
+        reason: &'static str,
+    },
+
+    #[error("metadata arithmetic overflow in {structure}")]
+    MetadataArithmeticOverflow { structure: &'static str },
+
+    #[error("hash-prefix collision run exceeds resource caps")]
+    HashPrefixCollisionRunExceeded,
+
+    #[error("unsafe archive path")]
+    UnsafeArchivePath,
+
+    #[error("writer unsupported case: {0}")]
+    WriterUnsupported(&'static str),
+
+    #[error("writer invariant failed: {0}")]
+    WriterInvariant(&'static str),
 }

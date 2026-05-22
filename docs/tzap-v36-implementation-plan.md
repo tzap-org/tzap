@@ -121,6 +121,8 @@ Completed implementation:
 
 ## Milestone 2: Crypto Header, KDF, HMAC, And Key Schedule
 
+Status: complete.
+
 Purpose: authenticate the archive identity and derive all v0.36 keys.
 
 Deliverables:
@@ -140,7 +142,22 @@ Acceptance:
   extensions, forbidden extensions, unknown critical extensions, and HMAC
   mismatch.
 
+Completed implementation:
+
+- `crates/tzap-core/src/crypto.rs`
+- Raw and Argon2id KdfParams parsing.
+- NFC passphrase byte normalization.
+- Raw master-key and Argon2id master-key derivation.
+- Normative HKDF-SHA-256 subkey schedule.
+- HMAC domains and verification helpers for CryptoHeader, ManifestFooter,
+  VolumeTrailer, and BootstrapSidecarHeader.
+- Whole CryptoHeader parse split into fixed header, KDF params, extension
+  TLVs, HMAC-covered bytes, and header HMAC.
+- Post-HMAC CryptoHeader extension semantic validation.
+
 ## Milestone 3: Padding, AEAD Objects, And Zstd Frame Codec
+
+Status: complete.
 
 Purpose: implement the authenticated object envelope used by payload and
 metadata.
@@ -166,25 +183,53 @@ Acceptance:
 - AEAD round-trip and tamper tests.
 - zstd frame validity tests matching §28.1 corpus requirements.
 
+Completed implementation:
+
+- `crates/tzap-core/src/padding.rs`
+- `crates/tzap-core/src/compression.rs`
+- Suffix-marker padding encode/decode, including exact-fit extra block and
+  wide-form parsing.
+- AEAD nonce derivation and AAD construction.
+- AEAD encrypt/decrypt helpers for AES-256-GCM-SIV, XChaCha20-Poly1305, and
+  AES-256-GCM.
+- Padded AEAD object encrypt/decrypt helper for later writer/reader slices.
+- zstd one-frame compression/decompression wrapper with exact-frame validation
+  and rejection for skippable frames, trailing bytes, and concatenated frames.
+
 ## Milestone 4: ReedSolomonGF16 FEC Profile
+
+Status: complete.
 
 Purpose: implement the exact v0.36 object-local FEC profile.
 
 Deliverables:
 
-- ReedSolomonGF16 module with spec-owned interface.
-- Cauchy coefficient generation per §18.
-- Systematic parity generation.
-- Repair from missing/corrupt data/parity shards.
-- Compatibility investigation for `reed-solomon-erasure`.
-- Wire-profile vectors committed under tests.
+- Complete: ReedSolomonGF16 module with spec-owned interface in
+  `crates/tzap-core/src/fec.rs`.
+- Complete: direct GF(2^16) arithmetic using primitive polynomial `0x1100B`
+  with low reduction polynomial `0x100B`.
+- Complete: Cauchy coefficient generation per §18.
+- Complete: systematic parity generation.
+- Complete: repair from any D available data/parity rows using GF(2^16)
+  matrix inversion.
+- Complete: shape validation for nonzero data shard count, even shard size,
+  consistent shard sizes, enough available rows, and total shard count at or
+  below 65,535.
+- Complete: compatibility investigation for `reed-solomon-erasure`; not used
+  because its core profile is Vandermonde-based rather than the v0.36 Cauchy
+  profile.
+- Complete: wire-profile vectors committed under tests for polynomial
+  arithmetic, little-endian symbols, Cauchy parity bytes, repair behavior, and
+  invalid shape rejection.
 
 Acceptance:
 
-- Vectors prove polynomial, symbol byte order, Cauchy matrix, parity bytes, and
-  repair behavior.
-- Reject tests for GF(2^8), Vandermonde, wrong polynomial, odd block size, and
-  total shard count above 65,535.
+- Core test suite passes with vectors proving polynomial, symbol byte order,
+  Cauchy matrix, parity bytes, and repair behavior.
+- Validation rejects odd block size, inconsistent shard sizes, too few
+  available rows, zero data shards, and total shard count above 65,535.
+- The parity vectors pin the v0.36 Cauchy/GF(2^16) profile so GF(2^8),
+  Vandermonde, and wrong-polynomial implementations will not match.
 
 Risk:
 
@@ -193,19 +238,26 @@ Risk:
 
 ## Milestone 5: Metadata Model And Index Validation
 
+Status: implementation complete; validation run pending.
+
 Purpose: make the encrypted index structures real and searchable.
 
 Deliverables:
 
-- IndexRoot parser/serializer.
-- IndexShard parser/serializer.
-- DirectoryHintTable parser/serializer.
-- ShardEntry lookup algorithm.
-- FileEntry lookup algorithm.
-- Directory-prefix lookup semantics.
-- Hash binding validation.
-- Canonical table cursor validation.
-- FrameEntry and EnvelopeEntry validation.
+- Complete: IndexRoot parser/serializer in `crates/tzap-core/src/metadata.rs`.
+- Complete: IndexShard parser/serializer.
+- Complete: DirectoryHintTable parser/serializer.
+- Complete: ShardEntry hash-prefix candidate lookup algorithm with bounded
+  collision-run scanning.
+- Complete: FileEntry exact-path final-view lookup helper.
+- Complete: Directory-prefix normalization and ancestor semantics.
+- Complete: FileEntry and DirectoryHintEntry SHA-256 hash binding validation.
+- Complete: canonical table cursor validation for IndexRoot, IndexShard, and
+  DirectoryHintTable.
+- Complete: FrameEntry and EnvelopeEntry structural validation, including
+  exact shard-local frame/envelope sets and minimal FileEntry frame ranges.
+- Complete: removed the unused `reed-solomon-erasure` dependency after M4
+  implemented the exact GF(2^16) Cauchy profile directly.
 
 Acceptance:
 
@@ -216,6 +268,8 @@ Acceptance:
   unsafe directory-prefix lookup behavior.
 
 ## Milestone 6: Minimal Conformant Archive Writer
+
+Status: implementation complete; validation run pending.
 
 Purpose: produce the first spec-conformant archive for a narrow case.
 
@@ -230,13 +284,17 @@ Scope:
 
 Deliverables:
 
-- Tar member group construction for regular files.
-- zstd frame generation.
-- Payload envelope packing.
-- BlockRecord emission.
-- IndexShard and IndexRoot emission.
-- ManifestFooter and VolumeTrailer emission.
-- Full HMAC/AEAD/FEC path.
+- Complete: Tar member group construction for small ustar regular files.
+- Complete: zstd frame generation, one complete frame per member group.
+- Complete: single payload envelope packing for small archives.
+- Complete: BlockRecord emission with CRC and last-data flags via
+  `wire::BlockRecord`.
+- Complete: IndexShard and IndexRoot plaintext emission.
+- Complete: ManifestFooter and VolumeTrailer emission with domain-separated
+  HMACs.
+- Complete: full HMAC/AEAD/suffix-padding/ReedSolomonGF16 path for payload,
+  IndexShard, and IndexRoot objects.
+- Complete: valid empty archive construction path.
 
 Acceptance:
 
@@ -429,8 +487,8 @@ Definition of done:
 
 ## Key Risks
 
-- **FEC exactness:** `reed-solomon-erasure` may not match the required Cauchy
-  wire profile; prove with vectors before relying on it.
+- **FEC exactness:** resolved in M4 by implementing the required GF(2^16)
+  Cauchy wire profile directly in `tzap-core`.
 - **Tar safety:** `tar` crate convenience extraction cannot be the conformance
   path. Safe extraction must be owned by tzap.
 - **Zstd exact-frame validation:** high-level decompression may accept inputs

@@ -1,10 +1,11 @@
 use crc32c::crc32c;
 
+use crate::crypto::KdfParams;
 use crate::format::{
     AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, FormatError, KdfAlgo, BLOCK_RECORD_FRAMING_LEN,
     BOOTSTRAP_SIDECAR_HEADER_LEN, CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_EXTENSION_MAX_VALUE_LEN,
-    CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION, MANIFEST_FOOTER_LEN, VOLUME_FORMAT_REV,
-    VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    CRYPTO_HEADER_FIXED_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, MANIFEST_FOOTER_LEN,
+    VOLUME_FORMAT_REV, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 
 const TZAP_MAGIC: [u8; 4] = *b"TZAP";
@@ -298,6 +299,82 @@ pub fn scan_crypto_extension_tlvs(bytes: &[u8]) -> Result<Vec<ExtensionTlv<'_>>,
             value: &bytes[offset..offset + length],
         });
         offset += length;
+    }
+}
+
+pub fn validate_crypto_extension_semantics(
+    extensions: &[ExtensionTlv<'_>],
+) -> Result<(), FormatError> {
+    let mut seen_known = Vec::new();
+    for extension in extensions {
+        let ext_tag = extension.tag & 0x7fff;
+        let is_critical = extension.tag & 0x8000 != 0;
+        if matches!(ext_tag, 0x0004 | 0x0006) {
+            return Err(FormatError::ForbiddenExtensionTag(ext_tag));
+        }
+        if is_known_extension(ext_tag) {
+            if seen_known.contains(&ext_tag) {
+                return Err(FormatError::DuplicateKnownExtension(ext_tag));
+            }
+            validate_known_extension(ext_tag, extension.value)?;
+            seen_known.push(ext_tag);
+        } else if is_critical {
+            return Err(FormatError::UnknownCriticalExtension(ext_tag));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CryptoHeader<'a> {
+    pub fixed: CryptoHeaderFixed,
+    pub kdf_params: KdfParams,
+    pub extensions: Vec<ExtensionTlv<'a>>,
+    pub header_hmac: [u8; 32],
+    pub hmac_covered_bytes: &'a [u8],
+}
+
+impl<'a> CryptoHeader<'a> {
+    pub fn parse(bytes: &'a [u8], volume_crypto_header_length: u32) -> Result<Self, FormatError> {
+        let declared_len = volume_crypto_header_length as usize;
+        if bytes.len() != declared_len {
+            return Err(FormatError::InvalidLength {
+                structure: "CryptoHeader",
+                expected: declared_len,
+                actual: bytes.len(),
+            });
+        }
+        let min_len =
+            CRYPTO_HEADER_FIXED_LEN + 2 + CRYPTO_EXTENSION_HEADER_LEN + CRYPTO_HEADER_HMAC_LEN;
+        if bytes.len() < min_len {
+            return Err(FormatError::CryptoHeaderTooShort {
+                min: min_len,
+                actual: bytes.len(),
+            });
+        }
+
+        let fixed = CryptoHeaderFixed::parse(
+            &bytes[..CRYPTO_HEADER_FIXED_LEN],
+            volume_crypto_header_length,
+        )?;
+        let hmac_offset = bytes.len() - CRYPTO_HEADER_HMAC_LEN;
+        let (kdf_params, kdf_len) =
+            KdfParams::parse(fixed.kdf_algo, &bytes[CRYPTO_HEADER_FIXED_LEN..hmac_offset])?;
+        let extension_bytes = &bytes[CRYPTO_HEADER_FIXED_LEN + kdf_len..hmac_offset];
+        let extensions = scan_crypto_extension_tlvs(extension_bytes)?;
+        let header_hmac = read_array_32(bytes, hmac_offset)?;
+
+        Ok(Self {
+            fixed,
+            kdf_params,
+            extensions,
+            header_hmac,
+            hmac_covered_bytes: &bytes[..hmac_offset],
+        })
+    }
+
+    pub fn validate_extension_semantics(&self) -> Result<(), FormatError> {
+        validate_crypto_extension_semantics(&self.extensions)
     }
 }
 
@@ -654,6 +731,26 @@ impl BootstrapSidecarHeader {
     }
 }
 
+fn is_known_extension(ext_tag: u16) -> bool {
+    matches!(ext_tag, 0x0001 | 0x0002 | 0x0003 | 0x0005)
+}
+
+fn validate_known_extension(ext_tag: u16, value: &[u8]) -> Result<(), FormatError> {
+    match ext_tag {
+        0x0001 | 0x0002 | 0x0005 => std::str::from_utf8(value)
+            .map(|_| ())
+            .map_err(|_| FormatError::MalformedKnownExtension(ext_tag)),
+        0x0003 => {
+            if value.len() == 8 {
+                Ok(())
+            } else {
+                Err(FormatError::MalformedKnownExtension(ext_tag))
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
 fn expect_len(structure: &'static str, expected: usize, actual: usize) -> Result<(), FormatError> {
     if actual != expected {
         return Err(FormatError::InvalidLength {
@@ -838,6 +935,17 @@ mod tests {
         }
     }
 
+    fn raw_crypto_header_bytes() -> Vec<u8> {
+        let fixed = crypto_fixed();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&fixed.to_bytes());
+        bytes.extend_from_slice(&(KdfAlgo::Raw as u16).to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xab; CRYPTO_HEADER_HMAC_LEN]);
+        bytes
+    }
+
     #[test]
     fn volume_header_round_trips_and_validates() {
         let bytes = volume_header().to_bytes();
@@ -947,6 +1055,95 @@ mod tests {
         assert_eq!(
             scan_crypto_extension_tlvs(&[]).unwrap_err(),
             FormatError::MissingExtensionTerminator
+        );
+    }
+
+    #[test]
+    fn crypto_header_parse_splits_fixed_kdf_extensions_and_hmac() {
+        let bytes = raw_crypto_header_bytes();
+        let header = CryptoHeader::parse(&bytes, bytes.len() as u32).unwrap();
+        assert_eq!(header.fixed.kdf_algo, KdfAlgo::Raw);
+        assert_eq!(header.kdf_params, KdfParams::Raw);
+        assert!(header.extensions.is_empty());
+        assert_eq!(header.header_hmac, [0xab; CRYPTO_HEADER_HMAC_LEN]);
+        assert_eq!(
+            header.hmac_covered_bytes.len(),
+            bytes.len() - CRYPTO_HEADER_HMAC_LEN
+        );
+    }
+
+    #[test]
+    fn crypto_header_parse_rejects_truncated_and_bad_kdf_params() {
+        let mut bytes = raw_crypto_header_bytes();
+        bytes.truncate(CRYPTO_HEADER_FIXED_LEN + 1);
+        assert_eq!(
+            CryptoHeader::parse(&bytes, bytes.len() as u32).unwrap_err(),
+            FormatError::CryptoHeaderTooShort {
+                min: CRYPTO_HEADER_FIXED_LEN
+                    + 2
+                    + CRYPTO_EXTENSION_HEADER_LEN
+                    + CRYPTO_HEADER_HMAC_LEN,
+                actual: CRYPTO_HEADER_FIXED_LEN + 1
+            }
+        );
+
+        let mut bytes = raw_crypto_header_bytes();
+        write_u16(
+            &mut bytes,
+            CRYPTO_HEADER_FIXED_LEN,
+            KdfAlgo::Argon2id as u16,
+        );
+        assert_eq!(
+            CryptoHeader::parse(&bytes, bytes.len() as u32).unwrap_err(),
+            FormatError::KdfAlgoTagMismatch {
+                expected: 0,
+                actual: 1
+            }
+        );
+    }
+
+    #[test]
+    fn crypto_extension_semantics_reject_forbidden_duplicate_and_critical() {
+        let duplicate = vec![
+            ExtensionTlv {
+                tag: 0x0001,
+                value: b"one",
+            },
+            ExtensionTlv {
+                tag: 0x0001,
+                value: b"two",
+            },
+        ];
+        assert_eq!(
+            validate_crypto_extension_semantics(&duplicate).unwrap_err(),
+            FormatError::DuplicateKnownExtension(0x0001)
+        );
+
+        let forbidden = vec![ExtensionTlv {
+            tag: 0x8004,
+            value: b"",
+        }];
+        assert_eq!(
+            validate_crypto_extension_semantics(&forbidden).unwrap_err(),
+            FormatError::ForbiddenExtensionTag(0x0004)
+        );
+
+        let unknown_critical = vec![ExtensionTlv {
+            tag: 0x8123,
+            value: b"",
+        }];
+        assert_eq!(
+            validate_crypto_extension_semantics(&unknown_critical).unwrap_err(),
+            FormatError::UnknownCriticalExtension(0x0123)
+        );
+
+        let malformed_known = vec![ExtensionTlv {
+            tag: 0x0003,
+            value: b"short",
+        }];
+        assert_eq!(
+            validate_crypto_extension_semantics(&malformed_known).unwrap_err(),
+            FormatError::MalformedKnownExtension(0x0003)
         );
     }
 

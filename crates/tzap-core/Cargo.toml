@@ -18,7 +18,6 @@ hex.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
 rand.workspace = true
-reed-solomon-erasure.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 tar.workspace = true
@@ -27,6 +26,7 @@ unicode-normalization.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 zstd.workspace = true
+zstd-safe.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
