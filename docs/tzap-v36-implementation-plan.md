@@ -553,6 +553,8 @@ Completed implementation:
 
 ## Milestone 13: Corpus, Mutation Tests, Fuzzing, And Interop
 
+Status: complete.
+
 Purpose: lock down the reference implementation as the executable spec.
 
 Deliverables:
@@ -573,6 +575,27 @@ Acceptance:
   issue.
 - Parser fuzz targets run without panics on malformed input.
 - Golden fixtures remain stable across releases unless the spec changes.
+
+Completed implementation:
+
+- Added `crates/tzap-core/tests/v36_corpus.rs` as the executable v0.36 corpus
+  suite, with deterministic golden-fixture generation, mutation fixtures,
+  §28.1-focused metadata vectors, cross-platform path rejection vectors, and
+  deterministic writer/reader round-trip matrix coverage.
+- Covered v0.36 §28.1 additions for minimal FileEntry frame ranges, exact-file
+  lookup independence from directory hints, and equal-start
+  DirectoryHintShardEntry ordering by `(first_dir_hash, last_dir_hash,
+  hint_shard_index)`.
+- Retained v0.35 corpus coverage for raw byte-order hash-prefix sorting,
+  Argon2id profile behavior, AEAD combined-output tag placement, GF(2^16)
+  ReedSolomon vectors, directory-hint counter uniqueness, shard-boundary
+  metadata bindings, sparse local frame offset validation, metadata zstd
+  exactness, effective FEC object ceiling rejection, and
+  `volume_format_rev = 36` freshness.
+- Added cargo-fuzz entrypoints under `fuzz/` for fixed wire-structure parsing
+  and metadata parsing. The fuzz crate is intentionally outside the main
+  workspace dependency graph so normal builds keep the reference
+  implementation dependency set lean.
 
 ## Recommended Execution Order
 

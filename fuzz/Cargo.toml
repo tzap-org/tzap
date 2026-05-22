@@ -1,0 +1,29 @@
+[package]
+name = "tzap-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tzap-core = { path = "../crates/tzap-core" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parse_fixed_structures"
+path = "fuzz_targets/parse_fixed_structures.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_metadata"
+path = "fuzz_targets/parse_metadata.rs"
+test = false
+doc = false
+bench = false
