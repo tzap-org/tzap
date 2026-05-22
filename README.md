@@ -1,7 +1,14 @@
 # tzap - the only open source archive you need
 
-Rust reference implementation of the **tzap archive format**: super fast, encrypted,
-self-healing, random-access archives for serious long-term storage.
+[![CI](https://github.com/frankmanzhu/tzap/actions/workflows/ci.yml/badge.svg)](https://github.com/frankmanzhu/tzap/actions/workflows/ci.yml)
+[![Release](https://github.com/frankmanzhu/tzap/actions/workflows/release.yml/badge.svg)](https://github.com/frankmanzhu/tzap/actions/workflows/release.yml)
+[![Release version](https://img.shields.io/github/v/release/frankmanzhu/tzap?include_prereleases&label=release)](https://github.com/frankmanzhu/tzap/releases)
+[![Downloads](https://img.shields.io/github/downloads/frankmanzhu/tzap/total)](https://github.com/frankmanzhu/tzap/releases)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+Rust reference implementation of the **tzap archive format**: fast compression,
+fast encryption, fast self-healing recovery, and instant random-access restores
+for serious long-term storage.
 
 tzap is built for real archives: huge backups, private datasets, cold storage,
 S3-style object storage, split volumes, and immediate single-file restores. It
