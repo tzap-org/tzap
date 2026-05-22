@@ -1,12 +1,11 @@
 # tzap
 
-Rust reference implementation of the **tzap archive format**: ultra fast, encrypted,
+Rust reference implementation of the **tzap archive format**: super fast, encrypted,
 self-healing, random-access archives for serious long-term storage.
 
 tzap is built for real archives: huge backups, private datasets, cold storage,
 S3-style object storage, split volumes, and restores where you need one file
-now, not after unpacking everything. It combines tar-style packing, zstd
-compression, AEAD encryption, authenticated metadata, and Reed-Solomon recovery
+now, not after unpacking everything. It combines packing, fast compression, strong encryption, authenticated metadata, and recovery
 in one practical format.
 
 The implementation currently targets the v0.36 format specification:
