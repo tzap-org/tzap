@@ -4831,6 +4831,124 @@ mod tests {
     }
 
     #[test]
+    fn rejects_multi_volume_count_mismatch_without_tolerance() {
+        let files = [RegularFile::new("alpha.txt", b"count check")];
+        let archive = write_archive(
+            &files,
+            &master_key(),
+            WriterOptions {
+                stripe_width: 3,
+                volume_loss_tolerance: 0,
+                ..single_stream_options()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            open_archive_volumes(&[archive.volumes[0].as_slice()], &master_key()).unwrap_err(),
+            FormatError::InvalidArchive("missing volume count exceeds volume_loss_tolerance")
+        );
+    }
+
+    #[test]
+    fn rejects_multi_volume_manifest_bootstrap_field_mismatch() {
+        let files = [RegularFile::new("alpha.txt", b"footer mismatch")];
+        let archive = write_archive(
+            &files,
+            &master_key(),
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 1,
+                ..single_stream_options()
+            },
+        )
+        .unwrap();
+
+        let mut bad_first = archive.volumes[0].clone();
+        rewrite_manifest_footer(&mut bad_first, &master_key(), |footer| {
+            footer.index_root_first_block = footer.index_root_first_block.wrapping_add(1);
+        });
+
+        assert_eq!(
+            open_archive_volumes(
+                &[bad_first.as_slice(), archive.volumes[1].as_slice()],
+                &master_key()
+            )
+            .unwrap_err(),
+            FormatError::InvalidArchive("ManifestFooter bootstrap fields differ")
+        );
+    }
+
+    #[test]
+    fn repairs_corrupted_index_root_block_in_multi_volume_archive() {
+        let files = [RegularFile::new("alpha.txt", b"repair meta root")];
+        let archive = write_archive(
+            &files,
+            &master_key(),
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 1,
+                ..single_stream_options()
+            },
+        )
+        .unwrap();
+        let mut volumes = archive.volumes.clone();
+
+        let mut corrupted = false;
+        for volume in &mut volumes {
+            if let Some(slot) = block_record_slots_with_kind(volume, BlockKind::IndexRootData).first() {
+                corrupt_block_record_payload_at_slot(volume, *slot);
+                corrupted = true;
+                break;
+            }
+        }
+        assert!(corrupted, "expected an IndexRootData record");
+
+        let volume_refs = volumes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let opened = open_archive_volumes(&volume_refs, &master_key()).unwrap();
+        assert_eq!(
+            opened.extract_file("alpha.txt").unwrap(),
+            Some(b"repair meta root".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn repairs_corrupted_index_shard_block_in_multi_volume_archive() {
+        let files = [RegularFile::new("alpha.txt", b"repair meta shard")];
+        let archive = write_archive(
+            &files,
+            &master_key(),
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 1,
+                ..single_stream_options()
+            },
+        )
+        .unwrap();
+        let mut volumes = archive.volumes.clone();
+
+        let mut corrupted = false;
+        for volume in &mut volumes {
+            if let Some(slot) = block_record_slots_with_kind(volume, BlockKind::IndexShardData).first()
+            {
+                corrupt_block_record_payload_at_slot(volume, *slot);
+                corrupted = true;
+                break;
+            }
+        }
+        assert!(corrupted, "expected an IndexShardData record");
+
+        let volume_refs = volumes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let opened = open_archive_volumes(&volume_refs, &master_key()).unwrap();
+        assert_eq!(
+            opened.extract_file("alpha.txt").unwrap(),
+            Some(b"repair meta shard".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
     fn rejects_missing_volume_when_loss_tolerance_zero_even_with_bitrot_parity() {
         let files = [RegularFile::new(
             "alpha.txt",
@@ -5160,7 +5278,7 @@ mod tests {
             BootstrapSidecarHeader::parse(&non_covered_sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
         let mut header_bytes = header.to_bytes();
         header_bytes[124] ^= 0x01;
-        let crc = crc32c(&header_bytes[..124]);
+        let crc = crc32c::crc32c(&header_bytes[..124]);
         header_bytes[124..128].copy_from_slice(&crc.to_le_bytes());
         non_covered_sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN].copy_from_slice(&header_bytes);
         let opened = open_archive_with_bootstrap_sidecar(
@@ -5256,10 +5374,10 @@ mod tests {
         let volume_header = VolumeHeader::parse(&first.bytes[..VOLUME_HEADER_LEN]).unwrap();
         let second_volume_header =
             VolumeHeader::parse(&second.bytes[..VOLUME_HEADER_LEN]).unwrap();
-        let crypto_start = usize::from(volume_header.crypto_header_offset);
-        let crypto_end = crypto_start + usize::from(volume_header.crypto_header_length);
-        let second_crypto_end = usize::from(second_volume_header.crypto_header_offset)
-            + usize::from(second_volume_header.crypto_header_length);
+        let crypto_start = volume_header.crypto_header_offset as usize;
+        let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
+        let second_crypto_end = second_volume_header.crypto_header_offset as usize
+            + second_volume_header.crypto_header_length as usize;
         assert_eq!(crypto_end, second_crypto_end);
 
         let mut spliced = first.bytes.clone();
@@ -5298,7 +5416,7 @@ mod tests {
 
         let volume_header = VolumeHeader::parse(&first.bytes[..VOLUME_HEADER_LEN]).unwrap();
         let crypto_end = volume_header.crypto_header_offset as usize
-            + usize::from(volume_header.crypto_header_length);
+            + volume_header.crypto_header_length as usize;
         let terminal_offset = terminal_material_offset(&first.bytes);
         let second_terminal_offset = terminal_material_offset(&second.bytes);
         assert_eq!(terminal_offset, second_terminal_offset);
