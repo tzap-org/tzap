@@ -221,12 +221,6 @@ tzap extract --keyfile project.key --volume project.tzap.002 project.tzap.000 --
 | 14 | missing-bootstrap | Bootstrap sidecar required |
 | 16 | unsupported-feature | Unsupported archive feature or writer shape |
 
-## Known limitations
-
-- Some large writer shapes are rejected as unsupported (for example invalid block/chunk combinations).
-- Bootstrap sidecars are not supported with multi-volume open input sets.
-- Multi-volume recovery is limited by tolerance settings and FEC profile.
-
 ## Password mode
 
 Password mode derives the master key from a passphrase with Argon2id. The CLI

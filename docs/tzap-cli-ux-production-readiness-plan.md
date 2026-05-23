@@ -907,15 +907,15 @@ Tasks:
    - published archive format revision
 5. Add an exit-code table.
 6. Add supported platform table.
-7. Add known limitations:
-   - unsupported large writer shapes if still true
-   - bootstrap plus multi-volume limitation if still true
+7. Keep README marketing-focused and put operational boundaries in docs:
+   - unsupported writer shapes with concrete examples if still true
+   - bootstrap plus multi-volume behavior with concrete examples if still true
 8. Ensure examples are tested or manually verified.
 
 Acceptance criteria:
 
 - README examples work when copied into a shell.
-- Known limitations are honest and current.
+- Operational boundary docs are honest and current.
 - The docs do not promise features the CLI rejects.
 
 ## Milestone 12: Crates.io Readiness

@@ -2,9 +2,12 @@
 **/*.rs.bk
 .DS_Store
 .claude/
+/AGENTS.md
+/agents.md
 /plugin-specs
 fuzz/target/
 /docs/*
 !/docs/tzap-cli-reference.md
 !/docs/tzap-cli-ux-production-readiness-plan.md
+!/docs/tzap-operational-boundaries.md
 !/docs/tzap-v36-implementation-plan.md

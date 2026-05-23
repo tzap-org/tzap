@@ -14,13 +14,17 @@ fn milestone10_ci_workflow_has_cross_platform_matrix() {
     let workflow = read_workspace_file(".github/workflows/ci.yml");
 
     assert!(workflow.contains("include:"));
-    assert!(workflow.contains("os: ubuntu-latest"));
-    assert!(workflow.contains("os: macos-latest"));
-    assert!(workflow.contains("os: windows-latest"));
+    assert!(workflow.contains("os: ubuntu-22.04"));
+    assert!(workflow.contains("os: macos-15-intel"));
+    assert!(workflow.contains("os: macos-14"));
+    assert!(workflow.contains("os: windows-2022"));
     assert!(workflow.contains("matrix.run_fmt"));
     assert!(workflow.contains("cargo fmt --all -- --check"));
     assert!(workflow.contains("cargo check --workspace --all-targets --locked"));
     assert!(workflow.contains("cargo test --workspace --locked"));
+    assert!(!workflow.contains("ubuntu-latest"));
+    assert!(!workflow.contains("macos-latest"));
+    assert!(!workflow.contains("windows-latest"));
 }
 
 #[test]

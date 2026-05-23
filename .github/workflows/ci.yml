@@ -17,11 +17,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             run_fmt: true
-          - os: macos-latest
+          - os: macos-15-intel
             run_fmt: false
-          - os: windows-latest
+          - os: macos-14
+            run_fmt: false
+          - os: windows-2022
             run_fmt: false
 
     steps:

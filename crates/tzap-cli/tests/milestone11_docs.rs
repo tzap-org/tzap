@@ -32,7 +32,7 @@ fn milestone11_readme_documents_required_workflows() {
     assert!(readme.contains("## Multi-volume workflow (recoverable)"));
     assert!(readme.contains("## Safety notes"));
     assert!(readme.contains("## Exit codes"));
-    assert!(readme.contains("## Known limitations"));
+    assert!(!readme.contains("## Known limitations"));
 
     assert!(readme.contains("tzap create --password-stdin"));
     assert!(readme.contains("tzap keygen --output"));
@@ -305,9 +305,13 @@ fn milestone11_readme_multivolume_recovery_example_executes() {
 #[test]
 fn milestone11_reference_file_mentions_unsupported_feature_limits() {
     let reference = read_workspace_file("docs/tzap-cli-reference.md");
+    let boundaries = read_workspace_file("docs/tzap-operational-boundaries.md");
 
-    assert!(reference.contains("Known limitations"));
-    assert!(reference.contains("unsupported"));
-    assert!(reference.contains("bootstrap sidecar"));
+    assert!(reference.contains("## Operational boundaries"));
+    assert!(reference.contains("tzap-operational-boundaries.md"));
+    assert!(boundaries.contains("Writer shape validation"));
+    assert!(boundaries.contains("unsupported-feature"));
+    assert!(boundaries.contains("Bootstrap sidecars and multi-volume inputs"));
+    assert!(boundaries.contains("Multi-volume recovery budget"));
     assert!(reference.contains("Global options"));
 }

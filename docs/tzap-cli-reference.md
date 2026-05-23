@@ -112,7 +112,8 @@ Useful flags:
 - `--stdout`: print 64 lowercase hex chars plus newline
 - `--force`: replace existing keyfile output
 
-## Known limitations
+## Operational boundaries
 
-- Some writer shapes and FEC profiles are rejected as unsupported depending on profile constraints.
-- Bootstrap sidecars are not supported with multi-volume open input sets.
+Writer validation, bootstrap sidecar combinations, and multi-volume recovery
+budget examples are documented in
+[tzap-operational-boundaries.md](tzap-operational-boundaries.md).

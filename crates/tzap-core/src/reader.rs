@@ -2701,9 +2701,16 @@ fn to_usize(value: u64, structure: &'static str) -> Result<usize, FormatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::compute_hmac;
-    use crate::format::{AeadAlgo, CompressionAlgo, FecAlgo, KdfAlgo};
-    use crate::metadata::{DirectoryHintEntry, DirectoryHintTableHeader};
+    use crate::compression::compress_zstd_frame;
+    use crate::crypto::{compute_hmac, encrypt_padded_aead_object};
+    use crate::format::{
+        AeadAlgo, CompressionAlgo, FecAlgo, KdfAlgo, CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION,
+        VOLUME_FORMAT_REV,
+    };
+    use crate::metadata::{
+        DirectoryHintEntry, DirectoryHintTableHeader, IndexRootHeader, IndexShardHeader,
+        ENVELOPE_ENTRY_LEN, FILE_ENTRY_LEN, FRAME_ENTRY_LEN, INDEX_SHARD_HEADER_LEN,
+    };
     use crate::writer::{write_archive, write_archive_with_dictionary, RegularFile, WriterOptions};
 
     fn master_key() -> MasterKey {
@@ -2893,6 +2900,24 @@ mod tests {
             Some(b"newer".to_vec())
         );
         opened.verify().unwrap();
+    }
+
+    #[test]
+    fn extract_file_does_not_decrypt_unselected_payload_envelope() {
+        // The current writer emits one small payload envelope, so this fixture
+        // exercises the reader's multi-envelope locality directly.
+        let (mut opened, broken_payload_block) = multi_envelope_reader_fixture();
+        corrupt_payload_record(&mut opened.blocks, broken_payload_block);
+
+        assert_eq!(
+            opened.extract_file("healthy.txt").unwrap(),
+            Some(b"healthy payload\n".to_vec())
+        );
+        assert_eq!(
+            opened.extract_file("broken.txt").unwrap_err(),
+            FormatError::AeadFailure
+        );
+        assert_eq!(opened.verify().unwrap_err(), FormatError::AeadFailure);
     }
 
     #[test]
@@ -3948,5 +3973,443 @@ mod tests {
         let index_record_count = footer.index_root_data_block_count as usize
             + footer.index_root_parity_block_count as usize;
         header.index_root_records_length as usize / index_record_count
+    }
+
+    #[derive(Debug)]
+    struct TestObject {
+        extent: ObjectExtent,
+        records: Vec<BlockRecord>,
+    }
+
+    #[derive(Debug)]
+    struct TestFileMeta {
+        path: Vec<u8>,
+        frame_index: u64,
+        tar_stream_offset: u64,
+        member_group_size: u64,
+        file_data_size: u64,
+    }
+
+    fn multi_envelope_reader_fixture() -> (OpenedArchive, u64) {
+        let volume_header = test_volume_header();
+        let crypto_header = test_crypto_header();
+        let subkeys = Subkeys::derive(
+            &master_key(),
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+        )
+        .unwrap();
+        let mut next_block_index = 0u64;
+        let mut blocks = BTreeMap::new();
+
+        let healthy = test_member(b"healthy.txt", b"healthy payload\n");
+        let broken = test_member(b"broken.txt", b"broken payload\n");
+        let tar_stream = [healthy.as_slice(), broken.as_slice()].concat();
+
+        let healthy_frame = compress_zstd_frame(&healthy, 1).unwrap();
+        let broken_frame = compress_zstd_frame(&broken, 1).unwrap();
+
+        let healthy_payload = encrypt_test_object(
+            &healthy_frame,
+            &subkeys.enc_key,
+            &subkeys.nonce_seed,
+            b"envelope",
+            0,
+            BlockKind::PayloadData,
+            &mut next_block_index,
+            &crypto_header,
+            &volume_header,
+        );
+        let broken_payload = encrypt_test_object(
+            &broken_frame,
+            &subkeys.enc_key,
+            &subkeys.nonce_seed,
+            b"envelope",
+            1,
+            BlockKind::PayloadData,
+            &mut next_block_index,
+            &crypto_header,
+            &volume_header,
+        );
+        let broken_payload_block = broken_payload.extent.first_block_index;
+        insert_records(&mut blocks, &healthy_payload.records);
+        insert_records(&mut blocks, &broken_payload.records);
+
+        let frames = vec![
+            FrameEntry {
+                frame_index: 0,
+                envelope_index: 0,
+                offset_in_envelope: 0,
+                compressed_size: healthy_frame.len() as u32,
+                decompressed_size: healthy.len() as u32,
+                flags: 0x0000_0003,
+                tar_stream_offset: 0,
+            },
+            FrameEntry {
+                frame_index: 1,
+                envelope_index: 1,
+                offset_in_envelope: 0,
+                compressed_size: broken_frame.len() as u32,
+                decompressed_size: broken.len() as u32,
+                flags: 0x0000_0003,
+                tar_stream_offset: healthy.len() as u64,
+            },
+        ];
+        let envelopes = vec![
+            EnvelopeEntry {
+                envelope_index: 0,
+                first_block_index: healthy_payload.extent.first_block_index,
+                data_block_count: healthy_payload.extent.data_block_count,
+                parity_block_count: 0,
+                encrypted_size: healthy_payload.extent.encrypted_size,
+                plaintext_size: healthy_frame.len() as u32,
+                first_frame_index: 0,
+                frame_count: 1,
+            },
+            EnvelopeEntry {
+                envelope_index: 1,
+                first_block_index: broken_payload.extent.first_block_index,
+                data_block_count: broken_payload.extent.data_block_count,
+                parity_block_count: 0,
+                encrypted_size: broken_payload.extent.encrypted_size,
+                plaintext_size: broken_frame.len() as u32,
+                first_frame_index: 1,
+                frame_count: 1,
+            },
+        ];
+        let files = vec![
+            TestFileMeta {
+                path: b"healthy.txt".to_vec(),
+                frame_index: 0,
+                tar_stream_offset: 0,
+                member_group_size: healthy.len() as u64,
+                file_data_size: b"healthy payload\n".len() as u64,
+            },
+            TestFileMeta {
+                path: b"broken.txt".to_vec(),
+                frame_index: 1,
+                tar_stream_offset: healthy.len() as u64,
+                member_group_size: broken.len() as u64,
+                file_data_size: b"broken payload\n".len() as u64,
+            },
+        ];
+
+        let (index_shard_plaintext, first_path_hash, last_path_hash) =
+            build_test_index_shard(&files, &frames, &envelopes);
+        let index_shard = encrypt_test_object(
+            &compress_zstd_frame(&index_shard_plaintext, 1).unwrap(),
+            &subkeys.index_shard_key,
+            &subkeys.index_nonce_seed,
+            b"idxshard",
+            0,
+            BlockKind::IndexShardData,
+            &mut next_block_index,
+            &crypto_header,
+            &volume_header,
+        );
+        insert_records(&mut blocks, &index_shard.records);
+
+        let shard_entry = ShardEntry {
+            shard_index: 0,
+            first_block_index: index_shard.extent.first_block_index,
+            data_block_count: index_shard.extent.data_block_count,
+            parity_block_count: 0,
+            encrypted_size: index_shard.extent.encrypted_size,
+            decompressed_size: index_shard_plaintext.len() as u32,
+            file_count: files.len() as u32,
+            first_path_hash,
+            last_path_hash,
+        };
+        let mut root_header = IndexRootHeader::empty();
+        root_header.frame_count = frames.len() as u64;
+        root_header.envelope_count = envelopes.len() as u64;
+        root_header.file_count = files.len() as u64;
+        root_header.payload_block_count = healthy_payload.extent.data_block_count as u64
+            + broken_payload.extent.data_block_count as u64;
+        root_header.tar_total_size = tar_stream.len() as u64;
+        root_header.content_sha256 = sha256_bytes(&tar_stream);
+        let index_root = IndexRoot {
+            header: root_header,
+            shards: vec![shard_entry],
+            directory_hint_shards: Vec::new(),
+        };
+
+        let index_root_plaintext = index_root.to_bytes();
+        let index_root_object = encrypt_test_object(
+            &compress_zstd_frame(&index_root_plaintext, 1).unwrap(),
+            &subkeys.index_root_key,
+            &subkeys.index_nonce_seed,
+            b"idxroot",
+            0,
+            BlockKind::IndexRootData,
+            &mut next_block_index,
+            &crypto_header,
+            &volume_header,
+        );
+        insert_records(&mut blocks, &index_root_object.records);
+
+        let archive_uuid = volume_header.archive_uuid;
+        let session_id = volume_header.session_id;
+        let opened = OpenedArchive {
+            options: ReaderOptions::default(),
+            observed_archive_bytes: 1_000_000,
+            subkeys,
+            blocks,
+            volume_header,
+            crypto_header,
+            manifest_footer: ManifestFooter {
+                archive_uuid,
+                session_id,
+                volume_index: 0,
+                is_authoritative: 1,
+                total_volumes: 1,
+                index_root_first_block: index_root_object.extent.first_block_index,
+                index_root_data_block_count: index_root_object.extent.data_block_count,
+                index_root_parity_block_count: 0,
+                index_root_encrypted_size: index_root_object.extent.encrypted_size,
+                index_root_decompressed_size: index_root_plaintext.len() as u32,
+                manifest_hmac: [0u8; 32],
+            },
+            volume_trailer: VolumeTrailer {
+                archive_uuid,
+                session_id,
+                volume_index: 0,
+                block_count: next_block_index,
+                bytes_written: 0,
+                manifest_footer_offset: 0,
+                manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
+                closed_at_ns: 0,
+                trailer_hmac: [0u8; 32],
+            },
+            index_root,
+            payload_dictionary: None,
+        };
+        (opened, broken_payload_block)
+    }
+
+    fn test_volume_header() -> VolumeHeader {
+        VolumeHeader {
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV,
+            volume_index: 0,
+            stripe_width: 1,
+            archive_uuid: [0x31; 16],
+            session_id: [0x42; 16],
+            crypto_header_offset: VOLUME_HEADER_LEN as u32,
+            crypto_header_length: CRYPTO_HEADER_FIXED_LEN as u32,
+            header_crc32c: 0,
+        }
+    }
+
+    fn test_crypto_header() -> CryptoHeaderFixed {
+        CryptoHeaderFixed {
+            length: CRYPTO_HEADER_FIXED_LEN as u32,
+            compression_algo: CompressionAlgo::ZstdFramed,
+            aead_algo: AeadAlgo::AesGcmSiv256,
+            fec_algo: FecAlgo::ReedSolomonGF16,
+            kdf_algo: KdfAlgo::Raw,
+            chunk_size: 4096,
+            envelope_target_size: 8192,
+            block_size: 4096,
+            fec_data_shards: 4,
+            fec_parity_shards: 0,
+            index_fec_data_shards: 4,
+            index_fec_parity_shards: 0,
+            index_root_fec_data_shards: 4,
+            index_root_fec_parity_shards: 0,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            has_dictionary: 0,
+            max_path_length: 4096,
+            expected_volume_size: 0,
+        }
+    }
+
+    fn encrypt_test_object(
+        plaintext: &[u8],
+        key: &[u8; 32],
+        nonce_seed: &[u8; 32],
+        domain: &[u8],
+        counter: u64,
+        data_kind: BlockKind,
+        next_block_index: &mut u64,
+        crypto_header: &CryptoHeaderFixed,
+        volume_header: &VolumeHeader,
+    ) -> TestObject {
+        let block_size = crypto_header.block_size as usize;
+        let encrypted = encrypt_padded_aead_object(
+            crypto_header.aead_algo,
+            key,
+            nonce_seed,
+            domain,
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+            counter,
+            block_size,
+            plaintext,
+        )
+        .unwrap();
+        assert_eq!(encrypted.len() % block_size, 0);
+
+        let first_block_index = *next_block_index;
+        let data_block_count = encrypted.len() / block_size;
+        let records = encrypted
+            .chunks(block_size)
+            .enumerate()
+            .map(|(index, payload)| BlockRecord {
+                block_index: first_block_index + index as u64,
+                kind: data_kind,
+                flags: if index + 1 == data_block_count {
+                    0x01
+                } else {
+                    0
+                },
+                payload: payload.to_vec(),
+                record_crc32c: 0,
+            })
+            .collect::<Vec<_>>();
+        *next_block_index += data_block_count as u64;
+
+        TestObject {
+            extent: ObjectExtent {
+                first_block_index,
+                data_block_count: data_block_count as u32,
+                parity_block_count: 0,
+                encrypted_size: encrypted.len() as u32,
+            },
+            records,
+        }
+    }
+
+    fn insert_records(blocks: &mut BTreeMap<u64, BlockRecord>, records: &[BlockRecord]) {
+        for record in records {
+            assert!(blocks.insert(record.block_index, record.clone()).is_none());
+        }
+    }
+
+    fn corrupt_payload_record(blocks: &mut BTreeMap<u64, BlockRecord>, block_index: u64) {
+        let record = blocks.get_mut(&block_index).unwrap();
+        assert_eq!(record.kind, BlockKind::PayloadData);
+        record.payload[0] ^= 0x55;
+    }
+
+    fn build_test_index_shard(
+        files: &[TestFileMeta],
+        frames: &[FrameEntry],
+        envelopes: &[EnvelopeEntry],
+    ) -> (Vec<u8>, [u8; 8], [u8; 8]) {
+        let mut sorted = files
+            .iter()
+            .map(|file| (hash_prefix(&file.path), file))
+            .collect::<Vec<_>>();
+        sorted.sort_by(|left, right| {
+            (left.0, left.1.path.as_slice(), left.1.tar_stream_offset).cmp(&(
+                right.0,
+                right.1.path.as_slice(),
+                right.1.tar_stream_offset,
+            ))
+        });
+
+        let mut string_pool = Vec::new();
+        let mut file_entries = Vec::with_capacity(sorted.len());
+        for (path_hash, file) in &sorted {
+            let path_offset = string_pool.len() as u32;
+            string_pool.extend_from_slice(&file.path);
+            file_entries.push(FileEntry {
+                path_hash: *path_hash,
+                path_offset,
+                path_length: file.path.len() as u32,
+                first_frame_index: file.frame_index,
+                frame_count: 1,
+                offset_in_first_frame_plaintext: 0,
+                tar_member_group_size: file.member_group_size,
+                file_data_size: file.file_data_size,
+                flags: 0,
+            });
+        }
+
+        let header = IndexShardHeader {
+            version: 1,
+            shard_index: 0,
+            file_count: file_entries.len() as u32,
+            frame_count: frames.len() as u32,
+            envelope_count: envelopes.len() as u32,
+            file_table_offset: INDEX_SHARD_HEADER_LEN as u32,
+            frame_table_offset: (INDEX_SHARD_HEADER_LEN + file_entries.len() * FILE_ENTRY_LEN)
+                as u32,
+            envelope_table_offset: (INDEX_SHARD_HEADER_LEN
+                + file_entries.len() * FILE_ENTRY_LEN
+                + frames.len() * FRAME_ENTRY_LEN) as u32,
+            string_pool_offset: (INDEX_SHARD_HEADER_LEN
+                + file_entries.len() * FILE_ENTRY_LEN
+                + frames.len() * FRAME_ENTRY_LEN
+                + envelopes.len() * ENVELOPE_ENTRY_LEN) as u32,
+            string_pool_size: string_pool.len() as u32,
+        };
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&header.to_bytes());
+        for entry in &file_entries {
+            bytes.extend_from_slice(&entry.to_bytes());
+        }
+        for entry in frames {
+            bytes.extend_from_slice(&entry.to_bytes());
+        }
+        for entry in envelopes {
+            bytes.extend_from_slice(&entry.to_bytes());
+        }
+        bytes.extend_from_slice(&string_pool);
+
+        (bytes, sorted.first().unwrap().0, sorted.last().unwrap().0)
+    }
+
+    fn test_member(path: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&test_tar_header(path, data.len() as u64));
+        out.extend_from_slice(data);
+        out.resize(out.len() + padding_to_512(data.len()), 0);
+        out
+    }
+
+    fn test_tar_header(path: &[u8], size: u64) -> [u8; 512] {
+        let mut header = [0u8; 512];
+        header[..path.len()].copy_from_slice(path);
+        write_test_tar_octal(&mut header[100..108], 0o644);
+        write_test_tar_octal(&mut header[108..116], 0);
+        write_test_tar_octal(&mut header[116..124], 0);
+        write_test_tar_octal(&mut header[124..136], size);
+        write_test_tar_octal(&mut header[136..148], 0);
+        header[148..156].fill(b' ');
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let checksum = header.iter().map(|byte| *byte as u64).sum::<u64>();
+        write_test_tar_checksum(&mut header[148..156], checksum);
+        header
+    }
+
+    fn write_test_tar_octal(field: &mut [u8], value: u64) {
+        let digits = format!("{value:o}");
+        field.fill(0);
+        let start = field.len() - 1 - digits.len();
+        field[..start].fill(b'0');
+        field[start..start + digits.len()].copy_from_slice(digits.as_bytes());
+    }
+
+    fn write_test_tar_checksum(field: &mut [u8], value: u64) {
+        let digits = format!("{value:06o}");
+        field[0..6].copy_from_slice(digits.as_bytes());
+        field[6] = 0;
+        field[7] = b' ';
+    }
+
+    fn padding_to_512(len: usize) -> usize {
+        let remainder = len % 512;
+        if remainder == 0 {
+            0
+        } else {
+            512 - remainder
+        }
     }
 }
