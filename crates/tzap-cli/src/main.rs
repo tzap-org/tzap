@@ -1853,6 +1853,15 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
                 action: "add the missing archive volume(s) or confirm volume-loss tolerance",
             }
         }
+        FormatError::InvalidArchive(message)
+            if *message == "missing volume count exceeds volume_loss_tolerance" =>
+        {
+            Diagnostic {
+                label: "missing-volume",
+                exit_code: EXIT_CORRUPT_ARCHIVE,
+                action: "add the missing archive volume(s) or confirm volume-loss tolerance",
+            }
+        }
         FormatError::HmacMismatch { .. } | FormatError::AeadFailure => Diagnostic {
             label: "corrupt-payload",
             exit_code: EXIT_CORRUPT_ARCHIVE,
@@ -1994,6 +2003,20 @@ mod tests {
             assert_eq!(diagnostic.exit_code, EXIT_MISSING_BOOTSTRAP);
             assert_eq!(diagnostic.action, "use --bootstrap with a matching sidecar");
         }
+    }
+
+    #[test]
+    fn missing_volume_errors_keep_stable_diagnostic() {
+        let diagnostic = classify_format_error(&FormatError::InvalidArchive(
+            "missing volume count exceeds volume_loss_tolerance",
+        ));
+
+        assert_eq!(diagnostic.label, "missing-volume");
+        assert_eq!(diagnostic.exit_code, EXIT_CORRUPT_ARCHIVE);
+        assert_eq!(
+            diagnostic.action,
+            "add the missing archive volume(s) or confirm volume-loss tolerance"
+        );
     }
 
     #[test]

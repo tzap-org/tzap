@@ -2649,6 +2649,25 @@ mod tests {
     }
 
     #[test]
+    fn parity_auto_scaling_rejects_non_convergent_budget() {
+        let err = compute_parity(
+            1,
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 1,
+                bit_rot_buffer_pct: 50,
+                ..WriterOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            FormatError::WriterUnsupported("parity calculation did not converge")
+        );
+    }
+
+    #[test]
     fn zero_parity_is_allowed_when_no_recovery_margin_is_requested() {
         let planned = plan_writer_options(WriterOptions {
             bit_rot_buffer_pct: 0,

@@ -61,7 +61,7 @@ and explicit release gates.
 | G06 | IndexRoot/dictionary sizing | complete | P0 | choose metadata FEC class before CryptoHeader HMAC |
 | G07 | Directory hints and directory entries | complete | P0/P1 | exact hint map, directory entries, and cloud claims settled |
 | G08 | Tar metadata profile | complete | P1 | supported metadata profile documented and tested |
-| G09 | Recovery and duplicate volumes | partial | P1 | default rejection and recovery modes are explicit |
+| G09 | Recovery and duplicate volumes | complete | P1 | strict recovery modes are documented and mutation-tested |
 | G10 | CLI/API boundaries | partial | P0 | help/docs/tests do not imply unsupported behavior |
 | G11 | v36 corpus coverage | complete | P0 | every section 28.1 case tracked as covered/missing/deferred |
 | G12 | Fuzzing and mutation harness | partial | P1/P2 | fuzz targets and smoke gates cover parsers and mutations |
@@ -169,7 +169,8 @@ Completed implementation:
      CLI/API scope
    - tar metadata profile: `W13`, `R13`, and `R23` complete for the documented
      profile
-   - duplicate-copy recovery: `R27` partial with the explicit mode deferred
+   - duplicate-copy recovery: `R27` complete by strict default rejection; any
+     explicit duplicate-copy mode would be a future feature
    - fuzz and release gates: tracked in the non-section-29 release evidence
      table
 5. Added `.gitignore` whitelist for the new tracked docs file.
@@ -652,52 +653,71 @@ Spec anchors:
 - writer obligations 15, 21, 22, 32
 - reader obligations 19, 21, 24, 27
 
-Current gap:
+Status: complete.
+
+Original gap:
 
 The CLI has multi-volume and bit-rot recovery tests, but the complete recovery
 surface is broader. Duplicate supplied volume indexes should reject by default
 unless an explicit duplicate-copy recovery mode proves byte-for-byte identity.
 All FEC edge cases need mutation coverage.
 
-Implementation work:
+Closed implementation:
 
-1. Define recovery modes:
-   - default strict mode
-   - missing-volume recovery within tolerance
-   - bit-rot repair within parity budget
-   - duplicate-copy recovery, only if explicitly implemented
-2. Default behavior:
-   - duplicate authenticated volume indexes reject
-   - conflicting blocks reject
-   - gaps inside object extents reject unless a repair mode can repair them
-3. FEC verification:
-   - exact GF16 Cauchy wire profile
-   - odd block size rejects before FEC repair
-   - data and parity BlockRecords ordered data-first then parity
-   - bit 0 set on exactly one final data block per encrypted object
-4. Bootstrap recovery:
-   - all ManifestFooter copies corrupt or missing means random-access bootstrap
-     fails unless a trusted sidecar supplies authority
-   - IndexRoot block repair still requires authenticated bootstrap metadata to
-     locate the extent
+- `OpenedArchive::open_volumes_with_options` now rejects omitted volumes when
+  the authenticated supplied set is missing more indexes than
+  `volume_loss_tolerance` allows. This prevents bit-rot parity from being
+  silently treated as whole-volume-loss authority.
+- The default recovery mode remains strict and deterministic: duplicate
+  authenticated volume indexes reject before any arbitrary copy is chosen,
+  including byte-identical inputs. No duplicate-copy recovery mode is exposed or
+  claimed in the CLI/API.
+- Bit-rot recovery is pinned at the object-local FEC boundary. CRC-failed data
+  BlockRecords become erasures only while the affected object remains inside its
+  parity budget; parity BlockRecord CRC failures are treated as erased parity
+  and cannot bypass AEAD/HMAC authentication for data. Structural BlockRecord
+  errors such as bad magic or non-zero reserved bytes reject instead of being
+  treated as repairable erasures.
+- Multi-volume bootstrap can survive one corrupt per-volume ManifestFooter copy
+  by using another authenticated ManifestFooter copy from the supplied set; if
+  no valid copy exists, random-access bootstrap still requires a trusted sidecar
+  or fails.
+- The reader has mutation coverage for odd block sizes before FEC repair,
+  parity blocks with last-data flags, and missing/duplicate payload last-data
+  flags. Existing wire and GF16 vector tests remain the exact Cauchy profile
+  baseline.
+- `docs/tzap-operational-boundaries.md` documents the supported recovery modes:
+  strict open, missing-volume recovery, bit-rot repair, and no duplicate-copy
+  recovery mode.
 
 Tests:
 
-- Duplicate volume index rejects by default.
-- Duplicate-copy recovery accepts only byte-for-byte identical duplicate inputs,
-  if that mode is implemented.
-- Missing volume succeeds only within `volume_loss_tolerance`.
-- Bit-rot repairs only within parity budget.
-- Odd `block_size` rejects before FEC repair.
-- Parity block with last-data bit rejects.
-- Data object with missing or duplicate final-data bit rejects.
-- All ManifestFooter copies corrupt fail without sidecar and succeed with a
-  trusted sidecar, if G05 implements the sidecar path.
+- `reader::tests::recovers_from_one_missing_volume_when_parity_allows`
+- `reader::tests::rejects_missing_volume_when_loss_tolerance_zero_even_with_bitrot_parity`
+- `reader::tests::recovers_from_crc_corrupted_block_when_parity_allows`
+- `reader::tests::repairs_crc_erasure_only_within_parity_budget`
+- `reader::tests::parity_crc_erasure_does_not_hide_authenticated_data`
+- `reader::tests::rejects_structurally_malformed_block_records_instead_of_repairing`
+- `reader::tests::rejects_duplicate_authenticated_volume_indexes`
+- `reader::tests::rejects_conflicting_duplicate_authenticated_volume_indexes_by_default`
+- `reader::tests::rejects_block_record_at_wrong_stripe_position`
+- `reader::tests::rejects_odd_block_size_before_fec_repair`
+- `reader::tests::rejects_parity_block_with_last_data_flag`
+- `reader::tests::rejects_missing_and_duplicate_payload_last_data_flags`
+- `reader::tests::recovers_from_one_corrupt_manifest_footer_copy_when_another_volume_authenticates`
+- `reader::tests::manifest_footer_corruption_requires_trusted_sidecar`
+- `reader::tests::rejects_authenticated_footer_and_trailer_volume_index_mismatches`
+- `writer::tests::parity_auto_scaling_rejects_non_convergent_budget`
+- `fec::tests::rejects_invalid_shapes_before_repair`
+- `main.rs::tests::missing_volume_errors_keep_stable_diagnostic`
 
-Done criteria:
+Remaining work:
 
-- Recovery behavior is deterministic, documented, and mutation-tested.
-- There is no silent arbitrary choice among duplicate volumes.
+- Broad malformed-buffer, identity-splice, and fixture-generator expansion
+  remains in G12.
+- A future duplicate-copy recovery mode would be a new feature and must prove
+  byte-for-byte identity for the requested operation before accepting duplicate
+  volume indexes.
 
 ## G10 - CLI and API Boundaries
 

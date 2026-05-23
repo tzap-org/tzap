@@ -173,12 +173,16 @@ impl OpenedArchive {
         let observed_archive_bytes =
             observed_archive_size(volumes.iter().map(|volume| volume.len() as u64))?;
         let mut first: Option<ParsedSeekableVolume> = None;
+        let mut manifest_authority: Option<ManifestFooter> = None;
+        let mut manifest_authority_volume_header: Option<VolumeHeader> = None;
+        let mut manifest_authority_volume_trailer: Option<VolumeTrailer> = None;
+        let mut first_manifest_footer_error: Option<FormatError> = None;
         let mut seen_volume_indexes = BTreeSet::new();
         let mut blocks = BTreeMap::new();
         let mut erased_block_indices = BTreeSet::new();
 
         for volume_bytes in volumes {
-            let parsed = parse_seekable_volume(volume_bytes, master_key, options)?;
+            let mut parsed = parse_seekable_volume(volume_bytes, master_key, options)?;
             if !seen_volume_indexes.insert(parsed.volume_header.volume_index) {
                 return Err(FormatError::InvalidArchive(
                     "duplicate authenticated volume index",
@@ -187,6 +191,22 @@ impl OpenedArchive {
 
             if let Some(first) = &first {
                 validate_volume_set_member(first, &parsed)?;
+            }
+
+            if let Some(footer) = &parsed.manifest_footer {
+                if let Some(authority) = &manifest_authority {
+                    if !manifest_bootstrap_fields_match(authority, footer) {
+                        return Err(FormatError::InvalidArchive(
+                            "ManifestFooter bootstrap fields differ",
+                        ));
+                    }
+                } else {
+                    manifest_authority = Some(footer.clone());
+                    manifest_authority_volume_header = Some(parsed.volume_header.clone());
+                    manifest_authority_volume_trailer = Some(parsed.volume_trailer.clone());
+                }
+            } else if first_manifest_footer_error.is_none() {
+                first_manifest_footer_error = parsed.manifest_footer_error.take();
             }
 
             for (block_index, record) in &parsed.blocks {
@@ -204,6 +224,29 @@ impl OpenedArchive {
         }
 
         let first = first.ok_or(FormatError::InvalidArchive("no volumes supplied"))?;
+        let manifest_footer =
+            manifest_authority.ok_or_else(|| match first_manifest_footer_error {
+                Some(err) => err,
+                None => FormatError::InvalidArchive("no authenticated ManifestFooter found"),
+            })?;
+        let authority_volume_header = manifest_authority_volume_header.ok_or(
+            FormatError::InvalidArchive("no authenticated ManifestFooter found"),
+        )?;
+        let authority_volume_trailer = manifest_authority_volume_trailer.ok_or(
+            FormatError::InvalidArchive("no authenticated ManifestFooter found"),
+        )?;
+        let observed_volume_count = u32::try_from(seen_volume_indexes.len())
+            .map_err(|_| FormatError::InvalidArchive("volume count overflow"))?;
+        let missing_volume_count = first
+            .crypto_header
+            .stripe_width
+            .checked_sub(observed_volume_count)
+            .ok_or(FormatError::InvalidArchive("volume count overflow"))?;
+        if missing_volume_count > first.crypto_header.volume_loss_tolerance as u32 {
+            return Err(FormatError::InvalidArchive(
+                "missing volume count exceeds volume_loss_tolerance",
+            ));
+        }
         if seen_volume_indexes.len() == first.crypto_header.stripe_width as usize {
             validate_complete_global_block_coverage(&blocks, &erased_block_indices)?;
         }
@@ -215,10 +258,10 @@ impl OpenedArchive {
             &first.volume_header,
             &first.crypto_header,
             ObjectExtent {
-                first_block_index: first.manifest_footer.index_root_first_block,
-                data_block_count: first.manifest_footer.index_root_data_block_count,
-                parity_block_count: first.manifest_footer.index_root_parity_block_count,
-                encrypted_size: first.manifest_footer.index_root_encrypted_size,
+                first_block_index: manifest_footer.index_root_first_block,
+                data_block_count: manifest_footer.index_root_data_block_count,
+                parity_block_count: manifest_footer.index_root_parity_block_count,
+                encrypted_size: manifest_footer.index_root_encrypted_size,
             },
             BlockKind::IndexRootData,
             BlockKind::IndexRootParity,
@@ -228,7 +271,7 @@ impl OpenedArchive {
             0,
             first.crypto_header.index_root_fec_data_shards,
             first.crypto_header.index_root_fec_parity_shards,
-            first.manifest_footer.index_root_decompressed_size,
+            manifest_footer.index_root_decompressed_size,
         )?;
         let index_root = IndexRoot::parse(
             &index_root_plaintext,
@@ -248,10 +291,10 @@ impl OpenedArchive {
             observed_archive_bytes,
             subkeys: first.subkeys,
             blocks,
-            volume_header: first.volume_header,
+            volume_header: authority_volume_header,
             crypto_header: first.crypto_header,
-            manifest_footer: first.manifest_footer,
-            volume_trailer: Some(first.volume_trailer),
+            manifest_footer,
+            volume_trailer: Some(authority_volume_trailer),
             index_root,
             payload_dictionary,
         })
@@ -1063,7 +1106,8 @@ struct ParsedSeekableVolume {
     crypto_header: CryptoHeaderFixed,
     crypto_header_bytes: Vec<u8>,
     subkeys: Subkeys,
-    manifest_footer: ManifestFooter,
+    manifest_footer: Option<ManifestFooter>,
+    manifest_footer_error: Option<FormatError>,
     volume_trailer: VolumeTrailer,
     blocks: BTreeMap<u64, BlockRecord>,
     erased_block_indices: BTreeSet<u64>,
@@ -1121,9 +1165,16 @@ fn parse_seekable_volume(
         MANIFEST_FOOTER_LEN,
         "ManifestFooter",
     )?;
-    let manifest_footer = ManifestFooter::parse(manifest_bytes)?;
-    validate_manifest_footer(&volume_header, &manifest_footer, &subkeys, manifest_bytes)?;
-    manifest_footer.validate_index_root_extent(parsed_crypto.fixed.block_size)?;
+    let (manifest_footer, manifest_footer_error) = match parse_valid_manifest_footer(
+        &volume_header,
+        &subkeys,
+        manifest_bytes,
+        parsed_crypto.fixed.block_size,
+    ) {
+        Ok(footer) => (Some(footer), None),
+        Err(err) if manifest_footer_copy_error_is_recoverable(&err) => (None, Some(err)),
+        Err(err) => return Err(err),
+    };
 
     let block_region = parse_block_region(
         bytes,
@@ -1140,10 +1191,37 @@ fn parse_seekable_volume(
         crypto_header_bytes: crypto_bytes.to_vec(),
         subkeys,
         manifest_footer,
+        manifest_footer_error,
         volume_trailer,
         blocks: block_region.blocks,
         erased_block_indices: block_region.erased_block_indices,
     })
+}
+
+fn parse_valid_manifest_footer(
+    volume_header: &VolumeHeader,
+    subkeys: &Subkeys,
+    manifest_bytes: &[u8],
+    block_size: u32,
+) -> Result<ManifestFooter, FormatError> {
+    let manifest_footer = ManifestFooter::parse(manifest_bytes)?;
+    validate_manifest_footer(volume_header, &manifest_footer, subkeys, manifest_bytes)?;
+    manifest_footer.validate_index_root_extent(block_size)?;
+    Ok(manifest_footer)
+}
+
+fn manifest_footer_copy_error_is_recoverable(error: &FormatError) -> bool {
+    matches!(
+        error,
+        FormatError::BadMagic {
+            structure: "ManifestFooter",
+        } | FormatError::NonZeroReserved {
+            structure: "ManifestFooter",
+        } | FormatError::InvalidAuthoritativeFlag(_)
+            | FormatError::HmacMismatch {
+                structure: "ManifestFooter",
+            }
+    )
 }
 
 fn validate_seekable_supported_volume(
@@ -1173,11 +1251,6 @@ fn validate_volume_set_member(
         || candidate.crypto_header != first.crypto_header
     {
         return Err(FormatError::InvalidArchive("CryptoHeader copies differ"));
-    }
-    if !manifest_bootstrap_fields_match(&first.manifest_footer, &candidate.manifest_footer) {
-        return Err(FormatError::InvalidArchive(
-            "ManifestFooter bootstrap fields differ",
-        ));
     }
     Ok(())
 }
@@ -1749,12 +1822,12 @@ fn parse_block_region(
 }
 
 fn block_record_error_is_recoverable_erasure(error: &FormatError) -> bool {
-    match error {
-        FormatError::BadCrc { structure }
-        | FormatError::BadMagic { structure }
-        | FormatError::NonZeroReserved { structure } => *structure == "BlockRecord",
-        _ => false,
-    }
+    matches!(
+        error,
+        FormatError::BadCrc {
+            structure: "BlockRecord",
+        }
+    )
 }
 
 fn checked_u64_mul(lhs: u64, rhs: u64, reason: &'static str) -> Result<u64, FormatError> {
@@ -2855,6 +2928,52 @@ mod tests {
             volume_loss_tolerance: 0,
             ..WriterOptions::default()
         }
+    }
+
+    fn small_block_recovery_options() -> WriterOptions {
+        WriterOptions {
+            block_size: 4096,
+            chunk_size: 32 * 1024,
+            envelope_target_size: 32 * 1024,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 1,
+            fec_data_shards: 16,
+            fec_parity_shards: 1,
+            index_fec_data_shards: 4,
+            index_fec_parity_shards: 1,
+            index_root_fec_data_shards: 16,
+            index_root_fec_parity_shards: 1,
+            ..WriterOptions::default()
+        }
+    }
+
+    fn parity_rich_recovery_options() -> WriterOptions {
+        WriterOptions {
+            block_size: 4096,
+            chunk_size: 32 * 1024,
+            envelope_target_size: 32 * 1024,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 40,
+            fec_data_shards: 16,
+            fec_parity_shards: 16,
+            index_fec_data_shards: 4,
+            index_fec_parity_shards: 4,
+            index_root_fec_data_shards: 16,
+            index_root_fec_parity_shards: 16,
+            ..WriterOptions::default()
+        }
+    }
+
+    fn pseudo_random_bytes(len: usize) -> Vec<u8> {
+        let mut state = 0x1234_5678u32;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect()
     }
 
     #[test]
@@ -4265,6 +4384,288 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_volume_when_loss_tolerance_zero_even_with_bitrot_parity() {
+        let files = [RegularFile::new(
+            "alpha.txt",
+            b"bitrot parity is not volume loss",
+        )];
+        let archive = write_archive(
+            &files,
+            &master_key(),
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 1,
+                ..single_stream_options()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            open_archive_volumes(&[archive.volumes[1].as_slice()], &master_key()).unwrap_err(),
+            FormatError::InvalidArchive("missing volume count exceeds volume_loss_tolerance")
+        );
+    }
+
+    #[test]
+    fn repairs_crc_erasure_only_within_parity_budget() {
+        let payload = pseudo_random_bytes(12_000);
+        let archive = write_archive(
+            &[RegularFile::new("rot.bin", &payload)],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+        let payload_slots = first_payload_data_run_slots(&archive.bytes);
+        assert!(
+            payload_slots.len() >= 2,
+            "fixture must contain a multi-block payload object"
+        );
+
+        let mut one_erasure = archive.bytes.clone();
+        corrupt_block_record_payload_at_slot(&mut one_erasure, payload_slots[0]);
+        let repaired = open_archive(&one_erasure, &master_key()).unwrap();
+        assert_eq!(
+            repaired.extract_file("rot.bin").unwrap(),
+            Some(payload.clone())
+        );
+
+        let mut two_erasures = archive.bytes.clone();
+        corrupt_block_record_payload_at_slot(&mut two_erasures, payload_slots[0]);
+        corrupt_block_record_payload_at_slot(&mut two_erasures, payload_slots[1]);
+        let unrepaired = open_archive(&two_erasures, &master_key()).unwrap();
+        assert_eq!(
+            unrepaired.extract_file("rot.bin").unwrap_err(),
+            FormatError::FecTooFewAvailableShards
+        );
+    }
+
+    #[test]
+    fn parity_crc_erasure_does_not_hide_authenticated_data() {
+        let payload = pseudo_random_bytes(12_000);
+        let archive = write_archive(
+            &[RegularFile::new("parity-erasure.bin", &payload)],
+            &master_key(),
+            parity_rich_recovery_options(),
+        )
+        .unwrap();
+        let payload_slot = first_payload_data_run_slots(&archive.bytes)[0];
+        let parity_slots = block_record_slots_with_kind(&archive.bytes, BlockKind::PayloadParity);
+        assert!(
+            parity_slots.len() >= 2,
+            "fixture must contain redundant parity shards"
+        );
+        let mut corrupted = archive.bytes;
+        corrupt_block_record_payload_at_slot(&mut corrupted, payload_slot);
+        corrupt_block_record_payload_at_slot(&mut corrupted, parity_slots[0]);
+
+        let opened = open_archive(&corrupted, &master_key()).unwrap();
+        assert_eq!(
+            opened.extract_file("parity-erasure.bin").unwrap(),
+            Some(payload)
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn rejects_odd_block_size_before_fec_repair() {
+        let archive = write_archive(
+            &[RegularFile::new("odd-block.txt", b"payload")],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+        let mut malformed = archive.bytes;
+        let volume_header = VolumeHeader::parse(&malformed[..VOLUME_HEADER_LEN]).unwrap();
+        let block_size_offset = volume_header.crypto_header_offset as usize + 24;
+        malformed[block_size_offset..block_size_offset + 4].copy_from_slice(&4097u32.to_le_bytes());
+
+        assert_eq!(
+            open_archive(&malformed, &master_key()).unwrap_err(),
+            FormatError::OddBlockSize(4097)
+        );
+    }
+
+    #[test]
+    fn rejects_structurally_malformed_block_records_instead_of_repairing() {
+        let archive = write_archive(
+            &[RegularFile::new("structural-block.txt", b"payload")],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+        let payload_slot = first_payload_data_run_slots(&archive.bytes)[0];
+
+        let mut bad_magic = archive.bytes.clone();
+        corrupt_block_record_magic_at_slot(&mut bad_magic, payload_slot);
+        assert_eq!(
+            open_archive(&bad_magic, &master_key()).unwrap_err(),
+            FormatError::BadMagic {
+                structure: "BlockRecord"
+            }
+        );
+
+        let mut bad_reserved = archive.bytes;
+        corrupt_block_record_reserved_at_slot(&mut bad_reserved, payload_slot);
+        assert_eq!(
+            open_archive(&bad_reserved, &master_key()).unwrap_err(),
+            FormatError::NonZeroReserved {
+                structure: "BlockRecord"
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_parity_block_with_last_data_flag() {
+        let archive = write_archive(
+            &[RegularFile::new("parity-flag.txt", b"payload")],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+        let parity_slot =
+            first_block_record_slot_with_kind(&archive.bytes, BlockKind::PayloadParity).unwrap();
+        let mut malformed = archive.bytes;
+        mutate_block_record_at_slot(&mut malformed, parity_slot, |record| {
+            record.flags = 0x01;
+        });
+
+        assert_eq!(
+            open_archive(&malformed, &master_key()).unwrap_err(),
+            FormatError::ParityBlockHasLastDataFlag
+        );
+    }
+
+    #[test]
+    fn rejects_missing_and_duplicate_payload_last_data_flags() {
+        let payload = pseudo_random_bytes(12_000);
+        let archive = write_archive(
+            &[RegularFile::new("flags.bin", &payload)],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+        let payload_slots = first_payload_data_run_slots(&archive.bytes);
+        assert!(
+            payload_slots.len() >= 2,
+            "fixture must contain a multi-block payload object"
+        );
+
+        let mut duplicate_last = archive.bytes.clone();
+        mutate_block_record_at_slot(&mut duplicate_last, payload_slots[0], |record| {
+            record.flags = 0x01;
+        });
+        let opened = open_archive(&duplicate_last, &master_key()).unwrap();
+        assert_eq!(
+            opened.extract_file("flags.bin").unwrap_err(),
+            FormatError::InvalidArchive("object last-data flag is not on the final data block")
+        );
+
+        let mut missing_last = archive.bytes;
+        mutate_block_record_at_slot(
+            &mut missing_last,
+            *payload_slots.last().unwrap(),
+            |record| {
+                record.flags = 0;
+            },
+        );
+        let opened = open_archive(&missing_last, &master_key()).unwrap();
+        assert_eq!(
+            opened.extract_file("flags.bin").unwrap_err(),
+            FormatError::InvalidArchive("object last-data flag is not on the final data block")
+        );
+    }
+
+    #[test]
+    fn recovers_from_one_corrupt_manifest_footer_copy_when_another_volume_authenticates() {
+        let files = [RegularFile::new(
+            "footer-copy.txt",
+            b"survives one bad footer",
+        )];
+        let archive = write_archive(
+            &files,
+            &master_key(),
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 1,
+                ..single_stream_options()
+            },
+        )
+        .unwrap();
+        let mut volumes = archive.volumes.clone();
+        corrupt_manifest_footer_hmac(&mut volumes[0]);
+
+        let volume_refs = volumes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let opened = open_archive_volumes(&volume_refs, &master_key()).unwrap();
+        assert_eq!(opened.manifest_footer.volume_index, 1);
+        assert_eq!(opened.volume_header.volume_index, 1);
+        assert_eq!(opened.volume_trailer.as_ref().unwrap().volume_index, 1);
+        assert_eq!(
+            opened.extract_file("footer-copy.txt").unwrap(),
+            Some(b"survives one bad footer".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn manifest_footer_corruption_requires_trusted_sidecar() {
+        let archive = write_archive(
+            &[RegularFile::new("footer.txt", b"sidecar authority")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let manifest_offset = terminal_material_offset(&archive.bytes);
+        let mut corrupted = archive.bytes.clone();
+        corrupted[manifest_offset + MANIFEST_HMAC_COVERED_LEN] ^= 0x01;
+
+        assert_eq!(
+            open_archive(&corrupted, &master_key()).unwrap_err(),
+            FormatError::HmacMismatch {
+                structure: "ManifestFooter"
+            }
+        );
+
+        let opened =
+            open_non_seekable_archive(&corrupted, &master_key(), Some(&archive.bootstrap_sidecar))
+                .unwrap();
+        assert!(opened.volume_trailer.is_none());
+        assert_eq!(
+            opened.extract_file("footer.txt").unwrap(),
+            Some(b"sidecar authority".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn rejects_authenticated_footer_and_trailer_volume_index_mismatches() {
+        let archive = write_archive(
+            &[RegularFile::new("volume-index.txt", b"identity")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+
+        let mut bad_trailer = archive.bytes.clone();
+        rewrite_volume_trailer(&mut bad_trailer, &master_key(), |trailer| {
+            trailer.volume_index = 1;
+        });
+        assert_eq!(
+            open_archive(&bad_trailer, &master_key()).unwrap_err(),
+            FormatError::InvalidArchive("VolumeTrailer identity does not match VolumeHeader")
+        );
+
+        let mut bad_manifest = archive.bytes;
+        rewrite_manifest_footer(&mut bad_manifest, &master_key(), |footer| {
+            footer.volume_index = 1;
+        });
+        assert_eq!(
+            open_archive(&bad_manifest, &master_key()).unwrap_err(),
+            FormatError::InvalidArchive("ManifestFooter identity does not match VolumeHeader")
+        );
+    }
+
+    #[test]
     fn rejects_block_record_at_wrong_stripe_position() {
         let files = [RegularFile::new("alpha.txt", b"wrong stripe")];
         let archive = write_archive(
@@ -4306,6 +4707,32 @@ mod tests {
         assert_eq!(
             open_archive_volumes(
                 &[archive.volumes[0].as_slice(), archive.volumes[0].as_slice()],
+                &master_key()
+            )
+            .unwrap_err(),
+            FormatError::InvalidArchive("duplicate authenticated volume index")
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_duplicate_authenticated_volume_indexes_by_default() {
+        let files = [RegularFile::new("alpha.txt", b"conflicting duplicates")];
+        let archive = write_archive(
+            &files,
+            &master_key(),
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 1,
+                ..single_stream_options()
+            },
+        )
+        .unwrap();
+        let mut conflicting = archive.volumes[0].clone();
+        corrupt_first_block_record_payload(&mut conflicting);
+
+        assert_eq!(
+            open_archive_volumes(
+                &[archive.volumes[0].as_slice(), conflicting.as_slice()],
                 &master_key()
             )
             .unwrap_err(),
@@ -4426,6 +4853,26 @@ mod tests {
         volume[record_offset + 16] ^= 0x55;
     }
 
+    fn corrupt_block_record_payload_at_slot(volume: &mut [u8], slot: usize) {
+        let (record_offset, _) = block_record_at_slot(volume, slot);
+        volume[record_offset + 16] ^= 0x55;
+    }
+
+    fn corrupt_block_record_magic_at_slot(volume: &mut [u8], slot: usize) {
+        let (record_offset, _) = block_record_at_slot(volume, slot);
+        volume[record_offset] ^= 0x55;
+    }
+
+    fn corrupt_block_record_reserved_at_slot(volume: &mut [u8], slot: usize) {
+        let (record_offset, _) = block_record_at_slot(volume, slot);
+        volume[record_offset + 14] = 0x01;
+    }
+
+    fn corrupt_manifest_footer_hmac(volume: &mut [u8]) {
+        let manifest_offset = terminal_material_offset(volume);
+        volume[manifest_offset + MANIFEST_HMAC_COVERED_LEN] ^= 0x01;
+    }
+
     fn mutate_first_block_record(volume: &mut [u8], mutate: impl FnOnce(&mut BlockRecord)) {
         let (record_offset, record_len) = first_block_record(volume);
         let block_size = record_len - BLOCK_RECORD_FRAMING_LEN;
@@ -4438,7 +4885,27 @@ mod tests {
         volume[record_offset..record_offset + record_len].copy_from_slice(&record.to_bytes());
     }
 
+    fn mutate_block_record_at_slot(
+        volume: &mut [u8],
+        slot: usize,
+        mutate: impl FnOnce(&mut BlockRecord),
+    ) {
+        let (record_offset, record_len) = block_record_at_slot(volume, slot);
+        let block_size = record_len - BLOCK_RECORD_FRAMING_LEN;
+        let mut record = BlockRecord::parse(
+            &volume[record_offset..record_offset + record_len],
+            block_size,
+        )
+        .unwrap();
+        mutate(&mut record);
+        volume[record_offset..record_offset + record_len].copy_from_slice(&record.to_bytes());
+    }
+
     fn first_block_record(volume: &[u8]) -> (usize, usize) {
+        block_record_at_slot(volume, 0)
+    }
+
+    fn block_record_at_slot(volume: &[u8], slot: usize) -> (usize, usize) {
         let volume_header = VolumeHeader::parse(&volume[..VOLUME_HEADER_LEN]).unwrap();
         let crypto_start = volume_header.crypto_header_offset as usize;
         let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
@@ -4447,10 +4914,121 @@ mod tests {
             volume_header.crypto_header_length,
         )
         .unwrap();
-        let record_offset = crypto_end;
         let record_len = crypto_header.fixed.block_size as usize + BLOCK_RECORD_FRAMING_LEN;
+        let record_offset = crypto_end + slot * record_len;
         assert!(volume.len() >= record_offset + record_len);
         (record_offset, record_len)
+    }
+
+    fn first_block_record_slot_with_kind(volume: &[u8], kind: BlockKind) -> Option<usize> {
+        block_record_slots(volume)
+            .into_iter()
+            .enumerate()
+            .find_map(|(slot, (_, _, record))| (record.kind == kind).then_some(slot))
+    }
+
+    fn block_record_slots_with_kind(volume: &[u8], kind: BlockKind) -> Vec<usize> {
+        block_record_slots(volume)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(slot, (_, _, record))| (record.kind == kind).then_some(slot))
+            .collect()
+    }
+
+    fn first_payload_data_run_slots(volume: &[u8]) -> Vec<usize> {
+        let mut slots = Vec::new();
+        for (slot, (_, _, record)) in block_record_slots(volume).into_iter().enumerate() {
+            if record.kind == BlockKind::PayloadData {
+                slots.push(slot);
+            } else if !slots.is_empty() {
+                break;
+            }
+        }
+        slots
+    }
+
+    fn block_record_slots(volume: &[u8]) -> Vec<(usize, usize, BlockRecord)> {
+        let volume_header = VolumeHeader::parse(&volume[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_start = volume_header.crypto_header_offset as usize;
+        let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
+        let crypto_header = CryptoHeader::parse(
+            &volume[crypto_start..crypto_end],
+            volume_header.crypto_header_length,
+        )
+        .unwrap();
+        let record_len = crypto_header.fixed.block_size as usize + BLOCK_RECORD_FRAMING_LEN;
+        let manifest_offset = terminal_material_offset(volume);
+        assert_eq!((manifest_offset - crypto_end) % record_len, 0);
+        let record_count = (manifest_offset - crypto_end) / record_len;
+        (0..record_count)
+            .map(|slot| {
+                let offset = crypto_end + slot * record_len;
+                let record = BlockRecord::parse(
+                    &volume[offset..offset + record_len],
+                    record_len - BLOCK_RECORD_FRAMING_LEN,
+                )
+                .unwrap();
+                (offset, record_len, record)
+            })
+            .collect()
+    }
+
+    fn rewrite_manifest_footer(
+        volume: &mut [u8],
+        master_key: &MasterKey,
+        mutate: impl FnOnce(&mut ManifestFooter),
+    ) {
+        let volume_header = VolumeHeader::parse(&volume[..VOLUME_HEADER_LEN]).unwrap();
+        let offset = terminal_material_offset(volume);
+        let mut footer =
+            ManifestFooter::parse(&volume[offset..offset + MANIFEST_FOOTER_LEN]).unwrap();
+        mutate(&mut footer);
+        footer.manifest_hmac = [0u8; 32];
+        let mut footer_bytes = footer.to_bytes();
+        let subkeys = Subkeys::derive(
+            master_key,
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+        )
+        .unwrap();
+        footer.manifest_hmac = compute_hmac(
+            HmacDomain::ManifestFooter,
+            &subkeys.mac_key,
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+            &footer_bytes[..MANIFEST_HMAC_COVERED_LEN],
+        );
+        footer_bytes = footer.to_bytes();
+        volume[offset..offset + MANIFEST_FOOTER_LEN].copy_from_slice(&footer_bytes);
+    }
+
+    fn rewrite_volume_trailer(
+        volume: &mut [u8],
+        master_key: &MasterKey,
+        mutate: impl FnOnce(&mut VolumeTrailer),
+    ) {
+        let volume_header = VolumeHeader::parse(&volume[..VOLUME_HEADER_LEN]).unwrap();
+        let offset = terminal_material_offset(volume) + MANIFEST_FOOTER_LEN;
+        let mut trailer =
+            VolumeTrailer::parse(&volume[offset..offset + VOLUME_TRAILER_LEN]).unwrap();
+        mutate(&mut trailer);
+        trailer.trailer_hmac = [0u8; 32];
+        let mut trailer_bytes = trailer.to_bytes();
+        let subkeys = Subkeys::derive(
+            master_key,
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+        )
+        .unwrap();
+        trailer.trailer_hmac = compute_hmac(
+            HmacDomain::VolumeTrailer,
+            &subkeys.mac_key,
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+            &trailer_bytes[..TRAILER_HMAC_COVERED_LEN],
+        );
+        trailer_bytes = trailer.to_bytes();
+        volume[offset..offset + VOLUME_TRAILER_LEN].copy_from_slice(&trailer_bytes);
     }
 
     fn rewrite_sidecar_header(

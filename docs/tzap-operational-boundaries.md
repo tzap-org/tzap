@@ -272,6 +272,26 @@ What to do:
 
 Recovery capacity is chosen when the archive is created. A volume can be omitted
 only when the archive was written with enough recovery budget for that loss.
+The default reader behavior is strict about identity: it authenticates each
+supplied volume, rejects duplicate authenticated `volume_index` values even when
+the bytes are identical, and does not expose a duplicate-copy recovery mode.
+
+Recovery modes in the current CLI/API are:
+
+- Default strict open: all supplied headers, CryptoHeaders, and trailers must
+  authenticate and match their stripe position; at least one ManifestFooter
+  authority must authenticate for random-access bootstrap; BlockRecords must be
+  structurally valid and match their stripe position; duplicate volume indexes
+  reject.
+- Missing-volume recovery: automatic only when the number of omitted volumes is
+  no greater than `volume_loss_tolerance` and the per-object FEC records can
+  repair the missing shards.
+- Bit-rot repair: CRC-failed BlockRecords are treated as erasures and repaired
+  only while the affected object stays within its parity budget. Authenticated
+  payload tamper with a recomputed CRC still fails AEAD/HMAC before plaintext is
+  released.
+- Duplicate-copy recovery: not implemented or claimed. Supply at most one file
+  for each authenticated volume index.
 
 Example with one recoverable missing volume:
 
@@ -310,4 +330,13 @@ What to do:
 - Set `--volume-loss-tolerance N` to the number of whole volumes the archive
   should survive losing.
 - Keep at least `N + 1` volumes available for recovery.
+- Do not pass duplicate volume files as a recovery strategy; keep one trusted
+  copy per volume index.
 - Use `tzap verify` after copying, uploading, or moving volume sets.
+
+Single-volume trusted bootstrap sidecars can recover random-access metadata
+authority when that archive's terminal ManifestFooter/VolumeTrailer material is
+corrupt or absent. Without a trusted sidecar, corrupt or missing terminal
+ManifestFooter copies are corruption, not a recoverable condition.
+Multi-volume archives can use another authenticated ManifestFooter copy when
+one volume's footer copy is corrupt.
