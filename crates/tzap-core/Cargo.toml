@@ -4,8 +4,13 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-description.workspace = true
+description = "Core library for reading and writing encrypted, recoverable tzap archives"
 license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/tzap-core"
+readme = "README.md"
+keywords = ["archive", "compression", "encryption", "recovery", "zstd"]
+categories = ["compression", "cryptography", "filesystem"]
 
 [dependencies]
 aes-gcm.workspace = true
