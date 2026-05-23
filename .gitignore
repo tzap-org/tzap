@@ -13,3 +13,4 @@ fuzz/target/
 !/docs/tzap-v36-implementation-plan.md
 !/docs/tzap-v36-gap-implementation-plan.md
 !/docs/tzap-v36-conformance-matrix.md
+!/docs/tzap-v36-corpus-tracker.md

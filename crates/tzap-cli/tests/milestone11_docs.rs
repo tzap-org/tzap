@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -436,6 +437,140 @@ fn milestone11_v36_conformance_matrix_uses_reviewable_statuses() {
     );
 }
 
+#[test]
+fn milestone11_v36_corpus_tracker_covers_representative_section_28_cases() {
+    let spec = read_workspace_file("specs/tzap-format-revisedv36.md");
+    let tracker = read_workspace_file("docs/tzap-v36-corpus-tracker.md");
+    let gitignore = read_workspace_file(".gitignore");
+
+    assert!(tracker.contains("Primary spec: `specs/tzap-format-revisedv36.md`, section 28.1"));
+    assert!(tracker.contains(
+        "| ID | Case name | Spec intent | Positive fixture/test | Mutation/negative fixture/test | Status | Follow-up/gap |"
+    ));
+    assert!(gitignore.contains("!/docs/tzap-v36-corpus-tracker.md"));
+
+    for (id, case) in [
+        ("C001", "Minimal FileEntry frame ranges"),
+        ("C002", "Exact file versus directory-prefix hints"),
+        ("C015", "Sequential provisional output"),
+        ("C063", "Large-index root bound"),
+        ("C088", "Directory hints"),
+        ("C097", "Single-sink streaming rejection"),
+        ("C098", "Streaming IndexRoot FEC preselection"),
+        ("C099", "Non-seekable sequential extract"),
+        ("C102", "Bootstrap sidecar"),
+        ("C104", "Sidecar cap arithmetic"),
+        ("C109", "S3 round-trip"),
+        ("C113", "Metadata warnings"),
+    ] {
+        let row_prefix = format!("| {id} | {case} |");
+        assert!(
+            tracker.contains(&row_prefix),
+            "corpus tracker missing required row prefix {row_prefix:?}"
+        );
+    }
+
+    let spec_cases = section_28_case_names(&spec);
+    let tracker_cases = corpus_tracker_case_names(&tracker);
+    assert_eq!(
+        spec_cases.len(),
+        113,
+        "v0.36 section 28.1 named corpus case count changed"
+    );
+    assert_eq!(
+        tracker_cases, spec_cases,
+        "corpus tracker rows must exactly match v0.36 section 28.1 case names"
+    );
+}
+
+#[test]
+fn milestone11_v36_corpus_tracker_uses_reviewable_statuses() {
+    let tracker = read_workspace_file("docs/tzap-v36-corpus-tracker.md");
+    let allowed = ["covered", "partial", "missing", "deferred"];
+    let mut status_counts = BTreeMap::<&str, usize>::new();
+
+    assert!(!tracker.contains("| unknown |"));
+    assert!(!tracker.contains("| unsupported |"));
+    assert!(!tracker.contains("| TODO |"));
+    assert!(!tracker.contains("| TBD |"));
+
+    for row in corpus_tracker_rows(&tracker) {
+        assert_eq!(row.len(), 9, "malformed corpus tracker row: {row:?}");
+        for column in 1..=7 {
+            assert!(
+                !row[column].is_empty(),
+                "empty corpus tracker column {column} in row: {row:?}"
+            );
+        }
+
+        let status = row[6];
+        assert!(
+            allowed.contains(&status),
+            "unreviewable corpus tracker status {status:?} in row: {row:?}"
+        );
+        *status_counts.entry(status).or_insert(0) += 1;
+
+        if status == "covered" {
+            assert!(
+                !row[4].starts_with("Missing") && !row[5].starts_with("Missing"),
+                "covered corpus row still has missing evidence: {row:?}"
+            );
+        } else {
+            assert!(
+                row[7].contains("[G"),
+                "open corpus row must link to a follow-up gap: {row:?}"
+            );
+        }
+    }
+
+    for status in allowed {
+        assert!(
+            status_counts.get(status).copied().unwrap_or(0) > 0,
+            "expected at least one corpus tracker row with status {status:?}"
+        );
+    }
+    assert!(
+        status_counts.get("partial").copied().unwrap_or(0) > 0
+            && status_counts.get("missing").copied().unwrap_or(0) > 0,
+        "known v36 gaps must remain visible until implemented"
+    );
+}
+
+#[test]
+fn milestone11_v36_corpus_tracker_references_existing_tests() {
+    let tracker = read_workspace_file("docs/tzap-v36-corpus-tracker.md");
+    let search_roots = [
+        "crates/tzap-core/src/compression.rs",
+        "crates/tzap-core/src/crypto.rs",
+        "crates/tzap-core/src/fec.rs",
+        "crates/tzap-core/src/metadata.rs",
+        "crates/tzap-core/src/padding.rs",
+        "crates/tzap-core/src/reader.rs",
+        "crates/tzap-core/src/tar_model.rs",
+        "crates/tzap-core/src/wire.rs",
+        "crates/tzap-core/src/writer.rs",
+        "crates/tzap-core/tests/v36_corpus.rs",
+        "crates/tzap-cli/tests/cli_smoke.rs",
+        "crates/tzap-cli/tests/milestone11_docs.rs",
+    ];
+    let test_sources = search_roots
+        .iter()
+        .map(|path| read_workspace_file(path))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for reference in backticked_test_references(&tracker) {
+        let test_name = reference
+            .rsplit("::")
+            .next()
+            .expect("test reference contains ::");
+        assert!(
+            test_sources.contains(&format!("fn {test_name}")),
+            "corpus tracker references missing test function {reference:?}"
+        );
+    }
+}
+
 fn assert_matrix_row_count(matrix: &str, id: &str, expected: usize) {
     let prefix = format!("| {id} |");
     let actual = matrix
@@ -446,4 +581,61 @@ fn assert_matrix_row_count(matrix: &str, id: &str, expected: usize) {
         actual, expected,
         "expected {expected} row(s) for {id}, found {actual}"
     );
+}
+
+fn corpus_tracker_rows(tracker: &str) -> Vec<Vec<&str>> {
+    tracker
+        .lines()
+        .filter(|line| line.starts_with("| C"))
+        .map(|line| line.split('|').map(str::trim).collect())
+        .collect()
+}
+
+fn corpus_tracker_case_names(tracker: &str) -> Vec<String> {
+    corpus_tracker_rows(tracker)
+        .into_iter()
+        .map(|row| row[2].to_owned())
+        .collect()
+}
+
+fn section_28_case_names(spec: &str) -> Vec<String> {
+    let mut in_section = false;
+    let mut names = Vec::new();
+
+    for line in spec.lines() {
+        if line.starts_with("### 28.1 Test corpus additions") {
+            in_section = true;
+            continue;
+        }
+        if in_section && line.starts_with("---") {
+            break;
+        }
+        if !in_section || !line.starts_with("- **") {
+            continue;
+        }
+        if let Some((name, _)) = line[4..].split_once("**:") {
+            names.push(name.to_owned());
+        }
+    }
+
+    names
+}
+
+fn backticked_test_references(markdown: &str) -> Vec<String> {
+    markdown
+        .split('`')
+        .enumerate()
+        .filter_map(|(index, chunk)| {
+            if index % 2 == 1
+                && (chunk.contains("::tests::")
+                    || chunk.contains("v36_corpus::")
+                    || chunk.contains("cli_smoke::")
+                    || chunk.contains("milestone11_docs::"))
+            {
+                Some(chunk.to_owned())
+            } else {
+                None
+            }
+        })
+        .collect()
 }

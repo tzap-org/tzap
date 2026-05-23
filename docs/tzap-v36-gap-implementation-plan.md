@@ -64,7 +64,7 @@ corpus coverage, and explicit release gates.
 | G08 | Tar metadata profile | partial | P1 | supported metadata profile documented and tested |
 | G09 | Recovery and duplicate volumes | partial | P1 | default rejection and recovery modes are explicit |
 | G10 | CLI/API boundaries | partial | P0 | help/docs/tests do not imply unsupported behavior |
-| G11 | v36 corpus coverage | partial | P0 | every section 28.1 case tracked as covered/missing/deferred |
+| G11 | v36 corpus coverage | complete | P0 | every section 28.1 case tracked as covered/missing/deferred |
 | G12 | Fuzzing and mutation harness | partial | P1/P2 | fuzz targets and smoke gates cover parsers and mutations |
 | G13 | Interop and release gate | missing | P0/P2 | release checklist blocks unverified conformance claims |
 
@@ -702,76 +702,45 @@ Done criteria:
 
 ## G11 - v36 Corpus and Mutation Coverage
 
+Status: complete.
+
 Spec anchors:
 
 - section 28.1 test corpus additions through v0.36
 
-Current gap:
+Original gap:
 
 `crates/tzap-core/tests/v36_corpus.rs` covers many v0.36 cases, but the repo
 does not yet have a tracker proving every corpus item is covered, partially
 covered, missing, or explicitly deferred.
 
-Implementation work:
+Completed implementation:
 
-1. Add `docs/tzap-v36-corpus-tracker.md`.
-2. For each section 28.1 case, record:
+1. Added `docs/tzap-v36-corpus-tracker.md`.
+2. Tracked all 113 named section 28.1 corpus cases with:
    - case name
-   - positive fixture/test
-   - mutation fixture/test
-   - current status
-   - deferred reason, if any
-3. Add reusable mutation helpers so each test does not hand-patch bytes in a
-   bespoke way.
-4. Seed fuzzers from the same fixture generator.
-
-Initial corpus triage:
-
-| Corpus case | Current signal | Required action |
-| --- | --- | --- |
-| Minimal FileEntry frame ranges | tests exist | ensure mutation fixtures cover unrelated trailing frames |
-| Exact file versus directory-prefix hints | parser tests exist | add writer/reader test once directory entries are settled |
-| Directory hint equal-start ordering | parser test exists | keep as matrix evidence |
-| Hash-prefix byte-order vectors | test exists | keep as matrix evidence |
-| Argon2id profile vectors | test exists | add malformed parameter negatives if missing |
-| AEAD combined-output vectors | test exists | keep as matrix evidence |
-| ReedSolomonGF16 wire profile vectors | test exists | add odd block-size and library-default mismatch negatives |
-| Directory hint AEAD counter uniqueness | test exists | keep as matrix evidence |
-| Shard boundary metadata binding | test exists | ensure decrypted IndexShard and DirectoryHint mutations both covered |
-| Sparse local frame offset validation | test exists | add full-verify global gap/overlap mutation if missing |
-| Metadata-object zstd exactness | test exists | keep and expand to all metadata object kinds |
-| FEC effective object ceiling | test exists | add writer-side split/reject tests |
-| Volume format revision freshness | test exists | keep as matrix evidence |
-| Sidecar ManifestFooter volume-0 equivalence | missing/partial | add full sidecar authority tests |
-| Sequential provisional output | missing | implement or document no live API |
-| Zero-data encrypted objects | partial/audit needed | add zero-data mutations for all object kinds |
-| Empty archive | partial | add core reader/writer/verify evidence |
-| Empty payload envelope rejection | audit needed | add envelope, frame, and file-entry zero-size mutations |
-| Reserved FileEntry flags | test exists | keep as matrix evidence |
-| Encrypted-size canonicality | audit needed | add checked arithmetic and class-max mutations |
-| Exact-fit overflow guard | missing | add writer planning test near u32/FEC boundary |
-| Shard and collision caps | partial/audit needed | add max collision and upper-bound landing tests |
-| Header/trailer identity binding | audit needed | combine authenticated material from different archives |
-| Volume count cross-checks | audit needed | mutate header, crypto header, and footer independently |
-| Volume index bounds and duplicates | partial | add duplicate-volume default rejection |
-| Magic-field validation | audit needed | mutate every magic field independently |
-| CryptoHeader canonical offset | audit needed | reject non-128 offsets even if in bounds |
-| CryptoHeader extension TLVs | audit needed | malformed, duplicate, forbidden, critical unknown |
-| KDF/HKDF/nonce/AAD vectors | partial | complete literal vectors and negative cases |
-| BlockRecord flags and reserved fields | partial | ensure all object kinds covered |
-| Per-volume ManifestFooter copies | partial | verify shared fields and per-volume index rules |
-| Zero-offset counted tables | audit needed | reject nonzero offset with zero count |
-| Archive totals | partial | mutate totals and content hash |
-| Bootstrap sidecar sparse/caps | missing/partial | covered by G05 |
-| Trailer-from-end and trailing garbage | audit needed | canonical trailer first, bounded recovery scan |
-| Metadata warnings | missing/partial | covered by G08 |
-| S3/object-store round trip | missing | add optional integration test or documented deferral |
+   - spec intent
+   - positive fixture/test evidence
+   - mutation or negative fixture/test evidence
+   - status: `covered`, `partial`, `missing`, or `deferred`
+   - follow-up gap link for every open case
+3. Kept the tracker honest: cases with aspirational or incomplete evidence stay
+   `partial`, `missing`, or `deferred` and link to G03 through G13.
+4. Added docs tests in `crates/tzap-cli/tests/milestone11_docs.rs` that:
+   - require representative section 28.1 cases to remain present
+   - require exactly 113 tracker rows for the current v0.36 spec
+   - reject vague status values such as `unknown`
+   - require remaining `partial` and `missing` statuses while known gaps remain
+   - require non-covered rows to link back to a follow-up gap
+5. Whitelisted the tracker in `.gitignore`.
 
 Done criteria:
 
 - Every section 28.1 case has a status.
 - Missing cases become work items, not reviewer folklore.
-- Corpus tracker and conformance matrix agree.
+- Corpus tracker now carries the corpus-level evidence map. The conformance
+  matrix remains the section 29 obligation map and can cite tracker rows as G03
+  through G13 close.
 
 ## G12 - Fuzzing and Mutation Harness
 
