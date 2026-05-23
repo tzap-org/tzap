@@ -350,6 +350,9 @@ fn milestone11_docs_pin_current_g01_boundaries() {
     assert!(boundaries.contains("`-`\nas archive stdin"));
     assert!(boundaries.contains("# exit 16: unsupported-feature"));
     assert!(boundaries.contains("# exit 3: io"));
+    assert!(boundaries.contains("Create outputs are archive files, not stdout"));
+    assert!(boundaries.contains("`-o -` is rejected"));
+    assert!(boundaries.contains("--bootstrap-out -"));
     assert!(boundaries.contains("Empty directory inputs"));
     assert!(boundaries.contains("empty directories\nare omitted"));
     assert!(boundaries.contains("Cloud directory-prefix optimization"));
@@ -359,6 +362,8 @@ fn milestone11_docs_pin_current_g01_boundaries() {
     assert!(reference
         .contains("`--bootstrap-out`: sidecar output path for single-volume archives only"));
     assert!(reference.contains("`-` is not an archive stdin sentinel"));
+    assert!(reference.contains("`-o -` is not archive stdout"));
+    assert!(reference.contains("No append-only sink or multipart-upload create"));
     assert!(reference.contains("volume-loss tolerance and FEC budget"));
 
     assert!(!readme.contains("Archive paths, not archive stdin"));
@@ -373,6 +378,63 @@ fn milestone11_docs_pin_current_g01_boundaries() {
     assert!(!reference.contains("cloud/object-store optimized"));
     assert!(!reference.contains("forced-hints"));
     assert!(!reference.contains("--cloud-directory-prefix"));
+}
+
+#[test]
+fn milestone11_docs_pin_current_g03_streaming_boundary() {
+    let readme = read_workspace_file("README.md");
+    let reference = read_workspace_file("docs/tzap-cli-reference.md");
+    let boundaries = read_workspace_file("docs/tzap-operational-boundaries.md");
+    let writer = read_workspace_file("crates/tzap-core/src/writer.rs");
+    let cli = read_workspace_file("crates/tzap-cli/src/main.rs");
+
+    assert!(boundaries.contains("in-memory archive artifact builder"));
+    assert!(boundaries.contains("does not expose archive stdout"));
+    assert!(boundaries.contains("append-only sink"));
+    assert!(boundaries.contains("multipart-upload sink"));
+    assert!(boundaries.contains("pipe output modes"));
+    assert!(writer.contains("in-memory archive artifact builder"));
+    assert!(writer.contains("not a sink-based streaming writer"));
+    assert!(cli.contains("--output - is not archive stdout"));
+    assert!(cli.contains("--bootstrap-out - is not sidecar stdout"));
+
+    let readme_forbidden = [
+        "cloud-streaming",
+        "single-pass",
+        "append-only",
+        "streaming writes",
+        "streaming storage",
+        "pipe-like",
+        "pipe workflows",
+        "sink-based",
+        "multipart uploads",
+    ];
+    let public_cli_forbidden = [
+        "streaming create",
+        "true streaming",
+        "append-only writes",
+        "pipe-like",
+        "pipe workflows",
+        "s3 multipart",
+    ];
+
+    let readme_lower = readme.to_lowercase();
+    for phrase in readme_forbidden {
+        assert!(
+            !readme_lower.contains(phrase),
+            "README must not claim unsupported streaming writer behavior via {phrase:?}"
+        );
+    }
+
+    for (surface, text) in [("CLI reference", reference), ("CLI help source", cli)] {
+        let lower = text.to_lowercase();
+        for phrase in public_cli_forbidden {
+            assert!(
+                !lower.contains(phrase),
+                "{surface} must not claim unsupported streaming writer behavior via {phrase:?}"
+            );
+        }
+    }
 }
 
 #[test]

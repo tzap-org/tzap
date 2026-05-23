@@ -120,6 +120,10 @@ impl<'a> RegularFile<'a> {
     }
 }
 
+/// Completed archive artifacts produced by the current in-memory writer API.
+///
+/// The public writer builds all volume bytes before returning this value. It is
+/// an in-memory archive artifact builder, not a sink-based streaming writer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrittenArchive {
     pub bytes: Vec<u8>,

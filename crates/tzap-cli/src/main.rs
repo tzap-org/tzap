@@ -524,6 +524,7 @@ fn run(cli: Cli) -> Result<()> {
                 )
                 .into());
             }
+            reject_create_stdout_sentinels(&output, bootstrap_out.as_deref())?;
 
             ensure_create_output_paths_can_be_written(
                 &output,
@@ -1152,6 +1153,20 @@ fn write_archive_outputs(output: &str, volumes: &[Vec<u8>]) -> Result<()> {
         let path = format!("{output}.{index:03}");
         fs::write(&path, volume)
             .with_context(|| format!("failed to write archive volume {path}"))?;
+    }
+    Ok(())
+}
+
+fn reject_create_stdout_sentinels(output: &str, bootstrap_out: Option<&str>) -> Result<()> {
+    if output == "-" {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--output - is not archive stdout; create output must be a file path",
+        )));
+    }
+    if matches!(bootstrap_out, Some("-")) {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--bootstrap-out - is not sidecar stdout; sidecar output must be a file path",
+        )));
     }
     Ok(())
 }
@@ -1914,5 +1929,19 @@ mod tests {
                 "VolumeHeader and CryptoHeader stripe_width differ"
             ))
         );
+    }
+
+    #[test]
+    fn bootstrap_required_errors_keep_missing_bootstrap_diagnostic() {
+        for err in [
+            FormatError::ReaderUnsupported("dictionary bootstrap required"),
+            FormatError::WriterUnsupported("bootstrap sidecar required"),
+        ] {
+            let diagnostic = classify_format_error(&err);
+
+            assert_eq!(diagnostic.label, "missing-bootstrap");
+            assert_eq!(diagnostic.exit_code, EXIT_MISSING_BOOTSTRAP);
+            assert_eq!(diagnostic.action, "use --bootstrap with a matching sidecar");
+        }
     }
 }

@@ -120,6 +120,39 @@ What to do:
 - Store the archive bytes in a file and pass that path to `tzap`.
 - Use `--bootstrap` only with a real single-volume archive path.
 
+## Create outputs are archive files, not stdout
+
+The current core writer is an in-memory archive artifact builder:
+`write_archive` returns completed volume buffers, and the CLI then writes those
+buffers to explicit archive paths. The CLI does not expose archive stdout,
+append-only sink, multipart-upload sink, or pipe output modes for `tzap create`.
+`-o -` is rejected instead of being treated as an archive stdout sentinel.
+
+Example:
+
+```sh
+tzap create --keyfile project.key -o - ./project
+# exit 16: unsupported-feature
+```
+
+Sidecar output is also file-path based:
+
+```sh
+tzap create \
+  --keyfile project.key \
+  --bootstrap-out - \
+  -o archive.tzap \
+  ./project
+# exit 16: unsupported-feature
+```
+
+What to do:
+
+- Write archive volumes to file paths, then copy or upload those files with
+  tooling appropriate for the destination.
+- Treat true append-only or multipart create output as a future writer API
+  feature, not as behavior of the current CLI.
+
 ## Empty directory inputs
 
 The current CLI scanner descends into directory inputs and archives regular file

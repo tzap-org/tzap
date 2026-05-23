@@ -11,7 +11,7 @@ fast encryption, fast self-healing recovery, and instant random-access restores
 for serious long-term storage.
 
 tzap is built for real archives: huge backups, private datasets, cold storage,
-S3-style object storage, split volumes, and immediate single-file restores. It
+cloud object storage, split volumes, and immediate single-file restores. It
 combines packing, fast compression, strong encryption, authenticated metadata,
 and recovery in one practical format.
 
@@ -21,8 +21,8 @@ See the full command guide in [docs/tzap-cli-reference.md](docs/tzap-cli-referen
 
 ## Why tzap
 
-- **Super fast.** Rust, zstd, indexed metadata, and single-pass writes keep big
-  archives moving.
+- **Super fast.** Rust, zstd, indexed metadata, and volume-aware layouts keep
+  big archives moving.
 - **Security baked in.** Contents, file names, metadata, and indexes are
   encrypted; headers, manifests, trailers, indexes, and payloads are
   authenticated.
@@ -32,8 +32,8 @@ See the full command guide in [docs/tzap-cli-reference.md](docs/tzap-cli-referen
   while the rest stays packed.
 - **Splittable.** Break archives into practical volumes for drives, discs, or
   cloud objects by volume count or target volume size.
-- **Cloud-streaming friendly.** Designed for single-pass append-only writes,
-  S3-style storage, multipart uploads, and pipe-like workflows.
+- **Cloud-volume friendly.** Split archives into deterministic volume files for
+  object storage, removable media, and long-lived backups.
 - **Reference implementation.** Clean Rust core, thin CLI, readable spec, tests,
   and fuzz targets.
 
@@ -42,12 +42,12 @@ See the full command guide in [docs/tzap-cli-reference.md](docs/tzap-cli-referen
 - cold backups that need privacy and recovery
 - source, legal, media, research, and records archives
 - huge datasets spread across drives, discs, or cloud objects
-- S3-style storage where streaming writes matter
+- cloud object storage and offline media sets
 - instant single-file restores from massive archives
 - implementers who want the canonical Rust reference
 
-Focused on archive creation, verification, listing, extraction, streaming
-storage, and recovery workflows.
+Focused on archive creation, verification, listing, extraction, storage, and
+recovery workflows.
 
 ## Install
 
@@ -313,8 +313,7 @@ tzap extract \
 ## Bootstrap sidecars
 
 Bootstrap sidecars carry startup metadata for workflows that benefit from
-separate bootstrap material, including pipe-like and random-access-oriented read
-paths.
+separate bootstrap material and random-access-oriented read paths.
 
 ```sh
 tzap create \

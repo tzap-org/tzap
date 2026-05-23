@@ -782,8 +782,8 @@ Purpose: make stdout/stderr behavior predictable.
 
 Rules:
 
-- Archive bytes and extracted file bytes may go to stdout only when explicitly
-  requested.
+- Extracted file bytes may go to stdout only when explicitly requested. Archive
+  create output is file-path based in the current CLI.
 - Human diagnostics go to stderr.
 - Machine-readable JSON goes to stdout.
 - Progress goes to stderr.

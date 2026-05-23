@@ -1212,7 +1212,7 @@ fn cli_reports_unsupported_revision_with_stable_category_and_exit_code() {
 }
 
 #[test]
-fn cli_reports_missing_bootstrap_with_stable_category_and_exit_code() {
+fn cli_verify_with_stripped_dictionary_sidecar_uses_terminal_archive_metadata() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
     let dictionary = temp.path().join("dict.txt");
@@ -1299,8 +1299,8 @@ fn cli_reports_missing_bootstrap_with_stable_category_and_exit_code() {
             archive.to_str().unwrap(),
         ])
         .assert()
-        .code(14)
-        .stderr(predicate::str::contains("missing-bootstrap"));
+        .success()
+        .stdout(predicate::str::contains("OK (1 volume(s), 1 file(s))"));
 }
 
 #[test]
@@ -2532,6 +2532,70 @@ fn cli_create_rejects_unsupported_writer_scope() {
         .assert()
         .code(16)
         .stderr(predicate::str::contains("unsupported-feature"));
+}
+
+#[test]
+fn cli_create_rejects_archive_stdout_output_sentinel_before_writing() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let dash_output = temp.path().join("-");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"hello\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .current_dir(temp.path())
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            "-",
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains("unsupported-feature"))
+        .stderr(predicate::str::contains("--output - is not archive stdout"));
+
+    assert!(!dash_output.exists());
+}
+
+#[test]
+fn cli_create_rejects_sidecar_stdout_output_sentinel_before_writing() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+    let dash_output = temp.path().join("-");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"hello\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .current_dir(temp.path())
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap-out",
+            "-",
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains("unsupported-feature"))
+        .stderr(predicate::str::contains(
+            "--bootstrap-out - is not sidecar stdout",
+        ));
+
+    assert!(!archive.exists());
+    assert!(!dash_output.exists());
 }
 
 #[test]

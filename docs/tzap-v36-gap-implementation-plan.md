@@ -36,10 +36,9 @@ Recent work closed important writer gaps:
 - `tzap create --bootstrap-out` is guarded as single-volume only
 
 Those fixes mean older plan text and some operational docs are stale. They do
-not prove full v0.36 conformance. The remaining gaps are mostly around true
-streaming surfaces, sidecar authority rules, sparse sidecar combinations,
-directory-entry semantics, IndexRoot sizing before header authentication,
-corpus coverage, and explicit release gates.
+not prove full v0.36 conformance. The remaining gaps are mostly around live
+sequential reader surfaces, tar metadata fidelity, recovery edge cases, broader
+mutation/fuzz coverage, and explicit release gates.
 
 ## Priority Model
 
@@ -56,7 +55,7 @@ corpus coverage, and explicit release gates.
 | --- | --- | --- | --- | --- |
 | G01 | Documentation and plan drift | complete | P0 | docs match actual code and no README drawbacks |
 | G02 | Conformance matrix | complete | P0 | map all writer/reader obligations to code/tests/status |
-| G03 | True streaming writer | partial/in-memory only | P0/P1 | implement sink model or document no true streaming claim |
+| G03 | True streaming writer | complete/unsupported boundary | P0/P1 | no true streaming claim; future sink model is a new feature |
 | G04 | Sequential non-seekable reader | partial/whole-buffer safe API | P0/P1 | safe provisional-output story and tests |
 | G05 | Bootstrap sidecar authority | complete | P0 | sparse sections and authority precedence match spec |
 | G06 | IndexRoot/dictionary sizing | complete | P0 | choose metadata FEC class before CryptoHeader HMAC |
@@ -161,7 +160,8 @@ Completed implementation:
    - status: `complete`, `partial`, `unsupported`, or `deferred`
    - notes / follow-up issue
 4. Marked broad or not-yet-claimed areas honestly:
-   - true streaming writer: `W12` unsupported, `W38` partial
+   - true streaming writer: `W12` unsupported, `W38` complete for the
+     in-memory writer, and no public sink-writer claim
    - live sequential/provisional output: `R04` and `R20` partial
    - sparse sidecar authority: `R16` complete
    - directory entries and cloud mode: `W14` and `R31` complete by current
@@ -188,13 +188,15 @@ Done criteria:
 
 ## G03 - True Streaming Writer and Sink Model
 
+Status: complete (unsupported boundary).
+
 Spec anchors:
 
 - single-stream streaming mode
 - writer obligations 1, 12, 24, and 38
 - writer sequence and no seek-back rules
 
-Current gap:
+Completed G03 scope:
 
 The writer creates valid archive bytes in memory and returns
 `WrittenArchive { bytes, volumes }`. It does not expose a sink-based writer that
@@ -204,58 +206,56 @@ stream, metadata, and output in memory before handing bytes to the caller.
 
 That is not the same as a conforming true streaming writer.
 
-Implementation work:
+G03 closes by choosing Option B: the current core writer remains an in-memory
+archive artifact builder, and every public README/API/CLI surface must avoid
+claiming true streaming, append-only sink, pipe, or multipart create output.
 
-1. Define sink capabilities explicitly:
-   - seekable file sink
-   - append-only single sink
-   - append-reopenable multi-volume sink
-   - externally multiplexed multi-stream sink, if ever supported
-2. Add a writer API that accepts a sink capability, or explicitly document that
-   the current core writer is an in-memory artifact builder and does not claim
-   true streaming.
-3. For fully non-reopenable single-sink streaming:
-   - force `stripe_width = 1`
-   - force `volume_loss_tolerance = 0`
-   - require bootstrap sidecar emission if `has_dictionary = 1`
-   - choose `index_root_fec_data_shards` and
-     `index_root_fec_parity_shards` before CryptoHeader HMAC
-4. For non-reopenable multi-volume streaming without an external multiplexing
-   protocol:
-   - reject before emitting any archive bytes
-   - diagnostic should say the sink shape is incompatible with striped
-     multi-volume streaming
-5. For unknown-size input sets:
-   - pre-scan, spool to a bounded temp area, choose conservative metadata FEC
-     maxima, or reject
-   - do not claim true streaming while silently buffering unbounded output
-6. Add a "streaming close" path:
-   - if final IndexRoot or dictionary object cannot fit the authenticated class
-     maxima, return a finalization error
-   - do not emit a success trailer/footer after that failure
+Implemented work:
+
+1. Public writer API documentation states that `WrittenArchive` is produced by
+   an in-memory archive artifact builder, not a sink-based streaming writer.
+2. CLI create output is guarded:
+   - `tzap create -o - ...` rejects before writing output bytes
+   - `tzap create --bootstrap-out - ...` rejects before writing archive or
+     sidecar bytes
+   - both paths return `16 unsupported-feature`
+3. README marketing language no longer claims single-pass, append-only,
+   pipe-like, streaming storage, or multipart-upload create behavior.
+4. Technical docs carry exact examples in `docs/tzap-operational-boundaries.md`
+   and `docs/tzap-cli-reference.md`.
+5. The conformance matrix marks true non-reopenable sink behavior as an
+   unsupported boundary while keeping the current in-memory metadata-FEC
+   planning evidence tied to W24/W38.
 
 Tests:
 
-- Fake append-only sink records every write and fails if the writer seeks,
-  overwrites, or reopens.
-- Append-only single sink with `stripe_width > 1` rejects before first write.
-- Append-only single sink with `volume_loss_tolerance > 0` rejects before first
-  write.
-- Dictionary-compressed append-only single sink without sidecar rejects before
-  first write.
-- Dictionary-compressed append-only single sink with sidecar writes a sidecar
-  containing ManifestFooter, IndexRoot records, and dictionary records.
-- Unknown-size streaming input either chooses conservative maxima or rejects
-  before first write.
-- A final IndexRoot overflow in streaming mode fails finalization and does not
-  produce a clean archive.
-- In-memory writer and streaming writer produce archives that the same reader
-  validates for a shared deterministic fixture.
+- `cli_smoke::cli_create_rejects_archive_stdout_output_sentinel_before_writing`
+- `cli_smoke::cli_create_rejects_sidecar_stdout_output_sentinel_before_writing`
+- `milestone11_docs::milestone11_docs_pin_current_g03_streaming_boundary`
+- `writer::tests::written_archive_authenticates_final_index_root_fec_class`
 
-Done criteria:
+Deferred future sink-writer work:
 
-- Either the repo has a tested sink-based writer, or every public API/CLI/doc
-  avoids true streaming claims.
+- Define explicit sink capabilities: seekable file sink, append-only single
+  sink, append-reopenable multi-volume sink, and any externally multiplexed
+  multi-stream sink.
+- For fully non-reopenable single-sink streaming, force `stripe_width = 1`,
+  force `volume_loss_tolerance = 0`, require bootstrap sidecar emission when
+  `has_dictionary = 1`, and choose IndexRoot/dictionary FEC maxima before the
+  CryptoHeader HMAC.
+- For non-reopenable multi-volume streaming without external multiplexing,
+  reject before emitting any archive bytes or spool to bounded local storage.
+- For unknown-size input sets, pre-scan, spool to a bounded temp area, choose
+  conservative metadata FEC maxima, or reject.
+- Add a streaming finalization path that fails rather than emitting a clean
+  footer/trailer if final metadata cannot fit the authenticated class maxima.
+
+Done criteria met:
+
+- The repo does not have a tested sink-based writer.
+- Every public API/CLI/README claim avoids true streaming writer support.
+- Unsupported create-output sink sentinels have stable diagnostics and
+  technical-doc examples.
 - No code path advertises append-only streaming while buffering unbounded data
   behind the caller's back.
 
@@ -460,7 +460,8 @@ Implemented work:
 
 Deferred related work:
 
-- True unknown-size streaming writer behavior belongs to G03:
+- True unknown-size streaming writer behavior is deferred outside the current
+  release claim by the G03 unsupported boundary:
   choose conservative maxima, pre-scan/spool, or reject before first write; if
   final metadata exceeds the selected class, fail finalization with a clear
   error and no clean trailer/footer.
@@ -499,8 +500,8 @@ Completion notes:
   IndexRoot and dictionary objects before encryption.
 - Oversized non-splittable IndexRoot payloads fail with `IndexRoot too large`;
   oversized dictionary objects fail with `dictionary object too large`.
-- True unknown-size streaming writer behavior remains in G03 and is not marked
-  complete by this gap.
+- True unknown-size streaming writer behavior remains outside the current
+  release claim under the G03 unsupported boundary.
 
 ## G07 - Directory Hints, Directory Entries, and Cloud Mode
 
@@ -877,8 +878,9 @@ Done criteria:
    claims.
 4. G05: close sidecar authority because it affects recovery, dictionary, and
    non-seekable behavior.
-5. G03 and G04: either implement true streaming/provisional APIs or explicitly
-   remove those claims from public surfaces.
+5. G04: either implement provisional reader APIs or explicitly remove those
+   claims from public surfaces. G03 is closed as an unsupported sink-writer
+   boundary for the current release claim.
 6. G08: settle the tar metadata profile.
 7. G09, G12, and G13: harden recovery, fuzzing, interop, and release gates.
 

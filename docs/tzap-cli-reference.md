@@ -45,6 +45,11 @@ Notes:
 
 - `--bootstrap-out` rejects `--volumes > 1` and `--volume-size` with
   `unsupported-feature`.
+- Create writes archive files to explicit paths. `-o -` is not archive stdout;
+  the current CLI rejects that sentinel with `unsupported-feature`.
+- The current core writer returns completed in-memory archive artifacts before
+  the CLI writes output paths. No append-only sink or multipart-upload create
+  mode is exposed.
 - Multi-volume recovery is available only within the `--volume-loss-tolerance`
   and FEC budget chosen when the archive is created.
 
