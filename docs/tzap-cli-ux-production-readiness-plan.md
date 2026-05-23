@@ -854,6 +854,8 @@ Implemented in this milestone:
   - `macos-15-intel`
   - `macos-14`
   - `windows-2022`
+- macOS release artifacts pin deployment targets to `10.12` for x86_64 and
+  `11.0` for aarch64.
 - Release packaging now emits per-platform SHA-256 checksum files and merges them into a `SHA256SUMS` manifest.
 - Release packaging now runs post-build smoke tests (`tzap --version`, `tzap --help`) before upload.
 

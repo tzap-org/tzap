@@ -53,6 +53,8 @@ fn milestone10_release_workflow_uses_pinned_baseline_runners() {
     assert!(workflow.contains("os: windows-2022"));
     assert!(workflow.contains("runs-on: ubuntu-22.04"));
     assert!(workflow.contains("MACOSX_DEPLOYMENT_TARGET"));
+    assert!(workflow.contains(r#"macosx_deployment_target: "10.12""#));
+    assert!(workflow.contains(r#"macosx_deployment_target: "11.0""#));
     assert!(!workflow.contains("ubuntu-latest"));
     assert!(!workflow.contains("macos-latest"));
     assert!(!workflow.contains("windows-latest"));

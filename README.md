@@ -132,7 +132,8 @@ Supported target artifacts:
 
 Release artifacts are built on pinned baseline runners instead of moving
 `*-latest` labels: `ubuntu-22.04`, `macos-15-intel`, `macos-14`, and
-`windows-2022`. macOS builds set `MACOSX_DEPLOYMENT_TARGET=12.0`.
+`windows-2022`. macOS builds set `MACOSX_DEPLOYMENT_TARGET=10.12` for
+x86_64 and `MACOSX_DEPLOYMENT_TARGET=11.0` for aarch64.
 
 tzap requires Rust 1.82 or newer.
 
