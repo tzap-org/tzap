@@ -4751,6 +4751,356 @@ mod tests {
     }
 
     #[test]
+    fn load_metadata_object_rejects_per_object_zstd_frame_exactness_mutations() {
+        let volume_header = test_volume_header();
+        let crypto_header = test_crypto_header();
+        let subkeys = Subkeys::derive(
+            &master_key(),
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+        )
+        .unwrap();
+        let mut next_block_index = 0u64;
+
+        let index_root_payload = b"index root metadata object";
+        let index_root_compressed = compress_zstd_frame(index_root_payload, 1).unwrap();
+        assert_metadata_object_from_compressed(
+            &{
+                let mut bytes = index_root_compressed.clone();
+                bytes.push(0);
+                bytes
+            },
+            index_root_payload.len(),
+            &subkeys,
+            &volume_header,
+            &crypto_header,
+            &subkeys.index_root_key,
+            &subkeys.index_nonce_seed,
+            b"idxroot",
+            0,
+            BlockKind::IndexRootData,
+            BlockKind::IndexRootParity,
+            crypto_header.index_root_fec_data_shards,
+            crypto_header.index_root_fec_parity_shards,
+            &mut next_block_index,
+            FormatError::TrailingBytesAfterZstdFrame,
+        );
+        assert_metadata_object_from_compressed(
+            &index_root_compressed,
+            index_root_payload.len() + 1,
+            &subkeys,
+            &volume_header,
+            &crypto_header,
+            &subkeys.index_root_key,
+            &subkeys.index_nonce_seed,
+            b"idxroot",
+            0,
+            BlockKind::IndexRootData,
+            BlockKind::IndexRootParity,
+            crypto_header.index_root_fec_data_shards,
+            crypto_header.index_root_fec_parity_shards,
+            &mut next_block_index,
+            FormatError::ZstdDecompressedSizeMismatch {
+                expected: index_root_payload.len() + 1,
+                actual: index_root_payload.len(),
+            },
+        );
+
+        let index_shard_payload = b"index shard metadata object";
+        let index_shard_compressed = compress_zstd_frame(index_shard_payload, 1).unwrap();
+        assert_metadata_object_from_compressed(
+            &{
+                let mut bytes = index_shard_compressed.clone();
+                bytes.push(0);
+                bytes
+            },
+            index_shard_payload.len(),
+            &subkeys,
+            &volume_header,
+            &crypto_header,
+            &subkeys.index_shard_key,
+            &subkeys.index_nonce_seed,
+            b"idxshard",
+            1,
+            BlockKind::IndexShardData,
+            BlockKind::IndexShardParity,
+            crypto_header.index_fec_data_shards,
+            crypto_header.index_fec_parity_shards,
+            &mut next_block_index,
+            FormatError::TrailingBytesAfterZstdFrame,
+        );
+        assert_metadata_object_from_compressed(
+            &index_shard_compressed,
+            index_shard_payload.len() + 1,
+            &subkeys,
+            &volume_header,
+            &crypto_header,
+            &subkeys.index_shard_key,
+            &subkeys.index_nonce_seed,
+            b"idxshard",
+            1,
+            BlockKind::IndexShardData,
+            BlockKind::IndexShardParity,
+            crypto_header.index_fec_data_shards,
+            crypto_header.index_fec_parity_shards,
+            &mut next_block_index,
+            FormatError::ZstdDecompressedSizeMismatch {
+                expected: index_shard_payload.len() + 1,
+                actual: index_shard_payload.len(),
+            },
+        );
+
+        let directory_hint_payload = b"directory hint metadata object";
+        let directory_hint_compressed = compress_zstd_frame(directory_hint_payload, 1).unwrap();
+        assert_metadata_object_from_compressed(
+            &{
+                let mut bytes = directory_hint_compressed.clone();
+                bytes.push(0);
+                bytes
+            },
+            directory_hint_payload.len(),
+            &subkeys,
+            &volume_header,
+            &crypto_header,
+            &subkeys.dir_hint_key,
+            &subkeys.index_nonce_seed,
+            b"dirhint",
+            0,
+            BlockKind::DirectoryHintData,
+            BlockKind::DirectoryHintParity,
+            crypto_header.index_fec_data_shards,
+            crypto_header.index_fec_parity_shards,
+            &mut next_block_index,
+            FormatError::TrailingBytesAfterZstdFrame,
+        );
+        assert_metadata_object_from_compressed(
+            &directory_hint_compressed,
+            directory_hint_payload.len() + 1,
+            &subkeys,
+            &volume_header,
+            &crypto_header,
+            &subkeys.dir_hint_key,
+            &subkeys.index_nonce_seed,
+            b"dirhint",
+            0,
+            BlockKind::DirectoryHintData,
+            BlockKind::DirectoryHintParity,
+            crypto_header.index_fec_data_shards,
+            crypto_header.index_fec_parity_shards,
+            &mut next_block_index,
+            FormatError::ZstdDecompressedSizeMismatch {
+                expected: directory_hint_payload.len() + 1,
+                actual: directory_hint_payload.len(),
+            },
+        );
+
+        let dictionary_payload = b"dictionary metadata object";
+        let dictionary_compressed = compress_zstd_frame(dictionary_payload, 1).unwrap();
+        assert_metadata_object_from_compressed(
+            &{
+                let mut bytes = dictionary_compressed.clone();
+                bytes.push(0);
+                bytes
+            },
+            dictionary_payload.len(),
+            &subkeys,
+            &volume_header,
+            &crypto_header,
+            &subkeys.dictionary_key,
+            &subkeys.index_nonce_seed,
+            b"dict",
+            0,
+            BlockKind::DictionaryData,
+            BlockKind::DictionaryParity,
+            crypto_header.index_root_fec_data_shards,
+            crypto_header.index_root_fec_parity_shards,
+            &mut next_block_index,
+            FormatError::TrailingBytesAfterZstdFrame,
+        );
+        assert_metadata_object_from_compressed(
+            &dictionary_compressed,
+            dictionary_payload.len() + 1,
+            &subkeys,
+            &volume_header,
+            &crypto_header,
+            &subkeys.dictionary_key,
+            &subkeys.index_nonce_seed,
+            b"dict",
+            0,
+            BlockKind::DictionaryData,
+            BlockKind::DictionaryParity,
+            crypto_header.index_root_fec_data_shards,
+            crypto_header.index_root_fec_parity_shards,
+            &mut next_block_index,
+            FormatError::ZstdDecompressedSizeMismatch {
+                expected: dictionary_payload.len() + 1,
+                actual: dictionary_payload.len(),
+            },
+        );
+    }
+
+    #[test]
+    fn load_metadata_object_extent_rejects_encrypted_size_not_data_block_count_times_block_size() {
+        let volume_header = test_volume_header();
+        let crypto_header = test_crypto_header();
+        let subkeys = Subkeys::derive(
+            &master_key(),
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+        )
+        .unwrap();
+        let mut next_block_index = 0u64;
+
+        let index_root_payload = b"index root metadata object";
+        let (index_root_extent, index_root_records) = build_metadata_object_from_payload(
+            index_root_payload,
+            &subkeys,
+            &volume_header,
+            &crypto_header,
+            &subkeys.index_root_key,
+            &subkeys.index_nonce_seed,
+            b"idxroot",
+            0,
+            BlockKind::IndexRootData,
+            &mut next_block_index,
+        );
+        let mut index_root_extent = index_root_extent;
+        index_root_extent.encrypted_size =
+            index_root_extent.encrypted_size.saturating_add(crypto_header.block_size);
+        assert_eq!(
+            load_metadata_object_from_parts(
+                &index_root_records,
+                &subkeys,
+                &volume_header,
+                &crypto_header,
+                index_root_extent,
+                BlockKind::IndexRootData,
+                BlockKind::IndexRootParity,
+                &subkeys.index_root_key,
+                &subkeys.index_nonce_seed,
+                b"idxroot",
+                0,
+                crypto_header.index_root_fec_data_shards,
+                crypto_header.index_root_fec_parity_shards,
+                index_root_payload.len(),
+            )
+            .unwrap_err(),
+            FormatError::InvalidArchive("encrypted object is not data_block_count * block_size")
+        );
+
+        let index_shard_payload = b"index shard metadata object";
+        let (index_shard_extent, index_shard_records) = build_metadata_object_from_payload(
+            index_shard_payload,
+            &subkeys,
+            &volume_header,
+            &crypto_header,
+            &subkeys.index_shard_key,
+            &subkeys.index_nonce_seed,
+            b"idxshard",
+            1,
+            BlockKind::IndexShardData,
+            &mut next_block_index,
+        );
+        let mut index_shard_extent = index_shard_extent;
+        index_shard_extent.encrypted_size =
+            index_shard_extent.encrypted_size.saturating_add(crypto_header.block_size);
+        assert_eq!(
+            load_metadata_object_from_parts(
+                &index_shard_records,
+                &subkeys,
+                &volume_header,
+                &crypto_header,
+                index_shard_extent,
+                BlockKind::IndexShardData,
+                BlockKind::IndexShardParity,
+                &subkeys.index_shard_key,
+                &subkeys.index_nonce_seed,
+                b"idxshard",
+                1,
+                crypto_header.index_fec_data_shards,
+                crypto_header.index_fec_parity_shards,
+                index_shard_payload.len(),
+            )
+            .unwrap_err(),
+            FormatError::InvalidArchive("encrypted object is not data_block_count * block_size")
+        );
+
+        let directory_hint_payload = b"directory hint metadata object";
+        let (directory_hint_extent, directory_hint_records) = build_metadata_object_from_payload(
+            directory_hint_payload,
+            &subkeys,
+            &volume_header,
+            &crypto_header,
+            &subkeys.dir_hint_key,
+            &subkeys.index_nonce_seed,
+            b"dirhint",
+            0,
+            BlockKind::DirectoryHintData,
+            &mut next_block_index,
+        );
+        let mut directory_hint_extent = directory_hint_extent;
+        directory_hint_extent.encrypted_size =
+            directory_hint_extent.encrypted_size.saturating_add(crypto_header.block_size);
+        assert_eq!(
+            load_metadata_object_from_parts(
+                &directory_hint_records,
+                &subkeys,
+                &volume_header,
+                &crypto_header,
+                directory_hint_extent,
+                BlockKind::DirectoryHintData,
+                BlockKind::DirectoryHintParity,
+                &subkeys.dir_hint_key,
+                &subkeys.index_nonce_seed,
+                b"dirhint",
+                0,
+                crypto_header.index_fec_data_shards,
+                crypto_header.index_fec_parity_shards,
+                directory_hint_payload.len(),
+            )
+            .unwrap_err(),
+            FormatError::InvalidArchive("encrypted object is not data_block_count * block_size")
+        );
+
+        let dictionary_payload = b"dictionary metadata object";
+        let (dictionary_extent, dictionary_records) = build_metadata_object_from_payload(
+            dictionary_payload,
+            &subkeys,
+            &volume_header,
+            &crypto_header,
+            &subkeys.dictionary_key,
+            &subkeys.index_nonce_seed,
+            b"dict",
+            0,
+            BlockKind::DictionaryData,
+            &mut next_block_index,
+        );
+        let mut dictionary_extent = dictionary_extent;
+        dictionary_extent.encrypted_size =
+            dictionary_extent.encrypted_size.saturating_add(crypto_header.block_size);
+        assert_eq!(
+            load_metadata_object_from_parts(
+                &dictionary_records,
+                &subkeys,
+                &volume_header,
+                &crypto_header,
+                dictionary_extent,
+                BlockKind::DictionaryData,
+                BlockKind::DictionaryParity,
+                &subkeys.dictionary_key,
+                &subkeys.index_nonce_seed,
+                b"dict",
+                0,
+                crypto_header.index_root_fec_data_shards,
+                crypto_header.index_root_fec_parity_shards,
+                dictionary_payload.len(),
+            )
+            .unwrap_err(),
+            FormatError::InvalidArchive("encrypted object is not data_block_count * block_size")
+        );
+    }
+
+    #[test]
     fn opens_complete_multi_volume_archive() {
         let files = [RegularFile::new("alpha.txt", b"hello from volume stripes")];
         let archive = write_archive(
@@ -6471,6 +6821,110 @@ mod tests {
         for record in records {
             assert!(blocks.insert(record.block_index, record.clone()).is_none());
         }
+    }
+
+    fn build_metadata_object_from_payload(
+        payload: &[u8],
+        _subkeys: &Subkeys,
+        volume_header: &VolumeHeader,
+        crypto_header: &CryptoHeaderFixed,
+        key: &[u8; 32],
+        nonce_seed: &[u8; 32],
+        domain: &[u8],
+        counter: u64,
+        data_kind: BlockKind,
+        next_block_index: &mut u64,
+    ) -> (ObjectExtent, BTreeMap<u64, BlockRecord>) {
+        let compressed = compress_zstd_frame(payload, 1).unwrap();
+        build_metadata_object_from_compressed(
+            &compressed,
+            key,
+            nonce_seed,
+            domain,
+            counter,
+            data_kind,
+            next_block_index,
+            crypto_header,
+            volume_header,
+        )
+    }
+
+    fn build_metadata_object_from_compressed(
+        compressed: &[u8],
+        key: &[u8; 32],
+        nonce_seed: &[u8; 32],
+        domain: &[u8],
+        counter: u64,
+        data_kind: BlockKind,
+        next_block_index: &mut u64,
+        crypto_header: &CryptoHeaderFixed,
+        volume_header: &VolumeHeader,
+    ) -> (ObjectExtent, BTreeMap<u64, BlockRecord>) {
+        let object = encrypt_test_object(
+            compressed,
+            key,
+            nonce_seed,
+            domain,
+            counter,
+            data_kind,
+            next_block_index,
+            crypto_header,
+            volume_header,
+        );
+
+        let mut blocks = BTreeMap::new();
+        for record in object.records {
+            blocks.insert(record.block_index, record);
+        }
+        (object.extent, blocks)
+    }
+
+    fn assert_metadata_object_from_compressed(
+        compressed: &[u8],
+        decompressed_size: usize,
+        subkeys: &Subkeys,
+        volume_header: &VolumeHeader,
+        crypto_header: &CryptoHeaderFixed,
+        key: &[u8; 32],
+        nonce_seed: &[u8; 32],
+        domain: &[u8],
+        counter: u64,
+        data_kind: BlockKind,
+        parity_kind: BlockKind,
+        class_data_shards: u16,
+        class_parity_shards: u16,
+        next_block_index: &mut u64,
+        expected: FormatError,
+    ) {
+        let (extent, blocks) = build_metadata_object_from_compressed(
+            compressed,
+            key,
+            nonce_seed,
+            domain,
+            counter,
+            data_kind,
+            next_block_index,
+            crypto_header,
+            volume_header,
+        );
+        let error = load_metadata_object_from_parts(
+            &blocks,
+            subkeys,
+            volume_header,
+            crypto_header,
+            extent,
+            data_kind,
+            parity_kind,
+            key,
+            nonce_seed,
+            domain,
+            counter,
+            class_data_shards,
+            class_parity_shards,
+            decompressed_size as u32,
+        )
+        .unwrap_err();
+        assert_eq!(error, expected);
     }
 
     fn corrupt_payload_record(blocks: &mut BTreeMap<u64, BlockRecord>, block_index: u64) {
