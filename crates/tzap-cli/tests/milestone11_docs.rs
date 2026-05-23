@@ -16,7 +16,9 @@ fn workspace_file(path: &str) -> PathBuf {
 }
 
 fn read_workspace_file(path: &str) -> String {
-    fs::read_to_string(workspace_file(path)).unwrap()
+    fs::read_to_string(workspace_file(path))
+        .unwrap()
+        .replace("\r\n", "\n")
 }
 
 fn write_file(path: &Path, data: &[u8]) {

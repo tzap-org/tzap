@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -1592,15 +1592,25 @@ fn read_passphrase_interactive_open() -> Result<String> {
 }
 
 fn read_passphrase_interactive(prompt: &str) -> Result<String> {
+    if !io::stdin().is_terminal() {
+        eprint!("{prompt}");
+        io::stderr().flush()?;
+        return read_non_empty_passphrase(read_passphrase_stdin_fallback()?);
+    }
+
     let passphrase = match read_passphrase_hidden(prompt) {
         Ok(passphrase) => passphrase,
         Err(err) => {
             let _ = err;
             eprint!("{prompt}");
-            io::stdout().flush()?;
+            io::stderr().flush()?;
             read_passphrase_stdin_fallback()?
         }
     };
+    read_non_empty_passphrase(passphrase)
+}
+
+fn read_non_empty_passphrase(passphrase: String) -> Result<String> {
     if passphrase.is_empty() {
         bail!("passphrase must not be empty");
     }

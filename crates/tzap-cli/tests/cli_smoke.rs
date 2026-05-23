@@ -1889,9 +1889,10 @@ fn cli_create_supports_long_archive_paths() {
     let archive_member = long_file
         .strip_prefix(&input_root)
         .unwrap()
-        .to_str()
-        .unwrap()
-        .to_owned();
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
 
     Command::cargo_bin("tzap")
         .unwrap()
