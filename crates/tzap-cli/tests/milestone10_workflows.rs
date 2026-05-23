@@ -44,6 +44,21 @@ fn milestone10_release_workflow_targets_distinct_build_triples() {
 }
 
 #[test]
+fn milestone10_release_workflow_uses_pinned_baseline_runners() {
+    let workflow = read_workspace_file(".github/workflows/release.yml");
+
+    assert!(workflow.contains("os: ubuntu-22.04"));
+    assert!(workflow.contains("os: macos-15-intel"));
+    assert!(workflow.contains("os: macos-14"));
+    assert!(workflow.contains("os: windows-2022"));
+    assert!(workflow.contains("runs-on: ubuntu-22.04"));
+    assert!(workflow.contains("MACOSX_DEPLOYMENT_TARGET"));
+    assert!(!workflow.contains("ubuntu-latest"));
+    assert!(!workflow.contains("macos-latest"));
+    assert!(!workflow.contains("windows-latest"));
+}
+
+#[test]
 fn milestone10_release_workflow_has_smoke_checks() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
 

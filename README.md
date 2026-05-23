@@ -130,6 +130,10 @@ Supported target artifacts:
 | macOS aarch64 | `tzap-vX.Y.Z-macos-aarch64.tar.gz` |
 | Windows x86_64 | `tzap-vX.Y.Z-windows-x86_64.zip` |
 
+Release artifacts are built on pinned baseline runners instead of moving
+`*-latest` labels: `ubuntu-22.04`, `macos-15-intel`, `macos-14`, and
+`windows-2022`. macOS builds set `MACOSX_DEPLOYMENT_TARGET=12.0`.
+
 tzap requires Rust 1.82 or newer.
 
 ## Quick start (passphrase mode)

@@ -848,6 +848,12 @@ Implemented in this milestone:
   - `tzap-vX.Y.Z-macos-x86_64.tar.gz`
   - `tzap-vX.Y.Z-macos-aarch64.tar.gz`
   - `tzap-vX.Y.Z-windows-x86_64.zip`
+- Release workflow now pins baseline runner images instead of moving `*-latest`
+  labels:
+  - `ubuntu-22.04`
+  - `macos-15-intel`
+  - `macos-14`
+  - `windows-2022`
 - Release packaging now emits per-platform SHA-256 checksum files and merges them into a `SHA256SUMS` manifest.
 - Release packaging now runs post-build smoke tests (`tzap --version`, `tzap --help`) before upload.
 

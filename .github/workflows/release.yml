@@ -18,25 +18,29 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive: tzap-${{ github.ref_name }}-linux-x86_64.tar.gz
             run_smoke: true
+            macosx_deployment_target: ""
           - name: macos-x86_64
-            os: macos-latest
+            os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tzap-${{ github.ref_name }}-macos-x86_64.tar.gz
-            run_smoke: false
+            run_smoke: true
+            macosx_deployment_target: "12.0"
           - name: macos-aarch64
-            os: macos-latest
+            os: macos-14
             target: aarch64-apple-darwin
             archive: tzap-${{ github.ref_name }}-macos-aarch64.tar.gz
             run_smoke: true
+            macosx_deployment_target: "12.0"
           - name: windows-x86_64
-            os: windows-latest
+            os: windows-2022
             target: x86_64-pc-windows-msvc
             archive: tzap-${{ github.ref_name }}-windows-x86_64.zip
             run_smoke: true
+            macosx_deployment_target: ""
 
     steps:
       - name: Checkout
@@ -51,6 +55,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
         run: cargo build --locked --release -p tzap --target ${{ matrix.target }}
 
       - name: Smoke test build
@@ -108,7 +114,7 @@ jobs:
 
   publish:
     name: Publish GitHub release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: build
 
     steps:
