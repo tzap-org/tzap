@@ -1517,6 +1517,7 @@ mod tests {
         let mut header = crypto_fixed();
         header.block_size = 1_048_576;
         header.fec_data_shards = 4_096;
+        header.fec_parity_shards = 0;
         let max_data_shards = u32::MAX as u64 / header.block_size as u64;
         assert_eq!(
             CryptoHeaderFixed::parse(&header.to_bytes(), header.length).unwrap_err(),
@@ -1530,6 +1531,7 @@ mod tests {
         let mut header = crypto_fixed();
         header.block_size = 1_048_576;
         header.index_fec_data_shards = 4_096;
+        header.index_fec_parity_shards = 0;
         let max_data_shards = u32::MAX as u64 / header.block_size as u64;
         assert_eq!(
             CryptoHeaderFixed::parse(&header.to_bytes(), header.length).unwrap_err(),

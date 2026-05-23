@@ -4982,10 +4982,10 @@ mod tests {
                 0,
                 crypto_header.index_root_fec_data_shards,
                 crypto_header.index_root_fec_parity_shards,
-                index_root_payload.len(),
+                index_root_payload.len() as u32,
             )
             .unwrap_err(),
-            FormatError::InvalidArchive("encrypted object is not data_block_count * block_size")
+            FormatError::InvalidArchive("encrypted object size is not data_block_count * block_size")
         );
 
         let index_shard_payload = b"index shard metadata object";
@@ -5019,10 +5019,10 @@ mod tests {
                 1,
                 crypto_header.index_fec_data_shards,
                 crypto_header.index_fec_parity_shards,
-                index_shard_payload.len(),
+                index_shard_payload.len() as u32,
             )
             .unwrap_err(),
-            FormatError::InvalidArchive("encrypted object is not data_block_count * block_size")
+            FormatError::InvalidArchive("encrypted object size is not data_block_count * block_size")
         );
 
         let directory_hint_payload = b"directory hint metadata object";
@@ -5056,10 +5056,10 @@ mod tests {
                 0,
                 crypto_header.index_fec_data_shards,
                 crypto_header.index_fec_parity_shards,
-                directory_hint_payload.len(),
+                directory_hint_payload.len() as u32,
             )
             .unwrap_err(),
-            FormatError::InvalidArchive("encrypted object is not data_block_count * block_size")
+            FormatError::InvalidArchive("encrypted object size is not data_block_count * block_size")
         );
 
         let dictionary_payload = b"dictionary metadata object";
@@ -5093,10 +5093,10 @@ mod tests {
                 0,
                 crypto_header.index_root_fec_data_shards,
                 crypto_header.index_root_fec_parity_shards,
-                dictionary_payload.len(),
+                dictionary_payload.len() as u32,
             )
             .unwrap_err(),
-            FormatError::InvalidArchive("encrypted object is not data_block_count * block_size")
+            FormatError::InvalidArchive("encrypted object size is not data_block_count * block_size")
         );
     }
 
