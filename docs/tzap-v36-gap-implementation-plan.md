@@ -59,7 +59,7 @@ corpus coverage, and explicit release gates.
 | G03 | True streaming writer | partial/in-memory only | P0/P1 | implement sink model or document no true streaming claim |
 | G04 | Sequential non-seekable reader | partial/whole-buffer safe API | P0/P1 | safe provisional-output story and tests |
 | G05 | Bootstrap sidecar authority | partial | P0 | sparse sections and authority precedence match spec |
-| G06 | IndexRoot/dictionary sizing | partial | P0 | choose metadata FEC class before CryptoHeader HMAC |
+| G06 | IndexRoot/dictionary sizing | complete | P0 | choose metadata FEC class before CryptoHeader HMAC |
 | G07 | Directory hints and directory entries | partial | P0/P1 | exact hint map, directory entries, and cloud claims settled |
 | G08 | Tar metadata profile | partial | P1 | supported metadata profile documented and tested |
 | G09 | Recovery and duplicate volumes | partial | P1 | default rejection and recovery modes are explicit |
@@ -408,6 +408,8 @@ Done criteria:
 
 ## G06 - IndexRoot and Dictionary Object Sizing
 
+Status: complete.
+
 Spec anchors:
 
 - IndexRoot bounded root object
@@ -416,16 +418,17 @@ Spec anchors:
 - writer obligations 24, 26, 28, and 38
 - reader obligations 11, 21, and 25
 
-Current gap:
+Completed G06 scope:
 
-Payload, IndexShard, and directory-hint objects now split before object caps.
-IndexRoot remains a single non-splittable object. The writer must choose
-`index_root_fec_data_shards` and `index_root_fec_parity_shards` before the
-CryptoHeader HMAC. If the serialized IndexRoot or dictionary object cannot fit,
-the writer must reject with a specific "IndexRoot too large" or dictionary-size
-diagnostic instead of relying on a late generic encrypted-object error.
+Payload, IndexShard, and directory-hint objects already split before object caps.
+G06 covers the remaining single-object metadata sizing rule: IndexRoot remains a
+non-splittable object, so the writer chooses `index_root_fec_data_shards` and
+`index_root_fec_parity_shards` before the CryptoHeader HMAC. If the compressed
+IndexRoot or dictionary object cannot fit, the writer rejects with a specific
+"IndexRoot too large" or dictionary-size diagnostic instead of relying on a late
+generic encrypted-object error.
 
-Implementation work:
+Implemented work:
 
 1. Add metadata sizing planning before CryptoHeader serialization:
    - estimate IndexRoot size from file/shard/hint/dictionary tables
@@ -436,19 +439,20 @@ Implementation work:
    - allow an internal planning/retry loop before bytes are finalized
    - never serialize an authenticated CryptoHeader until the metadata class is
      selected
-3. For true streaming writer:
-   - choose conservative maxima, pre-scan/spool, or reject before first write
-   - if final metadata exceeds the selected class, fail finalization with a
-     clear error and no clean trailer/footer
-4. Add exact error categories:
+3. Add exact error categories:
    - `IndexRoot too large`
    - `dictionary object too large`
-   - `metadata object exceeds GF16 total shard limit`
-   - `metadata object exceeds u32 encrypted size limit`
-5. Ensure reader validation checks:
-   - encrypted size equals data blocks times block size with checked arithmetic
-   - class maxima are enforced before FEC repair
-   - zero-data metadata objects reject before decrypt/decompress
+
+Deferred related work:
+
+- True unknown-size streaming writer behavior belongs to G03:
+  choose conservative maxima, pre-scan/spool, or reject before first write; if
+  final metadata exceeds the selected class, fail finalization with a clear
+  error and no clean trailer/footer.
+- Reader mutation-matrix expansion belongs to G12:
+  encrypted size equals data blocks times block size with checked arithmetic,
+  class maxima are enforced before FEC repair, and zero-data metadata objects
+  reject before decrypt/decompress.
 
 Tests:
 
@@ -459,16 +463,29 @@ Tests:
   diagnostic.
 - Actual metadata object where data plus parity exceeds 65,535 rejects even when
   the individual configured maxima fit in u16.
-- Mutated ManifestFooter `index_root_encrypted_size` rejects before fetching or
-  decrypting IndexRoot.
-- Metadata object with trailing zstd bytes, skippable frame, concatenated
-  frames, or decompressed-size mismatch rejects.
+- Mutated ManifestFooter `index_root_encrypted_size` reader fixtures remain G12.
+- Metadata object trailing zstd/skippable/concatenated/decompressed-size
+  mutation expansion remains G12.
 
 Done criteria:
 
 - IndexRoot/dictionary sizing is an explicit pre-header decision.
 - Late encrypted-object errors are not the only protection against invalid
   metadata class choices.
+
+Completion notes:
+
+- `writer.rs::plan_index_root_metadata_class` now selects the final
+  `index_root_fec_*` class from the compressed IndexRoot and optional
+  dictionary object before `writer.rs::build_crypto_header` computes the
+  CryptoHeader HMAC.
+- Metadata planning enforces actual object data blocks, parity blocks,
+  ReedSolomonGF16 total-shard limit, and u32 encrypted-size limit for
+  IndexRoot and dictionary objects before encryption.
+- Oversized non-splittable IndexRoot payloads fail with `IndexRoot too large`;
+  oversized dictionary objects fail with `dictionary object too large`.
+- True unknown-size streaming writer behavior remains in G03 and is not marked
+  complete by this gap.
 
 ## G07 - Directory Hints, Directory Entries, and Cloud Mode
 

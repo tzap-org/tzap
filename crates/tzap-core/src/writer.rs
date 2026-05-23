@@ -193,6 +193,62 @@ struct EncryptedObject {
     records: Vec<BlockRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObjectExtent {
+    first_block_index: u64,
+    data_block_count: u32,
+    parity_block_count: u32,
+    encrypted_size: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlannedEncryptedObject {
+    data_block_count: u32,
+    parity_block_count: u32,
+    encrypted_size: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataObjectKind {
+    IndexRoot,
+    Dictionary,
+}
+
+impl MetadataObjectKind {
+    fn too_large_error(self) -> FormatError {
+        match self {
+            Self::IndexRoot => FormatError::WriterUnsupported("IndexRoot too large"),
+            Self::Dictionary => FormatError::WriterUnsupported("dictionary object too large"),
+        }
+    }
+}
+
+impl ObjectExtent {
+    fn new(first_block_index: u64, plan: PlannedEncryptedObject) -> Result<Self, FormatError> {
+        Ok(Self {
+            first_block_index,
+            data_block_count: plan.data_block_count,
+            parity_block_count: plan.parity_block_count,
+            encrypted_size: plan.encrypted_size,
+        })
+    }
+
+    fn next_block_index(self) -> Result<u64, FormatError> {
+        checked_u64_add(
+            self.first_block_index,
+            self.data_block_count as u64 + self.parity_block_count as u64,
+            "next_block_index",
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PlannedDirectoryHintObject {
+    hint_shard_index: u64,
+    compressed: Vec<u8>,
+    extent: ObjectExtent,
+}
+
 pub fn write_archive(
     files: &[RegularFile<'_>],
     master_key: &MasterKey,
@@ -311,22 +367,13 @@ fn write_archive_inner(
 fn write_archive_once(
     files: &[RegularFile<'_>],
     master_key: &MasterKey,
-    options: WriterOptions,
+    mut options: WriterOptions,
     dictionary: Option<&[u8]>,
     kdf_params: &KdfParams,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
 ) -> Result<WrittenArchive, FormatError> {
     let subkeys = Subkeys::derive(master_key, &archive_uuid, &session_id)?;
-    let crypto_header = build_crypto_header(
-        options,
-        dictionary.is_some(),
-        &subkeys,
-        &archive_uuid,
-        &session_id,
-        kdf_params,
-    )?;
-
     let mut next_block_index = 0u64;
     let mut block_records = Vec::new();
     let (tar_stream, tar_members) = build_tar_stream(files, options.max_path_length)?;
@@ -416,27 +463,29 @@ fn write_archive_once(
     let frame_count = frames.len() as u64;
     let envelope_count = payload_objects.len() as u64;
 
-    let dictionary_extent = if let Some(dictionary) = dictionary {
-        let compressed_dictionary = compress_zstd_frame(dictionary, options.zstd_level)?;
-        let object = encrypt_object(
-            &compressed_dictionary,
-            &subkeys.dictionary_key,
-            &subkeys.index_nonce_seed,
-            b"dict",
-            0,
-            BlockKind::DictionaryData,
-            BlockKind::DictionaryParity,
-            options.index_root_fec_data_shards,
-            options.index_root_fec_parity_shards,
-            &mut next_block_index,
-            options,
-            &archive_uuid,
-            &session_id,
-        )?;
-        block_records.extend(object.records.clone());
-        Some((object, dictionary.len() as u32))
+    let compressed_dictionary = dictionary
+        .map(|dictionary| compress_zstd_frame(dictionary, options.zstd_level))
+        .transpose()?;
+    let dictionary_decompressed_size = dictionary
+        .map(|dictionary| u32_len(dictionary.len(), "dictionary"))
+        .transpose()?;
+    let dictionary_plan = compressed_dictionary
+        .as_ref()
+        .map(|compressed| {
+            plan_metadata_object_without_class(
+                compressed.len(),
+                options,
+                MetadataObjectKind::Dictionary,
+            )
+        })
+        .transpose()?;
+    let dictionary_extent = dictionary_plan
+        .map(|plan| ObjectExtent::new(next_block_index, plan))
+        .transpose()?;
+    let next_after_dictionary = if let Some(extent) = dictionary_extent {
+        extent.next_block_index()?
     } else {
-        None
+        next_block_index
     };
 
     let planned_directory_hint_shards = if tar_members.len() > DIRECTORY_HINT_REQUIRED_FILE_COUNT {
@@ -445,10 +494,100 @@ fn write_archive_once(
         Vec::new()
     };
     let mut directory_hint_entries = Vec::with_capacity(planned_directory_hint_shards.len());
+    let mut planned_directory_hint_objects =
+        Vec::with_capacity(planned_directory_hint_shards.len());
+    let mut planned_next_block_index = next_after_dictionary;
     for planned in planned_directory_hint_shards {
         let compressed = compress_zstd_frame(&planned.plaintext, options.zstd_level)?;
+        let object_plan = plan_encrypted_object(
+            compressed.len(),
+            options.index_fec_data_shards,
+            options.index_fec_parity_shards,
+            options,
+        )?;
+        let extent = ObjectExtent::new(planned_next_block_index, object_plan)?;
+        planned_next_block_index = extent.next_block_index()?;
+        directory_hint_entries.push(DirectoryHintShardEntry {
+            hint_shard_index: planned.hint_shard_index,
+            first_dir_hash: planned.first_dir_hash,
+            last_dir_hash: planned.last_dir_hash,
+            first_block_index: extent.first_block_index,
+            data_block_count: extent.data_block_count,
+            parity_block_count: extent.parity_block_count,
+            encrypted_size: extent.encrypted_size,
+            decompressed_size: u32_len(planned.plaintext.len(), "DirectoryHintTable")?,
+            entry_count: planned.entry_count,
+        });
+        planned_directory_hint_objects.push(PlannedDirectoryHintObject {
+            hint_shard_index: planned.hint_shard_index,
+            compressed,
+            extent,
+        });
+    }
+
+    let index_root_plaintext = build_index_root_plaintext(
+        &shard_entries,
+        frame_count,
+        envelope_count,
+        tar_members.len() as u64,
+        payload_block_count,
+        tar_total_size,
+        content_sha256,
+        &directory_hint_entries,
+        dictionary_extent
+            .zip(dictionary_decompressed_size)
+            .map(|(extent, decompressed_size)| (extent, decompressed_size)),
+    );
+    let compressed_index_root = compress_zstd_frame(&index_root_plaintext, options.zstd_level)?;
+    let metadata_class = plan_index_root_metadata_class(
+        options,
+        compressed_index_root.len(),
+        compressed_dictionary.as_ref().map(Vec::len),
+    )?;
+    options = metadata_class.options;
+    let crypto_header = build_crypto_header(
+        options,
+        dictionary.is_some(),
+        &subkeys,
+        &archive_uuid,
+        &session_id,
+        kdf_params,
+    )?;
+
+    let actual_dictionary_extent =
+        if let (Some(compressed_dictionary), Some(expected_extent), Some(decompressed_size)) = (
+            compressed_dictionary.as_ref(),
+            dictionary_extent,
+            dictionary_decompressed_size,
+        ) {
+            let object = encrypt_object(
+                compressed_dictionary,
+                &subkeys.dictionary_key,
+                &subkeys.index_nonce_seed,
+                b"dict",
+                0,
+                BlockKind::DictionaryData,
+                BlockKind::DictionaryParity,
+                options.index_root_fec_data_shards,
+                options.index_root_fec_parity_shards,
+                &mut next_block_index,
+                options,
+                &archive_uuid,
+                &session_id,
+            )
+            .map_err(|err| map_metadata_encrypt_error(err, MetadataObjectKind::Dictionary))?;
+            if let Some(dictionary_plan) = metadata_class.dictionary {
+                validate_planned_object(&object, dictionary_plan)?;
+            }
+            validate_planned_extent(&object, expected_extent)?;
+            block_records.extend(object.records.clone());
+            Some((object, decompressed_size))
+        } else {
+            None
+        };
+    for planned in planned_directory_hint_objects {
         let object = encrypt_object(
-            &compressed,
+            &planned.compressed,
             &subkeys.dir_hint_key,
             &subkeys.index_nonce_seed,
             b"dirhint",
@@ -462,34 +601,9 @@ fn write_archive_once(
             &archive_uuid,
             &session_id,
         )?;
-        directory_hint_entries.push(DirectoryHintShardEntry {
-            hint_shard_index: planned.hint_shard_index,
-            first_dir_hash: planned.first_dir_hash,
-            last_dir_hash: planned.last_dir_hash,
-            first_block_index: object.first_block_index,
-            data_block_count: object.data_block_count,
-            parity_block_count: object.parity_block_count,
-            encrypted_size: object.encrypted_size,
-            decompressed_size: u32_len(planned.plaintext.len(), "DirectoryHintTable")?,
-            entry_count: planned.entry_count,
-        });
+        validate_planned_extent(&object, planned.extent)?;
         block_records.extend(object.records.clone());
     }
-
-    let index_root_plaintext = build_index_root_plaintext(
-        &shard_entries,
-        frame_count,
-        envelope_count,
-        tar_members.len() as u64,
-        payload_block_count,
-        tar_total_size,
-        content_sha256,
-        &directory_hint_entries,
-        dictionary_extent
-            .as_ref()
-            .map(|(object, decompressed_size)| (object, *decompressed_size)),
-    );
-    let compressed_index_root = compress_zstd_frame(&index_root_plaintext, options.zstd_level)?;
     let index_root_extent = encrypt_object(
         &compressed_index_root,
         &subkeys.index_root_key,
@@ -504,7 +618,9 @@ fn write_archive_once(
         options,
         &archive_uuid,
         &session_id,
-    )?;
+    )
+    .map_err(|err| map_metadata_encrypt_error(err, MetadataObjectKind::IndexRoot))?;
+    validate_planned_object(&index_root_extent, metadata_class.index_root)?;
     block_records.extend(index_root_extent.records.clone());
 
     let stripe_width = options.stripe_width as usize;
@@ -576,7 +692,7 @@ fn write_archive_once(
             session_id,
             &volume_zero_manifest,
             &index_root_extent.records,
-            dictionary_extent
+            actual_dictionary_extent
                 .as_ref()
                 .map(|(object, _)| object.records.as_slice()),
         )?
@@ -1413,7 +1529,7 @@ fn build_index_root_plaintext(
     tar_total_size: u64,
     content_sha256: [u8; 32],
     directory_hint_entries: &[DirectoryHintShardEntry],
-    dictionary_extent: Option<(&EncryptedObject, u32)>,
+    dictionary_extent: Option<(ObjectExtent, u32)>,
 ) -> Vec<u8> {
     let mut header = IndexRootHeader::empty();
     header.frame_count = frame_count;
@@ -1435,6 +1551,82 @@ fn build_index_root_plaintext(
         directory_hint_shards: directory_hint_entries.to_vec(),
     };
     root.to_bytes()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetadataClassPlan {
+    options: WriterOptions,
+    index_root: PlannedEncryptedObject,
+    dictionary: Option<PlannedEncryptedObject>,
+}
+
+fn plan_index_root_metadata_class(
+    mut options: WriterOptions,
+    compressed_index_root_len: usize,
+    compressed_dictionary_len: Option<usize>,
+) -> Result<MetadataClassPlan, FormatError> {
+    let index_root = plan_metadata_object_without_class(
+        compressed_index_root_len,
+        options,
+        MetadataObjectKind::IndexRoot,
+    )?;
+    let dictionary = compressed_dictionary_len
+        .map(|len| plan_metadata_object_without_class(len, options, MetadataObjectKind::Dictionary))
+        .transpose()?;
+    let required_data_shards = u32::from(options.index_root_fec_data_shards)
+        .max(MIN_INDEX_ROOT_FEC_DATA_SHARDS as u32)
+        .max(index_root.data_block_count)
+        .max(dictionary.map(|plan| plan.data_block_count).unwrap_or(0));
+    let required_data_shards = u16::try_from(required_data_shards)
+        .map_err(|_| MetadataObjectKind::IndexRoot.too_large_error())?;
+    options.index_root_fec_data_shards = required_data_shards;
+    let required_parity_shards = compute_parity_u16(
+        options.index_root_fec_data_shards as u64,
+        options,
+        "index_root_fec_parity_shards",
+    )?;
+    options.index_root_fec_parity_shards = options
+        .index_root_fec_parity_shards
+        .max(required_parity_shards);
+    ensure_metadata_object_fits_class(index_root, options, MetadataObjectKind::IndexRoot)?;
+    if let Some(dictionary) = dictionary {
+        ensure_metadata_object_fits_class(dictionary, options, MetadataObjectKind::Dictionary)?;
+    }
+    Ok(MetadataClassPlan {
+        options,
+        index_root,
+        dictionary,
+    })
+}
+
+fn plan_metadata_object_without_class(
+    payload_len: usize,
+    options: WriterOptions,
+    kind: MetadataObjectKind,
+) -> Result<PlannedEncryptedObject, FormatError> {
+    let plan = plan_encrypted_object_without_class(payload_len, options)
+        .map_err(|_| kind.too_large_error())?;
+    if plan.data_block_count > u16::MAX as u32 || plan.parity_block_count > u16::MAX as u32 {
+        return Err(kind.too_large_error());
+    }
+    validate_object_shard_total(plan.data_block_count, plan.parity_block_count)
+        .map_err(|_| kind.too_large_error())?;
+    Ok(plan)
+}
+
+fn ensure_metadata_object_fits_class(
+    plan: PlannedEncryptedObject,
+    options: WriterOptions,
+    kind: MetadataObjectKind,
+) -> Result<(), FormatError> {
+    if plan.data_block_count > options.index_root_fec_data_shards as u32 {
+        return Err(kind.too_large_error());
+    }
+    if plan.parity_block_count > options.index_root_fec_parity_shards as u32 {
+        return Err(kind.too_large_error());
+    }
+    validate_object_shard_total(plan.data_block_count, plan.parity_block_count)
+        .map_err(|_| kind.too_large_error())
 }
 
 fn payload_object_can_fit(payload_len: usize, options: WriterOptions) -> Result<bool, FormatError> {
@@ -1461,26 +1653,60 @@ fn encrypted_object_can_fit(
     parity_shard_max: u16,
     options: WriterOptions,
 ) -> Result<bool, FormatError> {
-    let data_block_count = encrypted_data_block_count(payload_len, options)?;
-    if data_block_count > data_shard_max as u32 {
-        return Ok(false);
+    match plan_encrypted_object(payload_len, data_shard_max, parity_shard_max, options) {
+        Ok(_) => Ok(true),
+        Err(FormatError::WriterUnsupported("encrypted object exceeds u32 size limit"))
+        | Err(FormatError::WriterUnsupported(
+            "encrypted object exceeds its data shard class maximum",
+        ))
+        | Err(FormatError::WriterUnsupported(
+            "encrypted object exceeds its parity shard class maximum",
+        ))
+        | Err(FormatError::WriterUnsupported(
+            "encrypted object exceeds ReedSolomonGF16 shard limit",
+        )) => Ok(false),
+        Err(err) => Err(err),
     }
-    let required_parity = compute_parity(data_block_count as u64, options)?;
-    if required_parity > parity_shard_max as u32 {
-        return Ok(false);
-    }
-    let total = checked_u64_add(
-        data_block_count as u64,
-        required_parity as u64,
-        "encrypted object shard total overflow",
-    )?;
-    Ok(total <= MAX_REED_SOLOMON_GF16_SHARDS)
 }
 
-fn encrypted_data_block_count(
+fn plan_encrypted_object(
+    payload_len: usize,
+    data_shard_max: u16,
+    parity_shard_max: u16,
+    options: WriterOptions,
+) -> Result<PlannedEncryptedObject, FormatError> {
+    let plan = plan_encrypted_object_without_class(payload_len, options)?;
+    if plan.data_block_count > data_shard_max as u32 {
+        return Err(FormatError::WriterUnsupported(
+            "encrypted object exceeds its data shard class maximum",
+        ));
+    }
+    if plan.parity_block_count > parity_shard_max as u32 {
+        return Err(FormatError::WriterUnsupported(
+            "encrypted object exceeds its parity shard class maximum",
+        ));
+    }
+    validate_object_shard_total(plan.data_block_count, plan.parity_block_count)?;
+    Ok(plan)
+}
+
+fn plan_encrypted_object_without_class(
     payload_len: usize,
     options: WriterOptions,
-) -> Result<u32, FormatError> {
+) -> Result<PlannedEncryptedObject, FormatError> {
+    let (data_block_count, encrypted_size) = encrypted_object_data_extent(payload_len, options)?;
+    let parity_block_count = compute_parity(data_block_count as u64, options)?;
+    Ok(PlannedEncryptedObject {
+        data_block_count,
+        parity_block_count,
+        encrypted_size,
+    })
+}
+
+fn encrypted_object_data_extent(
+    payload_len: usize,
+    options: WriterOptions,
+) -> Result<(u32, u32), FormatError> {
     let block_size = options.block_size as usize;
     let tag_len = options.aead_algo.tag_len();
     let total_before_padding =
@@ -1505,7 +1731,7 @@ fn encrypted_data_block_count(
     };
     let encrypted_size = u32_len(encrypted_size, "encrypted_size")
         .map_err(|_| FormatError::WriterUnsupported("encrypted object exceeds u32 size limit"))?;
-    Ok(encrypted_size / options.block_size)
+    Ok((encrypted_size / options.block_size, encrypted_size))
 }
 
 fn encrypt_object(
@@ -1613,6 +1839,55 @@ fn encrypt_object(
         encrypted_size,
         records,
     })
+}
+
+fn validate_planned_object(
+    object: &EncryptedObject,
+    expected: PlannedEncryptedObject,
+) -> Result<(), FormatError> {
+    if object.data_block_count != expected.data_block_count
+        || object.parity_block_count != expected.parity_block_count
+        || object.encrypted_size != expected.encrypted_size
+    {
+        return Err(FormatError::WriterInvariant(
+            "encrypted object did not match planned sizing",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_planned_extent(
+    object: &EncryptedObject,
+    expected: ObjectExtent,
+) -> Result<(), FormatError> {
+    validate_planned_object(
+        object,
+        PlannedEncryptedObject {
+            data_block_count: expected.data_block_count,
+            parity_block_count: expected.parity_block_count,
+            encrypted_size: expected.encrypted_size,
+        },
+    )?;
+    if object.first_block_index != expected.first_block_index {
+        return Err(FormatError::WriterInvariant(
+            "encrypted object did not match planned extent",
+        ));
+    }
+    Ok(())
+}
+
+fn map_metadata_encrypt_error(error: FormatError, kind: MetadataObjectKind) -> FormatError {
+    match error {
+        FormatError::WriterUnsupported("encrypted object exceeds u32 size limit")
+        | FormatError::WriterUnsupported("encrypted object exceeds its data shard class maximum")
+        | FormatError::WriterUnsupported(
+            "encrypted object exceeds its parity shard class maximum",
+        )
+        | FormatError::WriterUnsupported("encrypted object exceeds ReedSolomonGF16 shard limit") => {
+            kind.too_large_error()
+        }
+        other => other,
+    }
 }
 
 fn build_manifest_footer(
@@ -2350,6 +2625,142 @@ mod tests {
     }
 
     #[test]
+    fn metadata_class_planning_raises_index_root_class_above_default() {
+        let options = plan_writer_options(WriterOptions {
+            block_size: MIN_BLOCK_SIZE,
+            index_root_fec_parity_shards: 0,
+            bit_rot_buffer_pct: 0,
+            ..WriterOptions::default()
+        })
+        .unwrap();
+        let index_root_payload_len = payload_len_for_encrypted_data_blocks(64, options);
+
+        let planned =
+            plan_index_root_metadata_class(options, index_root_payload_len, None).unwrap();
+
+        assert_eq!(planned.index_root.data_block_count, 64);
+        assert_eq!(planned.options.index_root_fec_data_shards, 64);
+        assert_eq!(
+            planned.options.index_root_fec_parity_shards,
+            compute_parity_u16(
+                planned.options.index_root_fec_data_shards as u64,
+                planned.options,
+                "index_root_fec_parity_shards",
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn metadata_class_planning_rejects_oversized_index_root() {
+        let options = single_volume_metadata_test_options();
+        let index_root_payload_len =
+            payload_len_for_encrypted_data_blocks(u16::MAX as u32 + 1, options);
+
+        let err =
+            plan_index_root_metadata_class(options, index_root_payload_len, None).unwrap_err();
+
+        assert_eq!(err, FormatError::WriterUnsupported("IndexRoot too large"));
+    }
+
+    #[test]
+    fn metadata_class_planning_rejects_index_root_u32_encrypted_size_overflow() {
+        let options = single_volume_metadata_test_options();
+        let index_root_payload_len = u32::MAX as usize - options.aead_algo.tag_len() + 1;
+
+        let err =
+            plan_index_root_metadata_class(options, index_root_payload_len, None).unwrap_err();
+
+        assert_eq!(err, FormatError::WriterUnsupported("IndexRoot too large"));
+    }
+
+    #[test]
+    fn metadata_class_planning_rejects_oversized_dictionary() {
+        let options = single_volume_metadata_test_options();
+        let dictionary_payload_len =
+            payload_len_for_encrypted_data_blocks(u16::MAX as u32 + 1, options);
+
+        let err =
+            plan_index_root_metadata_class(options, 1, Some(dictionary_payload_len)).unwrap_err();
+
+        assert_eq!(
+            err,
+            FormatError::WriterUnsupported("dictionary object too large")
+        );
+    }
+
+    #[test]
+    fn metadata_class_planning_rejects_gf16_total_overflow_for_dictionary() {
+        let options = plan_writer_options(WriterOptions {
+            block_size: MIN_BLOCK_SIZE,
+            stripe_width: 8,
+            volume_loss_tolerance: 1,
+            bit_rot_buffer_pct: 5,
+            ..WriterOptions::default()
+        })
+        .unwrap();
+        let dictionary_payload_len = payload_len_for_encrypted_data_blocks(60_000, options);
+
+        let err =
+            plan_index_root_metadata_class(options, 1, Some(dictionary_payload_len)).unwrap_err();
+
+        assert_eq!(
+            err,
+            FormatError::WriterUnsupported("dictionary object too large")
+        );
+    }
+
+    #[test]
+    fn written_archive_authenticates_final_index_root_fec_class() {
+        let master_key = MasterKey::from_raw_key(&[9u8; 32]).unwrap();
+        let dictionary = deterministic_bytes(80 * 1024);
+        let file = RegularFile::new("uses-dictionary.txt", b"payload");
+        let archive = write_archive_with_dictionary(
+            &[file],
+            &master_key,
+            WriterOptions {
+                block_size: MIN_BLOCK_SIZE,
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                index_root_fec_parity_shards: 0,
+                ..WriterOptions::default()
+            },
+            &dictionary,
+        )
+        .unwrap();
+
+        let volume_header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_start = VOLUME_HEADER_LEN;
+        let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
+        let crypto_header = CryptoHeader::parse(
+            &archive.bytes[crypto_start..crypto_end],
+            volume_header.crypto_header_length,
+        )
+        .unwrap();
+        let subkeys =
+            Subkeys::derive(&master_key, &archive.archive_uuid, &archive.session_id).unwrap();
+        verify_hmac(
+            HmacDomain::CryptoHeader,
+            &subkeys.mac_key,
+            &archive.archive_uuid,
+            &archive.session_id,
+            crypto_header.hmac_covered_bytes,
+            &crypto_header.header_hmac,
+        )
+        .unwrap();
+
+        assert!(crypto_header.fixed.index_root_fec_data_shards > MIN_INDEX_ROOT_FEC_DATA_SHARDS);
+        assert_eq!(crypto_header.fixed.index_root_fec_parity_shards, 0);
+        let opened = open_archive(&archive.bytes, &master_key).unwrap();
+        assert_eq!(
+            opened.extract_file("uses-dictionary.txt").unwrap(),
+            Some(b"payload".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
     fn object_parity_uses_per_object_recurrence_even_with_larger_class_max() {
         let options = WriterOptions {
             bit_rot_buffer_pct: 0,
@@ -2393,6 +2804,30 @@ mod tests {
             out.push((state >> 24) as u8);
         }
         out
+    }
+
+    fn single_volume_metadata_test_options() -> WriterOptions {
+        plan_writer_options(WriterOptions {
+            block_size: MIN_BLOCK_SIZE,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            index_root_fec_parity_shards: 0,
+            ..WriterOptions::default()
+        })
+        .unwrap()
+    }
+
+    fn payload_len_for_encrypted_data_blocks(
+        data_block_count: u32,
+        options: WriterOptions,
+    ) -> usize {
+        assert!(data_block_count > 0);
+        if data_block_count == 1 {
+            return 1;
+        }
+        let block_size = options.block_size as usize;
+        (data_block_count as usize - 1) * block_size - options.aead_algo.tag_len() + 1
     }
 
     fn test_file_row(idx: usize, path_hash: [u8; 8]) -> FileRow {
