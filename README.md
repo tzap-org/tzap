@@ -126,6 +126,7 @@ Supported target artifacts:
 | Platform | Artifact |
 | --- | --- |
 | Linux x86_64 | `tzap-vX.Y.Z-linux-x86_64.tar.gz` |
+| Linux x86_64 static/musl | `tzap-vX.Y.Z-linux-x86_64-musl.tar.gz` |
 | macOS x86_64 | `tzap-vX.Y.Z-macos-x86_64.tar.gz` |
 | macOS aarch64 | `tzap-vX.Y.Z-macos-aarch64.tar.gz` |
 | Windows x86_64 | `tzap-vX.Y.Z-windows-x86_64.zip` |
@@ -133,9 +134,11 @@ Supported target artifacts:
 Release artifacts are built on pinned baseline runners instead of moving
 `*-latest` labels: `ubuntu-22.04`, `macos-15-intel`, `macos-14`, and
 `windows-2022`. macOS builds set `MACOSX_DEPLOYMENT_TARGET=10.12` for
-x86_64 and `MACOSX_DEPLOYMENT_TARGET=11.0` for aarch64.
+x86_64 and `MACOSX_DEPLOYMENT_TARGET=11.0` for aarch64. Linux publishes both
+glibc and static musl x86_64 artifacts; Windows release builds use the static
+CRT.
 
-tzap requires Rust 1.82 or newer.
+tzap requires Rust 1.85 or newer.
 
 ## Quick start (passphrase mode)
 

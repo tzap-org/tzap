@@ -28,6 +28,7 @@ fn milestone10_release_workflow_has_all_release_archives() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
 
     assert!(workflow.contains("tzap-${{ github.ref_name }}-linux-x86_64.tar.gz"));
+    assert!(workflow.contains("tzap-${{ github.ref_name }}-linux-x86_64-musl.tar.gz"));
     assert!(workflow.contains("tzap-${{ github.ref_name }}-macos-x86_64.tar.gz"));
     assert!(workflow.contains("tzap-${{ github.ref_name }}-macos-aarch64.tar.gz"));
     assert!(workflow.contains("tzap-${{ github.ref_name }}-windows-x86_64.zip"));
@@ -38,6 +39,7 @@ fn milestone10_release_workflow_targets_distinct_build_triples() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
 
     assert!(workflow.contains("x86_64-unknown-linux-gnu"));
+    assert!(workflow.contains("x86_64-unknown-linux-musl"));
     assert!(workflow.contains("x86_64-apple-darwin"));
     assert!(workflow.contains("aarch64-apple-darwin"));
     assert!(workflow.contains("x86_64-pc-windows-msvc"));
@@ -55,6 +57,9 @@ fn milestone10_release_workflow_uses_pinned_baseline_runners() {
     assert!(workflow.contains("MACOSX_DEPLOYMENT_TARGET"));
     assert!(workflow.contains(r#"macosx_deployment_target: "10.12""#));
     assert!(workflow.contains(r#"macosx_deployment_target: "11.0""#));
+    assert!(workflow.contains("musl-tools"));
+    assert!(workflow.contains("CC_x86_64_unknown_linux_musl=musl-gcc"));
+    assert!(workflow.contains("target-feature=+crt-static"));
     assert!(!workflow.contains("ubuntu-latest"));
     assert!(!workflow.contains("macos-latest"));
     assert!(!workflow.contains("windows-latest"));

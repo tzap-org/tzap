@@ -845,6 +845,7 @@ Implemented in this milestone:
 - `cargo fmt --all -- --check` runs on Linux runner only.
 - Release workflow now builds each required target artifact:
   - `tzap-vX.Y.Z-linux-x86_64.tar.gz`
+  - `tzap-vX.Y.Z-linux-x86_64-musl.tar.gz`
   - `tzap-vX.Y.Z-macos-x86_64.tar.gz`
   - `tzap-vX.Y.Z-macos-aarch64.tar.gz`
   - `tzap-vX.Y.Z-windows-x86_64.zip`
@@ -856,6 +857,8 @@ Implemented in this milestone:
   - `windows-2022`
 - macOS release artifacts pin deployment targets to `10.12` for x86_64 and
   `11.0` for aarch64.
+- Linux now publishes a static musl artifact for older distro compatibility.
+- Windows release builds use static CRT flags.
 - Release packaging now emits per-platform SHA-256 checksum files and merges them into a `SHA256SUMS` manifest.
 - Release packaging now runs post-build smoke tests (`tzap --version`, `tzap --help`) before upload.
 

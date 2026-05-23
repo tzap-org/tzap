@@ -23,24 +23,35 @@ jobs:
             archive: tzap-${{ github.ref_name }}-linux-x86_64.tar.gz
             run_smoke: true
             macosx_deployment_target: ""
+            rustflags: ""
+          - name: linux-x86_64-musl
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            archive: tzap-${{ github.ref_name }}-linux-x86_64-musl.tar.gz
+            run_smoke: true
+            macosx_deployment_target: ""
+            rustflags: ""
           - name: macos-x86_64
             os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tzap-${{ github.ref_name }}-macos-x86_64.tar.gz
             run_smoke: true
             macosx_deployment_target: "10.12"
+            rustflags: ""
           - name: macos-aarch64
             os: macos-14
             target: aarch64-apple-darwin
             archive: tzap-${{ github.ref_name }}-macos-aarch64.tar.gz
             run_smoke: true
             macosx_deployment_target: "11.0"
+            rustflags: ""
           - name: windows-x86_64
             os: windows-2022
             target: x86_64-pc-windows-msvc
             archive: tzap-${{ github.ref_name }}-windows-x86_64.zip
             run_smoke: true
             macosx_deployment_target: ""
+            rustflags: "-C target-feature=+crt-static"
 
     steps:
       - name: Checkout
@@ -54,9 +65,17 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+
       - name: Build
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --locked --release -p tzap --target ${{ matrix.target }}
 
       - name: Smoke test build
