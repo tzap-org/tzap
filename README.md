@@ -51,6 +51,12 @@ storage, and recovery workflows.
 
 ## Install
 
+From crates.io:
+
+```sh
+cargo install tzap
+```
+
 From a checkout:
 
 ```sh

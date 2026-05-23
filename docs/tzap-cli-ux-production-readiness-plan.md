@@ -909,9 +909,19 @@ Acceptance criteria:
 
 ## Milestone 12: Crates.io Readiness
 
-Status: not started.
+Status: done.
 
 Purpose: prepare source publishing after the CLI is polished.
+
+Completion notes:
+
+- `tzap-core` package metadata and README are publish-ready and `tzap-core`
+  0.1.0 has been published before the CLI crate.
+- `tzap` uses a versioned `tzap-core` dependency for crates.io while keeping
+  the workspace path dependency for local development.
+- Package contents were inspected for both crates and kept focused on
+  manifests, READMEs, source, and tests.
+- Final release checks pass with locked dependencies.
 
 Tasks:
 

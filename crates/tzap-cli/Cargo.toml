@@ -4,8 +4,13 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-description.workspace = true
+description = "Command-line tool for creating, listing, verifying, and extracting tzap archives"
 license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/tzap"
+readme = "README.md"
+keywords = ["archive", "backup", "encryption", "recovery", "zstd"]
+categories = ["command-line-utilities", "compression", "cryptography", "filesystem"]
 
 [[bin]]
 name = "tzap"
@@ -17,7 +22,7 @@ clap.workspace = true
 rand.workspace = true
 serde_json.workspace = true
 rpassword = "7"
-tzap-core = { path = "../tzap-core" }
+tzap-core = { path = "../tzap-core", version = "0.1.0" }
 
 [dev-dependencies]
 assert_cmd.workspace = true
