@@ -62,7 +62,7 @@ and explicit release gates.
 | G07 | Directory hints and directory entries | complete | P0/P1 | exact hint map, directory entries, and cloud claims settled |
 | G08 | Tar metadata profile | complete | P1 | supported metadata profile documented and tested |
 | G09 | Recovery and duplicate volumes | complete | P1 | strict recovery modes are documented and mutation-tested |
-| G10 | CLI/API boundaries | partial | P0 | help/docs/tests do not imply unsupported behavior |
+| G10 | CLI/API boundaries | complete | P0 | help/docs/tests do not imply unsupported behavior |
 | G11 | v36 corpus coverage | complete | P0 | every section 28.1 case tracked as covered/missing/deferred |
 | G12 | Fuzzing and mutation harness | partial | P1/P2 | fuzz targets and smoke gates cover parsers and mutations |
 | G13 | Interop and release gate | missing | P0/P2 | release checklist blocks unverified conformance claims |
@@ -101,8 +101,8 @@ Completed implementation:
    - cap-aware metadata splitting: complete
    - bootstrap sidecar: single-volume CLI boundary
 2. Updated `docs/tzap-operational-boundaries.md` with precise examples:
-   - bootstrap sidecars with multi-volume open input sets are currently not a
-     supported CLI path unless G05/G10 implement it
+   - bootstrap sidecars with multi-volume open input sets are not a supported
+     CLI path unless a future product feature implements it
    - empty directory entries are omitted by current CLI/API scope
    - true archive stdin/live non-seekable streaming is not exposed; G04 closes
      this as an unsupported live-output boundary
@@ -283,8 +283,8 @@ provisional-output API.
 
 This closes G04 as a current-release boundary, not as full live sequential
 reader conformance. The conformance matrix keeps R04/R20 `partial` because live
-archive stdin/provisional output and the remaining sequential mutation fixtures
-are deferred to G10/G12.
+archive stdin/provisional output would be future product work, and the remaining
+sequential mutation fixtures are deferred to G12.
 
 The CLI uses archive file paths for `list`, `verify`, and `extract`. It does not
 expose archive stdin, live non-seekable extraction, provisional stdout events, or
@@ -321,8 +321,8 @@ Deferred future live-reader work:
   atomic commit only after terminal authentication succeeds.
 - A future live stdout mode would need opt-in wording because stdout bytes cannot
   be recalled after terminal failure.
-- A future CLI archive-stdin mode belongs with G10 and must not be implied by
-  the current `--password-stdin` flag.
+- A future CLI archive-stdin mode would be a new product feature and must not be
+  implied by the current `--password-stdin` flag.
 
 Done criteria met:
 
@@ -420,7 +420,8 @@ Tests:
 Deferred related work:
 
 - CLI support for multi-volume input sets plus `--bootstrap`, if ever desired,
-  belongs to G10.
+  would be a new product feature. The current CLI rejects that combination
+  before reading archive inputs.
 - Broad near-u64 arithmetic and boundary-byte mutation expansion remains in
   G12; the implemented reader path uses checked arithmetic and present-section
   cap accounting.
@@ -727,49 +728,63 @@ Spec anchors:
 - non-seekable read/write sections
 - bootstrap sidecar sections
 
-Current gap:
+Status: complete.
+
+Original gap:
 
 The CLI is the main user-facing conformance boundary. It should not imply
 features that the core does not implement, and it should not hide unsupported
 writer/reader shapes behind generic errors.
 
-Implementation work:
+Closed implementation:
 
-1. Audit all CLI flags and help text:
-   - `create`
-   - `list`
-   - `verify`
-   - `extract`
-   - `keygen`
-2. For each unsupported combination, require:
-   - preflight rejection before partial output
-   - stable error category
-   - actionable message
-   - test
-   - technical-doc example
-3. Required boundaries to settle:
-   - archive stdin / non-seekable archive input
-   - live stdout streaming versus whole-buffer output
-   - multi-volume plus `--bootstrap`
-   - multi-volume plus `--bootstrap-out`
-   - directory entry preservation
-   - true append-only create output
-4. Keep the README focused on successful workflows. Put limitations and examples
-   in `docs/`.
+1. CLI help and technical docs now keep archive streaming boundaries explicit:
+   - archive input is by file path; `-` is a literal path, not archive stdin
+   - `--password-stdin` reads only passphrase bytes
+   - `tzap extract --stdout` emits one selected regular-file payload only after
+     the archive has opened and authenticated from file paths
+   - `tzap create -o -` and `--bootstrap-out -` are unsupported sentinel forms
+     and reject before writing files or stdout bytes
+2. Multi-volume `--bootstrap` rejects as a preflight for `list`, `extract`, and
+   `verify`, before reading archive paths, loading the key, creating extraction
+   directories, or emitting list/verify/extract payload output. The stable
+   diagnostic is `unsupported-feature` with an actionable message to pass volume
+   files without `--bootstrap`.
+3. `--bootstrap-out` remains single-volume only. Both fixed-count multi-volume
+   output and `--volume-size` output reject before creating archive or sidecar
+   files.
+4. Directory preservation is documented as the current regular-file CLI scanner
+   boundary: nested regular files are preserved, but standalone empty directory
+   FileEntries are omitted unless a future directory-entry feature is added.
+5. README stays marketing-focused. Exact limitations and examples live in
+   `docs/tzap-cli-reference.md` and `docs/tzap-operational-boundaries.md`.
 
 Tests:
 
-- Help text does not mention archive stdin unless implemented.
-- `--bootstrap-out` with multi-volume rejects before creating output files.
-- Multi-volume plus `--bootstrap` either works with G05 authority checks or
-  rejects with the documented unsupported diagnostic.
-- Unsupported streaming create shape rejects before first output byte.
-- CLI reference tests cover the implemented/unsupported boundary.
+- `cli_smoke::cli_help_does_not_advertise_archive_stdin_or_create_stdout`
+- `cli_smoke::cli_list_treats_dash_as_literal_archive_path_not_stdin`
+- `cli_smoke::cli_extract_treats_dash_as_literal_archive_path_not_stdin`
+- `cli_smoke::cli_verify_treats_dash_as_literal_archive_path_not_stdin`
+- `cli_smoke::cli_commands_read_real_file_named_dash_as_archive_path`
+- `cli_smoke::cli_extract_stdout_requires_exactly_one_path`
+- `cli_smoke::cli_extract_stdout_emits_no_payload_when_archive_authentication_fails`
+- `cli_smoke::cli_open_commands_reject_multi_volume_bootstrap_before_archive_reads`
+- `cli_smoke::cli_verify_json_reports_multi_volume_bootstrap_boundary_before_archive_reads`
+- `cli_smoke::cli_create_rejects_bootstrap_out_with_multi_volume_with_unsupported_error`
+- `cli_smoke::cli_create_rejects_bootstrap_out_with_volume_size_before_writing`
+- `cli_smoke::cli_create_rejects_archive_stdout_output_sentinel_before_writing`
+- `cli_smoke::cli_create_rejects_sidecar_stdout_output_sentinel_before_writing`
+- `cli_smoke::cli_create_omits_empty_directories_by_default`
+- `milestone11_docs::milestone11_docs_pin_current_g10_cli_api_boundaries`
 
-Done criteria:
+Remaining work:
 
-- Users get clear behavior at command boundaries.
-- Technical docs carry limitations; README remains a marketing page.
+- Broad generated corpus and fuzz coverage for sequential, streaming, and
+  directory-prefix edge cases remains G12.
+- Any future archive-stdin, live stdout streaming, append-only sink, multipart
+  sink, multi-volume sidecar, or directory FileEntry creation feature must add a
+  new product design, docs, diagnostics, and tests instead of relying on the
+  current unsupported boundary.
 
 ## G11 - v36 Corpus and Mutation Coverage
 

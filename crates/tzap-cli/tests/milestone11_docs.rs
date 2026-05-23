@@ -461,7 +461,7 @@ fn milestone11_docs_pin_current_g04_non_seekable_boundary() {
     assert!(!cli.contains("sequential_extract_tar_stream"));
     assert!(matrix.contains("| R04 |"));
     assert!(matrix.contains("| `partial` | Core has a whole-buffer sequential helper"));
-    assert!(matrix.contains("true live sequential API is deferred to G10/G12"));
+    assert!(matrix.contains("true live sequential API would be future product work"));
     assert!(matrix.contains("| R20 |"));
     assert!(matrix.contains("| `partial` | Whole-buffer API returns decoded bytes"));
     assert!(matrix.contains("Skipped-metadata, non-authoritative terminal, and multi-envelope CRC-boundary fixtures remain G12"));
@@ -482,6 +482,56 @@ fn milestone11_docs_pin_current_g04_non_seekable_boundary() {
         assert!(
             !cli_lower.contains(phrase),
             "CLI help source must not claim unsupported sequential reader behavior via {phrase:?}"
+        );
+    }
+}
+
+#[test]
+fn milestone11_docs_pin_current_g10_cli_api_boundaries() {
+    let readme = read_workspace_file("README.md");
+    let reference = read_workspace_file("docs/tzap-cli-reference.md");
+    let boundaries = read_workspace_file("docs/tzap-operational-boundaries.md");
+    let matrix = read_workspace_file("docs/tzap-v36-conformance-matrix.md");
+    let tracker = read_workspace_file("docs/tzap-v36-corpus-tracker.md");
+    let plan = read_workspace_file("docs/tzap-v36-gap-implementation-plan.md");
+    let cli = read_workspace_file("crates/tzap-cli/src/main.rs");
+
+    assert!(reference.contains("Archive input comes from file paths"));
+    assert!(reference.contains("`-` is not an archive stdin sentinel"));
+    assert!(reference.contains("combining multiple archive inputs"));
+    assert!(reference.contains("rejects before reading archive files"));
+    assert!(boundaries.contains("preflight CLI rejection"));
+    assert!(boundaries.contains("before archive paths, sidecar\npaths, or key material are read"));
+    assert!(boundaries.contains("Create outputs are archive files, not stdout"));
+    assert!(boundaries.contains("Empty directory inputs"));
+    assert!(cli.contains("multi-volume inputs with --bootstrap are not supported"));
+    assert!(cli.contains("--output - is not archive stdout"));
+    assert!(cli.contains("--bootstrap-out - is not sidecar stdout"));
+    assert!(matrix.contains("| G10 CLI/API boundaries | `complete` |"));
+    assert!(matrix.contains(
+        "cli_smoke::cli_open_commands_reject_multi_volume_bootstrap_before_archive_reads"
+    ));
+    assert!(matrix.contains(
+        "cli_smoke::cli_extract_stdout_emits_no_payload_when_archive_authentication_fails"
+    ));
+    assert!(
+        tracker.contains("cli_smoke::cli_help_does_not_advertise_archive_stdin_or_create_stdout")
+    );
+    assert!(!tracker.contains("[G10]"));
+    assert!(plan.contains("## G10 - CLI and API Boundaries"));
+    assert!(plan.contains("Status: complete."));
+
+    let readme_lower = readme.to_lowercase();
+    for phrase in [
+        "archive stdin",
+        "live stdout streaming",
+        "append-only sink",
+        "multipart sink",
+        "multi-volume sidecar",
+    ] {
+        assert!(
+            !readme_lower.contains(phrase),
+            "README must keep G10 boundary details out of marketing copy via {phrase:?}"
         );
     }
 }

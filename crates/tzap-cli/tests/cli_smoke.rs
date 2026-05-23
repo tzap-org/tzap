@@ -117,6 +117,24 @@ fn zero_deterministic_payload_blocks(
     (corrupt_count, locations.len())
 }
 
+fn assert_no_archive_stream_claims(help: &str) {
+    let lower = help.to_lowercase();
+    for phrase in [
+        "archive stdin",
+        "archive from stdin",
+        "read archive from stdin",
+        "stdin archive",
+        "pipe archive",
+        "archive stdout",
+        "create to stdout",
+    ] {
+        assert!(
+            !lower.contains(phrase),
+            "help text should not claim unsupported archive streaming via {phrase:?}"
+        );
+    }
+}
+
 #[test]
 fn cli_subcommand_help_paths_are_available() {
     for command in ["create", "extract", "list", "verify", "keygen"] {
@@ -162,6 +180,39 @@ fn cli_top_level_help_contains_product_description_and_commands() {
         .stdout(predicate::str::contains("keygen"))
         .stdout(predicate::str::contains("K/KB/KiB"))
         .stdout(predicate::str::contains("Exit codes"));
+}
+
+#[test]
+fn cli_help_does_not_advertise_archive_stdin_or_create_stdout() {
+    let output = Command::cargo_bin("tzap")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_no_archive_stream_claims(&String::from_utf8_lossy(&output));
+
+    for command in ["create", "extract", "list", "verify"] {
+        let output = Command::cargo_bin("tzap")
+            .unwrap()
+            .args([command, "--help"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let help = String::from_utf8_lossy(&output);
+        assert_no_archive_stream_claims(&help);
+        match command {
+            "create" => assert!(help.contains("single-volume output only")),
+            "extract" | "list" | "verify" => {
+                assert!(help.contains("single-volume archive input"));
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[test]
@@ -589,6 +640,119 @@ fn cli_commands_read_real_file_named_dash_as_archive_path() {
 }
 
 #[test]
+fn cli_open_commands_reject_multi_volume_bootstrap_before_archive_reads() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let primary = temp.path().join("missing-primary.tzap.000");
+    let extra = temp.path().join("missing-primary.tzap.001");
+    let bootstrap = temp.path().join("missing-primary.tzap.bootstrap");
+    let output = temp.path().join("out");
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap",
+            bootstrap.to_str().unwrap(),
+            primary.to_str().unwrap(),
+            "--volume",
+            extra.to_str().unwrap(),
+        ])
+        .assert()
+        .code(16)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("unsupported-feature"))
+        .stderr(predicate::str::contains(
+            "multi-volume inputs with --bootstrap are not supported",
+        ))
+        .stderr(predicate::str::contains("failed to read archive").not());
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap",
+            bootstrap.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            primary.to_str().unwrap(),
+            "--volume",
+            extra.to_str().unwrap(),
+            "hello.txt",
+        ])
+        .assert()
+        .code(16)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("unsupported-feature"))
+        .stderr(predicate::str::contains(
+            "multi-volume inputs with --bootstrap are not supported",
+        ))
+        .stderr(predicate::str::contains("failed to read archive").not());
+    assert!(!output.exists());
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap",
+            bootstrap.to_str().unwrap(),
+            primary.to_str().unwrap(),
+            extra.to_str().unwrap(),
+        ])
+        .assert()
+        .code(16)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("unsupported-feature"))
+        .stderr(predicate::str::contains(
+            "multi-volume inputs with --bootstrap are not supported",
+        ))
+        .stderr(predicate::str::contains("failed to read archive").not());
+}
+
+#[test]
+fn cli_verify_json_reports_multi_volume_bootstrap_boundary_before_archive_reads() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let primary = temp.path().join("missing-primary.tzap.000");
+    let extra = temp.path().join("missing-primary.tzap.001");
+    let bootstrap = temp.path().join("missing-primary.tzap.bootstrap");
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    let output = Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--json",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap",
+            bootstrap.to_str().unwrap(),
+            primary.to_str().unwrap(),
+            extra.to_str().unwrap(),
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["label"], "unsupported-feature");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("multi-volume inputs with --bootstrap are not supported"));
+}
+
+#[test]
 fn cli_verify_one_volume_archive_with_keyfile_reports_summary_with_counts() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
@@ -1003,6 +1167,47 @@ fn cli_extract_stdout_outputs_binary_data_only_to_stdout() {
         .clone();
     assert_eq!(output.stdout, payload);
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn cli_extract_stdout_emits_no_payload_when_archive_authentication_fails() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let bad_key = temp.path().join("bad.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("sample.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&bad_key, BAD_KEY_HEX).unwrap();
+    fs::write(&input, b"stdout payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            bad_key.to_str().unwrap(),
+            "--stdout",
+            archive.to_str().unwrap(),
+            "hello.txt",
+        ])
+        .assert()
+        .code(10)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("wrong-key"));
 }
 
 #[test]
@@ -4436,24 +4641,8 @@ fn cli_extract_reports_missing_archive_path_and_lists_missing_paths() {
 #[test]
 fn cli_extract_stdout_requires_exactly_one_path() {
     let temp = tempdir().unwrap();
-    let keyfile = temp.path().join("key.hex");
-    let input = temp.path().join("hello.txt");
-    let archive = temp.path().join("sample.tzap");
-    fs::write(&keyfile, KEY_HEX).unwrap();
-    fs::write(&input, b"payload\n").unwrap();
-
-    Command::cargo_bin("tzap")
-        .unwrap()
-        .args([
-            "create",
-            "--keyfile",
-            keyfile.to_str().unwrap(),
-            "-o",
-            archive.to_str().unwrap(),
-            input.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    let keyfile = temp.path().join("missing-key.hex");
+    let archive = temp.path().join("missing-archive.tzap");
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -4465,10 +4654,13 @@ fn cli_extract_stdout_requires_exactly_one_path() {
             archive.to_str().unwrap(),
         ])
         .assert()
-        .code(1)
+        .code(16)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("unsupported-feature"))
         .stderr(predicate::str::contains(
             "--stdout requires exactly one archive path",
-        ));
+        ))
+        .stderr(predicate::str::contains("failed to read").not());
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -4482,10 +4674,13 @@ fn cli_extract_stdout_requires_exactly_one_path() {
             "hello.txt",
         ])
         .assert()
-        .code(1)
+        .code(16)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("unsupported-feature"))
         .stderr(predicate::str::contains(
             "--stdout requires exactly one archive path",
-        ));
+        ))
+        .stderr(predicate::str::contains("failed to read").not());
 }
 
 #[test]
@@ -4762,6 +4957,46 @@ fn cli_create_rejects_bootstrap_out_with_multi_volume_with_unsupported_error() {
         .stderr(predicate::str::contains(
             "--bootstrap-out is currently supported only for single-volume output",
         ));
+    assert!(!numbered_volume_path(&archive, 0).exists());
+    assert!(!numbered_volume_path(&archive, 1).exists());
+    assert!(!bootstrap.exists());
+}
+
+#[test]
+fn cli_create_rejects_bootstrap_out_with_volume_size_before_writing() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("hello.txt");
+    let archive = temp.path().join("split.tzap");
+    let bootstrap = temp.path().join("split.tzap.bootstrap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volume-size",
+            "1M",
+            "--bootstrap-out",
+            bootstrap.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(16)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("unsupported-feature"))
+        .stderr(predicate::str::contains(
+            "--bootstrap-out is currently supported only for single-volume output",
+        ));
+    assert!(!archive.exists());
+    assert!(!numbered_volume_path(&archive, 0).exists());
+    assert!(!bootstrap.exists());
 }
 
 #[test]

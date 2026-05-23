@@ -82,7 +82,9 @@ Notes:
   opened and authenticated from file paths; it is not live non-seekable archive
   streaming.
 - `--bootstrap` is for single-volume open paths. Multi-volume open paths should
-  pass volume files and omit the sidecar.
+  pass volume files and omit the sidecar; combining multiple archive inputs
+  with `--bootstrap` rejects before reading archive files with
+  `unsupported-feature`.
 - Unsupported local tar metadata profiles and mode/mtime restoration failures
   are reported to stderr as `tzap: degraded-metadata: ...`. Global PAX/GNU state
   is rejected.
@@ -110,7 +112,9 @@ Notes:
 
 - Archive input comes from file paths. `-` is not an archive stdin sentinel.
 - `--bootstrap` is for single-volume open paths. Multi-volume open paths should
-  pass volume files and omit the sidecar.
+  pass volume files and omit the sidecar; combining multiple archive inputs
+  with `--bootstrap` rejects before reading archive files with
+  `unsupported-feature`.
 - Long listing and JSON output expose the parsed tar kind, size, ustar mode, and
   integer mtime. Unsupported local tar metadata profiles are reported to stderr
   as `tzap: degraded-metadata: ...`; global PAX/GNU state is rejected.
@@ -138,7 +142,9 @@ Notes:
   `tzap: degraded-metadata: ...` after the archive structure and content verify.
 - Archive input comes from file paths. `-` is not an archive stdin sentinel.
 - `--bootstrap` is for single-volume open paths. Multi-volume open paths should
-  pass volume files and omit the sidecar.
+  pass volume files and omit the sidecar; combining multiple archive inputs
+  with `--bootstrap` rejects before reading archive files with
+  `unsupported-feature`.
 - Multi-volume recovery succeeds only when available inputs stay within the
   archive's configured volume-loss tolerance and FEC budget.
 

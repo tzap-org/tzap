@@ -95,6 +95,11 @@ tzap list \
 # exit 16: unsupported-feature
 ```
 
+This is a preflight CLI rejection: it happens before archive paths, sidecar
+paths, or key material are read. The diagnostic says multi-volume inputs with
+`--bootstrap` are unsupported and tells callers to pass volume files without the
+sidecar.
+
 What to do:
 
 - For single-volume workflows, use `--bootstrap-out` on create and `--bootstrap`

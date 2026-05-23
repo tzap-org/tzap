@@ -172,7 +172,7 @@ enum Command {
         #[arg(
             long = "bootstrap-out",
             value_name = "FILE",
-            help = "Write bootstrap recovery sidecar to FILE."
+            help = "Write bootstrap recovery sidecar to FILE (single-volume output only)."
         )]
         bootstrap_out: Option<String>,
 
@@ -296,7 +296,7 @@ enum Command {
         #[arg(
             long = "bootstrap",
             value_name = "FILE",
-            help = "Use bootstrap sidecar FILE."
+            help = "Use bootstrap sidecar FILE for single-volume archive input."
         )]
         bootstrap: Option<String>,
 
@@ -344,7 +344,7 @@ enum Command {
         #[arg(
             long = "bootstrap",
             value_name = "FILE",
-            help = "Use bootstrap sidecar FILE."
+            help = "Use bootstrap sidecar FILE for single-volume archive input."
         )]
         bootstrap: Option<String>,
 
@@ -410,7 +410,7 @@ enum Command {
         #[arg(
             long = "bootstrap",
             value_name = "FILE",
-            help = "Use bootstrap sidecar FILE."
+            help = "Use bootstrap sidecar FILE for single-volume archive input."
         )]
         bootstrap: Option<String>,
 
@@ -656,6 +656,8 @@ fn run(cli: Cli) -> Result<()> {
             bootstrap,
             volumes,
         } => {
+            reject_multi_volume_bootstrap(1 + volumes.len(), bootstrap.as_deref())?;
+            reject_stdout_extract_shape(stdout, paths.len())?;
             let volume_bytes = read_volume_inputs(&archive, &volumes)?;
             let master_key = load_open_key(
                 keyfile.as_deref(),
@@ -676,9 +678,6 @@ fn run(cli: Cli) -> Result<()> {
                 return Err(anyhow!("missing requested archive paths"));
             }
             if stdout {
-                if paths.is_empty() || requested_paths.len() != 1 {
-                    bail!("--stdout requires exactly one archive path");
-                }
                 let path = requested_paths[0].as_str();
                 let member = opened
                     .extract_member(path)?
@@ -750,6 +749,7 @@ fn run(cli: Cli) -> Result<()> {
             long,
             json,
         } => {
+            reject_multi_volume_bootstrap(1 + volumes.len(), bootstrap.as_deref())?;
             let volume_bytes = read_volume_inputs(&archive, &volumes)?;
             let master_key = load_open_key(
                 keyfile.as_deref(),
@@ -819,6 +819,12 @@ fn run(cli: Cli) -> Result<()> {
                 .first()
                 .ok_or_else(|| anyhow!("at least one archive volume is required"))?;
             let archive_paths = archives.to_vec();
+            if let Err(err) = reject_multi_volume_bootstrap(archives.len(), bootstrap.as_deref()) {
+                if json {
+                    emit_verify_json_error(&archive_paths, None, None, &err)?;
+                }
+                return Err(err);
+            }
             let volume_bytes = match read_volume_inputs(first, &archives[1..]) {
                 Ok(volume_bytes) => volume_bytes,
                 Err(err) => {
@@ -1429,18 +1435,31 @@ fn read_volume_inputs(primary: &str, additional: &[String]) -> Result<Vec<Vec<u8
         .collect()
 }
 
+fn reject_multi_volume_bootstrap(volume_count: usize, bootstrap: Option<&str>) -> Result<()> {
+    if volume_count > 1 && bootstrap.is_some() {
+        return Err(anyhow!(FormatError::ReaderUnsupported(
+            "multi-volume inputs with --bootstrap are not supported; pass volume files without --bootstrap",
+        )));
+    }
+    Ok(())
+}
+
+fn reject_stdout_extract_shape(stdout: bool, path_count: usize) -> Result<()> {
+    if stdout && path_count != 1 {
+        return Err(anyhow!(FormatError::ReaderUnsupported(
+            "--stdout requires exactly one archive path",
+        )));
+    }
+    Ok(())
+}
+
 fn open_inputs_maybe_bootstrap(
     volume_bytes: &[Vec<u8>],
     master_key: &MasterKey,
     bootstrap: Option<&str>,
 ) -> Result<OpenedArchive> {
     if volume_bytes.len() > 1 {
-        if bootstrap.is_some() {
-            return Err(anyhow!(FormatError::ReaderUnsupported(
-                "bootstrap is not supported with multi-volume extraction",
-            ))
-            .into());
-        }
+        reject_multi_volume_bootstrap(volume_bytes.len(), bootstrap)?;
         let borrowed = volume_bytes.iter().map(Vec::as_slice).collect::<Vec<_>>();
         return open_archive_volumes(&borrowed, master_key).map_err(Into::into);
     }
