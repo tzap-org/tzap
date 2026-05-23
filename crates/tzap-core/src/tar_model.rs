@@ -1167,32 +1167,28 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn safe_restore_rejects_symlink_parent() {
         let tmp = tempdir().unwrap();
         let outside = tempdir().unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), tmp.path().join("link")).unwrap();
 
-        #[cfg(unix)]
-        {
-            let member = OwnedTarMember {
-                path: b"link/file.txt".to_vec(),
-                kind: TarEntryKind::Regular,
-                data: b"blocked".to_vec(),
-                link_target: None,
-                mode: 0o644,
-                mtime: 0,
-                logical_size: 7,
-                diagnostics: Vec::new(),
-            };
+        let member = OwnedTarMember {
+            path: b"link/file.txt".to_vec(),
+            kind: TarEntryKind::Regular,
+            data: b"blocked".to_vec(),
+            link_target: None,
+            mode: 0o644,
+            mtime: 0,
+            logical_size: 7,
+            diagnostics: Vec::new(),
+        };
 
-            assert_eq!(
-                restore_tar_member(tmp.path(), &member, SafeExtractionOptions::default())
-                    .unwrap_err(),
-                FormatError::UnsafeArchivePath
-            );
-        }
+        assert_eq!(
+            restore_tar_member(tmp.path(), &member, SafeExtractionOptions::default()).unwrap_err(),
+            FormatError::UnsafeArchivePath
+        );
     }
 
     #[test]
@@ -1249,7 +1245,7 @@ mod tests {
             kind: TarEntryKind::Regular,
             data: b"dated".to_vec(),
             link_target: None,
-            mode: 0o644,
+            mode: 0o666,
             mtime: 1_700_000_000,
             logical_size: 5,
             diagnostics: Vec::new(),

@@ -685,13 +685,13 @@ fn run(cli: Cli) -> Result<()> {
                 if member.kind != TarEntryKind::Regular {
                     bail!("--stdout supports regular file members only");
                 }
-                emit_member_metadata_diagnostics(path, &member.diagnostics)?;
+                emit_member_metadata_diagnostics(quiet, path, &member.diagnostics)?;
                 io::stdout().write_all(&member.data)?;
                 return Ok(());
             }
 
             if dry_run {
-                emit_entry_metadata_diagnostics_for_paths(&all_entries, &requested_paths)?;
+                emit_entry_metadata_diagnostics_for_paths(quiet, &all_entries, &requested_paths)?;
                 eprintln!("extract dry-run summary:");
                 eprintln!("  destination: {}", directory);
                 eprintln!("  archive members:");
@@ -728,7 +728,7 @@ fn run(cli: Cli) -> Result<()> {
                 degraded_metadata_count = degraded_metadata_count
                     .checked_add(diagnostics.len() as u64)
                     .ok_or_else(|| anyhow!("degraded metadata count overflow"))?;
-                emit_member_metadata_diagnostics(&path, &diagnostics)?;
+                emit_member_metadata_diagnostics(quiet, &path, &diagnostics)?;
             }
             emit_success_summary(
                 quiet,
@@ -761,7 +761,7 @@ fn run(cli: Cli) -> Result<()> {
                 open_inputs_maybe_bootstrap(&volume_bytes, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {archive}"))?;
             let entries = opened.list_files()?;
-            emit_entry_metadata_diagnostics(&entries)?;
+            emit_entry_metadata_diagnostics(quiet, &entries)?;
             if json {
                 let files = entries
                     .iter()
@@ -868,7 +868,7 @@ fn run(cli: Cli) -> Result<()> {
             match result {
                 Ok(()) => {
                     let entries = opened.list_files()?;
-                    emit_entry_metadata_diagnostics(&entries)?;
+                    emit_entry_metadata_diagnostics(quiet, &entries)?;
                     if json {
                         println!(
                             "{}",
@@ -948,9 +948,13 @@ fn metadata_diagnostic_line(path: &str, diagnostic: &MetadataDiagnostic) -> Stri
 }
 
 fn emit_member_metadata_diagnostics(
+    quiet: bool,
     path: &str,
     diagnostics: &[MetadataDiagnostic],
 ) -> io::Result<()> {
+    if quiet {
+        return Ok(());
+    }
     for diagnostic in diagnostics {
         eprintln!("{}", metadata_diagnostic_line(path, diagnostic));
     }
@@ -982,7 +986,10 @@ fn metadata_diagnostic_lines_for_paths(entries: &[ArchiveEntry], paths: &[String
         .collect()
 }
 
-fn emit_entry_metadata_diagnostics(entries: &[ArchiveEntry]) -> io::Result<()> {
+fn emit_entry_metadata_diagnostics(quiet: bool, entries: &[ArchiveEntry]) -> io::Result<()> {
+    if quiet {
+        return Ok(());
+    }
     for line in metadata_diagnostic_lines_for_entries(entries) {
         eprintln!("{line}");
     }
@@ -990,9 +997,13 @@ fn emit_entry_metadata_diagnostics(entries: &[ArchiveEntry]) -> io::Result<()> {
 }
 
 fn emit_entry_metadata_diagnostics_for_paths(
+    quiet: bool,
     entries: &[ArchiveEntry],
     paths: &[String],
 ) -> io::Result<()> {
+    if quiet {
+        return Ok(());
+    }
     for line in metadata_diagnostic_lines_for_paths(entries, paths) {
         eprintln!("{line}");
     }
