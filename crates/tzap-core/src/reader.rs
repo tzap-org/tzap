@@ -2904,8 +2904,8 @@ mod tests {
 
     #[test]
     fn extract_file_does_not_decrypt_unselected_payload_envelope() {
-        // The current writer emits one small payload envelope, so this fixture
-        // exercises the reader's multi-envelope locality directly.
+        // This fixture corrupts only the unselected envelope, proving selected
+        // extraction does not decrypt unrelated payload envelopes.
         let (mut opened, broken_payload_block) = multi_envelope_reader_fixture();
         corrupt_payload_record(&mut opened.blocks, broken_payload_block);
 

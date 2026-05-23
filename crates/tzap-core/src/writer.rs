@@ -130,10 +130,25 @@ struct TarMember {
 #[derive(Debug, Clone)]
 struct PayloadFrame {
     frame_index: u64,
+    envelope_index: u64,
+    member_index: usize,
     offset_in_envelope: u32,
     compressed_size: u32,
     decompressed_size: u32,
     tar_stream_offset: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PayloadEnvelope {
+    envelope_index: u64,
+    plaintext: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct PayloadObject {
+    envelope_index: u64,
+    plaintext_size: u32,
+    object: EncryptedObject,
 }
 
 #[derive(Debug, Clone)]
@@ -287,40 +302,51 @@ fn write_archive_once(
     let tar_total_size = tar_stream.len() as u64;
     let content_sha256 = sha256_bytes(&tar_stream);
 
-    let (payload_extent, frames, payload_block_count) = if tar_stream.is_empty() {
-        (None, Vec::new(), 0u64)
+    let (payload_objects, frames, payload_block_count) = if tar_stream.is_empty() {
+        (Vec::new(), Vec::new(), 0u64)
     } else {
-        let (payload_plaintext, frames) =
-            build_payload_envelope(&tar_stream, &tar_members, options, dictionary)?;
-        let object = encrypt_object(
-            &payload_plaintext,
-            &subkeys.enc_key,
-            &subkeys.nonce_seed,
-            b"envelope",
-            0,
-            BlockKind::PayloadData,
-            BlockKind::PayloadParity,
-            options.fec_data_shards,
-            options.fec_parity_shards,
-            &mut next_block_index,
-            options,
-            &archive_uuid,
-            &session_id,
-        )?;
-        let payload_block_count = object.data_block_count as u64;
-        block_records.extend(object.records.clone());
-        (Some(object), frames, payload_block_count)
+        let (payload_envelopes, frames) =
+            build_payload_envelopes(&tar_stream, &tar_members, options, dictionary)?;
+        let mut objects = Vec::with_capacity(payload_envelopes.len());
+        let mut payload_block_count = 0u64;
+        for envelope in payload_envelopes {
+            let plaintext_size = u32_len(envelope.plaintext.len(), "EnvelopeEntry.plaintext_size")?;
+            let object = encrypt_object(
+                &envelope.plaintext,
+                &subkeys.enc_key,
+                &subkeys.nonce_seed,
+                b"envelope",
+                envelope.envelope_index,
+                BlockKind::PayloadData,
+                BlockKind::PayloadParity,
+                options.fec_data_shards,
+                options.fec_parity_shards,
+                &mut next_block_index,
+                options,
+                &archive_uuid,
+                &session_id,
+            )?;
+            payload_block_count = checked_u64_add(
+                payload_block_count,
+                object.data_block_count as u64,
+                "payload",
+            )?;
+            block_records.extend(object.records.clone());
+            objects.push(PayloadObject {
+                envelope_index: envelope.envelope_index,
+                plaintext_size,
+                object,
+            });
+        }
+        (objects, frames, payload_block_count)
     };
 
     let (index_shard_extent, shard_entries, frame_count, envelope_count) = if tar_members.is_empty()
     {
         (None, Vec::new(), 0u64, 0u64)
     } else {
-        let payload = payload_extent
-            .as_ref()
-            .ok_or(FormatError::WriterInvariant("payload extent missing"))?;
         let index_shard_plaintext =
-            build_single_index_shard(&tar_members, &frames, payload, options)?;
+            build_single_index_shard(&tar_members, &frames, &payload_objects, options)?;
         let compressed = compress_zstd_frame(&index_shard_plaintext, options.zstd_level)?;
         let object = encrypt_object(
             &compressed,
@@ -350,7 +376,12 @@ fn write_archive_once(
             last_path_hash: last_hash,
         };
         block_records.extend(object.records.clone());
-        (Some(object), vec![shard_entry], frames.len() as u64, 1u64)
+        (
+            Some(object),
+            vec![shard_entry],
+            frames.len() as u64,
+            payload_objects.len() as u64,
+        )
     };
 
     let dictionary_extent = if let Some(dictionary) = dictionary {
@@ -763,15 +794,28 @@ fn build_tar_stream(
     Ok((stream, members))
 }
 
-fn build_payload_envelope(
+fn build_payload_envelopes(
     tar_stream: &[u8],
     members: &[TarMember],
     options: WriterOptions,
     dictionary: Option<&[u8]>,
-) -> Result<(Vec<u8>, Vec<PayloadFrame>), FormatError> {
-    let mut plaintext = Vec::new();
-    let mut frames = Vec::with_capacity(members.len());
-    for (index, member) in members.iter().enumerate() {
+) -> Result<(Vec<PayloadEnvelope>, Vec<PayloadFrame>), FormatError> {
+    let chunk_size = options.chunk_size as usize;
+    if chunk_size == 0 {
+        return Err(FormatError::WriterUnsupported(
+            "chunk_size must be non-zero and no larger than envelope_target_size",
+        ));
+    }
+    let envelope_target_size = options.envelope_target_size as usize;
+    let mut envelopes = Vec::new();
+    let mut current = PayloadEnvelope {
+        envelope_index: 0,
+        plaintext: Vec::new(),
+    };
+    let mut frames = Vec::new();
+    let mut next_frame_index = 0u64;
+
+    for (member_index, member) in members.iter().enumerate() {
         let start = member.tar_member_group_start as usize;
         let end = checked_usize_add(start, member.tar_member_group_size as usize, "tar member")?;
         let member_bytes = tar_stream
@@ -779,61 +823,85 @@ fn build_payload_envelope(
             .ok_or(FormatError::WriterInvariant(
                 "tar member range is out of bounds",
             ))?;
-        let frame = if let Some(dictionary) = dictionary {
-            compress_zstd_frame_with_dictionary(member_bytes, options.zstd_level, dictionary)?
-        } else {
-            compress_zstd_frame(member_bytes, options.zstd_level)?
-        };
-        let offset = u32_len(plaintext.len(), "FrameEntry.offset_in_envelope")?;
-        plaintext.extend_from_slice(&frame);
-        frames.push(PayloadFrame {
-            frame_index: index as u64,
-            offset_in_envelope: offset,
-            compressed_size: u32_len(frame.len(), "FrameEntry.compressed_size")?,
-            decompressed_size: u32_len(member_bytes.len(), "FrameEntry.decompressed_size")?,
-            tar_stream_offset: member.tar_member_group_start,
-        });
+        for (chunk_index, chunk) in member_bytes.chunks(chunk_size).enumerate() {
+            let frame = if let Some(dictionary) = dictionary {
+                compress_zstd_frame_with_dictionary(chunk, options.zstd_level, dictionary)?
+            } else {
+                compress_zstd_frame(chunk, options.zstd_level)?
+            };
+            let next_len = checked_usize_add(current.plaintext.len(), frame.len(), "payload")?;
+            if !current.plaintext.is_empty() && next_len > envelope_target_size {
+                envelopes.push(current);
+                current = PayloadEnvelope {
+                    envelope_index: envelopes.len() as u64,
+                    plaintext: Vec::new(),
+                };
+            }
+
+            let offset = u32_len(current.plaintext.len(), "FrameEntry.offset_in_envelope")?;
+            current.plaintext.extend_from_slice(&frame);
+            let chunk_start = checked_u64_mul(
+                u64::try_from(chunk_index)
+                    .map_err(|_| FormatError::WriterUnsupported("chunk index"))?,
+                chunk_size as u64,
+                "PayloadFrame.tar_stream_offset",
+            )?;
+            frames.push(PayloadFrame {
+                frame_index: next_frame_index,
+                envelope_index: current.envelope_index,
+                member_index,
+                offset_in_envelope: offset,
+                compressed_size: u32_len(frame.len(), "FrameEntry.compressed_size")?,
+                decompressed_size: u32_len(chunk.len(), "FrameEntry.decompressed_size")?,
+                tar_stream_offset: checked_u64_add(
+                    member.tar_member_group_start,
+                    chunk_start,
+                    "PayloadFrame.tar_stream_offset",
+                )?,
+            });
+            next_frame_index = checked_u64_add(next_frame_index, 1, "PayloadFrame.frame_index")?;
+        }
     }
-    if plaintext.len() > options.envelope_target_size as usize {
-        return Err(FormatError::WriterUnsupported(
-            "M6 writer supports one small payload envelope",
-        ));
+    if !current.plaintext.is_empty() {
+        envelopes.push(current);
     }
-    Ok((plaintext, frames))
+    Ok((envelopes, frames))
 }
 
 fn build_single_index_shard(
     members: &[TarMember],
     frames: &[PayloadFrame],
-    payload: &EncryptedObject,
+    payloads: &[PayloadObject],
     options: WriterOptions,
 ) -> Result<Vec<u8>, FormatError> {
     let mut file_rows = members
         .iter()
-        .map(|member| {
+        .enumerate()
+        .map(|(member_index, member)| {
             let path_hash = hash_prefix(&member.path);
-            Ok((path_hash, member.path.clone(), member.clone()))
+            Ok((path_hash, member.path.clone(), member_index, member.clone()))
         })
         .collect::<Result<Vec<_>, FormatError>>()?;
     file_rows.sort_by(|left, right| {
-        (left.0, left.1.as_slice(), left.2.tar_member_group_start).cmp(&(
+        (left.0, left.1.as_slice(), left.3.tar_member_group_start).cmp(&(
             right.0,
             right.1.as_slice(),
-            right.2.tar_member_group_start,
+            right.3.tar_member_group_start,
         ))
     });
 
     let mut string_pool = Vec::new();
     let mut file_entries = Vec::with_capacity(file_rows.len());
-    for (path_hash, path, member) in file_rows {
+    for (path_hash, path, member_index, member) in file_rows {
         let path_offset = u32_len(string_pool.len(), "FileEntry.path_offset")?;
         string_pool.extend_from_slice(&path);
+        let (first_frame_index, frame_count) = member_frame_range(member_index, frames)?;
         file_entries.push(FileEntry {
             path_hash,
             path_offset,
             path_length: u32_len(path.len(), "FileEntry.path_length")?,
-            first_frame_index: member_frame_index(&member, frames)?,
-            frame_count: 1,
+            first_frame_index,
+            frame_count,
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: member.tar_member_group_size,
             file_data_size: member.file_data_size,
@@ -845,7 +913,7 @@ fn build_single_index_shard(
         .iter()
         .map(|frame| FrameEntry {
             frame_index: frame.frame_index,
-            envelope_index: 0,
+            envelope_index: frame.envelope_index,
             offset_in_envelope: frame.offset_in_envelope,
             compressed_size: frame.compressed_size,
             decompressed_size: frame.decompressed_size,
@@ -853,19 +921,23 @@ fn build_single_index_shard(
             tar_stream_offset: frame.tar_stream_offset,
         })
         .collect::<Vec<_>>();
-    let envelope_entries = vec![EnvelopeEntry {
-        envelope_index: 0,
-        first_block_index: payload.first_block_index,
-        data_block_count: payload.data_block_count,
-        parity_block_count: payload.parity_block_count,
-        encrypted_size: payload.encrypted_size,
-        plaintext_size: frames
-            .last()
-            .map(|frame| frame.offset_in_envelope + frame.compressed_size)
-            .unwrap_or(0),
-        first_frame_index: 0,
-        frame_count: u32_len(frames.len(), "EnvelopeEntry.frame_count")?,
-    }];
+    let envelope_entries = payloads
+        .iter()
+        .map(|payload| {
+            let (first_frame_index, frame_count) =
+                envelope_frame_range(payload.envelope_index, frames)?;
+            Ok(EnvelopeEntry {
+                envelope_index: payload.envelope_index,
+                first_block_index: payload.object.first_block_index,
+                data_block_count: payload.object.data_block_count,
+                parity_block_count: payload.object.parity_block_count,
+                encrypted_size: payload.object.encrypted_size,
+                plaintext_size: payload.plaintext_size,
+                first_frame_index,
+                frame_count,
+            })
+        })
+        .collect::<Result<Vec<_>, FormatError>>()?;
 
     serialize_index_shard(
         0,
@@ -1412,12 +1484,36 @@ fn write_tar_checksum(field: &mut [u8], value: u64) -> Result<(), FormatError> {
     Ok(())
 }
 
-fn member_frame_index(member: &TarMember, frames: &[PayloadFrame]) -> Result<u64, FormatError> {
-    frames
+fn member_frame_range(
+    member_index: usize,
+    frames: &[PayloadFrame],
+) -> Result<(u64, u32), FormatError> {
+    let first = frames
         .iter()
-        .find(|frame| frame.tar_stream_offset == member.tar_member_group_start)
+        .find(|frame| frame.member_index == member_index)
         .map(|frame| frame.frame_index)
-        .ok_or(FormatError::WriterInvariant("member frame is missing"))
+        .ok_or(FormatError::WriterInvariant("member frame is missing"))?;
+    let count = frames
+        .iter()
+        .filter(|frame| frame.member_index == member_index)
+        .count();
+    Ok((first, u32_len(count, "FileEntry.frame_count")?))
+}
+
+fn envelope_frame_range(
+    envelope_index: u64,
+    frames: &[PayloadFrame],
+) -> Result<(u64, u32), FormatError> {
+    let first = frames
+        .iter()
+        .find(|frame| frame.envelope_index == envelope_index)
+        .map(|frame| frame.frame_index)
+        .ok_or(FormatError::WriterInvariant("envelope frame is missing"))?;
+    let count = frames
+        .iter()
+        .filter(|frame| frame.envelope_index == envelope_index)
+        .count();
+    Ok((first, u32_len(count, "EnvelopeEntry.frame_count")?))
 }
 
 fn file_hash_bounds(members: &[TarMember]) -> Result<([u8; 8], [u8; 8]), FormatError> {
@@ -1476,6 +1572,7 @@ fn checked_u64_add(lhs: u64, rhs: u64, field: &'static str) -> Result<u64, Forma
 mod tests {
     use super::*;
     use crate::crypto::{verify_hmac, Subkeys};
+    use crate::reader::open_archive;
     use crate::tar_model::parse_tar_member_group;
     use crate::wire::CryptoHeader;
 
@@ -1543,6 +1640,29 @@ mod tests {
             assert_eq!(parsed.path, expected_path);
             assert_eq!(parsed.data, expected_data);
         }
+    }
+
+    #[test]
+    fn writer_splits_large_payload_across_seekable_envelopes() {
+        let master_key = MasterKey::from_raw_key(&[8u8; 32]).unwrap();
+        let data = deterministic_bytes(2 * 1024 * 1024);
+        let archive = write_archive(
+            &[RegularFile::new("large.bin", &data)],
+            &master_key,
+            WriterOptions {
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key).unwrap();
+
+        assert_eq!(opened.list_files().unwrap()[0].path, "large.bin");
+        assert_eq!(opened.extract_file("large.bin").unwrap(), Some(data));
+        opened.verify().unwrap();
+        assert!(opened.index_root.header.envelope_count > 1);
     }
 
     #[test]
@@ -1684,5 +1804,15 @@ mod tests {
             .unwrap_err(),
             FormatError::InvalidKdfParams("m_cost_kib requirement overflow")
         );
+    }
+
+    fn deterministic_bytes(len: usize) -> Vec<u8> {
+        let mut state = 0x4d41_4d45u32;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            out.push((state >> 24) as u8);
+        }
+        out
     }
 }
