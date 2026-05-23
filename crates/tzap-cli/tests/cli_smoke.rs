@@ -1,18 +1,29 @@
+use std::collections::BTreeSet;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
 use tempfile::tempdir;
 use tzap_core::format::{
-    BOOTSTRAP_SIDECAR_HEADER_LEN, MANIFEST_FOOTER_LEN, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    BlockKind, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN, MANIFEST_FOOTER_LEN,
+    VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
-use tzap_core::wire::{BootstrapSidecarHeader, VolumeHeader};
+use tzap_core::wire::{BlockRecord, BootstrapSidecarHeader, CryptoHeader, VolumeHeader};
 use tzap_core::{crypto::compute_hmac, HmacDomain, MasterKey, Subkeys};
 
 const KEY_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 const BAD_KEY_HEX: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 const SIDECAR_HMAC_COVERED_LEN: usize = 92;
+
+#[derive(Clone)]
+struct PayloadRecordLocation {
+    volume_index: usize,
+    payload_offset: usize,
+    block_size: usize,
+    block_index: u64,
+}
 
 fn master_key_from_hex(hex: &str) -> Vec<u8> {
     let mut out = [0u8; 32];
@@ -20,6 +31,90 @@ fn master_key_from_hex(hex: &str) -> Vec<u8> {
         out[idx] = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
     }
     out.to_vec()
+}
+
+fn numbered_volume_path(output_base: &Path, index: usize) -> PathBuf {
+    output_base.with_file_name(format!(
+        "{}.{index:03}",
+        output_base.file_name().unwrap().to_string_lossy()
+    ))
+}
+
+fn payload_data_record_locations(volume_index: usize, volume: &[u8]) -> Vec<PayloadRecordLocation> {
+    let volume_header = VolumeHeader::parse(&volume[..VOLUME_HEADER_LEN]).unwrap();
+    let crypto_start = volume_header.crypto_header_offset as usize;
+    let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
+    let crypto_header = CryptoHeader::parse(
+        &volume[crypto_start..crypto_end],
+        volume_header.crypto_header_length,
+    )
+    .unwrap();
+    let block_size = crypto_header.fixed.block_size as usize;
+    let record_len = block_size + BLOCK_RECORD_FRAMING_LEN;
+    let manifest_offset = volume.len() - VOLUME_TRAILER_LEN - MANIFEST_FOOTER_LEN;
+    assert_eq!((manifest_offset - crypto_end) % record_len, 0);
+
+    (crypto_end..manifest_offset)
+        .step_by(record_len)
+        .filter_map(|offset| {
+            let record =
+                BlockRecord::parse(&volume[offset..offset + record_len], block_size).unwrap();
+            (record.kind == BlockKind::PayloadData).then_some(PayloadRecordLocation {
+                volume_index,
+                payload_offset: offset + 16,
+                block_size,
+                block_index: record.block_index,
+            })
+        })
+        .collect()
+}
+
+fn zero_deterministic_payload_blocks(
+    volume_paths: &[PathBuf],
+    corruption_pct: usize,
+) -> (usize, usize) {
+    let mut volumes = volume_paths
+        .iter()
+        .map(|path| fs::read(path).unwrap())
+        .collect::<Vec<_>>();
+    let mut locations = volumes
+        .iter()
+        .enumerate()
+        .flat_map(|(volume_index, volume)| payload_data_record_locations(volume_index, volume))
+        .collect::<Vec<_>>();
+    locations.sort_by_key(|location| location.block_index);
+    assert!(
+        locations.len() >= 50,
+        "test archive should have enough payload blocks for a meaningful percent corruption"
+    );
+
+    let corrupt_count = locations.len() * corruption_pct / 100;
+    assert!(
+        corrupt_count > 0,
+        "corruption percent should select at least one payload block"
+    );
+
+    let mut selected = BTreeSet::new();
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    while selected.len() < corrupt_count {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        selected.insert((state as usize) % locations.len());
+    }
+
+    for index in selected {
+        let location = &locations[index];
+        volumes[location.volume_index]
+            [location.payload_offset..location.payload_offset + location.block_size]
+            .fill(0);
+    }
+
+    for (path, bytes) in volume_paths.iter().zip(volumes) {
+        fs::write(path, bytes).unwrap();
+    }
+
+    (corrupt_count, locations.len())
 }
 
 #[test]
@@ -2512,6 +2607,80 @@ fn cli_create_with_volume_size_splits_archive_by_target_size() {
         .stdout(predicate::str::contains("OK"));
 }
 
+#[test]
+fn cli_extracts_archive_created_with_volume_size_split() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("sized-extract.bin");
+    let output_base = temp.path().join("sized-extract.tzap");
+    let output = temp.path().join("out");
+    let expected = (0..64 * 1024)
+        .map(|idx| ((idx * 37 + 11) % 251) as u8)
+        .collect::<Vec<_>>();
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, &expected).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volume-size",
+            "8K",
+            "--volume-loss-tolerance",
+            "1",
+            "--block-size",
+            "4K",
+            "--chunk-size",
+            "4K",
+            "--envelope-size",
+            "128K",
+            "-o",
+            output_base.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let mut volume_args = Vec::new();
+    for index in 0.. {
+        let volume = numbered_volume_path(&output_base, index);
+        if !volume.exists() {
+            break;
+        }
+        volume_args.push(volume);
+    }
+    assert!(volume_args.len() > 1);
+
+    let mut args = vec![
+        "extract".to_owned(),
+        "--keyfile".to_owned(),
+        keyfile.to_str().unwrap().to_owned(),
+        "--directory".to_owned(),
+        output.to_str().unwrap().to_owned(),
+        volume_args[0].to_str().unwrap().to_owned(),
+    ];
+    for volume in &volume_args[1..] {
+        args.push("--volume".to_owned());
+        args.push(volume.to_str().unwrap().to_owned());
+    }
+    args.push("sized-extract.bin".to_owned());
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args(args)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("extracted 1 file(s)"));
+
+    assert_eq!(
+        fs::read(output.join("sized-extract.bin")).unwrap(),
+        expected
+    );
+}
+
 fn is_lower_hex_byte(byte: u8) -> bool {
     matches!(byte, b'0'..=b'9' | b'a'..=b'f')
 }
@@ -3713,6 +3882,70 @@ fn cli_extract_with_passphrase_is_supported_and_safe() {
 }
 
 #[test]
+fn cli_extracts_password_multivolume_archive_with_missing_recoverable_volume() {
+    let temp = tempdir().unwrap();
+    let input = temp.path().join("password-volume.bin");
+    let output_base = temp.path().join("password-volume.tzap");
+    let output = temp.path().join("out");
+    let passphrase = "split passphrase recovery\n";
+    let expected = (0..128 * 1024)
+        .map(|idx| ((idx * 17 + 29) % 251) as u8)
+        .collect::<Vec<_>>();
+
+    fs::write(&input, &expected).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--password-stdin",
+            "--argon2-t-cost",
+            "1",
+            "--argon2-m-cost-kib",
+            "8",
+            "--argon2-parallelism",
+            "1",
+            "--volumes",
+            "3",
+            "--volume-loss-tolerance",
+            "1",
+            "-o",
+            output_base.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .write_stdin(passphrase)
+        .assert()
+        .success();
+
+    let v0 = numbered_volume_path(&output_base, 0);
+    let v1 = numbered_volume_path(&output_base, 1);
+    let v2 = numbered_volume_path(&output_base, 2);
+    fs::remove_file(&v1).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--password-stdin",
+            "--directory",
+            output.to_str().unwrap(),
+            v0.to_str().unwrap(),
+            "--volume",
+            v2.to_str().unwrap(),
+            "password-volume.bin",
+        ])
+        .write_stdin(passphrase)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("extracted 1 file(s)"));
+
+    assert_eq!(
+        fs::read(output.join("password-volume.bin")).unwrap(),
+        expected
+    );
+}
+
+#[test]
 fn cli_extract_with_bootstrap_sidecar() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
@@ -3883,6 +4116,99 @@ fn cli_extract_recovers_when_one_volume_is_missing_but_tolerance_allows_it() {
         .success();
 
     assert_eq!(fs::read(output.join("payload.bin")).unwrap(), data);
+}
+
+#[test]
+fn cli_bit_rot_buffer_recovers_corrupted_payload_blocks_in_split_archive() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("bitrot.bin");
+    let output_base = temp.path().join("bitrot.tzap");
+    let output = temp.path().join("out");
+    let mut expected = Vec::with_capacity(512 * 1024);
+    let mut state = 0x1234_5678_9abc_def0u64;
+    for _ in 0..512 * 1024 {
+        state = state
+            .wrapping_mul(2_862_933_555_777_941_757)
+            .wrapping_add(3_037_000_493);
+        expected.push((state >> 56) as u8);
+    }
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, &expected).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volumes",
+            "3",
+            "--bit-rot-buffer-pct",
+            "5",
+            "--block-size",
+            "4K",
+            "--chunk-size",
+            "4K",
+            "--envelope-size",
+            "1M",
+            "-o",
+            output_base.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("bit-rot buffer 5%"));
+
+    let volume_paths = vec![
+        numbered_volume_path(&output_base, 0),
+        numbered_volume_path(&output_base, 1),
+        numbered_volume_path(&output_base, 2),
+    ];
+    for path in &volume_paths {
+        assert!(path.exists(), "{} should exist", path.display());
+    }
+    let (corrupted_blocks, payload_blocks) = zero_deterministic_payload_blocks(&volume_paths, 4);
+    assert!(
+        corrupted_blocks * 100 <= payload_blocks * 5,
+        "test must stay within the configured bit-rot buffer"
+    );
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            volume_paths[0].to_str().unwrap(),
+            volume_paths[1].to_str().unwrap(),
+            volume_paths[2].to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK (3 volume(s), 1 file(s))"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            volume_paths[0].to_str().unwrap(),
+            "--volume",
+            volume_paths[1].to_str().unwrap(),
+            "--volume",
+            volume_paths[2].to_str().unwrap(),
+            "bitrot.bin",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("extracted 1 file(s)"));
+
+    assert_eq!(fs::read(output.join("bitrot.bin")).unwrap(), expected);
 }
 
 #[test]
