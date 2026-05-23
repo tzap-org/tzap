@@ -2779,6 +2779,151 @@ mod tests {
     }
 
     #[test]
+    fn index_shard_rejects_non_exact_local_frame_and_envelope_tables() {
+        let path = b"exact-local.txt";
+        let path_hash = hash_prefix(path);
+        let file = FileEntry {
+            path_hash,
+            path_offset: 0,
+            path_length: path.len() as u32,
+            first_frame_index: 0,
+            frame_count: 1,
+            offset_in_first_frame_plaintext: 0,
+            tar_member_group_size: 512,
+            file_data_size: 0,
+            flags: 0,
+        };
+        let frame = FrameEntry {
+            frame_index: 0,
+            envelope_index: 0,
+            offset_in_envelope: 0,
+            compressed_size: 128,
+            decompressed_size: 512,
+            flags: 0,
+            tar_stream_offset: 0,
+        };
+        let envelope = EnvelopeEntry {
+            envelope_index: 0,
+            first_block_index: 10,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+            plaintext_size: 128,
+            first_frame_index: 0,
+            frame_count: 1,
+        };
+        let shard = IndexShard {
+            header: IndexShardHeader {
+                version: 1,
+                shard_index: 3,
+                file_count: 0,
+                frame_count: 0,
+                envelope_count: 0,
+                file_table_offset: 0,
+                frame_table_offset: 0,
+                envelope_table_offset: 0,
+                string_pool_offset: 0,
+                string_pool_size: 0,
+            },
+            files: vec![file.clone()],
+            frames: vec![frame.clone()],
+            envelopes: vec![envelope.clone()],
+            string_pool: path.to_vec(),
+            file_paths: Vec::new(),
+            file_tar_member_group_starts: Vec::new(),
+        };
+        let locating = ShardEntry {
+            shard_index: 3,
+            first_block_index: 20,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+            decompressed_size: shard.to_bytes().len() as u32,
+            file_count: 1,
+            first_path_hash: path_hash,
+            last_path_hash: path_hash,
+        };
+        IndexShard::parse(&shard.to_bytes(), &locating, MetadataLimits::default()).unwrap();
+
+        let parse_with = |frames: Vec<FrameEntry>, envelopes: Vec<EnvelopeEntry>| {
+            let mut mutated = shard.clone();
+            mutated.frames = frames;
+            mutated.envelopes = envelopes;
+            let bytes = mutated.to_bytes();
+            let locating = ShardEntry {
+                decompressed_size: bytes.len() as u32,
+                ..locating.clone()
+            };
+            IndexShard::parse(&bytes, &locating, MetadataLimits::default()).unwrap_err()
+        };
+
+        let mut missing_frame = frame.clone();
+        missing_frame.frame_index = 1;
+        assert_eq!(
+            parse_with(vec![missing_frame], vec![envelope.clone()]),
+            FormatError::InvalidMetadata {
+                structure: "FileEntry",
+                reason: "referenced FrameEntry is missing",
+            }
+        );
+
+        let mut unreferenced_frame = frame.clone();
+        unreferenced_frame.frame_index = 9;
+        unreferenced_frame.tar_stream_offset = 1024;
+        assert_eq!(
+            parse_with(
+                vec![frame.clone(), unreferenced_frame],
+                vec![envelope.clone()]
+            ),
+            FormatError::InvalidMetadata {
+                structure: "IndexShard",
+                reason: "FrameEntry table is not the exact set referenced by FileEntry rows",
+            }
+        );
+
+        assert_eq!(
+            parse_with(vec![frame.clone(), frame.clone()], vec![envelope.clone()]),
+            FormatError::InvalidMetadata {
+                structure: "IndexShard",
+                reason: "FrameEntry rows are not sorted and unique",
+            }
+        );
+
+        let mut missing_envelope = envelope.clone();
+        missing_envelope.envelope_index = 1;
+        assert_eq!(
+            parse_with(vec![frame.clone()], vec![missing_envelope]),
+            FormatError::InvalidMetadata {
+                structure: "FrameEntry",
+                reason: "referenced EnvelopeEntry is missing",
+            }
+        );
+
+        let mut unreferenced_envelope = envelope.clone();
+        unreferenced_envelope.envelope_index = 9;
+        unreferenced_envelope.first_block_index = 11;
+        unreferenced_envelope.first_frame_index = 9;
+        assert_eq!(
+            parse_with(
+                vec![frame.clone()],
+                vec![envelope.clone(), unreferenced_envelope]
+            ),
+            FormatError::InvalidMetadata {
+                structure: "IndexShard",
+                reason: "EnvelopeEntry table is not the exact set referenced by FrameEntry rows",
+            }
+        );
+
+        assert_eq!(
+            parse_with(vec![frame], vec![envelope.clone(), envelope]),
+            FormatError::InvalidMetadata {
+                structure: "IndexShard",
+                reason: "EnvelopeEntry rows are not sorted and unique",
+            }
+        );
+    }
+
+    #[test]
     fn metadata_parsers_reject_malformed_buffer_corpus() {
         let limits = MetadataLimits::default();
         let path = b"file.txt";

@@ -4229,6 +4229,27 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_file_entry_tar_path_and_size_mismatches() {
+        let (mut path_mismatch, _) = multi_envelope_reader_fixture();
+        rewrite_as_single_healthy_file(&mut path_mismatch, |_file, path| {
+            path[0] = b'x';
+        });
+        assert_eq!(
+            path_mismatch.verify().unwrap_err(),
+            FormatError::InvalidArchive("tar member path does not match FileEntry path")
+        );
+
+        let (mut size_mismatch, _) = multi_envelope_reader_fixture();
+        rewrite_as_single_healthy_file(&mut size_mismatch, |file, _path| {
+            file.file_data_size += 1;
+        });
+        assert_eq!(
+            size_mismatch.verify().unwrap_err(),
+            FormatError::InvalidArchive("tar member size does not match FileEntry file_data_size")
+        );
+    }
+
+    #[test]
     fn verify_rejects_inconsistent_duplicate_local_frame_rows_across_shards() {
         let (mut opened, _) = multi_envelope_reader_fixture();
         let locating = opened.index_root.shards[0].clone();
@@ -4317,6 +4338,48 @@ mod tests {
         assert_eq!(
             opened.verify().unwrap_err(),
             FormatError::InvalidArchive("duplicate EnvelopeEntry rows do not match")
+        );
+    }
+
+    #[test]
+    fn verify_rejects_non_contiguous_global_envelope_indexes() {
+        let (mut opened, _) = multi_envelope_reader_fixture();
+        replace_first_index_shard(&mut opened, |shard| {
+            let frame = shard
+                .frames
+                .iter_mut()
+                .find(|entry| entry.frame_index == 1)
+                .unwrap();
+            frame.envelope_index = 2;
+
+            let envelope = shard
+                .envelopes
+                .iter_mut()
+                .find(|entry| entry.envelope_index == 1)
+                .unwrap();
+            envelope.envelope_index = 2;
+        });
+
+        assert_eq!(
+            opened.verify().unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "EnvelopeEntry",
+                reason: "global index coverage has a gap",
+            }
+        );
+    }
+
+    #[test]
+    fn verify_rejects_payload_object_extent_overlap() {
+        let (mut opened, _) = multi_envelope_reader_fixture();
+        replace_first_index_shard(&mut opened, |shard| {
+            let first_block_index = shard.envelopes[0].first_block_index;
+            shard.envelopes[1].first_block_index = first_block_index;
+        });
+
+        assert_eq!(
+            opened.verify().unwrap_err(),
+            FormatError::InvalidArchive("encrypted object block ranges overlap")
         );
     }
 
@@ -4747,6 +4810,94 @@ mod tests {
             FormatError::InvalidArchive(
                 "encrypted object has insufficient parity for recovery settings"
             )
+        );
+    }
+
+    #[test]
+    fn encrypted_object_extent_matrix_rejects_overlaps() {
+        let (opened, _) = multi_envelope_reader_fixture();
+        let loaded_shard = opened
+            .load_index_shard(&opened.index_root.shards[0])
+            .unwrap();
+        let base_envelopes = loaded_shard
+            .envelopes
+            .iter()
+            .map(|entry| (entry.envelope_index, entry.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let payload_start = loaded_shard.envelopes[0].first_block_index;
+        let overlap = FormatError::InvalidArchive("encrypted object block ranges overlap");
+
+        let mut payload_overlap = base_envelopes.clone();
+        payload_overlap
+            .get_mut(&loaded_shard.envelopes[1].envelope_index)
+            .unwrap()
+            .first_block_index = payload_start;
+        assert_eq!(
+            opened
+                .validate_encrypted_object_block_ranges(&payload_overlap)
+                .unwrap_err(),
+            overlap
+        );
+
+        let mut shard_overlap = opened.clone();
+        let shard = shard_overlap.index_root.shards[0].clone();
+        shard_overlap.index_root.shards.push(ShardEntry {
+            shard_index: 1,
+            ..shard
+        });
+        assert_eq!(
+            shard_overlap
+                .validate_encrypted_object_block_ranges(&base_envelopes)
+                .unwrap_err(),
+            overlap
+        );
+
+        let mut dictionary_overlap = opened.clone();
+        dictionary_overlap.crypto_header.has_dictionary = 1;
+        dictionary_overlap.index_root.header.dictionary_first_block = payload_start;
+        dictionary_overlap
+            .index_root
+            .header
+            .dictionary_data_block_count = 1;
+        dictionary_overlap
+            .index_root
+            .header
+            .dictionary_parity_block_count = 0;
+        dictionary_overlap
+            .index_root
+            .header
+            .dictionary_encrypted_size = 4096;
+        dictionary_overlap
+            .index_root
+            .header
+            .dictionary_decompressed_size = 128;
+        assert_eq!(
+            dictionary_overlap
+                .validate_encrypted_object_block_ranges(&base_envelopes)
+                .unwrap_err(),
+            overlap
+        );
+
+        let mut hint_overlap = opened.clone();
+        hint_overlap
+            .index_root
+            .directory_hint_shards
+            .push(DirectoryHintShardEntry {
+                hint_shard_index: 0,
+                first_dir_hash: [0; 8],
+                last_dir_hash: [0; 8],
+                first_block_index: payload_start,
+                data_block_count: 1,
+                parity_block_count: 0,
+                encrypted_size: 4096,
+                decompressed_size: 128,
+                entry_count: 1,
+            });
+        assert_eq!(
+            hint_overlap
+                .validate_encrypted_object_block_ranges(&base_envelopes)
+                .unwrap_err(),
+            overlap
         );
     }
 
@@ -5356,6 +5507,17 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_missing_required_object_block_extent() {
+        let (mut opened, missing_block) = multi_envelope_reader_fixture();
+        assert!(opened.blocks.remove(&missing_block).is_some());
+
+        assert_eq!(
+            opened.verify().unwrap_err(),
+            FormatError::FecTooFewAvailableShards
+        );
+    }
+
+    #[test]
     fn parity_crc_erasure_does_not_hide_authenticated_data() {
         let payload = pseudo_random_bytes(12_000);
         let archive = write_archive(
@@ -5936,6 +6098,27 @@ mod tests {
         let volume_refs = volumes.iter().map(Vec::as_slice).collect::<Vec<_>>();
         assert_eq!(
             open_archive_volumes(&volume_refs, &master_key()).unwrap_err(),
+            FormatError::InvalidArchive("BlockRecord index does not match volume position")
+        );
+    }
+
+    #[test]
+    fn rejects_decreasing_block_record_index_in_required_region() {
+        let archive = write_archive(
+            &[RegularFile::new("alpha.txt", b"decreasing block index")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        assert!(block_record_slots(&archive.bytes).len() >= 2);
+
+        let mut malformed = archive.bytes;
+        mutate_block_record_at_slot(&mut malformed, 1, |record| {
+            record.block_index = 0;
+        });
+
+        assert_eq!(
+            open_archive(&malformed, &master_key()).unwrap_err(),
             FormatError::InvalidArchive("BlockRecord index does not match volume position")
         );
     }
@@ -6720,6 +6903,96 @@ mod tests {
             payload_dictionary: None,
         };
         (opened, broken_payload_block)
+    }
+
+    fn replace_first_index_shard(opened: &mut OpenedArchive, mutate: impl FnOnce(&mut IndexShard)) {
+        let locating = opened.index_root.shards[0].clone();
+        let mut shard = opened.load_index_shard(&locating).unwrap();
+        mutate(&mut shard);
+        let plaintext = shard.to_bytes();
+        let mut next_block_index = opened
+            .blocks
+            .keys()
+            .last()
+            .copied()
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let replacement = encrypt_test_object(
+            &compress_zstd_frame(&plaintext, 1).unwrap(),
+            &opened.subkeys.index_shard_key,
+            &opened.subkeys.index_nonce_seed,
+            b"idxshard",
+            locating.shard_index,
+            BlockKind::IndexShardData,
+            &mut next_block_index,
+            &opened.crypto_header,
+            &opened.volume_header,
+        );
+        insert_records(&mut opened.blocks, &replacement.records);
+        opened.index_root.shards[0] = ShardEntry {
+            shard_index: locating.shard_index,
+            first_block_index: replacement.extent.first_block_index,
+            data_block_count: replacement.extent.data_block_count,
+            parity_block_count: 0,
+            encrypted_size: replacement.extent.encrypted_size,
+            decompressed_size: plaintext.len() as u32,
+            file_count: shard.files.len() as u32,
+            first_path_hash: shard.files.first().unwrap().path_hash,
+            last_path_hash: shard.files.last().unwrap().path_hash,
+        };
+    }
+
+    fn rewrite_as_single_healthy_file(
+        opened: &mut OpenedArchive,
+        mutate: impl FnOnce(&mut FileEntry, &mut Vec<u8>),
+    ) {
+        let healthy_path = b"healthy.txt";
+        let healthy_payload = b"healthy payload\n";
+        let healthy_member = test_member(healthy_path, healthy_payload);
+        replace_first_index_shard(opened, |shard| {
+            let file_index = (0..shard.files.len())
+                .find(|idx| shard.file_path(*idx) == Some(healthy_path.as_slice()))
+                .unwrap();
+            let mut file = shard.files[file_index].clone();
+            let frame = shard
+                .frames
+                .iter()
+                .find(|entry| entry.frame_index == 0)
+                .unwrap()
+                .clone();
+            let envelope = shard
+                .envelopes
+                .iter()
+                .find(|entry| entry.envelope_index == 0)
+                .unwrap()
+                .clone();
+            let mut path = healthy_path.to_vec();
+
+            file.path_offset = 0;
+            file.path_length = path.len() as u32;
+            file.first_frame_index = 0;
+            file.frame_count = 1;
+            file.offset_in_first_frame_plaintext = 0;
+            file.tar_member_group_size = healthy_member.len() as u64;
+            file.file_data_size = healthy_payload.len() as u64;
+            file.flags = 0;
+            mutate(&mut file, &mut path);
+            file.path_offset = 0;
+            file.path_length = path.len() as u32;
+            file.path_hash = hash_prefix(&path);
+
+            shard.files = vec![file];
+            shard.frames = vec![frame];
+            shard.envelopes = vec![envelope];
+            shard.string_pool = path;
+        });
+
+        opened.index_root.header.file_count = 1;
+        opened.index_root.header.frame_count = 1;
+        opened.index_root.header.envelope_count = 1;
+        opened.index_root.header.payload_block_count = 1;
+        opened.index_root.header.tar_total_size = healthy_member.len() as u64;
+        opened.index_root.header.content_sha256 = sha256_bytes(&healthy_member);
     }
 
     fn test_volume_header() -> VolumeHeader {
