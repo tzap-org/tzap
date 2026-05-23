@@ -120,6 +120,36 @@ What to do:
 - Store the archive bytes in a file and pass that path to `tzap`.
 - Use `--bootstrap` only with a real single-volume archive path.
 
+## Sequential reader and provisional output
+
+The core reader exposes a whole-buffer helper for dictionary-free
+single-volume non-seekable archive images. That helper returns decoded tar bytes
+only after the terminal ManifestFooter and VolumeTrailer authenticate. It is not
+a live stdout or filesystem extraction API, so callers do not receive
+provisional bytes.
+
+The CLI does not expose archive stdin or live non-seekable extraction. `tzap
+extract --stdout` first opens and authenticates an archive from file paths, then
+writes one selected regular-file member to stdout. The default filesystem
+extractor also uses the opened authenticated archive; it does not stream
+unauthenticated non-seekable bytes into the destination directory.
+
+Examples:
+
+```sh
+tzap extract --keyfile project.key --stdout project.tzap project/readme.txt
+# stdout receives bytes only after project.tzap has opened and authenticated
+
+tzap verify --keyfile project.key -
+# exit 3: io, because "-" is treated as a literal file path
+```
+
+What to do:
+
+- Store archive bytes in a file before using the CLI.
+- Treat live provisional stdout or staged filesystem extraction from a
+  non-seekable archive stream as a future API, not current CLI behavior.
+
 ## Create outputs are archive files, not stdout
 
 The current core writer is an in-memory archive artifact builder:

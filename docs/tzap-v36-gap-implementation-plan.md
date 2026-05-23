@@ -56,7 +56,7 @@ mutation/fuzz coverage, and explicit release gates.
 | G01 | Documentation and plan drift | complete | P0 | docs match actual code and no README drawbacks |
 | G02 | Conformance matrix | complete | P0 | map all writer/reader obligations to code/tests/status |
 | G03 | True streaming writer | complete/unsupported boundary | P0/P1 | no true streaming claim; future sink model is a new feature |
-| G04 | Sequential non-seekable reader | partial/whole-buffer safe API | P0/P1 | safe provisional-output story and tests |
+| G04 | Sequential non-seekable reader | complete/unsupported live boundary | P0/P1 | whole-buffer safe helper; no live provisional-output claim |
 | G05 | Bootstrap sidecar authority | complete | P0 | sparse sections and authority precedence match spec |
 | G06 | IndexRoot/dictionary sizing | complete | P0 | choose metadata FEC class before CryptoHeader HMAC |
 | G07 | Directory hints and directory entries | complete | P0/P1 | exact hint map, directory entries, and cloud claims settled |
@@ -104,8 +104,8 @@ Completed implementation:
    - bootstrap sidecars with multi-volume open input sets are currently not a
      supported CLI path unless G05/G10 implement it
    - empty directory entries are omitted by current CLI/API scope
-   - true archive stdin/non-seekable streaming is not exposed unless G03/G04
-     implement it
+   - true archive stdin/live non-seekable streaming is not exposed; G04 closes
+     this as an unsupported live-output boundary
 3. Updated `docs/tzap-cli-reference.md`:
    - state that `--bootstrap-out` is single-volume only
    - state whether archive stdin is unsupported or implemented
@@ -162,7 +162,8 @@ Completed implementation:
 4. Marked broad or not-yet-claimed areas honestly:
    - true streaming writer: `W12` unsupported, `W38` complete for the
      in-memory writer, and no public sink-writer claim
-   - live sequential/provisional output: `R04` and `R20` partial
+  - live sequential/provisional output: `R04` and `R20` remain `partial`,
+    while G04 is closed only as a current-release unsupported-live boundary
    - sparse sidecar authority: `R16` complete
    - directory entries and cloud mode: `W14` and `R31` complete by current
      CLI/API scope
@@ -261,66 +262,73 @@ Done criteria met:
 
 ## G04 - Sequential Non-seekable Reader and Provisional Output
 
+Status: complete/unsupported live boundary.
+
 Spec anchors:
 
 - non-seekable sequential extraction
 - reader obligations 4 and 20
 - terminal authentication and provisional-output rules
 
-Current gap:
+Completed implementation:
 
-`sequential_extract_tar_stream` returns a `Vec<u8>`. That is safe because bytes
-are not released incrementally, but it is not a live streaming/provisional API.
-The CLI also uses archive paths rather than an archive-stdin mode.
+Option A is the current product/API stance. The core exposes only
+`sequential_extract_tar_stream`, a whole-buffer helper for dictionary-free
+single-volume archive images. It may decode payload envelopes internally, but it
+does not return any decoded tar bytes to the caller until the terminal
+ManifestFooter and VolumeTrailer authenticate. It is not a live
+provisional-output API.
 
-If a future CLI/API streams archive bytes to stdout or to the filesystem before
-terminal authentication, the implementation must mark those bytes as
-provisional and must stage filesystem writes until the terminal
-ManifestFooter/VolumeTrailer authenticates.
+This closes G04 as a current-release boundary, not as full live sequential
+reader conformance. The conformance matrix keeps R04/R20 `partial` because live
+archive stdin/provisional output and the remaining sequential mutation fixtures
+are deferred to G10/G12.
 
-Implementation work:
+The CLI uses archive file paths for `list`, `verify`, and `extract`. It does not
+expose archive stdin, live non-seekable extraction, provisional stdout events, or
+staged filesystem extraction from an unauthenticated stream. `tzap extract
+--stdout` opens and authenticates an archive from file paths, then writes one
+selected regular-file member to stdout.
 
-1. Decide the product/API stance:
-   - Option A: keep only whole-buffer sequential extraction and document that no
-     live non-seekable extraction API is exposed.
-   - Option B: add a live sequential API with provisional output semantics.
-2. If Option B:
-   - expose `SequentialEvent::ProvisionalBytes`
-   - expose a terminal authenticated success event
-   - expose terminal authentication failure as a hard failure
-   - require callers to opt into retaining provisional bytes after failure
-3. For filesystem extraction:
-   - write to a staging/quarantine directory
-   - commit atomically only after terminal authentication succeeds
-   - clean up staged data on failure unless unsafe/debug mode says otherwise
-4. For stdout:
-   - default should avoid live streaming unless the user opts in to provisional
-     output
-   - document that already-written stdout bytes cannot be recalled after failure
-5. For dictionary archives:
-   - without a bootstrap sidecar, reject non-seekable sequential extraction with
-     the stable "dictionary bootstrap required" diagnostic
-   - with a sidecar, load the dictionary before payload decompression or buffer
-     until bootstrap is complete
+Dictionary-compressed non-seekable sequential extraction without bootstrap stays
+unsupported with the stable "dictionary bootstrap required for non-seekable
+sequential extraction" diagnostic. Non-seekable random access without sidecar
+continues to reject with "non-seekable random access requires a bootstrap
+sidecar".
 
 Tests:
 
-- Valid dictionary-free non-seekable stream emits bytes only as provisional
-  before terminal auth, then reports clean success.
-- Mutated terminal footer after valid payload envelopes causes:
-  - stdout-style API: terminal failure is reported after provisional bytes
-  - filesystem API: staged files are not committed
-- Dictionary archive without sidecar rejects before payload decompression.
-- Payload block after metadata BlockRecord in sequential mode rejects.
-- CRC failure before envelope authentication aborts correctly.
-- Sequential extraction does not append synthetic tar EOF until terminal auth.
+- `reader::tests::sequential_extracts_dictionary_free_tar_stream`
+- `reader::tests::sequential_rejects_when_terminal_authentication_fails_without_returning_bytes`
+- `reader::tests::sequential_rejects_dictionary_archive_without_bootstrap_before_payload_release`
+- `reader::tests::sequential_rejects_crc_failed_payload_data_without_guaranteed_parity`
+- `reader::tests::sequential_repairs_crc_failed_payload_data_when_parity_is_guaranteed`
+- `reader::tests::sequential_zstd_stream_rejects_skippable_frame_segments`
+- `cli_smoke::cli_commands_read_real_file_named_dash_as_archive_path`
+- `cli_smoke::cli_list_treats_dash_as_literal_archive_path_not_stdin`
+- `cli_smoke::cli_extract_treats_dash_as_literal_archive_path_not_stdin`
+- `cli_smoke::cli_verify_treats_dash_as_literal_archive_path_not_stdin`
+- `milestone11_docs::milestone11_docs_pin_current_g04_non_seekable_boundary`
 
-Done criteria:
+Deferred future live-reader work:
+
+- A live sequential API would need explicit provisional events, a terminal
+  authenticated success event, and a terminal failure event that tells callers
+  previously delivered bytes were not final.
+- A future filesystem mode would need a staging/quarantine destination and an
+  atomic commit only after terminal authentication succeeds.
+- A future live stdout mode would need opt-in wording because stdout bytes cannot
+  be recalled after terminal failure.
+- A future CLI archive-stdin mode belongs with G10 and must not be implied by
+  the current `--password-stdin` flag.
+
+Done criteria met:
 
 - The API stance is explicit.
-- Any live stream path has tests proving provisional behavior.
-- The default filesystem extractor cannot leave unauthenticated files in the
-  final destination.
+- The whole-buffer sequential helper has tests proving terminal authentication
+  failure does not return decoded bytes.
+- No default CLI filesystem extractor can leave unauthenticated non-seekable
+  stream bytes in the final destination because that path is not exposed.
 
 ## G05 - Bootstrap Sidecar Authority and Sparse Sections
 
@@ -878,9 +886,9 @@ Done criteria:
    claims.
 4. G05: close sidecar authority because it affects recovery, dictionary, and
    non-seekable behavior.
-5. G04: either implement provisional reader APIs or explicitly remove those
-   claims from public surfaces. G03 is closed as an unsupported sink-writer
-   boundary for the current release claim.
+5. G04: closed with an explicit whole-buffer reader stance and no live
+   provisional-output claim. G03 is closed as an unsupported sink-writer boundary
+   for the current release claim.
 6. G08: settle the tar metadata profile.
 7. G09, G12, and G13: harden recovery, fuzzing, interop, and release gates.
 

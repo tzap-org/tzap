@@ -470,6 +470,124 @@ fn cli_verify_key_mode_and_archive_input_are_required() {
         .stderr(predicate::str::contains("required"));
 }
 
+fn create_dash_boundary_archive(temp: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+    let keyfile = temp.join("key.hex");
+    let input = temp.join("hello.txt");
+    let archive = temp.join("sample.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"hello from dash archive\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let archive_bytes = fs::read(&archive).unwrap();
+    (keyfile, archive, archive_bytes)
+}
+
+#[test]
+fn cli_list_treats_dash_as_literal_archive_path_not_stdin() {
+    let temp = tempdir().unwrap();
+    let (keyfile, _archive, archive_bytes) = create_dash_boundary_archive(temp.path());
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["list", "--keyfile", keyfile.to_str().unwrap(), "-"])
+        .write_stdin(archive_bytes)
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("io-error"))
+        .stderr(predicate::str::contains("failed to read archive -"));
+}
+
+#[test]
+fn cli_extract_treats_dash_as_literal_archive_path_not_stdin() {
+    let temp = tempdir().unwrap();
+    let (keyfile, _archive, archive_bytes) = create_dash_boundary_archive(temp.path());
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["extract", "--keyfile", keyfile.to_str().unwrap(), "-"])
+        .write_stdin(archive_bytes)
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("io-error"))
+        .stderr(predicate::str::contains("failed to read archive -"));
+}
+
+#[test]
+fn cli_verify_treats_dash_as_literal_archive_path_not_stdin() {
+    let temp = tempdir().unwrap();
+    let (keyfile, _archive, archive_bytes) = create_dash_boundary_archive(temp.path());
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["verify", "--keyfile", keyfile.to_str().unwrap(), "-"])
+        .write_stdin(archive_bytes)
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("io-error"))
+        .stderr(predicate::str::contains("failed to read archive -"));
+}
+
+#[test]
+fn cli_commands_read_real_file_named_dash_as_archive_path() {
+    let temp = tempdir().unwrap();
+    let (keyfile, archive, _archive_bytes) = create_dash_boundary_archive(temp.path());
+    let dash_archive = temp.path().join("-");
+    let output = temp.path().join("out");
+    fs::copy(&archive, &dash_archive).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["list", "--keyfile", keyfile.to_str().unwrap(), "-"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.txt\n"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["verify", "--keyfile", keyfile.to_str().unwrap(), "-"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .current_dir(temp.path())
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            "-",
+            "hello.txt",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(output.join("hello.txt")).unwrap(),
+        b"hello from dash archive\n"
+    );
+}
+
 #[test]
 fn cli_verify_one_volume_archive_with_keyfile_reports_summary_with_counts() {
     let temp = tempdir().unwrap();

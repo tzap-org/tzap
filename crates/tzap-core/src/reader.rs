@@ -140,6 +140,11 @@ pub fn open_non_seekable_archive(
     }
 }
 
+/// Decode a single-volume, dictionary-free non-seekable archive image into tar
+/// bytes after authenticating its terminal ManifestFooter and VolumeTrailer.
+///
+/// This is a whole-buffer helper, not a live provisional-output API.
+/// Callers receive no decoded bytes if terminal authentication fails.
 pub fn sequential_extract_tar_stream(
     bytes: &[u8],
     master_key: &MasterKey,
@@ -2063,6 +2068,8 @@ fn sequential_extract_tar_stream_with_options(
         &volume_header,
         parsed_crypto.fixed.block_size,
     )?;
+    // This public helper is intentionally whole-buffer: decoded payload bytes
+    // stay internal until terminal ManifestFooter and VolumeTrailer HMACs pass.
     let observed_archive_bytes = observed_archive_size([bytes.len() as u64])?;
     validate_tar_stream_total_extraction_size(
         &tar_stream,
@@ -3541,9 +3548,12 @@ mod tests {
     }
 
     #[test]
-    fn sequential_rejects_when_terminal_authentication_fails() {
+    fn sequential_rejects_when_terminal_authentication_fails_without_returning_bytes() {
         let archive = write_archive(
-            &[RegularFile::new("seq.txt", b"streaming")],
+            &[RegularFile::new(
+                "seq.txt",
+                b"payload must not be returned after terminal auth failure",
+            )],
             &master_key(),
             single_stream_options(),
         )
@@ -3552,11 +3562,65 @@ mod tests {
         let trailer_hmac_offset = corrupted.len() - VOLUME_TRAILER_LEN + TRAILER_HMAC_COVERED_LEN;
         corrupted[trailer_hmac_offset] ^= 0x01;
 
+        match sequential_extract_tar_stream(&corrupted, &master_key()) {
+            Ok(bytes) => panic!(
+                "sequential helper returned {} decoded byte(s) despite terminal HMAC failure",
+                bytes.len()
+            ),
+            Err(err) => assert_eq!(
+                err,
+                FormatError::HmacMismatch {
+                    structure: "VolumeTrailer"
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn sequential_rejects_dictionary_archive_without_bootstrap_before_payload_release() {
+        let archive = write_archive_with_dictionary(
+            &[RegularFile::new(
+                "seq-dict.txt",
+                b"common words common words dictionary payload",
+            )],
+            &master_key(),
+            single_stream_options(),
+            b"common words dictionary",
+        )
+        .unwrap();
+
+        match sequential_extract_tar_stream(&archive.bytes, &master_key()) {
+            Ok(bytes) => panic!(
+                "sequential helper returned {} decoded byte(s) for dictionary archive without bootstrap",
+                bytes.len()
+            ),
+            Err(err) => assert_eq!(
+                err,
+                FormatError::ReaderUnsupported(
+                    "dictionary bootstrap required for non-seekable sequential extraction"
+                )
+            ),
+        }
+    }
+
+    #[test]
+    fn non_seekable_dictionary_error_keeps_missing_bootstrap_wording() {
+        let archive = write_archive_with_dictionary(
+            &[RegularFile::new(
+                "seq-dict-open.txt",
+                b"common words common words bootstrap required",
+            )],
+            &master_key(),
+            single_stream_options(),
+            b"common words bootstrap",
+        )
+        .unwrap();
+
         assert_eq!(
-            sequential_extract_tar_stream(&corrupted, &master_key()).unwrap_err(),
-            FormatError::HmacMismatch {
-                structure: "VolumeTrailer"
-            }
+            open_non_seekable_archive(&archive.bytes, &master_key(), None).unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "non-seekable random access requires a bootstrap sidecar"
+            )
         );
     }
 

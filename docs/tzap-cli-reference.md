@@ -75,6 +75,9 @@ Useful flags:
 Notes:
 
 - Archive input comes from file paths. `-` is not an archive stdin sentinel.
+- `--stdout` writes one selected regular-file member after the archive has been
+  opened and authenticated from file paths; it is not live non-seekable archive
+  streaming.
 - `--bootstrap` is for single-volume open paths. Multi-volume open paths should
   pass volume files and omit the sidecar.
 
@@ -146,6 +149,6 @@ Useful flags:
 
 ## Operational boundaries
 
-Writer validation, bootstrap sidecar combinations, and multi-volume recovery
-budget examples are documented in
+Writer validation, bootstrap sidecar combinations, sequential reader boundaries,
+and multi-volume recovery budget examples are documented in
 [tzap-operational-boundaries.md](tzap-operational-boundaries.md).

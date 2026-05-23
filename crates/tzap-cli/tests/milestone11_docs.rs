@@ -438,6 +438,55 @@ fn milestone11_docs_pin_current_g03_streaming_boundary() {
 }
 
 #[test]
+fn milestone11_docs_pin_current_g04_non_seekable_boundary() {
+    let readme = read_workspace_file("README.md");
+    let reference = read_workspace_file("docs/tzap-cli-reference.md");
+    let boundaries = read_workspace_file("docs/tzap-operational-boundaries.md");
+    let matrix = read_workspace_file("docs/tzap-v36-conformance-matrix.md");
+    let cli = read_workspace_file("crates/tzap-cli/src/main.rs");
+    let reader = read_workspace_file("crates/tzap-core/src/reader.rs");
+
+    assert!(boundaries.contains("Sequential reader and provisional output"));
+    assert!(boundaries.contains("whole-buffer helper"));
+    assert!(boundaries
+        .contains("only after the terminal ManifestFooter and VolumeTrailer authenticate"));
+    assert!(boundaries.contains("a live stdout or filesystem extraction API"));
+    assert!(boundaries.contains("does not expose archive stdin or live non-seekable extraction"));
+    assert!(boundaries.contains("future API, not current CLI behavior"));
+    assert!(reference
+        .contains("`--stdout` writes one selected regular-file member after the archive has been"));
+    assert!(reference.contains("not live non-seekable archive\n  streaming"));
+    assert!(reader.contains("not a live provisional-output API"));
+    assert!(reader.contains("Callers receive no decoded bytes if terminal authentication fails"));
+    assert!(!cli.contains("sequential_extract_tar_stream"));
+    assert!(matrix.contains("| R04 |"));
+    assert!(matrix.contains("| `partial` | Core has a whole-buffer sequential helper"));
+    assert!(matrix.contains("true live sequential API is deferred to G10/G12"));
+    assert!(matrix.contains("| R20 |"));
+    assert!(matrix.contains("| `partial` | Whole-buffer API returns decoded bytes"));
+    assert!(matrix.contains("Skipped-metadata, non-authoritative terminal, and multi-envelope CRC-boundary fixtures remain G12"));
+
+    let forbidden_claims = [
+        "archive stdin",
+        "live provisional stdout",
+        "live non-seekable extraction",
+        "staged filesystem extraction",
+    ];
+    let readme_lower = readme.to_lowercase();
+    let cli_lower = cli.to_lowercase();
+    for phrase in forbidden_claims {
+        assert!(
+            !readme_lower.contains(phrase),
+            "README must not claim unsupported sequential reader behavior via {phrase:?}"
+        );
+        assert!(
+            !cli_lower.contains(phrase),
+            "CLI help source must not claim unsupported sequential reader behavior via {phrase:?}"
+        );
+    }
+}
+
+#[test]
 fn milestone11_v36_conformance_matrix_covers_section_29_obligations() {
     let matrix = read_workspace_file("docs/tzap-v36-conformance-matrix.md");
 

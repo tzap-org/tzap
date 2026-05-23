@@ -1935,6 +1935,12 @@ mod tests {
     fn bootstrap_required_errors_keep_missing_bootstrap_diagnostic() {
         for err in [
             FormatError::ReaderUnsupported("dictionary bootstrap required"),
+            FormatError::ReaderUnsupported(
+                "dictionary bootstrap required for non-seekable sequential extraction",
+            ),
+            FormatError::ReaderUnsupported(
+                "non-seekable random access requires a bootstrap sidecar",
+            ),
             FormatError::WriterUnsupported("bootstrap sidecar required"),
         ] {
             let diagnostic = classify_format_error(&err);
