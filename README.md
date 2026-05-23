@@ -17,7 +17,8 @@ and recovery in one practical format.
 
 The implementation currently targets the v0.36 format specification:
 [specs/tzap-format-revisedv36.md](specs/tzap-format-revisedv36.md).
-See the full command guide in [docs/tzap-cli-reference.md](docs/tzap-cli-reference.md).
+See the full command guide in
+[public-docs/tzap-cli-reference.md](public-docs/tzap-cli-reference.md).
 
 ## Why tzap
 

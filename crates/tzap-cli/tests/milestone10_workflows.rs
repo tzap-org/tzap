@@ -161,7 +161,12 @@ fn milestone10_release_workflow_uploads_checksum_artifacts() {
 }
 
 #[test]
-fn milestone10_milestone_status_marked_done() {
-    let plan = read_workspace_file("docs/tzap-cli-ux-production-readiness-plan.md");
-    assert!(plan.contains("## Milestone 10: Cross-Platform CI And Release Builds\n\nStatus: done."));
+fn milestone10_internal_docs_are_not_public_release_inputs() {
+    let gitignore = read_workspace_file(".gitignore");
+    let workflow = read_workspace_file(".github/workflows/release.yml");
+
+    assert!(gitignore.contains("/docs/"));
+    assert!(gitignore.contains("/implementation-docs/"));
+    assert!(!gitignore.contains("!/docs/"));
+    assert!(!workflow.contains("docs/tzap-"));
 }

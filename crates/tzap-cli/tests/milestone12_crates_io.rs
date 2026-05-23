@@ -199,29 +199,20 @@ fn milestone12_package_trees_are_small_and_focused() {
 }
 
 #[test]
-fn milestone12_release_readiness_checks_are_documented_in_order() {
-    let plan = read_workspace_file("docs/tzap-cli-ux-production-readiness-plan.md");
+fn milestone12_public_package_docs_do_not_link_private_docs() {
+    let root_readme = read_workspace_file("README.md");
+    let cli_readme = read_workspace_file("crates/tzap-cli/README.md");
+    let root_manifest = read_workspace_file("Cargo.toml");
 
-    assert!(plan.contains("## Milestone 12: Crates.io Readiness\n\nStatus: done."));
-    assert!(plan.contains("0.1.0 has been published before the CLI crate"));
-
-    for command in [
-        "cargo package -p tzap-core --list",
-        "cargo package -p tzap --list",
-        "cargo publish -p tzap-core --dry-run",
-        "cargo publish -p tzap --dry-run",
-        "cargo doc --workspace --no-deps",
-    ] {
-        assert!(
-            plan.contains(command),
-            "missing readiness command `{command}`"
-        );
-    }
-
-    let core_publish = plan.find("cargo publish -p tzap-core --dry-run").unwrap();
-    let cli_publish = plan.find("cargo publish -p tzap --dry-run").unwrap();
-    assert!(
-        core_publish < cli_publish,
-        "tzap-core should be checked before tzap"
-    );
+    assert!(root_manifest.contains(
+        "documentation = \"https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv36.md\""
+    ));
+    assert!(root_readme.contains("specs/tzap-format-revisedv36.md"));
+    assert!(root_readme.contains("public-docs/tzap-cli-reference.md"));
+    assert!(cli_readme.contains("specs/tzap-format-revisedv36.md"));
+    assert!(cli_readme.contains("public-docs/tzap-cli-reference.md"));
+    assert!(!root_readme.contains("](docs/"));
+    assert!(!root_readme.contains("blob/main/docs/"));
+    assert!(!cli_readme.contains("](docs/"));
+    assert!(!cli_readme.contains("blob/main/docs/"));
 }

@@ -73,6 +73,6 @@ archive data; raw-key archives require the original 32-byte key.
 ## More Information
 
 - Repository: <https://github.com/frankmanzhu/tzap>
-- CLI reference: <https://github.com/frankmanzhu/tzap/blob/main/docs/tzap-cli-reference.md>
+- CLI reference: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-cli-reference.md>
 - Format specification: <https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv36.md>
 - Library crate: <https://crates.io/crates/tzap-core>
