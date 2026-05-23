@@ -50,6 +50,9 @@ Notes:
 - The current core writer returns completed in-memory archive artifacts before
   the CLI writes output paths. No append-only sink or multipart-upload create
   mode is exposed.
+- Create emits regular-file tar member groups only. Long or non-ASCII archive
+  paths use local path-specific PAX metadata; global PAX/GNU state and tar EOF
+  zero blocks are not emitted into the encrypted tar stream.
 - Multi-volume recovery is available only within the `--volume-loss-tolerance`
   and FEC budget chosen when the archive is created.
 
@@ -80,6 +83,9 @@ Notes:
   streaming.
 - `--bootstrap` is for single-volume open paths. Multi-volume open paths should
   pass volume files and omit the sidecar.
+- Unsupported local tar metadata profiles and mode/mtime restoration failures
+  are reported to stderr as `tzap: degraded-metadata: ...`. Global PAX/GNU state
+  is rejected.
 
 ## Command: list
 
@@ -105,6 +111,9 @@ Notes:
 - Archive input comes from file paths. `-` is not an archive stdin sentinel.
 - `--bootstrap` is for single-volume open paths. Multi-volume open paths should
   pass volume files and omit the sidecar.
+- Long listing and JSON output expose the parsed tar kind, size, ustar mode, and
+  integer mtime. Unsupported local tar metadata profiles are reported to stderr
+  as `tzap: degraded-metadata: ...`; global PAX/GNU state is rejected.
 
 ## Command: verify
 
@@ -125,6 +134,8 @@ Useful flags:
 
 Notes:
 
+- Verification reports unsupported local tar metadata profiles to stderr as
+  `tzap: degraded-metadata: ...` after the archive structure and content verify.
 - Archive input comes from file paths. `-` is not an archive stdin sentinel.
 - `--bootstrap` is for single-volume open paths. Multi-volume open paths should
   pass volume files and omit the sidecar.

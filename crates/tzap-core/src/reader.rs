@@ -513,6 +513,12 @@ impl OpenedArchive {
             .collect()
     }
 
+    /// Return only the regular-file payload bytes for `path`.
+    ///
+    /// This is a payload-only convenience for callers that do not need tar
+    /// metadata fidelity diagnostics. Use [`Self::extract_file_with_diagnostics`]
+    /// or [`Self::extract_member`] when unsupported local PAX/GNU metadata must
+    /// be reported to users.
     pub fn extract_file(&self, path: &str) -> Result<Option<Vec<u8>>, FormatError> {
         self.extract_member(path)?
             .map(|member| {
@@ -522,6 +528,24 @@ impl OpenedArchive {
                     ));
                 }
                 Ok(member.data)
+            })
+            .transpose()
+    }
+
+    /// Return regular-file payload bytes together with parsed tar metadata
+    /// diagnostics for `path`.
+    pub fn extract_file_with_diagnostics(
+        &self,
+        path: &str,
+    ) -> Result<Option<(Vec<u8>, Vec<MetadataDiagnostic>)>, FormatError> {
+        self.extract_member(path)?
+            .map(|member| {
+                if member.kind != TarEntryKind::Regular {
+                    return Err(FormatError::ReaderUnsupported(
+                        "extract_file_with_diagnostics returns only regular file payloads",
+                    ));
+                }
+                Ok((member.data, member.diagnostics))
             })
             .transpose()
     }

@@ -2493,6 +2493,44 @@ mod tests {
     }
 
     #[test]
+    fn regular_file_writer_emits_no_global_metadata_or_tar_eof() {
+        let long_path = format!("dir/{}.txt", "a".repeat(120));
+        let files = [
+            RegularFile::new("plain.txt", b"plain contents"),
+            RegularFile::new(&long_path, b"long path contents"),
+        ];
+
+        let (tar_stream, members) = build_tar_stream(&files, 4096).unwrap();
+
+        let member_bytes = members
+            .iter()
+            .map(|member| member.tar_member_group_size)
+            .sum::<u64>();
+        assert_eq!(tar_stream.len() as u64, member_bytes);
+        assert!(!tar_stream[tar_stream.len() - TAR_BLOCK_LEN * 2..]
+            .chunks(TAR_BLOCK_LEN)
+            .all(|block| block.iter().all(|byte| *byte == 0)));
+
+        for member in members {
+            let start = member.tar_member_group_start as usize;
+            let end = start + member.tar_member_group_size as usize;
+            assert_path_specific_member_group(&tar_stream[start..end]);
+        }
+    }
+
+    #[test]
+    fn regular_file_writer_round_trips_mode_and_mtime() {
+        let group =
+            build_regular_file_member_group(b"script.sh", b"#!/bin/sh\n", 0o755, 1_700_000_000)
+                .unwrap();
+
+        let parsed = parse_tar_member_group(&group, 4096).unwrap();
+
+        assert_eq!(parsed.mode, 0o755);
+        assert_eq!(parsed.mtime, 1_700_000_000);
+    }
+
+    #[test]
     fn writer_splits_large_payload_across_seekable_envelopes() {
         let master_key = MasterKey::from_raw_key(&[8u8; 32]).unwrap();
         let data = deterministic_bytes(2 * 1024 * 1024);
@@ -2847,6 +2885,49 @@ mod tests {
         }
         let block_size = options.block_size as usize;
         (data_block_count as usize - 1) * block_size - options.aead_algo.tag_len() + 1
+    }
+
+    fn assert_path_specific_member_group(group: &[u8]) {
+        let mut cursor = 0usize;
+        let mut saw_main = false;
+        while cursor < group.len() {
+            let header = &group[cursor..cursor + TAR_BLOCK_LEN];
+            assert!(
+                header.iter().any(|byte| *byte != 0),
+                "writer emitted tar zero block inside member group"
+            );
+            let typeflag = header[156];
+            assert_ne!(typeflag, b'g', "writer emitted global PAX metadata");
+            assert!(
+                !matches!(typeflag, b'V' | b'M' | b'N'),
+                "writer emitted global GNU metadata"
+            );
+            assert!(
+                matches!(typeflag, b'x' | b'0'),
+                "writer emitted unexpected tar record type {typeflag:?}"
+            );
+            if typeflag == b'0' {
+                saw_main = true;
+            }
+            let size = read_test_tar_octal(&header[124..136]);
+            cursor += TAR_BLOCK_LEN + size + padding_to_512(size);
+        }
+        assert_eq!(cursor, group.len());
+        assert!(saw_main);
+    }
+
+    fn read_test_tar_octal(field: &[u8]) -> usize {
+        let mut value = 0usize;
+        for byte in field {
+            match *byte {
+                0 | b' ' => break,
+                b'0'..=b'7' => {
+                    value = value * 8 + usize::from(*byte - b'0');
+                }
+                other => panic!("malformed test tar octal byte {other:?}"),
+            }
+        }
+        value
     }
 
     fn test_file_row(idx: usize, path_hash: [u8; 8]) -> FileRow {

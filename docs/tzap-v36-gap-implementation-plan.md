@@ -37,8 +37,8 @@ Recent work closed important writer gaps:
 
 Those fixes mean older plan text and some operational docs are stale. They do
 not prove full v0.36 conformance. The remaining gaps are mostly around live
-sequential reader surfaces, tar metadata fidelity, recovery edge cases, broader
-mutation/fuzz coverage, and explicit release gates.
+sequential reader surfaces, recovery edge cases, broader mutation/fuzz coverage,
+and explicit release gates.
 
 ## Priority Model
 
@@ -60,7 +60,7 @@ mutation/fuzz coverage, and explicit release gates.
 | G05 | Bootstrap sidecar authority | complete | P0 | sparse sections and authority precedence match spec |
 | G06 | IndexRoot/dictionary sizing | complete | P0 | choose metadata FEC class before CryptoHeader HMAC |
 | G07 | Directory hints and directory entries | complete | P0/P1 | exact hint map, directory entries, and cloud claims settled |
-| G08 | Tar metadata profile | partial | P1 | supported metadata profile documented and tested |
+| G08 | Tar metadata profile | complete | P1 | supported metadata profile documented and tested |
 | G09 | Recovery and duplicate volumes | partial | P1 | default rejection and recovery modes are explicit |
 | G10 | CLI/API boundaries | partial | P0 | help/docs/tests do not imply unsupported behavior |
 | G11 | v36 corpus coverage | complete | P0 | every section 28.1 case tracked as covered/missing/deferred |
@@ -167,7 +167,8 @@ Completed implementation:
    - sparse sidecar authority: `R16` complete
    - directory entries and cloud mode: `W14` and `R31` complete by current
      CLI/API scope
-   - tar metadata profile: `W13`, `R13`, and `R23` partial
+   - tar metadata profile: `W13`, `R13`, and `R23` complete for the documented
+     profile
    - duplicate-copy recovery: `R27` partial with the explicit mode deferred
    - fuzz and release gates: tracked in the non-section-29 release evidence
      table
@@ -582,52 +583,65 @@ Residual risk:
 
 ## G08 - Tar Metadata Profile
 
+Status: complete.
+
 Spec anchors:
 
 - writer obligation 13
 - reader obligations 13 and 23
 - metadata warnings corpus cases
 
-Current gap:
+Original gap:
 
 The implementation is strongest for regular-file payloads and local path PAX
 needed for long/unicode paths. The supported tar metadata profile is not yet
 defined as a strict conformance surface. Unsupported PAX/GNU/xattr/ACL/sparse
 cases need consistent diagnostics.
 
-Implementation work:
+Closed implementation:
 
-1. Write a supported metadata profile in technical docs:
-   - regular files
-   - safe relative paths
-   - long/unicode path support through local path-specific PAX if needed
-   - mode and mtime behavior, if fully supported
-   - no global PAX state
-   - no global GNU state
-   - xattr/ACL/sparse unsupported unless implemented
-2. Make reader behavior explicit:
-   - reject global PAX/GNU state that affects unrelated entries
-   - emit degraded metadata diagnostics for unsupported local profiles
-   - best-effort quiet mode may suppress warnings only if documented
-3. Make writer behavior explicit:
-   - never emit POSIX end-of-archive zero blocks into encrypted tzap tar stream
-   - never emit global PAX/GNU state
-   - if claiming metadata beyond baseline, emit only path-specific metadata
-     inside that member group
+- `docs/tzap-operational-boundaries.md` and `docs/tzap-cli-reference.md`
+  define the current supported tar metadata profile: regular-file create output,
+  safe relative archive paths, local path-specific PAX for long/non-ASCII paths,
+  local PAX `path`/`linkpath`/`size`, local GNU long name/link, parsed ustar
+  mode and integer mtime, regular-file mode/mtime restoration with diagnostics
+  on failure, no global PAX/GNU state, no tar EOF blocks in the encrypted tar
+  stream, and no xattr/ACL/sparse/nanosecond timestamp restoration claim.
+- `tar_model.rs::parse_tar_member_group` rejects global PAX and global GNU
+  state and rejects unsupported GNU sparse entry records. Unsupported local PAX
+  xattr/ACL, sparse, timestamp-precision, and unknown keys produce structured
+  degraded metadata diagnostics.
+- The CLI uses one degraded metadata formatter for list, verify, dry-run,
+  stdout extraction, and filesystem extraction so unsupported local metadata does
+  not look like silent success on a successful command surface.
+- `writer.rs::build_regular_file_member_group` and `writer.rs::build_tar_stream`
+  are pinned by tests to emit only path-specific local PAX when needed, no
+  global metadata records, and no POSIX end-of-archive zero blocks.
 
 Tests:
 
-- Writer emits no global PAX/GNU records for representative inputs.
-- Reader rejects global PAX/GNU state rather than carrying mutable tar state
-  across FileEntry boundaries.
-- Unsupported local PAX/GNU extension, xattr/ACL failure, timestamp precision
-  loss, and sparse-file fallback produce diagnostics.
-- Quiet/best-effort mode, if present, suppresses only documented warnings.
+- `writer::tests::regular_file_writer_emits_no_global_metadata_or_tar_eof`
+- `writer::tests::regular_file_writer_round_trips_mode_and_mtime`
+- `writer::tests::regular_file_writer_uses_local_pax_path_for_long_and_non_ascii_paths`
+- `tar_model::tests::rejects_global_pax_before_main_entry`
+- `tar_model::tests::rejects_global_gnu_headers`
+- `tar_model::tests::rejects_unsupported_gnu_sparse_entry_type`
+- `tar_model::tests::applies_local_gnu_long_name_and_link_to_following_entry`
+- `tar_model::tests::reports_degraded_diagnostics_for_xattr_and_acl_pax_profiles`
+- `tar_model::tests::reports_degraded_diagnostics_for_pax_timestamp_precision`
+- `tar_model::tests::reports_degraded_diagnostics_for_sparse_and_unknown_pax_profiles`
+- `tar_model::tests::reports_degraded_diagnostics_for_unsupported_local_pax_profiles`
+- `tar_model::tests::restore_applies_regular_file_mtime_metadata`
+- `main.rs::tests::metadata_diagnostic_lines_use_stable_cli_warning_prefix`
+- `milestone11_docs::milestone11_docs_pin_current_g08_tar_metadata_profile`
+- existing safe-path and local PAX path/size tests remain the baseline coverage.
 
-Done criteria:
+Remaining work:
 
-- The metadata profile is no longer implicit.
-- Unsupported tar metadata does not silently look successful.
+- Broad mutation/fuzz expansion for tar metadata remains in G12.
+- Future filesystem restoration of ownership, xattrs, ACLs, sparse files,
+  nanosecond timestamps, or directory FileEntry creation would be new feature
+  work and must update this profile and its diagnostics.
 
 ## G09 - Recovery, Duplicates, and FEC Edge Cases
 
@@ -889,7 +903,7 @@ Done criteria:
 5. G04: closed with an explicit whole-buffer reader stance and no live
    provisional-output claim. G03 is closed as an unsupported sink-writer boundary
    for the current release claim.
-6. G08: settle the tar metadata profile.
+6. G08: settled with an explicit supported tar metadata profile.
 7. G09, G12, and G13: harden recovery, fuzzing, interop, and release gates.
 
 ## Release Blocking Rule

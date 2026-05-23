@@ -487,6 +487,38 @@ fn milestone11_docs_pin_current_g04_non_seekable_boundary() {
 }
 
 #[test]
+fn milestone11_docs_pin_current_g08_tar_metadata_profile() {
+    let reference = read_workspace_file("docs/tzap-cli-reference.md");
+    let boundaries = read_workspace_file("docs/tzap-operational-boundaries.md");
+    let matrix = read_workspace_file("docs/tzap-v36-conformance-matrix.md");
+    let tracker = read_workspace_file("docs/tzap-v36-corpus-tracker.md");
+    let plan = read_workspace_file("docs/tzap-v36-gap-implementation-plan.md");
+
+    assert!(boundaries.contains("## Tar metadata profile"));
+    assert!(boundaries.contains("regular-file tar member groups"));
+    assert!(boundaries.contains("local PAX `path`, `linkpath`, and `size` records"));
+    assert!(boundaries.contains("local GNU long name and long link records"));
+    assert!(boundaries.contains("applied to restored regular files"));
+    assert!(boundaries.contains("Mode or mtime application"));
+    assert!(boundaries.contains("failures are reported as degraded metadata diagnostics"));
+    assert!(boundaries.contains("Global PAX headers and global GNU state are rejected"));
+    assert!(boundaries.contains("not a best-effort metadata-warning\nmode"));
+    assert!(boundaries.contains("`extract_file`, which is explicitly\npayload-only"));
+    assert!(boundaries.contains("`extract_file_with_diagnostics`"));
+    assert!(reference
+        .contains("Unsupported local tar metadata profiles and mode/mtime restoration failures"));
+    assert!(reference.contains("Verification reports unsupported local tar metadata profiles"));
+    assert!(matrix.contains("| W13 |"));
+    assert!(matrix.contains("| R13 |"));
+    assert!(matrix.contains("| R23 |"));
+    assert!(matrix.contains("| G08 tar metadata profile | `complete` |"));
+    assert!(tracker.contains("| C084 | Metadata profiles |"));
+    assert!(tracker.contains("| C113 | Metadata warnings |"));
+    assert!(plan.contains("## G08 - Tar Metadata Profile"));
+    assert!(plan.contains("Status: complete."));
+}
+
+#[test]
 fn milestone11_v36_conformance_matrix_covers_section_29_obligations() {
     let matrix = read_workspace_file("docs/tzap-v36-conformance-matrix.md");
 
@@ -671,6 +703,7 @@ fn milestone11_v36_corpus_tracker_references_existing_tests() {
         "crates/tzap-core/src/tar_model.rs",
         "crates/tzap-core/src/wire.rs",
         "crates/tzap-core/src/writer.rs",
+        "crates/tzap-cli/src/main.rs",
         "crates/tzap-core/tests/v36_corpus.rs",
         "crates/tzap-cli/tests/cli_smoke.rs",
         "crates/tzap-cli/tests/milestone11_docs.rs",

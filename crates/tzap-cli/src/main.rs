@@ -18,8 +18,8 @@ use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
 use tzap_core::{
     open_archive, open_archive_volumes, open_archive_with_bootstrap_sidecar, write_archive,
     write_archive_with_dictionary, write_archive_with_dictionary_and_kdf, write_archive_with_kdf,
-    KdfParams, MasterKey, OpenedArchive, RegularFile, SafeExtractionOptions, TarEntryKind,
-    WriterOptions,
+    KdfParams, MasterKey, MetadataDiagnostic, OpenedArchive, RegularFile, SafeExtractionOptions,
+    TarEntryKind, WriterOptions,
 };
 
 const EXIT_USAGE: u8 = 2;
@@ -686,17 +686,13 @@ fn run(cli: Cli) -> Result<()> {
                 if member.kind != TarEntryKind::Regular {
                     bail!("--stdout supports regular file members only");
                 }
-                for diagnostic in member.diagnostics {
-                    eprintln!(
-                        "tzap: degraded-metadata: {}: {}: {}",
-                        path, diagnostic.profile, diagnostic.message
-                    );
-                }
+                emit_member_metadata_diagnostics(path, &member.diagnostics)?;
                 io::stdout().write_all(&member.data)?;
                 return Ok(());
             }
 
             if dry_run {
+                emit_entry_metadata_diagnostics_for_paths(&all_entries, &requested_paths)?;
                 eprintln!("extract dry-run summary:");
                 eprintln!("  destination: {}", directory);
                 eprintln!("  archive members:");
@@ -733,12 +729,7 @@ fn run(cli: Cli) -> Result<()> {
                 degraded_metadata_count = degraded_metadata_count
                     .checked_add(diagnostics.len() as u64)
                     .ok_or_else(|| anyhow!("degraded metadata count overflow"))?;
-                for diagnostic in diagnostics {
-                    eprintln!(
-                        "tzap: degraded-metadata: {}: {}: {}",
-                        path, diagnostic.profile, diagnostic.message
-                    );
-                }
+                emit_member_metadata_diagnostics(&path, &diagnostics)?;
             }
             emit_success_summary(
                 quiet,
@@ -770,14 +761,7 @@ fn run(cli: Cli) -> Result<()> {
                 open_inputs_maybe_bootstrap(&volume_bytes, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {archive}"))?;
             let entries = opened.list_files()?;
-            for entry in &entries {
-                for diagnostic in &entry.diagnostics {
-                    eprintln!(
-                        "tzap: degraded-metadata: {}: {}: {}",
-                        entry.path, diagnostic.profile, diagnostic.message
-                    );
-                }
-            }
+            emit_entry_metadata_diagnostics(&entries)?;
             if json {
                 let files = entries
                     .iter()
@@ -877,6 +861,8 @@ fn run(cli: Cli) -> Result<()> {
             let file_count = opened.index_root.header.file_count;
             match result {
                 Ok(()) => {
+                    let entries = opened.list_files()?;
+                    emit_entry_metadata_diagnostics(&entries)?;
                     if json {
                         println!(
                             "{}",
@@ -945,6 +931,65 @@ fn emit_success_stdout(quiet: bool, message: &str) -> io::Result<()> {
         return Ok(());
     }
     println!("{message}");
+    Ok(())
+}
+
+fn metadata_diagnostic_line(path: &str, diagnostic: &MetadataDiagnostic) -> String {
+    format!(
+        "tzap: degraded-metadata: {}: {}: {}",
+        path, diagnostic.profile, diagnostic.message
+    )
+}
+
+fn emit_member_metadata_diagnostics(
+    path: &str,
+    diagnostics: &[MetadataDiagnostic],
+) -> io::Result<()> {
+    for diagnostic in diagnostics {
+        eprintln!("{}", metadata_diagnostic_line(path, diagnostic));
+    }
+    Ok(())
+}
+
+fn metadata_diagnostic_lines_for_entries(entries: &[ArchiveEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .diagnostics
+                .iter()
+                .map(|diagnostic| metadata_diagnostic_line(&entry.path, diagnostic))
+        })
+        .collect()
+}
+
+fn metadata_diagnostic_lines_for_paths(entries: &[ArchiveEntry], paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter_map(|path| entries.iter().find(|entry| entry.path == *path))
+        .flat_map(|entry| {
+            entry
+                .diagnostics
+                .iter()
+                .map(|diagnostic| metadata_diagnostic_line(&entry.path, diagnostic))
+        })
+        .collect()
+}
+
+fn emit_entry_metadata_diagnostics(entries: &[ArchiveEntry]) -> io::Result<()> {
+    for line in metadata_diagnostic_lines_for_entries(entries) {
+        eprintln!("{line}");
+    }
+    Ok(())
+}
+
+fn emit_entry_metadata_diagnostics_for_paths(
+    entries: &[ArchiveEntry],
+    paths: &[String],
+) -> io::Result<()> {
+    for line in metadata_diagnostic_lines_for_paths(entries, paths) {
+        eprintln!("{line}");
+    }
     Ok(())
 }
 
@@ -1949,5 +1994,58 @@ mod tests {
             assert_eq!(diagnostic.exit_code, EXIT_MISSING_BOOTSTRAP);
             assert_eq!(diagnostic.action, "use --bootstrap with a matching sidecar");
         }
+    }
+
+    #[test]
+    fn metadata_diagnostic_lines_use_stable_cli_warning_prefix() {
+        let line = metadata_diagnostic_line(
+            "path/in/archive",
+            &MetadataDiagnostic {
+                profile: "gnu-sparse",
+                message: "unsupported sparse-file PAX metadata was ignored",
+            },
+        );
+
+        assert_eq!(
+            line,
+            "tzap: degraded-metadata: path/in/archive: gnu-sparse: unsupported sparse-file PAX metadata was ignored"
+        );
+    }
+
+    #[test]
+    fn selected_metadata_diagnostic_lines_filter_to_requested_paths() {
+        let entries = vec![
+            ArchiveEntry {
+                path: "selected.txt".to_string(),
+                file_data_size: 1,
+                kind: TarEntryKind::Regular,
+                mode: 0o644,
+                mtime: 0,
+                diagnostics: vec![MetadataDiagnostic {
+                    profile: "pax-posix-2001",
+                    message: "unsupported PAX key was ignored",
+                }],
+            },
+            ArchiveEntry {
+                path: "other.txt".to_string(),
+                file_data_size: 1,
+                kind: TarEntryKind::Regular,
+                mode: 0o644,
+                mtime: 0,
+                diagnostics: vec![MetadataDiagnostic {
+                    profile: "gnu-sparse",
+                    message: "unsupported sparse-file PAX metadata was ignored",
+                }],
+            },
+        ];
+
+        assert_eq!(
+            metadata_diagnostic_lines_for_paths(&entries, &["selected.txt".to_string()]),
+            vec![
+                "tzap: degraded-metadata: selected.txt: pax-posix-2001: unsupported PAX key was ignored"
+                    .to_string()
+            ]
+        );
+        assert_eq!(metadata_diagnostic_lines_for_entries(&entries).len(), 2);
     }
 }

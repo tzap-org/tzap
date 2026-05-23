@@ -1,6 +1,10 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use crate::format::FormatError;
 use crate::metadata::validate_file_path_bytes;
@@ -136,6 +140,11 @@ pub fn parse_tar_member_group<'a>(
                     "global PAX headers are not allowed",
                 ));
             }
+            b'V' | b'M' | b'N' => {
+                return Err(FormatError::InvalidArchive(
+                    "global GNU headers are not allowed",
+                ));
+            }
             b'L' => {
                 metadata.gnu_long_name = Some(trimmed_metadata_payload(payload));
                 cursor = padded_end;
@@ -143,6 +152,11 @@ pub fn parse_tar_member_group<'a>(
             b'K' => {
                 metadata.gnu_long_link = Some(trimmed_metadata_payload(payload));
                 cursor = padded_end;
+            }
+            b'S' => {
+                return Err(FormatError::ReaderUnsupported(
+                    "unsupported GNU sparse tar entry",
+                ));
             }
             0 | b'0' | b'5' | b'2' | b'1' => {
                 if padded_end != group.len() {
@@ -282,6 +296,16 @@ fn tar_member_group_end(stream: &[u8], start: usize) -> Result<usize, FormatErro
                     "global PAX headers are not allowed",
                 ));
             }
+            b'V' | b'M' | b'N' => {
+                return Err(FormatError::InvalidArchive(
+                    "global GNU headers are not allowed",
+                ));
+            }
+            b'S' => {
+                return Err(FormatError::ReaderUnsupported(
+                    "unsupported GNU sparse tar entry",
+                ));
+            }
             0 | b'0' | b'5' | b'2' | b'1' => return Ok(padded_end),
             _ => return Err(FormatError::ReaderUnsupported("unsupported tar entry type")),
         }
@@ -300,8 +324,12 @@ pub fn restore_tar_member(
     options: SafeExtractionOptions,
 ) -> Result<Vec<MetadataDiagnostic>, FormatError> {
     let destination = prepare_destination(root, &member.path, member.kind, options)?;
+    let mut diagnostics = member.diagnostics.clone();
     match member.kind {
-        TarEntryKind::Regular => write_regular_file(&destination, &member.data, options)?,
+        TarEntryKind::Regular => {
+            let file = write_regular_file(&destination, &member.data, options)?;
+            apply_restored_regular_file_metadata(&file, member, &mut diagnostics);
+        }
         TarEntryKind::Directory => create_directory(&destination)?,
         TarEntryKind::Symlink => {
             let target = member
@@ -320,7 +348,84 @@ pub fn restore_tar_member(
             create_hardlink(&destination, &target_path, options)?;
         }
     }
-    Ok(member.diagnostics.clone())
+    Ok(diagnostics)
+}
+
+fn apply_restored_regular_file_metadata(
+    file: &fs::File,
+    member: &OwnedTarMember,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) {
+    apply_regular_file_mtime(file, member.mtime, diagnostics);
+    apply_regular_file_mode(file, member.mode, diagnostics);
+}
+
+#[cfg(unix)]
+fn apply_regular_file_mode(file: &fs::File, mode: u32, diagnostics: &mut Vec<MetadataDiagnostic>) {
+    match file.metadata() {
+        Ok(metadata) => {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(mode & 0o7777);
+            if file.set_permissions(permissions).is_err() {
+                diagnostics.push(MetadataDiagnostic {
+                    profile: "ustar-baseline",
+                    message: "failed to apply mode metadata",
+                });
+            }
+        }
+        Err(_) => diagnostics.push(MetadataDiagnostic {
+            profile: "ustar-baseline",
+            message: "failed to apply mode metadata",
+        }),
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_regular_file_mode(file: &fs::File, mode: u32, diagnostics: &mut Vec<MetadataDiagnostic>) {
+    match file.metadata() {
+        Ok(metadata) => {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(mode & 0o222 == 0);
+            if file.set_permissions(permissions).is_err() {
+                diagnostics.push(MetadataDiagnostic {
+                    profile: "ustar-baseline",
+                    message: "failed to apply mode metadata",
+                });
+                return;
+            }
+            if mode & 0o777 != 0o444 && mode & 0o777 != 0o666 {
+                diagnostics.push(MetadataDiagnostic {
+                    profile: "ustar-baseline",
+                    message: "mode metadata was only partially applied on this platform",
+                });
+            }
+        }
+        Err(_) => diagnostics.push(MetadataDiagnostic {
+            profile: "ustar-baseline",
+            message: "failed to apply mode metadata",
+        }),
+    }
+}
+
+fn apply_regular_file_mtime(
+    file: &fs::File,
+    mtime: u64,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) {
+    let Some(modified) = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(mtime)) else {
+        diagnostics.push(MetadataDiagnostic {
+            profile: "ustar-baseline",
+            message: "failed to apply mtime metadata",
+        });
+        return;
+    };
+    let times = fs::FileTimes::new().set_modified(modified);
+    if file.set_times(times).is_err() {
+        diagnostics.push(MetadataDiagnostic {
+            profile: "ustar-baseline",
+            message: "failed to apply mtime metadata",
+        });
+    }
 }
 
 fn canonical_main_path(
@@ -400,14 +505,24 @@ fn parse_pax_records(payload: &[u8], metadata: &mut LocalMetadata) -> Result<(),
             "path" => metadata.pax_path = Some(value.to_vec()),
             "linkpath" => metadata.pax_linkpath = Some(value.to_vec()),
             "size" => metadata.pax_size = Some(parse_decimal(value)? as u64),
+            "atime" | "ctime" | "mtime" => metadata.diagnostics.push(MetadataDiagnostic {
+                profile: "pax-posix-2001",
+                message: "unsupported PAX timestamp metadata was ignored",
+            }),
             key if key.starts_with("SCHILY.xattr.")
                 || key.starts_with("LIBARCHIVE.xattr.")
                 || key.starts_with("SCHILY.acl.")
-                || key.starts_with("GNU.sparse.") =>
+                || key.starts_with("LIBARCHIVE.acl.") =>
             {
                 metadata.diagnostics.push(MetadataDiagnostic {
                     profile: "pax-xattrs-acls",
-                    message: "unsupported PAX metadata was ignored",
+                    message: "unsupported xattr/ACL PAX metadata was ignored",
+                });
+            }
+            key if key.starts_with("GNU.sparse.") => {
+                metadata.diagnostics.push(MetadataDiagnostic {
+                    profile: "gnu-sparse",
+                    message: "unsupported sparse-file PAX metadata was ignored",
                 });
             }
             _ => metadata.diagnostics.push(MetadataDiagnostic {
@@ -558,7 +673,7 @@ fn write_regular_file(
     destination: &Path,
     data: &[u8],
     options: SafeExtractionOptions,
-) -> Result<(), FormatError> {
+) -> Result<fs::File, FormatError> {
     if options.overwrite_existing && destination.exists() {
         fs::remove_file(destination)
             .map_err(|_| FormatError::FilesystemExtractionFailed("failed to remove old file"))?;
@@ -569,7 +684,8 @@ fn write_regular_file(
         .open(destination)
         .map_err(|_| FormatError::FilesystemExtractionFailed("failed to create regular file"))?;
     file.write_all(data)
-        .map_err(|_| FormatError::FilesystemExtractionFailed("failed to write regular file"))
+        .map_err(|_| FormatError::FilesystemExtractionFailed("failed to write regular file"))?;
+    Ok(file)
 }
 
 fn create_directory(destination: &Path) -> Result<(), FormatError> {
@@ -848,6 +964,41 @@ mod tests {
     }
 
     #[test]
+    fn rejects_global_pax_before_main_entry() {
+        let global_pax = pax_record("path", b"poisoned.txt");
+        let mut bytes = member(b"GlobalHead/path", b'g', &global_pax, b"");
+        bytes.extend_from_slice(&member(b"safe.txt", b'0', b"abc", b""));
+
+        assert_eq!(
+            parse_tar_member_group(&bytes, 4096).unwrap_err(),
+            FormatError::InvalidArchive("global PAX headers are not allowed")
+        );
+    }
+
+    #[test]
+    fn rejects_global_gnu_headers() {
+        for typeflag in [b'V', b'M', b'N'] {
+            let bytes = member(b"global", typeflag, b"archive-label", b"");
+
+            assert_eq!(
+                parse_tar_member_group(&bytes, 4096).unwrap_err(),
+                FormatError::InvalidArchive("global GNU headers are not allowed"),
+                "typeflag {typeflag:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_gnu_sparse_entry_type() {
+        let bytes = member(b"sparse.bin", b'S', b"", b"");
+
+        assert_eq!(
+            parse_tar_member_group(&bytes, 4096).unwrap_err(),
+            FormatError::ReaderUnsupported("unsupported GNU sparse tar entry")
+        );
+    }
+
+    #[test]
     fn applies_local_pax_path_and_size() {
         let pax = pax_record("path", b"long/name.txt");
         let mut bytes = member(b"PaxHeaders/name", b'x', &pax, b"");
@@ -856,6 +1007,146 @@ mod tests {
         let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
         assert_eq!(parsed.path, b"long/name.txt");
         assert_eq!(parsed.data, b"abc");
+    }
+
+    #[test]
+    fn applies_local_gnu_long_name_and_link_to_following_entry() {
+        let mut named = member(b"././@LongLink", b'L', b"long/path.txt\0", b"");
+        named.extend_from_slice(&member(b"short", b'0', b"abc", b""));
+        let parsed = parse_tar_member_group(&named, 4096).unwrap();
+        assert_eq!(parsed.path, b"long/path.txt");
+        assert_eq!(parsed.data, b"abc");
+
+        let mut linked = member(b"././@LongLink", b'K', b"target/file.txt\0", b"");
+        linked.extend_from_slice(&member(b"short-link", b'2', b"", b"fallback"));
+        let parsed = parse_tar_member_group(&linked, 4096).unwrap();
+        assert_eq!(parsed.path, b"short-link");
+        assert_eq!(
+            parsed.link_target.as_deref(),
+            Some(b"target/file.txt".as_slice())
+        );
+    }
+
+    #[test]
+    fn reports_degraded_diagnostics_for_xattr_and_acl_pax_profiles() {
+        let mut pax = Vec::new();
+        pax.extend_from_slice(&pax_record("SCHILY.xattr.user.comment", b"hello"));
+        pax.extend_from_slice(&pax_record("LIBARCHIVE.xattr.user.comment", b"hello"));
+        pax.extend_from_slice(&pax_record("SCHILY.acl.access", b"user::rw-"));
+        pax.extend_from_slice(&pax_record("LIBARCHIVE.acl.access", b"user::rw-"));
+        let mut bytes = member(b"PaxHeaders/file", b'x', &pax, b"");
+        bytes.extend_from_slice(&member(b"file.txt", b'0', b"abc", b""));
+
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+
+        assert_eq!(parsed.path, b"file.txt");
+        assert_eq!(parsed.data, b"abc");
+        assert_eq!(
+            parsed
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| **diagnostic
+                    == MetadataDiagnostic {
+                        profile: "pax-xattrs-acls",
+                        message: "unsupported xattr/ACL PAX metadata was ignored",
+                    })
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn reports_degraded_diagnostics_for_pax_timestamp_precision() {
+        let mut pax = Vec::new();
+        pax.extend_from_slice(&pax_record("atime", b"1.123456789"));
+        pax.extend_from_slice(&pax_record("ctime", b"2.123456789"));
+        pax.extend_from_slice(&pax_record("mtime", b"3.123456789"));
+        let mut bytes = member(b"PaxHeaders/file", b'x', &pax, b"");
+        bytes.extend_from_slice(&member(b"file.txt", b'0', b"abc", b""));
+
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+
+        assert_eq!(
+            parsed
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| **diagnostic
+                    == MetadataDiagnostic {
+                        profile: "pax-posix-2001",
+                        message: "unsupported PAX timestamp metadata was ignored",
+                    })
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn reports_degraded_diagnostics_for_sparse_and_unknown_pax_profiles() {
+        let mut pax = Vec::new();
+        pax.extend_from_slice(&pax_record("GNU.sparse.realsize", b"1024"));
+        pax.extend_from_slice(&pax_record("GNU.sparse.map", b"0,1"));
+        pax.extend_from_slice(&pax_record("comment", b"ignored"));
+        let mut bytes = member(b"PaxHeaders/file", b'x', &pax, b"");
+        bytes.extend_from_slice(&member(b"file.txt", b'0', b"abc", b""));
+
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+
+        assert_eq!(
+            parsed
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| **diagnostic
+                    == MetadataDiagnostic {
+                        profile: "gnu-sparse",
+                        message: "unsupported sparse-file PAX metadata was ignored",
+                    })
+                .count(),
+            2
+        );
+        assert_eq!(
+            parsed
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| **diagnostic
+                    == MetadataDiagnostic {
+                        profile: "pax-posix-2001",
+                        message: "unsupported PAX key was ignored",
+                    })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn reports_degraded_diagnostics_for_unsupported_local_pax_profiles() {
+        let mut pax = Vec::new();
+        pax.extend_from_slice(&pax_record("SCHILY.xattr.user.comment", b"hello"));
+        pax.extend_from_slice(&pax_record("GNU.sparse.realsize", b"1024"));
+        pax.extend_from_slice(&pax_record("mtime", b"1.123456789"));
+        pax.extend_from_slice(&pax_record("comment", b"ignored"));
+        let mut bytes = member(b"PaxHeaders/file", b'x', &pax, b"");
+        bytes.extend_from_slice(&member(b"file.txt", b'0', b"abc", b""));
+
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+
+        assert_eq!(parsed.path, b"file.txt");
+        assert_eq!(parsed.data, b"abc");
+        assert!(parsed.diagnostics.contains(&MetadataDiagnostic {
+            profile: "pax-xattrs-acls",
+            message: "unsupported xattr/ACL PAX metadata was ignored",
+        }));
+        assert!(parsed.diagnostics.contains(&MetadataDiagnostic {
+            profile: "gnu-sparse",
+            message: "unsupported sparse-file PAX metadata was ignored",
+        }));
+        assert!(parsed.diagnostics.contains(&MetadataDiagnostic {
+            profile: "pax-posix-2001",
+            message: "unsupported PAX timestamp metadata was ignored",
+        }));
+        assert!(parsed.diagnostics.contains(&MetadataDiagnostic {
+            profile: "pax-posix-2001",
+            message: "unsupported PAX key was ignored",
+        }));
     }
 
     #[test]
@@ -921,6 +1212,61 @@ mod tests {
 
         restore_tar_member(tmp.path(), &member, SafeExtractionOptions::default()).unwrap();
         assert_eq!(fs::read(tmp.path().join("linked.txt")).unwrap(), b"target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_applies_regular_file_mode_metadata() {
+        let tmp = tempdir().unwrap();
+        let member = OwnedTarMember {
+            path: b"script.sh".to_vec(),
+            kind: TarEntryKind::Regular,
+            data: b"#!/bin/sh\n".to_vec(),
+            link_target: None,
+            mode: 0o755,
+            mtime: 0,
+            logical_size: 10,
+            diagnostics: Vec::new(),
+        };
+
+        let diagnostics =
+            restore_tar_member(tmp.path(), &member, SafeExtractionOptions::default()).unwrap();
+
+        assert!(diagnostics.is_empty());
+        let mode = fs::metadata(tmp.path().join("script.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn restore_applies_regular_file_mtime_metadata() {
+        let tmp = tempdir().unwrap();
+        let member = OwnedTarMember {
+            path: b"dated.txt".to_vec(),
+            kind: TarEntryKind::Regular,
+            data: b"dated".to_vec(),
+            link_target: None,
+            mode: 0o644,
+            mtime: 1_700_000_000,
+            logical_size: 5,
+            diagnostics: Vec::new(),
+        };
+
+        let diagnostics =
+            restore_tar_member(tmp.path(), &member, SafeExtractionOptions::default()).unwrap();
+
+        assert!(diagnostics.is_empty());
+        let modified = fs::metadata(tmp.path().join("dated.txt"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(modified, 1_700_000_000);
     }
 
     #[test]

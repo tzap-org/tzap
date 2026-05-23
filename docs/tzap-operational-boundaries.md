@@ -203,6 +203,49 @@ What to do:
 - Add a regular placeholder file if preserving an otherwise empty directory is
   required.
 
+## Tar metadata profile
+
+The current v0.36 CLI create path emits regular-file tar member groups. Archive
+paths are normalized safe relative UTF-8 paths using `/` separators. Long paths
+and non-ASCII paths are represented with a path-specific local PAX `path` record
+inside the same member group as the file it modifies. The writer does not emit
+global PAX headers, global GNU state, or the POSIX two-zero-block tar
+end-of-archive marker into the encrypted tzap tar stream.
+
+The supported reader profile is:
+
+- ustar regular files, directories, symlinks, and hardlinks after safe-path
+  validation;
+- local PAX `path`, `linkpath`, and `size` records for the following main entry;
+- local GNU long name and long link records for the following main entry;
+- ustar mode and integer mtime parsed from the main tar header, exposed by
+  list/API metadata, and applied to restored regular files when the platform
+  filesystem API accepts them.
+
+Filesystem extraction writes file payloads and supported links safely under the
+destination root. It does not currently claim ownership, xattr, ACL, sparse-file,
+nanosecond timestamp, or global tar-state restoration. Mode or mtime application
+failures are reported as degraded metadata diagnostics.
+
+Unsupported local metadata is reported as degraded metadata instead of looking
+fully successful. `tzap list`, `tzap verify`, and `tzap extract` write
+diagnostics such as:
+
+```text
+tzap: degraded-metadata: path/in/archive: gnu-sparse: unsupported sparse-file PAX metadata was ignored
+```
+
+Global PAX headers and global GNU state are rejected as malformed archive state.
+GNU sparse entry records are rejected; GNU sparse PAX keys, xattr/ACL PAX keys,
+PAX timestamp precision keys, and other unsupported local PAX keys are surfaced
+through degraded metadata diagnostics. The global `--quiet` flag suppresses
+success summaries where applicable; it is not a best-effort metadata-warning
+mode.
+
+Library callers that only need bytes may use `extract_file`, which is explicitly
+payload-only. Callers that surface metadata fidelity should use `list_files`,
+`extract_member`, `extract_file_with_diagnostics`, or `extract_file_to`.
+
 ## Cloud directory-prefix optimization
 
 The v0.36 spec defines a cloud/object-store optimized directory-prefix mode
