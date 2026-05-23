@@ -47,3 +47,11 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --locked
+
+      - name: Run fuzz smoke
+        if: ${{ matrix.run_fmt }}
+        run: cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked
+
+      - name: Check libFuzzer targets
+        if: ${{ matrix.run_fmt }}
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins --features libfuzzer --locked

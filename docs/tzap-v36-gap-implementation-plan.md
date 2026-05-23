@@ -64,8 +64,8 @@ and explicit release gates.
 | G09 | Recovery and duplicate volumes | complete | P1 | strict recovery modes are documented and mutation-tested |
 | G10 | CLI/API boundaries | complete | P0 | help/docs/tests do not imply unsupported behavior |
 | G11 | v36 corpus coverage | complete | P0 | every section 28.1 case tracked as covered/missing/deferred |
-| G12 | Fuzzing and mutation harness | partial | P1/P2 | fuzz targets and smoke gates cover parsers and mutations |
-| G13 | Interop and release gate | missing | P0/P2 | release checklist blocks unverified conformance claims |
+| G12 | Fuzzing and mutation harness | complete | P1/P2 | fuzz targets and smoke gates cover parsers and mutations |
+| G13 | Interop and release gate | partial | P0/P2 | release checklist blocks unverified conformance claims |
 
 ## G01 - Documentation and Plan Drift
 
@@ -284,7 +284,7 @@ provisional-output API.
 This closes G04 as a current-release boundary, not as full live sequential
 reader conformance. The conformance matrix keeps R04/R20 `partial` because live
 archive stdin/provisional output would be future product work, and the remaining
-sequential mutation fixtures are deferred to G12.
+sequential mutation fixtures are release-gated by G13.
 
 The CLI uses archive file paths for `list`, `verify`, and `extract`. It does not
 expose archive stdin, live non-seekable extraction, provisional stdout events, or
@@ -422,9 +422,9 @@ Deferred related work:
 - CLI support for multi-volume input sets plus `--bootstrap`, if ever desired,
   would be a new product feature. The current CLI rejects that combination
   before reading archive inputs.
-- Broad near-u64 arithmetic and boundary-byte mutation expansion remains in
-  G12; the implemented reader path uses checked arithmetic and present-section
-  cap accounting.
+- Broad near-u64 arithmetic and boundary-byte mutation expansion is
+  release-gated by G13; the implemented reader path uses checked arithmetic and
+  present-section cap accounting.
 
 Done criteria:
 
@@ -476,7 +476,7 @@ Deferred related work:
   choose conservative maxima, pre-scan/spool, or reject before first write; if
   final metadata exceeds the selected class, fail finalization with a clear
   error and no clean trailer/footer.
-- Reader mutation-matrix expansion belongs to G12:
+- Reader mutation-matrix expansion is release-gated by G13:
   encrypted size equals data blocks times block size with checked arithmetic,
   class maxima are enforced before FEC repair, and zero-data metadata objects
   reject before decrypt/decompress.
@@ -490,9 +490,10 @@ Tests:
   diagnostic.
 - Actual metadata object where data plus parity exceeds 65,535 rejects even when
   the individual configured maxima fit in u16.
-- Mutated ManifestFooter `index_root_encrypted_size` reader fixtures remain G12.
+- Mutated ManifestFooter `index_root_encrypted_size` reader fixtures are
+  release-gated by G13.
 - Metadata object trailing zstd/skippable/concatenated/decompressed-size
-  mutation expansion remains G12.
+  mutation expansion is release-gated by G13.
 
 Done criteria:
 
@@ -581,7 +582,7 @@ Residual risk:
   current CLI/API scope. Adding that later is a product feature, not an
   unfinished G07 conformance claim.
 - Broad malformed DirectoryHintTable buffer generation and huge hint stress
-  fixtures remain in G12.
+  fixtures are release-gated by G13.
 
 ## G08 - Tar Metadata Profile
 
@@ -640,7 +641,7 @@ Tests:
 
 Remaining work:
 
-- Broad mutation/fuzz expansion for tar metadata remains in G12.
+- Broad mutation/fuzz expansion for tar metadata is release-gated by G13.
 - Future filesystem restoration of ownership, xattrs, ACLs, sparse files,
   nanosecond timestamps, or directory FileEntry creation would be new feature
   work and must update this profile and its diagnostics.
@@ -714,8 +715,8 @@ Tests:
 
 Remaining work:
 
-- Broad malformed-buffer, identity-splice, and fixture-generator expansion
-  remains in G12.
+- Broad malformed-buffer, identity-splice, and fixture-generator expansion is
+  release-gated by G13.
 - A future duplicate-copy recovery mode would be a new feature and must prove
   byte-for-byte identity for the requested operation before accepting duplicate
   volume indexes.
@@ -779,8 +780,8 @@ Tests:
 
 Remaining work:
 
-- Broad generated corpus and fuzz coverage for sequential, streaming, and
-  directory-prefix edge cases remains G12.
+- Broad generated corpus coverage for sequential, streaming, and
+  directory-prefix edge cases is release-gated by G13.
 - Any future archive-stdin, live stdout streaming, append-only sink, multipart
   sink, multi-volume sidecar, or directory FileEntry creation feature must add a
   new product design, docs, diagnostics, and tests instead of relying on the
@@ -836,15 +837,20 @@ Spec anchors:
 - parser/resource cap requirements
 - sidecar and metadata object exactness
 
-Current gap:
+Status: complete.
+
+Original gap:
 
 Fuzz targets may exist or be planned, but there is no visible release gate that
 requires a fuzz smoke run or keeps fuzz seeds aligned with the v36 corpus.
 
-Implementation work:
+Closed implementation:
 
-1. Inventory existing fuzz targets.
-2. Add or update targets for:
+1. Inventoried the existing `fuzz/` crate and kept it outside the main
+   workspace so normal `cargo test --workspace` does not pull in
+   `libfuzzer-sys`.
+2. Added shared parser harness coverage in `fuzz/fuzz_targets/support.rs` and
+   libFuzzer targets for:
    - VolumeHeader/CryptoHeader/Extension TLVs
    - BlockRecord
    - ManifestFooter/VolumeTrailer
@@ -854,19 +860,26 @@ Implementation work:
    - DirectoryHintTable
    - metadata zstd exactness
    - padding depad
-3. Add deterministic corpus seeds generated from `v36_corpus.rs` helpers.
-4. Add a CI/manual release smoke command:
-   - short fuzz run for parser targets
-   - no network dependency
-   - bounded runtime
-5. Ensure fuzz failures produce minimized repro bytes that can become regression
-   tests.
+3. Added deterministic parser seeds under `fuzz/corpus/` plus
+   `fuzz/corpus/manifest.tsv`, which maps each fuzz target back to the v0.36
+   section 28.1 corpus cases it warms.
+4. Added `fuzz_smoke`, a normal Cargo binary that runs all deterministic seeds
+   through the parser harnesses with no `cargo-fuzz` install and no network
+   dependency.
+5. Added the fuzz smoke to Ubuntu CI and documented both the CI smoke command
+   and bounded local `cargo fuzz run --features libfuzzer ...` commands in
+   `fuzz/README.md`.
+6. Moved still-open broad corpus follow-ups to G13 so G12 closes only the
+   fuzz/mutation harness infrastructure and does not hide release-blocking
+   corpus evidence.
 
 Tests:
 
-- CI or documented release checklist runs a bounded fuzz smoke.
-- Mutation helper tests verify malformed fixtures reach the intended parser
-  branch, not just authentication failure.
+- `cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked`
+- `cargo check --manifest-path fuzz/Cargo.toml --bin parse_fixed_structures --features libfuzzer --locked`
+- `cargo check --manifest-path fuzz/Cargo.toml --bin parse_metadata --features libfuzzer --locked`
+- `cargo check --manifest-path fuzz/Cargo.toml --bin parse_compressed_and_padding --features libfuzzer --locked`
+- `milestone11_docs::milestone11_docs_pin_current_g12_fuzz_gate`
 
 Done criteria:
 
@@ -887,10 +900,17 @@ readiness need one gate that combines tests, docs, corpus, packaging, and
 interop. Otherwise it is too easy to tag a release while a spec gap is known but
 not documented.
 
+Current progress:
+
+- `docs/tzap-v36-release-gate.md` now exists and includes the fuzz smoke,
+  libFuzzer target compile check, workspace checks, evidence-doc checks,
+  release wording guidance, artifact gate, and distribution gate.
+- G13 remains open until artifact/interop evidence and final release workflow
+  checks are all pinned.
+
 Implementation work:
 
-1. Add `docs/tzap-v36-release-gate.md` or extend the implementation plan with a
-   release checklist:
+1. Keep `docs/tzap-v36-release-gate.md` current with the release checklist:
    - conformance matrix has no `unknown`
    - P0 gaps closed or explicitly unsupported with tests/docs
    - v36 corpus tracker has no untriaged cases

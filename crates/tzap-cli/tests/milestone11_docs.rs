@@ -464,7 +464,9 @@ fn milestone11_docs_pin_current_g04_non_seekable_boundary() {
     assert!(matrix.contains("true live sequential API would be future product work"));
     assert!(matrix.contains("| R20 |"));
     assert!(matrix.contains("| `partial` | Whole-buffer API returns decoded bytes"));
-    assert!(matrix.contains("Skipped-metadata, non-authoritative terminal, and multi-envelope CRC-boundary fixtures remain G12"));
+    assert!(matrix.contains(
+        "Skipped-metadata, non-authoritative terminal, and multi-envelope CRC-boundary fixtures are release-gated by G13"
+    ));
 
     let forbidden_claims = [
         "archive stdin",
@@ -774,6 +776,125 @@ fn milestone11_v36_corpus_tracker_references_existing_tests() {
             "corpus tracker references missing test function {reference:?}"
         );
     }
+}
+
+#[test]
+fn milestone11_docs_pin_current_g12_fuzz_gate() {
+    let ci = read_workspace_file(".github/workflows/ci.yml");
+    let fuzz_readme = read_workspace_file("fuzz/README.md");
+    let fuzz_cargo = read_workspace_file("fuzz/Cargo.toml");
+    let support = read_workspace_file("fuzz/fuzz_targets/support.rs");
+    let smoke = read_workspace_file("fuzz/fuzz_targets/fuzz_smoke.rs");
+    let seeds = read_workspace_file("fuzz/fuzz_targets/seeds.rs");
+    let manifest = read_workspace_file("fuzz/corpus/manifest.tsv");
+    let release_gate = read_workspace_file("docs/tzap-v36-release-gate.md");
+    let matrix = read_workspace_file("docs/tzap-v36-conformance-matrix.md");
+    let tracker = read_workspace_file("docs/tzap-v36-corpus-tracker.md");
+    let plan = read_workspace_file("docs/tzap-v36-gap-implementation-plan.md");
+
+    let smoke_command = "cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked";
+    let libfuzzer_check =
+        "cargo check --manifest-path fuzz/Cargo.toml --bins --features libfuzzer --locked";
+    assert!(ci.contains(smoke_command));
+    assert!(ci.contains(libfuzzer_check));
+    assert!(fuzz_readme.contains(smoke_command));
+    assert!(release_gate.contains(smoke_command));
+    assert!(release_gate.contains(libfuzzer_check));
+    assert!(fuzz_readme.contains("cargo fuzz run --features libfuzzer parse_fixed_structures"));
+    assert!(fuzz_readme.contains("parse_compressed_and_padding"));
+    assert!(fuzz_cargo.contains("name = \"parse_fixed_structures\""));
+    assert!(fuzz_cargo.contains("name = \"parse_metadata\""));
+    assert!(fuzz_cargo.contains("name = \"parse_compressed_and_padding\""));
+    assert!(fuzz_cargo.contains("name = \"fuzz_smoke\""));
+    assert!(fuzz_cargo.contains("required-features = [\"libfuzzer\"]"));
+    assert!(smoke.contains("assert_structured_seed_success"));
+
+    for parser in [
+        "VolumeHeader::parse",
+        "CryptoHeader::parse",
+        "CryptoHeaderFixed::parse",
+        "BlockRecord::parse",
+        "ManifestFooter::parse",
+        "VolumeTrailer::parse",
+        "BootstrapSidecarHeader::parse",
+        "IndexRoot::parse",
+        "IndexShard::parse",
+        "DirectoryHintTable::parse",
+        "validate_exact_zstd_frame",
+        "decompress_exact_zstd_frame",
+        "depad_suffix_padding",
+    ] {
+        assert!(
+            support.contains(parser),
+            "fuzz support missing parser coverage for {parser}"
+        );
+    }
+
+    for target in [
+        "parse_fixed_structures",
+        "parse_metadata",
+        "parse_compressed_and_padding",
+    ] {
+        assert!(manifest.contains(target));
+        assert!(smoke.contains(target));
+        let seed_dir = workspace_file(&format!("fuzz/corpus/{target}"));
+        let seed_count = fs::read_dir(seed_dir)
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().path().is_file())
+            .count();
+        assert!(seed_count > 0, "missing fuzz seeds for {target}");
+    }
+
+    let manifest_rows = manifest
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(manifest_rows.len(), 3);
+    for row in manifest_rows {
+        let columns = row.split('\t').collect::<Vec<_>>();
+        assert_eq!(columns.len(), 5, "malformed fuzz manifest row: {row}");
+        let target = columns[0];
+        let cases = columns[1];
+        let structured_seeds = columns[2];
+        let file_seeds = columns[3];
+        assert!(smoke.contains(target));
+        for case_id in cases.split(',') {
+            assert!(
+                tracker.contains(&format!("| {case_id} |")),
+                "fuzz manifest references unknown corpus case {case_id}"
+            );
+        }
+        for seed_name in structured_seeds.split(',') {
+            assert!(
+                seeds.contains(seed_name),
+                "structured fuzz seed {seed_name} is not built in seeds.rs"
+            );
+        }
+        for seed_file in file_seeds.split(',') {
+            assert!(
+                workspace_file(&format!("fuzz/corpus/{target}/{seed_file}")).is_file(),
+                "fuzz manifest references missing seed file {target}/{seed_file}"
+            );
+        }
+    }
+
+    for case_id in ["C011", "C026", "C033", "C089", "C102", "C108"] {
+        assert!(
+            manifest.contains(case_id),
+            "fuzz manifest should map {case_id} to a parser target"
+        );
+    }
+
+    assert!(matrix.contains("| G12 fuzz and mutation gates | `complete` |"));
+    assert!(matrix.contains("`fuzz_smoke` runs deterministic parser seeds in CI"));
+    assert!(release_gate.contains("## Required Pre-Tag Checks"));
+    assert!(release_gate.contains("## Release Wording"));
+    assert!(release_gate.contains("fully v0.36 conformant"));
+    assert!(tracker.contains("[G13]"));
+    assert!(!tracker.contains("[G12]"));
+    assert!(plan.contains("## G12 - Fuzzing and Mutation Harness"));
+    assert!(plan.contains("Status: complete."));
 }
 
 fn assert_matrix_row_count(matrix: &str, id: &str, expected: usize) {

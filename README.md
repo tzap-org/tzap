@@ -416,7 +416,7 @@ crates/tzap-core   Format parsing, validation, crypto, compression, FEC, reader,
                    writer, metadata, and safe extraction primitives.
 crates/tzap-cli    Command-line interface for create, extract, list, and verify.
 specs/             tzap archive format specification.
-fuzz/              cargo-fuzz targets for fixed structures and metadata parsing.
+fuzz/              Parser fuzz targets, deterministic seeds, and fuzz smoke.
 ```
 
 ## Development
@@ -433,11 +433,18 @@ Run the CLI locally:
 cargo run -p tzap -- --help
 ```
 
-Run fuzz targets with `cargo-fuzz` installed:
+Run the bounded parser fuzz smoke:
 
 ```sh
-cargo fuzz run parse_fixed_structures
-cargo fuzz run parse_metadata
+cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked
+```
+
+Run longer fuzz targets with `cargo-fuzz` installed:
+
+```sh
+cargo fuzz run --features libfuzzer parse_fixed_structures -- -max_total_time=60
+cargo fuzz run --features libfuzzer parse_metadata -- -max_total_time=60
+cargo fuzz run --features libfuzzer parse_compressed_and_padding -- -max_total_time=60
 ```
 
 ## Security model

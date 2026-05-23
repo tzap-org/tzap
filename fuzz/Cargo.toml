@@ -7,8 +7,12 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+[features]
+default = []
+libfuzzer = ["dep:libfuzzer-sys"]
+
 [dependencies]
-libfuzzer-sys = "0.4"
+libfuzzer-sys = { version = "0.4", optional = true }
 tzap-core = { path = "../crates/tzap-core" }
 
 [workspace]
@@ -20,10 +24,27 @@ path = "fuzz_targets/parse_fixed_structures.rs"
 test = false
 doc = false
 bench = false
+required-features = ["libfuzzer"]
 
 [[bin]]
 name = "parse_metadata"
 path = "fuzz_targets/parse_metadata.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "parse_compressed_and_padding"
+path = "fuzz_targets/parse_compressed_and_padding.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "fuzz_smoke"
+path = "fuzz_targets/fuzz_smoke.rs"
 test = false
 doc = false
 bench = false
