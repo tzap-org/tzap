@@ -447,6 +447,35 @@ fn hash_prefix_ordering_is_raw_digest_byte_order() {
 }
 
 #[test]
+fn hash_prefix_ordering_rejects_little_endian_integer_reinterpretation() {
+    let raw_low_but_le_high = [0x00, 0x00, 0, 0, 0, 0, 0, 0x02];
+    let raw_high_but_le_low = [0x01, 0x00, 0, 0, 0, 0, 0, 0x00];
+
+    let raw_byte_order = index_root_with_shard_hashes(vec![
+        (0, raw_low_but_le_high, raw_low_but_le_high),
+        (1, raw_high_but_le_low, raw_high_but_le_low),
+    ]);
+    IndexRoot::parse(&raw_byte_order.to_bytes(), false, MetadataLimits::default()).unwrap();
+
+    let little_endian_integer_order = index_root_with_shard_hashes(vec![
+        (0, raw_high_but_le_low, raw_high_but_le_low),
+        (1, raw_low_but_le_high, raw_low_but_le_high),
+    ]);
+    assert_eq!(
+        IndexRoot::parse(
+            &little_endian_integer_order.to_bytes(),
+            false,
+            MetadataLimits::default(),
+        )
+        .unwrap_err(),
+        FormatError::InvalidMetadata {
+            structure: "IndexRoot",
+            reason: "ShardEntry rows are not sorted",
+        }
+    );
+}
+
+#[test]
 fn argon2id_profile_vector_is_pinned() {
     let params = KdfParams::Argon2id {
         t_cost: 1,
@@ -847,6 +876,27 @@ fn metadata_zstd_exactness_mutation_corpus() {
             expected: plaintext.len() + 1,
             actual: plaintext.len(),
         }
+    );
+}
+
+#[test]
+fn payload_zstd_frame_validity_rejects_arbitrary_and_truncated_frames() {
+    assert_eq!(
+        decompress_exact_zstd_frame(b"not a zstd payload frame", 24).unwrap_err(),
+        FormatError::NotStandardZstdFrame
+    );
+
+    let plaintext = b"payload frame validity";
+    let compressed = compress_zstd_frame(plaintext, 1).unwrap();
+    assert_eq!(
+        decompress_exact_zstd_frame(&compressed[..compressed.len() - 1], plaintext.len())
+            .unwrap_err(),
+        FormatError::InvalidZstdFrame
+    );
+
+    assert_eq!(
+        decompress_exact_zstd_frame(&compressed[..4], plaintext.len()).unwrap_err(),
+        FormatError::InvalidZstdFrame
     );
 }
 

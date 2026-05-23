@@ -2347,6 +2347,40 @@ mod tests {
     }
 
     #[test]
+    fn production_writer_defaults_generate_distinct_v4_identities() {
+        let master_key = MasterKey::from_raw_key(&[9u8; 32]).unwrap();
+        let first = write_archive(&[], &master_key, WriterOptions::default()).unwrap();
+        let second = write_archive(&[], &master_key, WriterOptions::default()).unwrap();
+
+        assert_ne!(first.archive_uuid, [0u8; 16]);
+        assert_ne!(first.session_id, [0u8; 16]);
+        assert_ne!(second.archive_uuid, [0u8; 16]);
+        assert_ne!(second.session_id, [0u8; 16]);
+        assert_ne!(first.archive_uuid, first.session_id);
+        assert_ne!(first.archive_uuid, second.archive_uuid);
+        assert_ne!(first.session_id, second.session_id);
+
+        for raw in [
+            first.archive_uuid,
+            first.session_id,
+            second.archive_uuid,
+            second.session_id,
+        ] {
+            let id = Uuid::from_bytes(raw);
+            assert_eq!(id.get_version_num(), 4);
+        }
+
+        let deterministic = WriterOptions {
+            archive_uuid: Some([0x44; 16]),
+            session_id: Some([0x55; 16]),
+            ..WriterOptions::default()
+        };
+        let fixture = write_archive(&[], &master_key, deterministic).unwrap();
+        assert_eq!(fixture.archive_uuid, [0x44; 16]);
+        assert_eq!(fixture.session_id, [0x55; 16]);
+    }
+
+    #[test]
     fn writer_partitions_multiple_default_sized_index_shards() {
         let members = (0..=DEFAULT_FILES_PER_INDEX_SHARD)
             .map(|idx| TarMember {

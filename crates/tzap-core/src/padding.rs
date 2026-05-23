@@ -129,6 +129,16 @@ mod tests {
     }
 
     #[test]
+    fn payload_ending_with_ff_does_not_confuse_suffix_marker() {
+        let payload = [b'f', b'r', b'a', b'm', b'e', 0xff];
+        let padded = suffix_pad_for_aead(&payload, 16, 32).unwrap();
+
+        assert_ne!(padded[payload.len() - 1], padded[padded.len() - 1]);
+        assert_eq!(padded[payload.len() - 1], 0xff);
+        assert_eq!(depad_suffix_padding(&padded).unwrap(), payload);
+    }
+
+    #[test]
     fn rejects_zero_padding_and_non_zero_padding_bytes() {
         assert_eq!(
             depad_suffix_padding(&[1, 2, 0]).unwrap_err(),

@@ -3080,6 +3080,55 @@ mod tests {
     }
 
     #[test]
+    fn seekable_open_rejects_too_small_and_unavailable_header_crypto_bytes() {
+        assert_eq!(
+            open_archive(
+                &[0u8; VOLUME_HEADER_LEN + VOLUME_TRAILER_LEN - 1],
+                &master_key()
+            )
+            .unwrap_err(),
+            FormatError::InvalidLength {
+                structure: "archive",
+                expected: VOLUME_HEADER_LEN + VOLUME_TRAILER_LEN,
+                actual: VOLUME_HEADER_LEN + VOLUME_TRAILER_LEN - 1,
+            }
+        );
+
+        let mut header = test_volume_header();
+        header.crypto_header_length = 512;
+        let mut unavailable_crypto = header.to_bytes().to_vec();
+        unavailable_crypto.resize(VOLUME_HEADER_LEN + VOLUME_TRAILER_LEN, 0);
+
+        assert_eq!(
+            open_archive(&unavailable_crypto, &master_key()).unwrap_err(),
+            FormatError::InvalidLength {
+                structure: "CryptoHeader",
+                expected: VOLUME_HEADER_LEN + 512,
+                actual: VOLUME_HEADER_LEN + VOLUME_TRAILER_LEN,
+            }
+        );
+    }
+
+    #[test]
+    fn seekable_open_rejects_in_bounds_noncanonical_crypto_header_offset() {
+        let archive = write_archive(
+            &[RegularFile::new("offset.txt", b"offset")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut mutated = archive.bytes;
+        let mut header = VolumeHeader::parse(&mutated[..VOLUME_HEADER_LEN]).unwrap();
+        header.crypto_header_offset = VOLUME_HEADER_LEN as u32 + 1;
+        mutated[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
+
+        assert_eq!(
+            open_archive(&mutated, &master_key()).unwrap_err(),
+            FormatError::NonCanonicalCryptoHeaderOffset(VOLUME_HEADER_LEN as u32 + 1)
+        );
+    }
+
+    #[test]
     fn rejects_wrong_key_before_metadata_release() {
         let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
         let wrong = MasterKey::from_raw_key(&[0x43; 32]).unwrap();
@@ -3941,6 +3990,41 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_size_cap_uses_wide_arithmetic_for_large_record_classes() {
+        let mut crypto_header = test_crypto_header();
+        crypto_header.block_size = u32::MAX;
+        crypto_header.index_root_fec_data_shards = u16::MAX;
+        crypto_header.index_root_fec_parity_shards = u16::MAX;
+        let record_len = crypto_header.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
+        let max_records = crypto_header.index_root_fec_data_shards as u64
+            + crypto_header.index_root_fec_parity_shards as u64;
+        let max_section_len = max_records * record_len;
+        let cap = BOOTSTRAP_SIDECAR_HEADER_LEN as u64
+            + MANIFEST_FOOTER_LEN as u64
+            + max_section_len
+            + max_section_len;
+        let header = BootstrapSidecarHeader {
+            archive_uuid: [0x31; 16],
+            session_id: [0x42; 16],
+            flags: 0x01 | 0x02 | 0x04,
+            manifest_footer_offset: BOOTSTRAP_SIDECAR_HEADER_LEN as u64,
+            manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
+            index_root_records_offset: 0,
+            index_root_records_length: max_section_len,
+            dictionary_records_offset: 0,
+            dictionary_records_length: max_section_len,
+            sidecar_hmac: [0u8; 32],
+            header_crc32c: 0,
+        };
+
+        validate_sidecar_size_cap(&header, &crypto_header, cap).unwrap();
+        assert_eq!(
+            validate_sidecar_size_cap(&header, &crypto_header, cap + 1).unwrap_err(),
+            FormatError::InvalidArchive("bootstrap sidecar exceeds resource cap")
+        );
+    }
+
+    #[test]
     fn bootstrap_sidecar_rejects_dictionary_section_for_no_dictionary_archive() {
         let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
         let mut with_dictionary = archive.bootstrap_sidecar.clone();
@@ -4073,6 +4157,369 @@ mod tests {
             validate_file_extent_coverage_ranges(&[(0, 1024), (512, 512)], 1024).unwrap_err(),
             FormatError::InvalidArchive("FileEntry extents do not cover tar stream exactly")
         );
+    }
+
+    #[test]
+    fn verify_rejects_authenticated_content_hash_mismatch() {
+        let options = WriterOptions {
+            index_root_fec_parity_shards: 0,
+            ..single_stream_options()
+        };
+        let archive = write_archive(
+            &[RegularFile::new("content-hash.txt", b"hash covered")],
+            &master_key(),
+            options,
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+
+        let mut root = opened.index_root.clone();
+        root.header.content_sha256 = [0xa5; 32];
+        let root_plaintext = root.to_bytes();
+        IndexRoot::parse(
+            &root_plaintext,
+            false,
+            metadata_limits(&opened.crypto_header),
+        )
+        .unwrap();
+        assert_eq!(
+            root_plaintext.len() as u32,
+            opened.manifest_footer.index_root_decompressed_size
+        );
+
+        let compressed_root = compress_zstd_frame(&root_plaintext, options.zstd_level).unwrap();
+        let mut next_block_index = opened.manifest_footer.index_root_first_block;
+        let replacement = encrypt_test_object(
+            &compressed_root,
+            &opened.subkeys.index_root_key,
+            &opened.subkeys.index_nonce_seed,
+            b"idxroot",
+            0,
+            BlockKind::IndexRootData,
+            &mut next_block_index,
+            &opened.crypto_header,
+            &opened.volume_header,
+        );
+        assert_eq!(
+            replacement.extent.data_block_count,
+            opened.manifest_footer.index_root_data_block_count
+        );
+        assert_eq!(
+            replacement.extent.encrypted_size,
+            opened.manifest_footer.index_root_encrypted_size
+        );
+
+        let volume_header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_end = volume_header.crypto_header_offset as usize
+            + volume_header.crypto_header_length as usize;
+        let record_len = opened.crypto_header.block_size as usize + BLOCK_RECORD_FRAMING_LEN;
+        let mut malformed = archive.bytes.clone();
+        for record in replacement.records {
+            let offset = crypto_end + record.block_index as usize * record_len;
+            malformed[offset..offset + record_len].copy_from_slice(&record.to_bytes());
+        }
+
+        let reopened = open_archive(&malformed, &master_key()).unwrap();
+        assert_eq!(
+            reopened.verify().unwrap_err(),
+            FormatError::InvalidArchive(
+                "IndexRoot content_sha256 does not match decoded tar stream"
+            )
+        );
+    }
+
+    #[test]
+    fn verify_rejects_inconsistent_duplicate_local_frame_rows_across_shards() {
+        let (mut opened, _) = multi_envelope_reader_fixture();
+        let locating = opened.index_root.shards[0].clone();
+        let mut duplicate = opened.load_index_shard(&locating).unwrap();
+        duplicate.header.shard_index = 1;
+        duplicate.frames[0].flags ^= 0x0000_0001;
+        let duplicate_plaintext = duplicate.to_bytes();
+        let mut next_block_index = opened
+            .blocks
+            .keys()
+            .last()
+            .copied()
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let duplicate_object = encrypt_test_object(
+            &compress_zstd_frame(&duplicate_plaintext, 1).unwrap(),
+            &opened.subkeys.index_shard_key,
+            &opened.subkeys.index_nonce_seed,
+            b"idxshard",
+            1,
+            BlockKind::IndexShardData,
+            &mut next_block_index,
+            &opened.crypto_header,
+            &opened.volume_header,
+        );
+        insert_records(&mut opened.blocks, &duplicate_object.records);
+        opened.index_root.shards.push(ShardEntry {
+            shard_index: 1,
+            first_block_index: duplicate_object.extent.first_block_index,
+            data_block_count: duplicate_object.extent.data_block_count,
+            parity_block_count: 0,
+            encrypted_size: duplicate_object.extent.encrypted_size,
+            decompressed_size: duplicate_plaintext.len() as u32,
+            file_count: locating.file_count,
+            first_path_hash: locating.first_path_hash,
+            last_path_hash: locating.last_path_hash,
+        });
+        opened.index_root.header.file_count += locating.file_count as u64;
+
+        assert_eq!(
+            opened.verify().unwrap_err(),
+            FormatError::InvalidArchive("duplicate FrameEntry rows do not match")
+        );
+    }
+
+    #[test]
+    fn verify_rejects_inconsistent_duplicate_local_envelope_rows_across_shards() {
+        let (mut opened, _) = multi_envelope_reader_fixture();
+        let locating = opened.index_root.shards[0].clone();
+        let mut duplicate = opened.load_index_shard(&locating).unwrap();
+        duplicate.header.shard_index = 1;
+        duplicate.envelopes[0].first_block_index += 1;
+        let duplicate_plaintext = duplicate.to_bytes();
+        let mut next_block_index = opened
+            .blocks
+            .keys()
+            .last()
+            .copied()
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let duplicate_object = encrypt_test_object(
+            &compress_zstd_frame(&duplicate_plaintext, 1).unwrap(),
+            &opened.subkeys.index_shard_key,
+            &opened.subkeys.index_nonce_seed,
+            b"idxshard",
+            1,
+            BlockKind::IndexShardData,
+            &mut next_block_index,
+            &opened.crypto_header,
+            &opened.volume_header,
+        );
+        insert_records(&mut opened.blocks, &duplicate_object.records);
+        opened.index_root.shards.push(ShardEntry {
+            shard_index: 1,
+            first_block_index: duplicate_object.extent.first_block_index,
+            data_block_count: duplicate_object.extent.data_block_count,
+            parity_block_count: 0,
+            encrypted_size: duplicate_object.extent.encrypted_size,
+            decompressed_size: duplicate_plaintext.len() as u32,
+            file_count: locating.file_count,
+            first_path_hash: locating.first_path_hash,
+            last_path_hash: locating.last_path_hash,
+        });
+        opened.index_root.header.file_count += locating.file_count as u64;
+
+        assert_eq!(
+            opened.verify().unwrap_err(),
+            FormatError::InvalidArchive("duplicate EnvelopeEntry rows do not match")
+        );
+    }
+
+    #[test]
+    fn verify_accepts_cross_shard_shared_envelope_frame_union() {
+        let volume_header = test_volume_header();
+        let crypto_header = test_crypto_header();
+        let subkeys = Subkeys::derive(
+            &master_key(),
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+        )
+        .unwrap();
+        let mut next_block_index = 0u64;
+        let mut blocks = BTreeMap::new();
+
+        let alpha = test_member(b"alpha.txt", b"alpha cross shard\n");
+        let zulu = test_member(b"zulu.txt", b"zulu cross shard\n");
+        let tar_stream = [alpha.as_slice(), zulu.as_slice()].concat();
+        let frame0_plaintext = compress_zstd_frame(&alpha, 1).unwrap();
+        let frame1_plaintext = compress_zstd_frame(&zulu, 1).unwrap();
+        let envelope_plaintext =
+            [frame0_plaintext.as_slice(), frame1_plaintext.as_slice()].concat();
+        let payload = encrypt_test_object(
+            &envelope_plaintext,
+            &subkeys.enc_key,
+            &subkeys.nonce_seed,
+            b"envelope",
+            0,
+            BlockKind::PayloadData,
+            &mut next_block_index,
+            &crypto_header,
+            &volume_header,
+        );
+        insert_records(&mut blocks, &payload.records);
+
+        let envelope = EnvelopeEntry {
+            envelope_index: 0,
+            first_block_index: payload.extent.first_block_index,
+            data_block_count: payload.extent.data_block_count,
+            parity_block_count: 0,
+            encrypted_size: payload.extent.encrypted_size,
+            plaintext_size: envelope_plaintext.len() as u32,
+            first_frame_index: 0,
+            frame_count: 2,
+        };
+        let frame0 = FrameEntry {
+            frame_index: 0,
+            envelope_index: 0,
+            offset_in_envelope: 0,
+            compressed_size: frame0_plaintext.len() as u32,
+            decompressed_size: alpha.len() as u32,
+            flags: 0x0000_0003,
+            tar_stream_offset: 0,
+        };
+        let frame1 = FrameEntry {
+            frame_index: 1,
+            envelope_index: 0,
+            offset_in_envelope: frame0_plaintext.len() as u32,
+            compressed_size: frame1_plaintext.len() as u32,
+            decompressed_size: zulu.len() as u32,
+            flags: 0x0000_0003,
+            tar_stream_offset: alpha.len() as u64,
+        };
+
+        let (shard0_plaintext, first0, last0) = build_test_index_shard(
+            &[TestFileMeta {
+                path: b"alpha.txt".to_vec(),
+                frame_index: 0,
+                tar_stream_offset: 0,
+                member_group_size: alpha.len() as u64,
+                file_data_size: b"alpha cross shard\n".len() as u64,
+            }],
+            &[frame0],
+            std::slice::from_ref(&envelope),
+        );
+        let (mut shard1_plaintext, first1, last1) = build_test_index_shard(
+            &[TestFileMeta {
+                path: b"zulu.txt".to_vec(),
+                frame_index: 1,
+                tar_stream_offset: alpha.len() as u64,
+                member_group_size: zulu.len() as u64,
+                file_data_size: b"zulu cross shard\n".len() as u64,
+            }],
+            &[frame1],
+            std::slice::from_ref(&envelope),
+        );
+        shard1_plaintext[8..16].copy_from_slice(&1u64.to_le_bytes());
+
+        let shard0 = encrypt_test_object(
+            &compress_zstd_frame(&shard0_plaintext, 1).unwrap(),
+            &subkeys.index_shard_key,
+            &subkeys.index_nonce_seed,
+            b"idxshard",
+            0,
+            BlockKind::IndexShardData,
+            &mut next_block_index,
+            &crypto_header,
+            &volume_header,
+        );
+        let shard1 = encrypt_test_object(
+            &compress_zstd_frame(&shard1_plaintext, 1).unwrap(),
+            &subkeys.index_shard_key,
+            &subkeys.index_nonce_seed,
+            b"idxshard",
+            1,
+            BlockKind::IndexShardData,
+            &mut next_block_index,
+            &crypto_header,
+            &volume_header,
+        );
+        insert_records(&mut blocks, &shard0.records);
+        insert_records(&mut blocks, &shard1.records);
+
+        let index_root = IndexRoot {
+            header: IndexRootHeader {
+                frame_count: 2,
+                envelope_count: 1,
+                file_count: 2,
+                payload_block_count: payload.extent.data_block_count as u64,
+                tar_total_size: tar_stream.len() as u64,
+                content_sha256: sha256_bytes(&tar_stream),
+                ..IndexRootHeader::empty()
+            },
+            shards: vec![
+                ShardEntry {
+                    shard_index: 0,
+                    first_block_index: shard0.extent.first_block_index,
+                    data_block_count: shard0.extent.data_block_count,
+                    parity_block_count: 0,
+                    encrypted_size: shard0.extent.encrypted_size,
+                    decompressed_size: shard0_plaintext.len() as u32,
+                    file_count: 1,
+                    first_path_hash: first0,
+                    last_path_hash: last0,
+                },
+                ShardEntry {
+                    shard_index: 1,
+                    first_block_index: shard1.extent.first_block_index,
+                    data_block_count: shard1.extent.data_block_count,
+                    parity_block_count: 0,
+                    encrypted_size: shard1.extent.encrypted_size,
+                    decompressed_size: shard1_plaintext.len() as u32,
+                    file_count: 1,
+                    first_path_hash: first1,
+                    last_path_hash: last1,
+                },
+            ],
+            directory_hint_shards: Vec::new(),
+        };
+
+        let index_root_plaintext = index_root.to_bytes();
+        let index_root_object = encrypt_test_object(
+            &compress_zstd_frame(&index_root_plaintext, 1).unwrap(),
+            &subkeys.index_root_key,
+            &subkeys.index_nonce_seed,
+            b"idxroot",
+            0,
+            BlockKind::IndexRootData,
+            &mut next_block_index,
+            &crypto_header,
+            &volume_header,
+        );
+        insert_records(&mut blocks, &index_root_object.records);
+
+        let archive_uuid = volume_header.archive_uuid;
+        let session_id = volume_header.session_id;
+        let opened = OpenedArchive {
+            options: ReaderOptions::default(),
+            observed_archive_bytes: 1_000_000,
+            subkeys,
+            blocks,
+            volume_header,
+            crypto_header,
+            manifest_footer: ManifestFooter {
+                archive_uuid,
+                session_id,
+                volume_index: 0,
+                is_authoritative: 1,
+                total_volumes: 1,
+                index_root_first_block: index_root_object.extent.first_block_index,
+                index_root_data_block_count: index_root_object.extent.data_block_count,
+                index_root_parity_block_count: 0,
+                index_root_encrypted_size: index_root_object.extent.encrypted_size,
+                index_root_decompressed_size: index_root_plaintext.len() as u32,
+                manifest_hmac: [0u8; 32],
+            },
+            volume_trailer: Some(VolumeTrailer {
+                archive_uuid,
+                session_id,
+                volume_index: 0,
+                block_count: next_block_index,
+                bytes_written: 0,
+                manifest_footer_offset: 0,
+                manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
+                closed_at_ns: 0,
+                trailer_hmac: [0u8; 32],
+            }),
+            index_root,
+            payload_dictionary: None,
+        };
+
+        opened.verify().unwrap();
     }
 
     #[test]
@@ -4638,6 +5085,78 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_footer_trailer_and_sidecar_hmac_boundaries_are_enforced() {
+        let archive = write_archive(
+            &[RegularFile::new("hmac-boundary.txt", b"boundary bytes")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut strict_options = ReaderOptions::default();
+        strict_options.max_trailing_garbage_scan = 0;
+
+        let manifest_offset = terminal_material_offset(&archive.bytes);
+        for offset in [
+            manifest_offset + 71,
+            manifest_offset + MANIFEST_HMAC_COVERED_LEN,
+        ] {
+            let mut corrupted = archive.bytes.clone();
+            corrupted[offset] ^= 0x01;
+            assert_eq!(
+                open_archive(&corrupted, &master_key()).unwrap_err(),
+                FormatError::HmacMismatch {
+                    structure: "ManifestFooter"
+                },
+                "manifest offset {offset}"
+            );
+        }
+
+        let trailer_offset = manifest_offset + MANIFEST_FOOTER_LEN;
+        for offset in [
+            trailer_offset + 75,
+            trailer_offset + TRAILER_HMAC_COVERED_LEN,
+        ] {
+            let mut corrupted = archive.bytes.clone();
+            corrupted[offset] ^= 0x01;
+            assert_eq!(
+                OpenedArchive::open_with_options(&corrupted, &master_key(), strict_options)
+                    .unwrap_err(),
+                FormatError::HmacMismatch {
+                    structure: "VolumeTrailer"
+                },
+                "trailer offset {offset}"
+            );
+        }
+
+        let mut covered_sidecar = archive.bootstrap_sidecar.clone();
+        let mut header =
+            BootstrapSidecarHeader::parse(&covered_sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN])
+                .unwrap();
+        header.manifest_footer_offset += 1;
+        covered_sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN].copy_from_slice(&header.to_bytes());
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &covered_sidecar, &master_key())
+                .unwrap_err(),
+            FormatError::HmacMismatch {
+                structure: "BootstrapSidecarHeader"
+            }
+        );
+
+        let mut tag_sidecar = archive.bootstrap_sidecar.clone();
+        let mut header =
+            BootstrapSidecarHeader::parse(&tag_sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
+        header.sidecar_hmac[0] ^= 1;
+        tag_sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN].copy_from_slice(&header.to_bytes());
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &tag_sidecar, &master_key())
+                .unwrap_err(),
+            FormatError::HmacMismatch {
+                structure: "BootstrapSidecarHeader"
+            }
+        );
+    }
+
+    #[test]
     fn rejects_authenticated_footer_and_trailer_volume_index_mismatches() {
         let archive = write_archive(
             &[RegularFile::new("volume-index.txt", b"identity")],
@@ -4662,6 +5181,100 @@ mod tests {
         assert_eq!(
             open_archive(&bad_manifest, &master_key()).unwrap_err(),
             FormatError::InvalidArchive("ManifestFooter identity does not match VolumeHeader")
+        );
+    }
+
+    #[test]
+    fn rejects_same_key_header_terminal_material_splice() {
+        let first = write_archive(
+            &[RegularFile::new("splice.txt", b"same shape")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let second = write_archive(
+            &[RegularFile::new("splice.txt", b"same shape")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        assert_ne!(first.archive_uuid, second.archive_uuid);
+        assert_eq!(
+            terminal_material_offset(&first.bytes),
+            terminal_material_offset(&second.bytes)
+        );
+        assert_eq!(first.bytes.len(), second.bytes.len());
+
+        let terminal_offset = terminal_material_offset(&first.bytes);
+        let mut spliced = first.bytes.clone();
+        spliced[terminal_offset..].copy_from_slice(&second.bytes[terminal_offset..]);
+
+        assert_eq!(
+            open_archive(&spliced, &master_key()).unwrap_err(),
+            FormatError::InvalidArchive("no authenticated VolumeTrailer found")
+        );
+    }
+
+    #[test]
+    fn rejects_authenticated_trailer_pointer_and_count_mutations() {
+        let archive = write_archive(
+            &[RegularFile::new(
+                "trailer-range.txt",
+                b"authenticated ranges",
+            )],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+
+        let mut wrong_bytes_written = archive.bytes.clone();
+        rewrite_volume_trailer(&mut wrong_bytes_written, &master_key(), |trailer| {
+            trailer.bytes_written += 1;
+        });
+        assert_eq!(
+            open_archive(&wrong_bytes_written, &master_key()).unwrap_err(),
+            FormatError::InvalidArchive(
+                "VolumeTrailer bytes_written does not match selected trailer offset"
+            )
+        );
+
+        let mut wrong_block_count = archive.bytes.clone();
+        rewrite_volume_trailer(&mut wrong_block_count, &master_key(), |trailer| {
+            trailer.block_count += 1;
+        });
+        assert_eq!(
+            open_archive(&wrong_block_count, &master_key()).unwrap_err(),
+            FormatError::InvalidArchive(
+                "VolumeTrailer block_count does not match BlockRecord region"
+            )
+        );
+
+        let mut wrong_footer_offset = archive.bytes;
+        rewrite_volume_trailer(&mut wrong_footer_offset, &master_key(), |trailer| {
+            trailer.manifest_footer_offset -= 1;
+        });
+        assert_eq!(
+            open_archive(&wrong_footer_offset, &master_key()).unwrap_err(),
+            FormatError::InvalidArchive("ManifestFooter does not end at selected trailer")
+        );
+    }
+
+    #[test]
+    fn rejects_authenticated_index_root_extent_size_mismatch_at_open() {
+        let archive = write_archive(
+            &[RegularFile::new("index-root-size.txt", b"extent size")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut malformed = archive.bytes;
+        rewrite_manifest_footer(&mut malformed, &master_key(), |footer| {
+            footer.index_root_encrypted_size += 4096;
+        });
+
+        assert_eq!(
+            open_archive(&malformed, &master_key()).unwrap_err(),
+            FormatError::IndexRootSizeMismatch
         );
     }
 

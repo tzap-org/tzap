@@ -637,6 +637,45 @@ mod tests {
     }
 
     #[test]
+    fn rejects_argon2id_salt_bounds_and_raw_kdf_truncation() {
+        fn argon_bytes(salt_len: u16, actual_salt: &[u8]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(KdfAlgo::Argon2id as u16).to_le_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&8u32.to_le_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&salt_len.to_le_bytes());
+            bytes.extend_from_slice(actual_salt);
+            bytes
+        }
+
+        assert_eq!(
+            KdfParams::parse(KdfAlgo::Raw, &[]).unwrap_err(),
+            FormatError::TruncatedKdfParams
+        );
+        assert_eq!(
+            KdfParams::parse(KdfAlgo::Argon2id, &argon_bytes(7, b"1234567")).unwrap_err(),
+            FormatError::InvalidKdfParams("argon2id salt length must be 8..64 bytes")
+        );
+        assert!(matches!(
+            KdfParams::parse(KdfAlgo::Argon2id, &argon_bytes(8, b"12345678")).unwrap(),
+            (KdfParams::Argon2id { .. }, 24)
+        ));
+        assert!(matches!(
+            KdfParams::parse(KdfAlgo::Argon2id, &argon_bytes(64, &[0x5a; 64])).unwrap(),
+            (KdfParams::Argon2id { .. }, 80)
+        ));
+        assert_eq!(
+            KdfParams::parse(KdfAlgo::Argon2id, &argon_bytes(65, &[0x5a; 65])).unwrap_err(),
+            FormatError::InvalidKdfParams("argon2id salt length must be 8..64 bytes")
+        );
+        assert_eq!(
+            KdfParams::parse(KdfAlgo::Argon2id, &argon_bytes(64, &[0x5a; 63])).unwrap_err(),
+            FormatError::TruncatedKdfParams
+        );
+    }
+
+    #[test]
     fn rejects_kdf_algo_tag_mismatch() {
         assert_eq!(
             KdfParams::parse(KdfAlgo::Raw, &(KdfAlgo::Argon2id as u16).to_le_bytes()).unwrap_err(),
@@ -650,6 +689,67 @@ mod tests {
     #[test]
     fn passphrase_normalization_preserves_archive_semantics() {
         assert_eq!(normalize_passphrase_nfc("e\u{301}\n\0"), "é\n\0".as_bytes());
+    }
+
+    #[test]
+    fn argon2id_passphrase_edge_vectors_are_literal() {
+        let params = KdfParams::Argon2id {
+            t_cost: 1,
+            m_cost_kib: 8,
+            parallelism: 1,
+            salt: b"12345678".to_vec(),
+        };
+        let cases = [
+            (
+                "trailing newline",
+                "pass\n",
+                "f63027356e6da90a4f6c81af70b9e6f1b1967ab684ecda8257cb7d21de760623",
+            ),
+            (
+                "embedded nul",
+                "pass\0word",
+                "23db596ddbaa8f3f36d653f456dd9819e342aad4e30224008a22f1fb7648780e",
+            ),
+            (
+                "leading bom",
+                "\u{feff}pass",
+                "d493645da269dce9b0ab6d39367d94c1896b0f4a2c3ca486c775d7275b8558da",
+            ),
+        ];
+
+        for (name, passphrase, expected_hex) in cases {
+            let master = MasterKey::derive_from_passphrase(&params, passphrase).unwrap();
+            assert_eq!(hex::encode(master.0), expected_hex, "{name}");
+        }
+
+        let without_newline = MasterKey::derive_from_passphrase(&params, "pass").unwrap();
+        let with_newline = MasterKey::derive_from_passphrase(&params, "pass\n").unwrap();
+        assert_ne!(without_newline, with_newline);
+    }
+
+    #[test]
+    fn argon2id_profile_rejects_alternate_version_vector() {
+        let params = KdfParams::Argon2id {
+            t_cost: 1,
+            m_cost_kib: 8,
+            parallelism: 1,
+            salt: b"12345678".to_vec(),
+        };
+        let v36 = MasterKey::derive_from_passphrase(&params, "e\u{301}").unwrap();
+
+        let argon_params = Params::new(8, 1, 1, Some(MASTER_KEY_LEN)).unwrap();
+        let old_argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x10, argon_params);
+        let mut old_output = [0u8; MASTER_KEY_LEN];
+        let passphrase = normalize_passphrase_nfc("e\u{301}");
+        old_argon2
+            .hash_password_into(&passphrase, b"12345678", &mut old_output)
+            .unwrap();
+
+        assert_eq!(
+            hex::encode(v36.0),
+            "24709642204c04bf88fb36550c478769eb10a0400c0493c9695d30fbf7082241"
+        );
+        assert_ne!(old_output, v36.0);
     }
 
     #[test]
@@ -675,6 +775,42 @@ mod tests {
 
         let repeat = Subkeys::derive(&master, &uuid(), &session()).unwrap();
         assert_eq!(subkeys, repeat);
+    }
+
+    #[test]
+    fn hkdf_passphrase_and_identity_vectors_are_literal() {
+        let params = KdfParams::Argon2id {
+            t_cost: 1,
+            m_cost_kib: 8,
+            parallelism: 1,
+            salt: b"saltsalt".to_vec(),
+        };
+        let archive_uuid = core::array::from_fn::<_, 16, _>(|idx| 0x30 + idx as u8);
+        let session_id = core::array::from_fn::<_, 16, _>(|idx| 0xc0 + idx as u8);
+        let master = MasterKey::derive_from_passphrase(&params, "correct horse\n").unwrap();
+        let subkeys = Subkeys::derive(&master, &archive_uuid, &session_id).unwrap();
+
+        assert_eq!(
+            hex::encode(master.0),
+            "c58d65c836c8a590c0d34fcc0907d876e969d72c51a267cad2518cfee8eb2a21"
+        );
+        assert_eq!(
+            hex::encode(subkeys.enc_key),
+            "786001f513f99062c7c7ef72c978847a7c2daa452f363177839ce2ed3ecfd5df"
+        );
+        assert_eq!(
+            hex::encode(subkeys.mac_key),
+            "024f2737f6db8aa03d3ce241d25c26fcc18bbcf4af242614c3d703224cd82b74"
+        );
+        assert_eq!(
+            hex::encode(subkeys.index_nonce_seed),
+            "5d51a19bf7f6d77ce7945517ce95837a089f8d1cd20aea43cbcb8d745c0668ee"
+        );
+
+        let different_session = Subkeys::derive(&master, &archive_uuid, &[0xc1; 16]).unwrap();
+        let different_archive = Subkeys::derive(&master, &[0x31; 16], &session_id).unwrap();
+        assert_ne!(subkeys.enc_key, different_session.enc_key);
+        assert_ne!(subkeys.enc_key, different_archive.enc_key);
     }
 
     #[test]
@@ -706,6 +842,70 @@ mod tests {
                 structure: "ManifestFooter"
             }
         );
+    }
+
+    #[test]
+    fn hmac_sidecar_domain_vector_and_boundary_bytes_are_literal() {
+        let key = [0x44; SUBKEY_LEN];
+        let covered = b"covered bytes";
+        let tag = compute_hmac(
+            HmacDomain::BootstrapSidecar,
+            &key,
+            &uuid(),
+            &session(),
+            covered,
+        );
+        assert_eq!(
+            hex::encode(tag),
+            "1ecc9e0c5c9079b6824e16c4468ac9df22ca50fa2a924d21a91aab33c3721d51"
+        );
+        verify_hmac(
+            HmacDomain::BootstrapSidecar,
+            &key,
+            &uuid(),
+            &session(),
+            covered,
+            &tag,
+        )
+        .unwrap();
+
+        for mutate_index in [0, covered.len() - 1] {
+            let mut mutated = covered.to_vec();
+            mutated[mutate_index] ^= 0x01;
+            assert_eq!(
+                verify_hmac(
+                    HmacDomain::BootstrapSidecar,
+                    &key,
+                    &uuid(),
+                    &session(),
+                    &mutated,
+                    &tag,
+                )
+                .unwrap_err(),
+                FormatError::HmacMismatch {
+                    structure: "BootstrapSidecarHeader"
+                }
+            );
+        }
+
+        for mutate_index in [0, tag.len() - 1] {
+            let mut mutated_tag = tag;
+            mutated_tag[mutate_index] ^= 0x01;
+            assert_eq!(
+                verify_hmac(
+                    HmacDomain::BootstrapSidecar,
+                    &key,
+                    &uuid(),
+                    &session(),
+                    covered,
+                    &mutated_tag,
+                )
+                .unwrap_err(),
+                FormatError::HmacMismatch {
+                    structure: "BootstrapSidecarHeader"
+                }
+            );
+        }
     }
 
     #[test]

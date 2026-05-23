@@ -2165,6 +2165,47 @@ mod tests {
     }
 
     #[test]
+    fn index_root_rejects_nonzero_offsets_for_absent_counted_tables() {
+        let mut root = IndexRoot {
+            header: IndexRootHeader::empty(),
+            shards: Vec::new(),
+            directory_hint_shards: Vec::new(),
+        };
+
+        let mut bytes = root.to_bytes();
+        write_u64(&mut bytes, 88, INDEX_ROOT_LEN as u64);
+        assert_eq!(
+            IndexRoot::parse(&bytes, false, MetadataLimits::default()).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexRoot",
+                reason: "absent shard table has non-zero offset",
+            }
+        );
+
+        root.header.file_count = 1;
+        root.shards.push(ShardEntry {
+            shard_index: 0,
+            first_block_index: 1,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+            decompressed_size: 128,
+            file_count: 1,
+            first_path_hash: hash_prefix(b"a.txt"),
+            last_path_hash: hash_prefix(b"a.txt"),
+        });
+        let mut bytes = root.to_bytes();
+        write_u64(&mut bytes, 96, (INDEX_ROOT_LEN + SHARD_ENTRY_LEN) as u64);
+        assert_eq!(
+            IndexRoot::parse(&bytes, false, MetadataLimits::default()).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexRoot",
+                reason: "absent directory hint shard table has non-zero offset",
+            }
+        );
+    }
+
+    #[test]
     fn index_root_rejects_has_dictionary_with_zero_dictionary_fields() {
         let root = IndexRoot {
             header: IndexRootHeader::empty(),
@@ -2200,6 +2241,112 @@ mod tests {
             FormatError::InvalidMetadata {
                 structure: "IndexRoot",
                 reason: "empty archive cannot use dictionary",
+            }
+        );
+    }
+
+    #[test]
+    fn encrypted_object_extents_reject_zero_data_or_size_for_all_metadata_rows() {
+        assert_eq!(
+            validate_encrypted_extent("ManifestFooter.IndexRoot", 0, 4096, 4096).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "ManifestFooter.IndexRoot",
+                reason: "encrypted object has zero data blocks or size",
+            }
+        );
+        assert_eq!(
+            validate_encrypted_extent("EnvelopeEntry", 1, 0, 4096).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "EnvelopeEntry",
+                reason: "encrypted object has zero data blocks or size",
+            }
+        );
+
+        let path_hash = hash_prefix(b"a.txt");
+        let mut root = IndexRoot {
+            header: IndexRootHeader {
+                file_count: 1,
+                ..IndexRootHeader::empty()
+            },
+            shards: vec![ShardEntry {
+                shard_index: 0,
+                first_block_index: 1,
+                data_block_count: 0,
+                parity_block_count: 0,
+                encrypted_size: 4096,
+                decompressed_size: 128,
+                file_count: 1,
+                first_path_hash: path_hash,
+                last_path_hash: path_hash,
+            }],
+            directory_hint_shards: Vec::new(),
+        };
+        assert_eq!(
+            IndexRoot::parse(&root.to_bytes(), false, MetadataLimits::default()).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "ShardEntry",
+                reason: "encrypted object has zero data blocks or size",
+            }
+        );
+
+        root.shards[0].data_block_count = 1;
+        root.shards[0].encrypted_size = 4096;
+        root.directory_hint_shards.push(DirectoryHintShardEntry {
+            hint_shard_index: 0,
+            first_dir_hash: hash_prefix(b""),
+            last_dir_hash: hash_prefix(b""),
+            first_block_index: 2,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 0,
+            decompressed_size: 72,
+            entry_count: 1,
+        });
+        assert_eq!(
+            IndexRoot::parse(&root.to_bytes(), false, MetadataLimits::default()).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "DirectoryHintShardEntry",
+                reason: "encrypted object has zero data blocks or size",
+            }
+        );
+
+        let mut dict_root = IndexRoot {
+            header: IndexRootHeader {
+                file_count: 1,
+                dictionary_first_block: 10,
+                dictionary_data_block_count: 0,
+                dictionary_parity_block_count: 0,
+                dictionary_encrypted_size: 4096,
+                dictionary_decompressed_size: 32,
+                ..IndexRootHeader::empty()
+            },
+            shards: vec![ShardEntry {
+                shard_index: 0,
+                first_block_index: 1,
+                data_block_count: 1,
+                parity_block_count: 0,
+                encrypted_size: 4096,
+                decompressed_size: 128,
+                file_count: 1,
+                first_path_hash: path_hash,
+                last_path_hash: path_hash,
+            }],
+            directory_hint_shards: Vec::new(),
+        };
+        assert_eq!(
+            IndexRoot::parse(&dict_root.to_bytes(), true, MetadataLimits::default()).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexRoot",
+                reason: "dictionary data block count is zero while has_dictionary is true",
+            }
+        );
+        dict_root.header.dictionary_data_block_count = 1;
+        dict_root.header.dictionary_encrypted_size = 0;
+        assert_eq!(
+            IndexRoot::parse(&dict_root.to_bytes(), true, MetadataLimits::default()).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexRoot",
+                reason: "required dictionary field is zero",
             }
         );
     }
@@ -2276,6 +2423,53 @@ mod tests {
             FormatError::InvalidMetadata {
                 structure: "IndexRoot",
                 reason: "DirectoryHintShardEntry rows are not sorted"
+            }
+        );
+    }
+
+    #[test]
+    fn directory_hint_shard_count_cap_is_independent_from_index_shard_cap() {
+        let path_hash = hash_prefix(b"a.txt");
+        let dir_hash = hash_prefix(b"");
+        let root = IndexRoot {
+            header: IndexRootHeader {
+                file_count: 1,
+                ..IndexRootHeader::empty()
+            },
+            shards: vec![ShardEntry {
+                shard_index: 0,
+                first_block_index: 1,
+                data_block_count: 1,
+                parity_block_count: 0,
+                encrypted_size: 4096,
+                decompressed_size: 128,
+                file_count: 1,
+                first_path_hash: path_hash,
+                last_path_hash: path_hash,
+            }],
+            directory_hint_shards: vec![DirectoryHintShardEntry {
+                hint_shard_index: 0,
+                first_dir_hash: dir_hash,
+                last_dir_hash: dir_hash,
+                first_block_index: 2,
+                data_block_count: 1,
+                parity_block_count: 0,
+                encrypted_size: 4096,
+                decompressed_size: 72,
+                entry_count: 1,
+            }],
+        };
+        let mut limits = MetadataLimits::default();
+        limits.max_shard_count = 1;
+        limits.max_directory_hint_shards = 1;
+        IndexRoot::parse(&root.to_bytes(), false, limits).unwrap();
+
+        limits.max_directory_hint_shards = 0;
+        assert_eq!(
+            IndexRoot::parse(&root.to_bytes(), false, limits).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexRoot",
+                reason: "directory hint shard count exceeds resource cap",
             }
         );
     }
@@ -2413,6 +2607,477 @@ mod tests {
             FormatError::InvalidMetadata {
                 structure: "DirectoryHintEntry",
                 reason: "shard count is zero",
+            }
+        );
+    }
+
+    #[test]
+    fn index_shard_rejects_unsupported_version_and_zero_count_pointer_offsets() {
+        let path = b"file.txt";
+        let path_hash = hash_prefix(path);
+        let file = FileEntry {
+            path_hash,
+            path_offset: 0,
+            path_length: path.len() as u32,
+            first_frame_index: 0,
+            frame_count: 1,
+            offset_in_first_frame_plaintext: 0,
+            tar_member_group_size: 512,
+            file_data_size: 0,
+            flags: 0,
+        };
+        let frame = FrameEntry {
+            frame_index: 0,
+            envelope_index: 0,
+            offset_in_envelope: 0,
+            compressed_size: 128,
+            decompressed_size: 512,
+            flags: 0,
+            tar_stream_offset: 0,
+        };
+        let envelope = EnvelopeEntry {
+            envelope_index: 0,
+            first_block_index: 0,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+            plaintext_size: 128,
+            first_frame_index: 0,
+            frame_count: 1,
+        };
+        let shard = IndexShard {
+            header: IndexShardHeader {
+                version: 1,
+                shard_index: 7,
+                file_count: 0,
+                frame_count: 0,
+                envelope_count: 0,
+                file_table_offset: 0,
+                frame_table_offset: 0,
+                envelope_table_offset: 0,
+                string_pool_offset: 0,
+                string_pool_size: 0,
+            },
+            files: vec![file],
+            frames: vec![frame],
+            envelopes: vec![envelope],
+            string_pool: path.to_vec(),
+            file_paths: Vec::new(),
+            file_tar_member_group_starts: Vec::new(),
+        };
+        let locating = ShardEntry {
+            shard_index: 7,
+            first_block_index: 10,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+            decompressed_size: shard.to_bytes().len() as u32,
+            file_count: 1,
+            first_path_hash: path_hash,
+            last_path_hash: path_hash,
+        };
+
+        let mut unsupported_version = shard.to_bytes();
+        write_u32(&mut unsupported_version, 4, 2);
+        assert_eq!(
+            IndexShard::parse(&unsupported_version, &locating, MetadataLimits::default())
+                .unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexShard",
+                reason: "unsupported version",
+            }
+        );
+
+        let mut nonzero_zero_frame_table = shard.to_bytes();
+        write_u32(&mut nonzero_zero_frame_table, 20, 0);
+        write_u32(
+            &mut nonzero_zero_frame_table,
+            32,
+            INDEX_SHARD_HEADER_LEN as u32,
+        );
+        assert_eq!(
+            IndexShard::parse(
+                &nonzero_zero_frame_table,
+                &locating,
+                MetadataLimits::default()
+            )
+            .unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexShard",
+                reason: "absent counted table has non-zero offset",
+            }
+        );
+
+        let mut nonzero_zero_envelope_table = shard.to_bytes();
+        write_u32(&mut nonzero_zero_envelope_table, 24, 0);
+        write_u32(
+            &mut nonzero_zero_envelope_table,
+            36,
+            (INDEX_SHARD_HEADER_LEN + FILE_ENTRY_LEN + FRAME_ENTRY_LEN) as u32,
+        );
+        assert_eq!(
+            IndexShard::parse(
+                &nonzero_zero_envelope_table,
+                &locating,
+                MetadataLimits::default()
+            )
+            .unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexShard",
+                reason: "absent counted table has non-zero offset",
+            }
+        );
+    }
+
+    #[test]
+    fn directory_hint_table_rejects_zero_count_nonzero_offsets() {
+        let path = b"dir".to_vec();
+        let table = DirectoryHintTable {
+            header: DirectoryHintTableHeader {
+                version: 1,
+                hint_shard_index: 5,
+                entry_count: 0,
+                entry_table_offset: 0,
+                shard_list_offset: 0,
+                string_pool_offset: 0,
+                string_pool_size: 0,
+            },
+            entries: vec![DirectoryHintEntry {
+                dir_hash: hash_prefix(&path),
+                path_offset: 0,
+                path_length: path.len() as u32,
+                shard_list_start_index: 0,
+                shard_count: 1,
+            }],
+            shard_row_indexes: vec![0],
+            string_pool: path.clone(),
+            entry_paths: vec![path.clone()],
+        };
+        let locating = DirectoryHintShardEntry {
+            hint_shard_index: 5,
+            first_dir_hash: hash_prefix(&path),
+            last_dir_hash: hash_prefix(&path),
+            first_block_index: 0,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+            decompressed_size: table.to_bytes().len() as u32,
+            entry_count: 1,
+        };
+        let mut bytes = table.to_bytes();
+        let bytes_len = bytes.len() as u64;
+        write_u64(&mut bytes, 48, 0);
+        write_u64(&mut bytes, 40, bytes_len);
+
+        assert_eq!(
+            DirectoryHintTable::parse(&bytes, &locating, 1, MetadataLimits::default()).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "DirectoryHintTable",
+                reason: "absent string pool has non-zero offset",
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_parsers_reject_malformed_buffer_corpus() {
+        let limits = MetadataLimits::default();
+        let path = b"file.txt";
+        let path_hash = hash_prefix(path);
+        let shard_entry = ShardEntry {
+            shard_index: 0,
+            first_block_index: 1,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+            decompressed_size: 0,
+            file_count: 1,
+            first_path_hash: path_hash,
+            last_path_hash: path_hash,
+        };
+
+        let root = IndexRoot {
+            header: IndexRootHeader {
+                file_count: 1,
+                frame_count: 1,
+                envelope_count: 1,
+                payload_block_count: 1,
+                tar_total_size: 512,
+                ..IndexRootHeader::empty()
+            },
+            shards: vec![ShardEntry {
+                decompressed_size: 256,
+                ..shard_entry.clone()
+            }],
+            directory_hint_shards: Vec::new(),
+        };
+        let root_bytes = root.to_bytes();
+        IndexRoot::parse(&root_bytes, false, limits).unwrap();
+
+        assert_eq!(
+            IndexRoot::parse(&root_bytes[..INDEX_ROOT_LEN - 1], false, limits).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexRoot",
+                reason: "plaintext is shorter than fixed header",
+            }
+        );
+        let mut bad_root = root_bytes.clone();
+        bad_root[0] ^= 1;
+        assert_eq!(
+            IndexRoot::parse(&bad_root, false, limits).unwrap_err(),
+            FormatError::BadMagic {
+                structure: "IndexRoot"
+            }
+        );
+        let mut bad_root = root_bytes.clone();
+        write_u32(&mut bad_root, 4, 2);
+        assert_eq!(
+            IndexRoot::parse(&bad_root, false, limits).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexRoot",
+                reason: "unsupported version",
+            }
+        );
+        let mut bad_root = root_bytes.clone();
+        bad_root[128] = 1;
+        assert_eq!(
+            IndexRoot::parse(&bad_root, false, limits).unwrap_err(),
+            FormatError::NonZeroReserved {
+                structure: "IndexRoot"
+            }
+        );
+        let mut bad_root = root_bytes.clone();
+        write_u64(&mut bad_root, 88, (INDEX_ROOT_LEN + 1) as u64);
+        assert_eq!(
+            IndexRoot::parse(&bad_root, false, limits).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexRoot",
+                reason: "shard table",
+            }
+        );
+        assert_eq!(
+            IndexRoot::parse(&root_bytes[..root_bytes.len() - 1], false, limits).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexRoot",
+                reason: "range is out of bounds",
+            }
+        );
+        let mut bad_root = root_bytes.clone();
+        bad_root.push(0);
+        assert_eq!(
+            IndexRoot::parse(&bad_root, false, limits).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexRoot",
+                reason: "plaintext length does not match canonical cursor",
+            }
+        );
+
+        let file = FileEntry {
+            path_hash,
+            path_offset: 0,
+            path_length: path.len() as u32,
+            first_frame_index: 0,
+            frame_count: 1,
+            offset_in_first_frame_plaintext: 0,
+            tar_member_group_size: 512,
+            file_data_size: 0,
+            flags: 0,
+        };
+        let frame = FrameEntry {
+            frame_index: 0,
+            envelope_index: 0,
+            offset_in_envelope: 0,
+            compressed_size: 128,
+            decompressed_size: 512,
+            flags: 0x0000_0003,
+            tar_stream_offset: 0,
+        };
+        let envelope = EnvelopeEntry {
+            envelope_index: 0,
+            first_block_index: 1,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+            plaintext_size: 128,
+            first_frame_index: 0,
+            frame_count: 1,
+        };
+        let shard = IndexShard {
+            header: IndexShardHeader {
+                version: 1,
+                shard_index: 0,
+                file_count: 0,
+                frame_count: 0,
+                envelope_count: 0,
+                file_table_offset: 0,
+                frame_table_offset: 0,
+                envelope_table_offset: 0,
+                string_pool_offset: 0,
+                string_pool_size: 0,
+            },
+            files: vec![file],
+            frames: vec![frame],
+            envelopes: vec![envelope],
+            string_pool: path.to_vec(),
+            file_paths: Vec::new(),
+            file_tar_member_group_starts: Vec::new(),
+        };
+        let shard_bytes = shard.to_bytes();
+        let locating = ShardEntry {
+            decompressed_size: shard_bytes.len() as u32,
+            ..shard_entry
+        };
+        IndexShard::parse(&shard_bytes, &locating, limits).unwrap();
+
+        assert_eq!(
+            IndexShard::parse(
+                &shard_bytes[..INDEX_SHARD_HEADER_LEN - 1],
+                &locating,
+                limits
+            )
+            .unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexShard",
+                reason: "plaintext is shorter than fixed header",
+            }
+        );
+        let mut bad_shard = shard_bytes.clone();
+        bad_shard[0] ^= 1;
+        assert_eq!(
+            IndexShard::parse(&bad_shard, &locating, limits).unwrap_err(),
+            FormatError::BadMagic {
+                structure: "IndexShard"
+            }
+        );
+        let mut bad_shard = shard_bytes.clone();
+        bad_shard[48] = 1;
+        assert_eq!(
+            IndexShard::parse(&bad_shard, &locating, limits).unwrap_err(),
+            FormatError::NonZeroReserved {
+                structure: "IndexShard"
+            }
+        );
+        let mut bad_shard = shard_bytes.clone();
+        write_u32(&mut bad_shard, 28, INDEX_SHARD_HEADER_LEN as u32 + 1);
+        assert_eq!(
+            IndexShard::parse(&bad_shard, &locating, limits).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexShard",
+                reason: "file table",
+            }
+        );
+        assert_eq!(
+            IndexShard::parse(&shard_bytes[..shard_bytes.len() - 1], &locating, limits)
+                .unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexShard",
+                reason: "range is out of bounds",
+            }
+        );
+        let mut bad_shard = shard_bytes.clone();
+        bad_shard.push(0);
+        assert_eq!(
+            IndexShard::parse(&bad_shard, &locating, limits).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "IndexShard",
+                reason: "plaintext length does not match canonical cursor",
+            }
+        );
+
+        let dir_path = b"dir".to_vec();
+        let dir_hash = hash_prefix(&dir_path);
+        let table = DirectoryHintTable {
+            header: DirectoryHintTableHeader {
+                version: 1,
+                hint_shard_index: 0,
+                entry_count: 0,
+                entry_table_offset: 0,
+                shard_list_offset: 0,
+                string_pool_offset: 0,
+                string_pool_size: 0,
+            },
+            entries: vec![DirectoryHintEntry {
+                dir_hash,
+                path_offset: 0,
+                path_length: dir_path.len() as u32,
+                shard_list_start_index: 0,
+                shard_count: 1,
+            }],
+            shard_row_indexes: vec![0],
+            string_pool: dir_path.clone(),
+            entry_paths: Vec::new(),
+        };
+        let table_bytes = table.to_bytes();
+        let locating_hint = DirectoryHintShardEntry {
+            hint_shard_index: 0,
+            first_dir_hash: dir_hash,
+            last_dir_hash: dir_hash,
+            first_block_index: 2,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+            decompressed_size: table_bytes.len() as u32,
+            entry_count: 1,
+        };
+        DirectoryHintTable::parse(&table_bytes, &locating_hint, 1, limits).unwrap();
+
+        assert_eq!(
+            DirectoryHintTable::parse(
+                &table_bytes[..DIRECTORY_HINT_TABLE_LEN - 1],
+                &locating_hint,
+                1,
+                limits,
+            )
+            .unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "DirectoryHintTable",
+                reason: "plaintext is shorter than fixed header",
+            }
+        );
+        let mut bad_table = table_bytes.clone();
+        bad_table[0] ^= 1;
+        assert_eq!(
+            DirectoryHintTable::parse(&bad_table, &locating_hint, 1, limits).unwrap_err(),
+            FormatError::BadMagic {
+                structure: "DirectoryHintTable"
+            }
+        );
+        let mut bad_table = table_bytes.clone();
+        bad_table[56] = 1;
+        assert_eq!(
+            DirectoryHintTable::parse(&bad_table, &locating_hint, 1, limits).unwrap_err(),
+            FormatError::NonZeroReserved {
+                structure: "DirectoryHintTable"
+            }
+        );
+        let mut bad_table = table_bytes.clone();
+        write_u64(&mut bad_table, 24, DIRECTORY_HINT_TABLE_LEN as u64 + 1);
+        assert_eq!(
+            DirectoryHintTable::parse(&bad_table, &locating_hint, 1, limits).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "DirectoryHintTable",
+                reason: "entry table",
+            }
+        );
+        assert_eq!(
+            DirectoryHintTable::parse(
+                &table_bytes[..table_bytes.len() - 1],
+                &locating_hint,
+                1,
+                limits
+            )
+            .unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "DirectoryHintTable",
+                reason: "range is out of bounds",
+            }
+        );
+        let mut bad_table = table_bytes.clone();
+        bad_table.push(0);
+        assert_eq!(
+            DirectoryHintTable::parse(&bad_table, &locating_hint, 1, limits).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "DirectoryHintTable",
+                reason: "plaintext length does not match canonical cursor",
             }
         );
     }

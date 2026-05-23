@@ -1103,6 +1103,107 @@ mod tests {
     }
 
     #[test]
+    fn fixed_structure_magic_matrix_rejects_all_magic_fields() {
+        let mut volume = volume_header().to_bytes();
+        volume[0] ^= 0x01;
+        assert_eq!(
+            VolumeHeader::parse(&volume).unwrap_err(),
+            FormatError::BadMagic {
+                structure: "VolumeHeader"
+            }
+        );
+
+        let mut crypto = crypto_fixed().to_bytes();
+        crypto[0] ^= 0x01;
+        assert_eq!(
+            CryptoHeaderFixed::parse(&crypto, crypto_fixed().length).unwrap_err(),
+            FormatError::BadMagic {
+                structure: "CryptoHeaderFixed"
+            }
+        );
+
+        let record = BlockRecord {
+            block_index: 0,
+            kind: BlockKind::PayloadData,
+            flags: BLOCK_LAST_DATA_FLAG,
+            payload: vec![7; 4096],
+            record_crc32c: 0,
+        };
+        let mut block = record.to_bytes();
+        block[0] ^= 0x01;
+        assert_eq!(
+            BlockRecord::parse(&block, 4096).unwrap_err(),
+            FormatError::BadMagic {
+                structure: "BlockRecord"
+            }
+        );
+
+        let footer = ManifestFooter {
+            archive_uuid: uuid(),
+            session_id: session(),
+            volume_index: 0,
+            is_authoritative: 1,
+            total_volumes: 1,
+            index_root_first_block: 0,
+            index_root_data_block_count: 1,
+            index_root_parity_block_count: 0,
+            index_root_encrypted_size: 4096,
+            index_root_decompressed_size: 120,
+            manifest_hmac: [0xaa; 32],
+        };
+        let mut manifest = footer.to_bytes();
+        manifest[0] ^= 0x01;
+        assert_eq!(
+            ManifestFooter::parse(&manifest).unwrap_err(),
+            FormatError::BadMagic {
+                structure: "ManifestFooter"
+            }
+        );
+
+        let trailer = VolumeTrailer {
+            archive_uuid: uuid(),
+            session_id: session(),
+            volume_index: 0,
+            block_count: 3,
+            bytes_written: 10_000,
+            manifest_footer_offset: 9_864,
+            manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
+            closed_at_ns: 123,
+            trailer_hmac: [0xbb; 32],
+        };
+        let mut trailer_bytes = trailer.to_bytes();
+        trailer_bytes[0] ^= 0x01;
+        assert_eq!(
+            VolumeTrailer::parse(&trailer_bytes).unwrap_err(),
+            FormatError::BadMagic {
+                structure: "VolumeTrailer"
+            }
+        );
+
+        let sidecar = BootstrapSidecarHeader {
+            archive_uuid: uuid(),
+            session_id: session(),
+            flags: SIDECAR_MANIFEST_PRESENT,
+            manifest_footer_offset: BOOTSTRAP_SIDECAR_HEADER_LEN as u64,
+            manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
+            index_root_records_offset: 0,
+            index_root_records_length: 0,
+            dictionary_records_offset: 0,
+            dictionary_records_length: 0,
+            sidecar_hmac: [0xcc; 32],
+            header_crc32c: 0,
+        };
+        let mut sidecar_bytes = sidecar.to_bytes();
+        sidecar_bytes[0] ^= 0x01;
+        assert_eq!(
+            BootstrapSidecarHeader::parse(&sidecar_bytes).unwrap_err(),
+            FormatError::BadMagic {
+                structure: "BootstrapSidecarHeader"
+            }
+        );
+    }
+
+    #[test]
     fn crypto_header_fixed_round_trips_and_validates() {
         let header = crypto_fixed();
         let bytes = header.to_bytes();
@@ -1135,6 +1236,181 @@ mod tests {
                 structure: "CryptoHeaderFixed"
             }
         );
+    }
+
+    #[test]
+    fn crypto_header_fixed_rejects_parameter_mutation_matrix() {
+        let mut bytes = crypto_fixed().to_bytes();
+        write_u16(&mut bytes, 8, 99);
+        assert_eq!(
+            CryptoHeaderFixed::parse(&bytes, crypto_fixed().length).unwrap_err(),
+            FormatError::UnknownCompressionAlgo(99)
+        );
+
+        let mut bytes = crypto_fixed().to_bytes();
+        write_u16(&mut bytes, 10, 99);
+        assert_eq!(
+            CryptoHeaderFixed::parse(&bytes, crypto_fixed().length).unwrap_err(),
+            FormatError::UnknownAeadAlgo(99)
+        );
+
+        let mut bytes = crypto_fixed().to_bytes();
+        write_u16(&mut bytes, 12, 99);
+        assert_eq!(
+            CryptoHeaderFixed::parse(&bytes, crypto_fixed().length).unwrap_err(),
+            FormatError::UnknownFecAlgo(99)
+        );
+
+        let mut bytes = crypto_fixed().to_bytes();
+        write_u16(&mut bytes, 14, 99);
+        assert_eq!(
+            CryptoHeaderFixed::parse(&bytes, crypto_fixed().length).unwrap_err(),
+            FormatError::UnknownKdfAlgo(99)
+        );
+
+        let cases: Vec<(&'static str, CryptoHeaderFixed, FormatError)> = vec![
+            (
+                "unsupported FEC None",
+                CryptoHeaderFixed {
+                    fec_algo: FecAlgo::None,
+                    ..crypto_fixed()
+                },
+                FormatError::UnsupportedFecForV36(FecAlgo::None),
+            ),
+            (
+                "unsupported FEC Wirehair",
+                CryptoHeaderFixed {
+                    fec_algo: FecAlgo::Wirehair,
+                    ..crypto_fixed()
+                },
+                FormatError::UnsupportedFecForV36(FecAlgo::Wirehair),
+            ),
+            (
+                "invalid dictionary flag",
+                CryptoHeaderFixed {
+                    has_dictionary: 2,
+                    ..crypto_fixed()
+                },
+                FormatError::InvalidBoolean {
+                    field: "has_dictionary",
+                    value: 2,
+                },
+            ),
+            (
+                "zero stripe width",
+                CryptoHeaderFixed {
+                    stripe_width: 0,
+                    ..crypto_fixed()
+                },
+                FormatError::ZeroStripeWidth,
+            ),
+            (
+                "stripe width cap",
+                CryptoHeaderFixed {
+                    stripe_width: READER_MAX_STRIPE_WIDTH + 1,
+                    ..crypto_fixed()
+                },
+                FormatError::ReaderResourceLimitExceeded {
+                    field: "stripe_width",
+                    cap: READER_MAX_STRIPE_WIDTH as u64,
+                    actual: (READER_MAX_STRIPE_WIDTH + 1) as u64,
+                },
+            ),
+            (
+                "loss tolerance must be below stripe width",
+                CryptoHeaderFixed {
+                    stripe_width: 2,
+                    volume_loss_tolerance: 2,
+                    ..crypto_fixed()
+                },
+                FormatError::VolumeLossToleranceOutOfRange {
+                    volume_loss_tolerance: 2,
+                    stripe_width: 2,
+                },
+            ),
+            (
+                "bit rot pct cap",
+                CryptoHeaderFixed {
+                    bit_rot_buffer_pct: 101,
+                    ..crypto_fixed()
+                },
+                FormatError::BitRotBufferPctTooLarge(101),
+            ),
+            (
+                "zero payload data shards",
+                CryptoHeaderFixed {
+                    fec_data_shards: 0,
+                    ..crypto_fixed()
+                },
+                FormatError::ZeroDataShardMaximum {
+                    field: "fec_data_shards",
+                },
+            ),
+            (
+                "zero index data shards",
+                CryptoHeaderFixed {
+                    index_fec_data_shards: 0,
+                    ..crypto_fixed()
+                },
+                FormatError::ZeroDataShardMaximum {
+                    field: "index_fec_data_shards",
+                },
+            ),
+            (
+                "zero index root data shards",
+                CryptoHeaderFixed {
+                    index_root_fec_data_shards: 0,
+                    ..crypto_fixed()
+                },
+                FormatError::ZeroDataShardMaximum {
+                    field: "index_root_fec_data_shards",
+                },
+            ),
+            (
+                "zero chunk size",
+                CryptoHeaderFixed {
+                    chunk_size: 0,
+                    ..crypto_fixed()
+                },
+                FormatError::ZeroChunkSize,
+            ),
+            (
+                "zero envelope target size",
+                CryptoHeaderFixed {
+                    envelope_target_size: 0,
+                    ..crypto_fixed()
+                },
+                FormatError::ZeroEnvelopeTargetSize,
+            ),
+            (
+                "chunk exceeds envelope",
+                CryptoHeaderFixed {
+                    chunk_size: 4096,
+                    envelope_target_size: 2048,
+                    ..crypto_fixed()
+                },
+                FormatError::ChunkSizeExceedsEnvelopeTarget {
+                    chunk_size: 4096,
+                    envelope_target_size: 2048,
+                },
+            ),
+            (
+                "block size too small",
+                CryptoHeaderFixed {
+                    block_size: 2048,
+                    ..crypto_fixed()
+                },
+                FormatError::BlockSizeTooSmall(2048),
+            ),
+        ];
+
+        for (name, header, expected) in cases {
+            assert_eq!(
+                CryptoHeaderFixed::parse(&header.to_bytes(), header.length).unwrap_err(),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1282,6 +1558,43 @@ mod tests {
     }
 
     #[test]
+    fn crypto_header_length_mismatch_matrix_rejects_independent_declared_lengths() {
+        let canonical = raw_crypto_header_bytes();
+        CryptoHeader::parse(&canonical, canonical.len() as u32).unwrap();
+
+        let mut fixed_longer = canonical.clone();
+        write_u32(&mut fixed_longer, 4, (canonical.len() + 1) as u32);
+        assert_eq!(
+            CryptoHeader::parse(&fixed_longer, fixed_longer.len() as u32).unwrap_err(),
+            FormatError::CryptoHeaderLengthMismatch {
+                fixed: (canonical.len() + 1) as u32,
+                volume: canonical.len() as u32,
+            }
+        );
+
+        let longer_volume_len = (canonical.len() + 1) as u32;
+        let mut padded = canonical.clone();
+        padded.insert(canonical.len() - CRYPTO_HEADER_HMAC_LEN, 0);
+        assert_eq!(
+            CryptoHeader::parse(&padded, longer_volume_len).unwrap_err(),
+            FormatError::CryptoHeaderLengthMismatch {
+                fixed: canonical.len() as u32,
+                volume: longer_volume_len,
+            }
+        );
+
+        let mut fixed_shorter = canonical.clone();
+        write_u32(&mut fixed_shorter, 4, (canonical.len() - 1) as u32);
+        assert_eq!(
+            CryptoHeader::parse(&fixed_shorter, fixed_shorter.len() as u32).unwrap_err(),
+            FormatError::CryptoHeaderLengthMismatch {
+                fixed: (canonical.len() - 1) as u32,
+                volume: canonical.len() as u32,
+            }
+        );
+    }
+
+    #[test]
     fn crypto_extension_semantics_reject_forbidden_duplicate_and_critical() {
         let duplicate = vec![
             ExtensionTlv {
@@ -1351,6 +1664,59 @@ mod tests {
     }
 
     #[test]
+    fn block_record_crc_covers_every_record_header_and_payload_byte() {
+        let record = BlockRecord {
+            block_index: 0x0102_0304_0506_0708,
+            kind: BlockKind::PayloadData,
+            flags: BLOCK_LAST_DATA_FLAG,
+            payload: (0..4096).map(|idx| (idx & 0xff) as u8).collect(),
+            record_crc32c: 0,
+        };
+        let bytes = record.to_bytes();
+        let covered_len = 16 + record.payload.len();
+
+        for offset in 0..covered_len {
+            let mut corrupted = bytes.clone();
+            corrupted[offset] ^= 0x80;
+            let err = BlockRecord::parse(&corrupted, record.payload.len()).unwrap_err();
+            if offset < 4 {
+                assert_eq!(
+                    err,
+                    FormatError::BadMagic {
+                        structure: "BlockRecord"
+                    },
+                    "magic byte {offset}"
+                );
+            } else if (14..16).contains(&offset) {
+                assert_eq!(
+                    err,
+                    FormatError::NonZeroReserved {
+                        structure: "BlockRecord"
+                    },
+                    "reserved byte {offset}"
+                );
+            } else {
+                assert_eq!(
+                    err,
+                    FormatError::BadCrc {
+                        structure: "BlockRecord"
+                    },
+                    "CRC-covered byte {offset}"
+                );
+            }
+        }
+
+        let mut corrupted_crc = bytes;
+        corrupted_crc[covered_len] ^= 0x80;
+        assert_eq!(
+            BlockRecord::parse(&corrupted_crc, record.payload.len()).unwrap_err(),
+            FormatError::BadCrc {
+                structure: "BlockRecord"
+            }
+        );
+    }
+
+    #[test]
     fn block_record_rejects_reserved_kind_flags_and_parity_last_flag() {
         let mut record = BlockRecord {
             block_index: 0,
@@ -1379,6 +1745,17 @@ mod tests {
             BlockRecord::parse(&bytes, 4096).unwrap_err(),
             FormatError::UnknownBlockKind(10)
         );
+
+        for unknown_kind in 10..=u8::MAX {
+            let mut bytes = record.to_bytes();
+            bytes[12] = unknown_kind;
+            let crc = crc32c(&bytes[..4112]);
+            write_u32(&mut bytes, 4112, crc);
+            assert_eq!(
+                BlockRecord::parse(&bytes, 4096).unwrap_err(),
+                FormatError::UnknownBlockKind(unknown_kind)
+            );
+        }
     }
 
     #[test]
