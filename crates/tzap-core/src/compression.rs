@@ -20,6 +20,7 @@ pub fn decompress_exact_zstd_frame(
     compressed: &[u8],
     expected_decompressed_size: usize,
 ) -> Result<Vec<u8>, FormatError> {
+    validate_metadata_decompressed_size(expected_decompressed_size)?;
     validate_exact_zstd_frame(compressed)?;
     let decompressed = zstd::bulk::decompress(compressed, expected_decompressed_size)
         .map_err(|_| FormatError::ZstdDecompressionFailure)?;
@@ -37,6 +38,7 @@ pub fn decompress_exact_zstd_frame_with_dictionary(
     expected_decompressed_size: usize,
     dictionary: &[u8],
 ) -> Result<Vec<u8>, FormatError> {
+    validate_metadata_decompressed_size(expected_decompressed_size)?;
     validate_exact_zstd_frame(compressed)?;
     let decompressed = zstd::bulk::Decompressor::with_dictionary(dictionary)
         .and_then(|mut decompressor| {
@@ -65,6 +67,18 @@ pub fn validate_exact_zstd_frame(compressed: &[u8]) -> Result<(), FormatError> {
         return Err(FormatError::TrailingBytesAfterZstdFrame);
     }
     Ok(())
+}
+
+fn validate_metadata_decompressed_size(expected_decompressed_size: usize) -> Result<(), FormatError> {
+    if expected_decompressed_size > u32::MAX as usize {
+        Err(FormatError::ReaderResourceLimitExceeded {
+            field: "decompressed_size",
+            cap: u32::MAX as u64,
+            actual: expected_decompressed_size as u64,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +126,20 @@ mod tests {
             FormatError::ZstdDecompressedSizeMismatch {
                 expected: 100,
                 actual: 7
+            }
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn rejects_decompressed_size_over_u32_cap() {
+        let compressed = compress_zstd_frame(b"metadata-object", 1).unwrap();
+        assert_eq!(
+            decompress_exact_zstd_frame(&compressed, (u32::MAX as usize) + 1).unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "decompressed_size",
+                cap: u32::MAX as u64,
+                actual: (u32::MAX as u64) + 1,
             }
         );
     }

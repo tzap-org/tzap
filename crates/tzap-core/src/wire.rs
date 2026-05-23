@@ -286,6 +286,21 @@ impl CryptoHeaderFixed {
         if self.block_size % 2 != 0 {
             return Err(FormatError::OddBlockSize(self.block_size));
         }
+        validate_fec_class_data_shards(
+            "fec_data_shards",
+            self.fec_data_shards,
+            self.block_size,
+        )?;
+        validate_fec_class_data_shards(
+            "index_fec_data_shards",
+            self.index_fec_data_shards,
+            self.block_size,
+        )?;
+        validate_fec_class_data_shards(
+            "index_root_fec_data_shards",
+            self.index_root_fec_data_shards,
+            self.block_size,
+        )?;
         if self.block_size > READER_MAX_BLOCK_SIZE {
             return Err(FormatError::ReaderResourceLimitExceeded {
                 field: "block_size",
@@ -342,6 +357,22 @@ fn validate_fec_class_shards(
             field,
             cap: cap as u64,
             actual: total as u64,
+        });
+    }
+    Ok(())
+}
+
+fn validate_fec_class_data_shards(
+    field: &'static str,
+    data_shards: u16,
+    block_size: u32,
+) -> Result<(), FormatError> {
+    let max_data_shards = u32::MAX as u64 / block_size as u64;
+    if (data_shards as u64) > max_data_shards {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field,
+            cap: max_data_shards,
+            actual: data_shards as u64,
         });
     }
     Ok(())
@@ -1480,6 +1511,45 @@ mod tests {
                 field: "index_fec_data_shards + index_fec_parity_shards",
                 cap: READER_MAX_INDEX_FEC_CLASS_SHARDS as u64,
                 actual: (READER_MAX_INDEX_FEC_CLASS_SHARDS + 1) as u64,
+            }
+        );
+
+        let mut header = crypto_fixed();
+        header.block_size = 1_048_576;
+        header.fec_data_shards = 4_096;
+        let max_data_shards = u32::MAX as u64 / header.block_size as u64;
+        assert_eq!(
+            CryptoHeaderFixed::parse(&header.to_bytes(), header.length).unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "fec_data_shards",
+                cap: max_data_shards,
+                actual: 4_096,
+            }
+        );
+
+        let mut header = crypto_fixed();
+        header.block_size = 1_048_576;
+        header.index_fec_data_shards = 4_096;
+        let max_data_shards = u32::MAX as u64 / header.block_size as u64;
+        assert_eq!(
+            CryptoHeaderFixed::parse(&header.to_bytes(), header.length).unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "index_fec_data_shards",
+                cap: max_data_shards,
+                actual: 4_096,
+            }
+        );
+
+        let mut header = crypto_fixed();
+        header.block_size = 1_048_576;
+        header.index_root_fec_data_shards = 4_096;
+        let max_data_shards = u32::MAX as u64 / header.block_size as u64;
+        assert_eq!(
+            CryptoHeaderFixed::parse(&header.to_bytes(), header.length).unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "index_root_fec_data_shards",
+                cap: max_data_shards,
+                actual: 4_096,
             }
         );
     }
