@@ -58,7 +58,7 @@ corpus coverage, and explicit release gates.
 | G02 | Conformance matrix | complete | P0 | map all writer/reader obligations to code/tests/status |
 | G03 | True streaming writer | partial/in-memory only | P0/P1 | implement sink model or document no true streaming claim |
 | G04 | Sequential non-seekable reader | partial/whole-buffer safe API | P0/P1 | safe provisional-output story and tests |
-| G05 | Bootstrap sidecar authority | partial | P0 | sparse sections and authority precedence match spec |
+| G05 | Bootstrap sidecar authority | complete | P0 | sparse sections and authority precedence match spec |
 | G06 | IndexRoot/dictionary sizing | complete | P0 | choose metadata FEC class before CryptoHeader HMAC |
 | G07 | Directory hints and directory entries | partial | P0/P1 | exact hint map, directory entries, and cloud claims settled |
 | G08 | Tar metadata profile | partial | P1 | supported metadata profile documented and tested |
@@ -324,6 +324,8 @@ Done criteria:
 
 ## G05 - Bootstrap Sidecar Authority and Sparse Sections
 
+Status: complete.
+
 Spec anchors:
 
 - bootstrap sidecar format
@@ -332,18 +334,22 @@ Spec anchors:
 - reader obligation 16
 - writer obligation 35
 
-Current gap:
+Completed G05 scope:
 
-The sidecar parser currently behaves like a full non-seekable bootstrap parser:
-it requires both ManifestFooter and IndexRoot sections. The v0.36 spec permits
-sparse sidecar combinations when another authenticated authority supplies the
-missing metadata.
+The sidecar parser now separates optional section parsing from authority
+decisions. A sidecar can carry any v0.36 sparse combination of sidecar
+ManifestFooter, IndexRoot BlockRecords, and dictionary BlockRecords, subject to
+the packed cursor/layout, flag, reserved-byte, CRC, HMAC, and size-cap checks.
+The reader decides whether those copied BlockRecords are usable only after an
+authenticated terminal ManifestFooter or sidecar ManifestFooter supplies the
+IndexRoot extent, and only after an authenticated IndexRoot supplies any
+dictionary extent.
 
-The CLI also rejects bootstrap sidecars with multi-volume input sets. That may
-remain a product boundary, but it must be documented and tested. If implemented,
-the sidecar authority graph must be precise.
+The CLI still rejects bootstrap sidecars with multi-volume input sets as a
+product boundary. That boundary is documented in the CLI reference and
+operational-boundaries docs and covered by docs tests.
 
-Implementation work:
+Implemented work:
 
 1. Replace "all required sections or reject" parsing with a structured sidecar
    result:
@@ -372,13 +378,11 @@ Implementation work:
      opened VolumeHeader's `volume_index`
    - conflicting archive UUID/session/bootstrap fields reject as mixed archive
 4. Decide CLI multi-volume plus `--bootstrap`:
-   - if still unsupported, keep a stable unsupported diagnostic and docs example
-   - if supported, use sidecar data only after the authority checks above
+   - keep the unsupported CLI boundary with stable docs/tests
 5. Revisit writer sidecar emission:
    - keep CLI single-volume only if that remains the boundary
-   - if multi-volume sidecar emission is added, emit packed sidecars with
-     sidecar ManifestFooter volume index zero and matching shared bootstrap
-     fields
+   - writer sidecars remain packed, single-volume helpers with sidecar
+     ManifestFooter volume index zero and matching shared bootstrap fields
 
 Tests:
 
@@ -386,6 +390,8 @@ Tests:
   dictionary-free archive.
 - Dictionary sidecar includes and authenticates dictionary records before
   payload decompression.
+- Full sidecars bootstrap non-seekable opens even when terminal trailer/footer
+  material is corrupt or absent.
 - IndexRoot-only sidecar rejects for non-seekable bootstrap.
 - IndexRoot-only sidecar can help a seekable input only after a terminal
   ManifestFooter authenticates the same archive.
@@ -398,7 +404,16 @@ Tests:
   all other fields match.
 - Unknown sidecar flags, nonzero reserved bytes, unclaimed gaps, trailing bytes,
   and cap violations reject before trust.
-- Sidecar cap tests cover near-u64 arithmetic and count only present sections.
+- Sidecar cap tests count only present sparse sections and reject sections above
+  the authenticated metadata FEC class maxima.
+
+Deferred related work:
+
+- CLI support for multi-volume input sets plus `--bootstrap`, if ever desired,
+  belongs to G10.
+- Broad near-u64 arithmetic and boundary-byte mutation expansion remains in
+  G12; the implemented reader path uses checked arithmetic and present-section
+  cap accounting.
 
 Done criteria:
 

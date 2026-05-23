@@ -79,7 +79,7 @@ pub struct OpenedArchive {
     pub volume_header: VolumeHeader,
     pub crypto_header: CryptoHeaderFixed,
     pub manifest_footer: ManifestFooter,
-    pub volume_trailer: VolumeTrailer,
+    pub volume_trailer: Option<VolumeTrailer>,
     pub index_root: IndexRoot,
     payload_dictionary: Option<Vec<u8>>,
 }
@@ -127,7 +127,13 @@ pub fn open_non_seekable_archive(
     bootstrap_sidecar: Option<&[u8]>,
 ) -> Result<OpenedArchive, FormatError> {
     match bootstrap_sidecar {
-        Some(sidecar) => open_archive_with_bootstrap_sidecar(bytes, sidecar, master_key),
+        Some(sidecar) => OpenedArchive::open_with_bootstrap_sidecar_options_for_mode(
+            bytes,
+            sidecar,
+            master_key,
+            ReaderOptions::default(),
+            BootstrapSidecarUse::NonSeekableRandomAccess,
+        ),
         None => Err(FormatError::ReaderUnsupported(
             "non-seekable random access requires a bootstrap sidecar",
         )),
@@ -240,7 +246,7 @@ impl OpenedArchive {
             volume_header: first.volume_header,
             crypto_header: first.crypto_header,
             manifest_footer: first.manifest_footer,
-            volume_trailer: first.volume_trailer,
+            volume_trailer: Some(first.volume_trailer),
             index_root,
             payload_dictionary,
         })
@@ -251,6 +257,22 @@ impl OpenedArchive {
         bootstrap_sidecar: &[u8],
         master_key: &MasterKey,
         options: ReaderOptions,
+    ) -> Result<Self, FormatError> {
+        Self::open_with_bootstrap_sidecar_options_for_mode(
+            bytes,
+            bootstrap_sidecar,
+            master_key,
+            options,
+            BootstrapSidecarUse::SeekableAssist,
+        )
+    }
+
+    fn open_with_bootstrap_sidecar_options_for_mode(
+        bytes: &[u8],
+        bootstrap_sidecar: &[u8],
+        master_key: &MasterKey,
+        options: ReaderOptions,
+        sidecar_use: BootstrapSidecarUse,
     ) -> Result<Self, FormatError> {
         let observed_archive_bytes =
             observed_archive_size([bytes.len() as u64, bootstrap_sidecar.len() as u64])?;
@@ -284,12 +306,13 @@ impl OpenedArchive {
         parsed_crypto.validate_extension_semantics()?;
         validate_m9_supported_volume(&volume_header, &parsed_crypto.fixed)?;
 
-        let sidecar = parse_trusted_bootstrap_sidecar(
+        let sidecar = parse_bootstrap_sidecar(
             bootstrap_sidecar,
             &volume_header,
             &parsed_crypto.fixed,
             &subkeys,
         )?;
+        sidecar.require_sections_for(sidecar_use, &parsed_crypto.fixed)?;
 
         let (mut blocks, terminal_offset, observed_block_count) = parse_stream_block_prefix(
             bytes,
@@ -297,20 +320,71 @@ impl OpenedArchive {
             parsed_crypto.fixed.block_size as usize,
             &volume_header,
         )?;
-        insert_sidecar_records(&mut blocks, sidecar.index_root_records)?;
+        let terminal_material = match sidecar_use {
+            BootstrapSidecarUse::SeekableAssist => Some(parse_terminal_material(
+                bytes,
+                terminal_offset,
+                observed_block_count,
+                &subkeys,
+                &volume_header,
+                parsed_crypto.fixed.block_size,
+            )?),
+            BootstrapSidecarUse::NonSeekableRandomAccess => parse_terminal_material(
+                bytes,
+                terminal_offset,
+                observed_block_count,
+                &subkeys,
+                &volume_header,
+                parsed_crypto.fixed.block_size,
+            )
+            .ok(),
+        };
+        let terminal_manifest = terminal_material.as_ref().map(|(manifest, _)| manifest);
+        let manifest_authority = match sidecar_use {
+            BootstrapSidecarUse::SeekableAssist => {
+                let terminal_manifest = terminal_manifest.ok_or(FormatError::InvalidArchive(
+                    "terminal ManifestFooter/VolumeTrailer is required",
+                ))?;
+                if let Some(sidecar_manifest) = &sidecar.manifest_footer {
+                    if !manifest_bootstrap_fields_match(terminal_manifest, sidecar_manifest) {
+                        return Err(FormatError::InvalidArchive(
+                            "bootstrap sidecar conflicts with terminal ManifestFooter",
+                        ));
+                    }
+                }
+                terminal_manifest.clone()
+            }
+            BootstrapSidecarUse::NonSeekableRandomAccess => {
+                let sidecar_manifest = sidecar
+                    .manifest_footer
+                    .as_ref()
+                    .ok_or(FormatError::ReaderUnsupported(
+                    "non-seekable bootstrap sidecar requires ManifestFooter and IndexRoot sections",
+                ))?;
+                if let Some(terminal_manifest) = terminal_manifest {
+                    if !manifest_bootstrap_fields_match(terminal_manifest, sidecar_manifest) {
+                        return Err(FormatError::InvalidArchive(
+                            "bootstrap sidecar conflicts with terminal ManifestFooter",
+                        ));
+                    }
+                }
+                sidecar_manifest.clone()
+            }
+        };
+        manifest_authority.validate_index_root_extent(parsed_crypto.fixed.block_size)?;
 
-        let (terminal_manifest, volume_trailer) = parse_terminal_material(
-            bytes,
-            terminal_offset,
-            observed_block_count,
-            &subkeys,
-            &volume_header,
-            parsed_crypto.fixed.block_size,
-        )?;
-        if terminal_manifest != sidecar.manifest_footer {
-            return Err(FormatError::InvalidArchive(
-                "bootstrap sidecar conflicts with terminal ManifestFooter",
-            ));
+        if let Some((offset, length)) = sidecar.index_root_records_section {
+            let index_root_records = parse_sidecar_block_records(
+                bootstrap_sidecar,
+                offset,
+                length,
+                parsed_crypto.fixed.block_size as usize,
+                index_root_extent_from_manifest(&manifest_authority),
+                BlockKind::IndexRootData,
+                BlockKind::IndexRootParity,
+                "IndexRoot",
+            )?;
+            insert_sidecar_records(&mut blocks, index_root_records)?;
         }
 
         let limits = metadata_limits(&parsed_crypto.fixed);
@@ -319,12 +393,7 @@ impl OpenedArchive {
             &subkeys,
             &volume_header,
             &parsed_crypto.fixed,
-            ObjectExtent {
-                first_block_index: sidecar.manifest_footer.index_root_first_block,
-                data_block_count: sidecar.manifest_footer.index_root_data_block_count,
-                parity_block_count: sidecar.manifest_footer.index_root_parity_block_count,
-                encrypted_size: sidecar.manifest_footer.index_root_encrypted_size,
-            },
+            index_root_extent_from_manifest(&manifest_authority),
             BlockKind::IndexRootData,
             BlockKind::IndexRootParity,
             &subkeys.index_root_key,
@@ -333,7 +402,7 @@ impl OpenedArchive {
             0,
             parsed_crypto.fixed.index_root_fec_data_shards,
             parsed_crypto.fixed.index_root_fec_parity_shards,
-            sidecar.manifest_footer.index_root_decompressed_size,
+            manifest_authority.index_root_decompressed_size,
         )?;
         let index_root = IndexRoot::parse(
             &index_root_plaintext,
@@ -341,23 +410,19 @@ impl OpenedArchive {
             limits,
         )?;
         if parsed_crypto.fixed.has_dictionary != 0 {
-            let (offset, length) =
-                sidecar
-                    .dictionary_records_section
-                    .ok_or(FormatError::ReaderUnsupported(
-                        "dictionary bootstrap required",
-                    ))?;
-            let dictionary_records = parse_sidecar_block_records(
-                bootstrap_sidecar,
-                offset,
-                length,
-                parsed_crypto.fixed.block_size as usize,
-                dictionary_extent_from_index_root(&index_root)?,
-                BlockKind::DictionaryData,
-                BlockKind::DictionaryParity,
-                "dictionary",
-            )?;
-            insert_sidecar_records(&mut blocks, dictionary_records)?;
+            if let Some((offset, length)) = sidecar.dictionary_records_section {
+                let dictionary_records = parse_sidecar_block_records(
+                    bootstrap_sidecar,
+                    offset,
+                    length,
+                    parsed_crypto.fixed.block_size as usize,
+                    dictionary_extent_from_index_root(&index_root)?,
+                    BlockKind::DictionaryData,
+                    BlockKind::DictionaryParity,
+                    "dictionary",
+                )?;
+                insert_sidecar_records(&mut blocks, dictionary_records)?;
+            }
         }
         let payload_dictionary = load_archive_dictionary(
             &blocks,
@@ -374,8 +439,8 @@ impl OpenedArchive {
             blocks,
             volume_header,
             crypto_header: parsed_crypto.fixed,
-            manifest_footer: sidecar.manifest_footer,
-            volume_trailer,
+            manifest_footer: manifest_authority,
+            volume_trailer: terminal_material.map(|(_, trailer)| trailer),
             index_root,
             payload_dictionary,
         })
@@ -1218,18 +1283,46 @@ fn validate_m9_supported_volume(
 }
 
 #[derive(Debug)]
-struct TrustedBootstrapSidecar {
-    manifest_footer: ManifestFooter,
-    index_root_records: Vec<BlockRecord>,
+struct ParsedBootstrapSidecar {
+    manifest_footer: Option<ManifestFooter>,
+    index_root_records_section: Option<(u64, u64)>,
     dictionary_records_section: Option<(u64, u64)>,
 }
 
-fn parse_trusted_bootstrap_sidecar(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapSidecarUse {
+    SeekableAssist,
+    NonSeekableRandomAccess,
+}
+
+impl ParsedBootstrapSidecar {
+    fn require_sections_for(
+        &self,
+        sidecar_use: BootstrapSidecarUse,
+        crypto_header: &CryptoHeaderFixed,
+    ) -> Result<(), FormatError> {
+        if sidecar_use == BootstrapSidecarUse::NonSeekableRandomAccess {
+            if self.manifest_footer.is_none() || self.index_root_records_section.is_none() {
+                return Err(FormatError::ReaderUnsupported(
+                    "non-seekable bootstrap sidecar requires ManifestFooter and IndexRoot sections",
+                ));
+            }
+            if crypto_header.has_dictionary != 0 && self.dictionary_records_section.is_none() {
+                return Err(FormatError::ReaderUnsupported(
+                    "dictionary bootstrap required",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_bootstrap_sidecar(
     bytes: &[u8],
     volume_header: &VolumeHeader,
     crypto_header: &CryptoHeaderFixed,
     subkeys: &Subkeys,
-) -> Result<TrustedBootstrapSidecar, FormatError> {
+) -> Result<ParsedBootstrapSidecar, FormatError> {
     let header_bytes = slice(
         bytes,
         0,
@@ -1255,64 +1348,56 @@ fn parse_trusted_bootstrap_sidecar(
     header.validate_packed_layout(bytes.len() as u64)?;
     validate_sidecar_size_cap(&header, crypto_header, bytes.len() as u64)?;
 
-    if !header.has_manifest_footer() || !header.has_index_root_records() {
-        return Err(FormatError::ReaderUnsupported(
-            "non-seekable bootstrap sidecar requires ManifestFooter and IndexRoot sections",
-        ));
-    }
     if header.has_dictionary_records() {
         if crypto_header.has_dictionary == 0 {
             return Err(FormatError::InvalidArchive(
                 "bootstrap sidecar has dictionary records while has_dictionary is false",
             ));
         }
-    } else if crypto_header.has_dictionary != 0 {
-        return Err(FormatError::ReaderUnsupported(
-            "dictionary bootstrap required",
-        ));
     }
 
-    let manifest_offset = to_usize(header.manifest_footer_offset, "BootstrapSidecarHeader")?;
-    let manifest_bytes = slice(
-        bytes,
-        manifest_offset,
-        MANIFEST_FOOTER_LEN,
-        "ManifestFooter",
-    )?;
-    let manifest_footer = ManifestFooter::parse(manifest_bytes)?;
-    validate_sidecar_manifest_footer(
-        volume_header,
-        crypto_header,
-        &manifest_footer,
-        subkeys,
-        manifest_bytes,
-    )?;
-    manifest_footer.validate_index_root_extent(crypto_header.block_size)?;
+    let manifest_footer = if header.has_manifest_footer() {
+        let manifest_offset = to_usize(header.manifest_footer_offset, "BootstrapSidecarHeader")?;
+        let manifest_bytes = slice(
+            bytes,
+            manifest_offset,
+            MANIFEST_FOOTER_LEN,
+            "ManifestFooter",
+        )?;
+        let manifest_footer = ManifestFooter::parse(manifest_bytes)?;
+        validate_sidecar_manifest_footer(
+            volume_header,
+            crypto_header,
+            &manifest_footer,
+            subkeys,
+            manifest_bytes,
+        )?;
+        manifest_footer.validate_index_root_extent(crypto_header.block_size)?;
+        Some(manifest_footer)
+    } else {
+        None
+    };
 
-    let index_root_records = parse_sidecar_block_records(
-        bytes,
-        header.index_root_records_offset,
-        header.index_root_records_length,
-        crypto_header.block_size as usize,
-        ObjectExtent {
-            first_block_index: manifest_footer.index_root_first_block,
-            data_block_count: manifest_footer.index_root_data_block_count,
-            parity_block_count: manifest_footer.index_root_parity_block_count,
-            encrypted_size: manifest_footer.index_root_encrypted_size,
-        },
-        BlockKind::IndexRootData,
-        BlockKind::IndexRootParity,
-        "IndexRoot",
-    )?;
-
-    Ok(TrustedBootstrapSidecar {
+    Ok(ParsedBootstrapSidecar {
         manifest_footer,
-        index_root_records,
+        index_root_records_section: header.has_index_root_records().then_some((
+            header.index_root_records_offset,
+            header.index_root_records_length,
+        )),
         dictionary_records_section: header.has_dictionary_records().then_some((
             header.dictionary_records_offset,
             header.dictionary_records_length,
         )),
     })
+}
+
+fn index_root_extent_from_manifest(manifest_footer: &ManifestFooter) -> ObjectExtent {
+    ObjectExtent {
+        first_block_index: manifest_footer.index_root_first_block,
+        data_block_count: manifest_footer.index_root_data_block_count,
+        parity_block_count: manifest_footer.index_root_parity_block_count,
+        encrypted_size: manifest_footer.index_root_encrypted_size,
+    }
 }
 
 fn insert_sidecar_records(
@@ -3056,6 +3141,62 @@ mod tests {
     }
 
     #[test]
+    fn non_seekable_full_sidecar_bootstraps_when_terminal_trailer_is_corrupt() {
+        let archive = write_archive(
+            &[RegularFile::new(
+                "sidecar-terminal.txt",
+                b"sidecar authority",
+            )],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut corrupted = archive.bytes.clone();
+        let trailer_hmac_offset = corrupted.len() - VOLUME_TRAILER_LEN + TRAILER_HMAC_COVERED_LEN;
+        corrupted[trailer_hmac_offset] ^= 0x01;
+        assert!(open_archive(&corrupted, &master_key()).is_err());
+
+        let opened =
+            open_non_seekable_archive(&corrupted, &master_key(), Some(&archive.bootstrap_sidecar))
+                .unwrap();
+
+        assert!(opened.volume_trailer.is_none());
+        assert_eq!(
+            opened.extract_file("sidecar-terminal.txt").unwrap(),
+            Some(b"sidecar authority".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn dictionary_full_sidecar_bootstraps_when_terminal_material_is_absent() {
+        let archive = write_archive_with_dictionary(
+            &[RegularFile::new(
+                "dict-no-terminal.txt",
+                b"common words common words without terminal",
+            )],
+            &master_key(),
+            single_stream_options(),
+            dictionary(),
+        )
+        .unwrap();
+        let terminal_offset = terminal_material_offset(&archive.bytes);
+        let truncated = archive.bytes[..terminal_offset].to_vec();
+        assert!(open_archive(&truncated, &master_key()).is_err());
+
+        let opened =
+            open_non_seekable_archive(&truncated, &master_key(), Some(&archive.bootstrap_sidecar))
+                .unwrap();
+
+        assert!(opened.volume_trailer.is_none());
+        assert_eq!(
+            opened.extract_file("dict-no-terminal.txt").unwrap(),
+            Some(b"common words common words without terminal".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
     fn bootstrap_sidecar_treats_crc_failed_payload_block_as_erasure() {
         let archive = write_archive(
             &[RegularFile::new(
@@ -3159,7 +3300,7 @@ mod tests {
         });
 
         assert_eq!(
-            open_archive_with_bootstrap_sidecar(&archive.bytes, &missing_dictionary, &master_key())
+            open_non_seekable_archive(&archive.bytes, &master_key(), Some(&missing_dictionary))
                 .unwrap_err(),
             FormatError::ReaderUnsupported("dictionary bootstrap required")
         );
@@ -3217,6 +3358,110 @@ mod tests {
             Some(&archive.bootstrap_sidecar)
         )
         .is_ok());
+    }
+
+    #[test]
+    fn non_seekable_bootstrap_rejects_index_root_only_sidecar() {
+        let archive = write_archive(
+            &[RegularFile::new("sparse.txt", b"sparse sidecar")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let index_root_only = sparse_bootstrap_sidecar(
+            &archive.bootstrap_sidecar,
+            &master_key(),
+            false,
+            true,
+            false,
+        );
+
+        assert_eq!(
+            open_non_seekable_archive(&archive.bytes, &master_key(), Some(&index_root_only))
+                .unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "non-seekable bootstrap sidecar requires ManifestFooter and IndexRoot sections"
+            )
+        );
+    }
+
+    #[test]
+    fn seekable_sidecar_uses_index_root_records_after_terminal_manifest_authority() {
+        let archive = write_archive(
+            &[RegularFile::new("sparse-index.txt", b"recover index root")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let mut corrupted = archive.bytes.clone();
+        corrupt_object_extent_records(
+            &mut corrupted,
+            index_root_extent_from_manifest(&opened.manifest_footer),
+        );
+        assert!(open_archive(&corrupted, &master_key()).is_err());
+
+        let index_root_only = sparse_bootstrap_sidecar(
+            &archive.bootstrap_sidecar,
+            &master_key(),
+            false,
+            true,
+            false,
+        );
+        let recovered =
+            open_archive_with_bootstrap_sidecar(&corrupted, &index_root_only, &master_key())
+                .unwrap();
+
+        assert_eq!(
+            recovered.extract_file("sparse-index.txt").unwrap(),
+            Some(b"recover index root".to_vec())
+        );
+        recovered.verify().unwrap();
+    }
+
+    #[test]
+    fn seekable_sidecar_uses_dictionary_records_after_index_root_authority() {
+        let archive = write_archive_with_dictionary(
+            &[RegularFile::new(
+                "sparse-dict.txt",
+                b"common words common words sparse dictionary",
+            )],
+            &master_key(),
+            single_stream_options(),
+            dictionary(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let mut corrupted = archive.bytes.clone();
+        corrupt_object_extent_records(
+            &mut corrupted,
+            dictionary_extent_from_index_root(&opened.index_root).unwrap(),
+        );
+        assert!(open_archive(&corrupted, &master_key()).is_err());
+
+        let dictionary_only = sparse_bootstrap_sidecar(
+            &archive.bootstrap_sidecar,
+            &master_key(),
+            false,
+            false,
+            true,
+        );
+        assert_eq!(
+            open_non_seekable_archive(&archive.bytes, &master_key(), Some(&dictionary_only))
+                .unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "non-seekable bootstrap sidecar requires ManifestFooter and IndexRoot sections"
+            )
+        );
+
+        let recovered =
+            open_archive_with_bootstrap_sidecar(&corrupted, &dictionary_only, &master_key())
+                .unwrap();
+        assert_eq!(
+            recovered.extract_file("sparse-dict.txt").unwrap(),
+            Some(b"common words common words sparse dictionary".to_vec())
+        );
+        recovered.verify().unwrap();
     }
 
     #[test]
@@ -3369,6 +3614,121 @@ mod tests {
             open_archive_with_bootstrap_sidecar(&archive.bytes, &non_authoritative, &master_key())
                 .unwrap_err(),
             FormatError::InvalidArchive("sidecar ManifestFooter is not authoritative")
+        );
+    }
+
+    #[test]
+    fn sidecar_manifest_validation_does_not_compare_opened_volume_index() {
+        let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
+        let volume_header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_start = volume_header.crypto_header_offset as usize;
+        let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
+        let crypto_header = CryptoHeader::parse(
+            &archive.bytes[crypto_start..crypto_end],
+            volume_header.crypto_header_length,
+        )
+        .unwrap();
+        let subkeys = Subkeys::derive(
+            &master_key(),
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+        )
+        .unwrap();
+        let mut opened_header = volume_header;
+        opened_header.volume_index = 1;
+
+        let parsed = parse_bootstrap_sidecar(
+            &archive.bootstrap_sidecar,
+            &opened_header,
+            &crypto_header.fixed,
+            &subkeys,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.manifest_footer.unwrap().volume_index, 0);
+    }
+
+    #[test]
+    fn bootstrap_sidecar_rejects_conflicting_manifest_bootstrap_fields() {
+        let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
+        let mut conflicting = archive.bootstrap_sidecar.clone();
+        mutate_sidecar_manifest(&mut conflicting, &master_key(), |footer| {
+            footer.index_root_first_block += 1;
+        });
+
+        assert_eq!(
+            open_archive_with_bootstrap_sidecar(&archive.bytes, &conflicting, &master_key())
+                .unwrap_err(),
+            FormatError::InvalidArchive("bootstrap sidecar conflicts with terminal ManifestFooter")
+        );
+    }
+
+    #[test]
+    fn sidecar_size_cap_counts_only_present_sparse_sections() {
+        let mut crypto_header = test_crypto_header();
+        crypto_header.has_dictionary = 1;
+        crypto_header.index_root_fec_data_shards = 1;
+        crypto_header.index_root_fec_parity_shards = 0;
+        let record_len = crypto_header.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
+        let header = BootstrapSidecarHeader {
+            archive_uuid: [0x31; 16],
+            session_id: [0x42; 16],
+            flags: 0x04,
+            manifest_footer_offset: 0,
+            manifest_footer_length: 0,
+            index_root_records_offset: 0,
+            index_root_records_length: 0,
+            dictionary_records_offset: BOOTSTRAP_SIDECAR_HEADER_LEN as u64,
+            dictionary_records_length: record_len,
+            sidecar_hmac: [0u8; 32],
+            header_crc32c: 0,
+        };
+
+        validate_sidecar_size_cap(
+            &header,
+            &crypto_header,
+            BOOTSTRAP_SIDECAR_HEADER_LEN as u64 + record_len,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_sidecar_size_cap(
+                &header,
+                &crypto_header,
+                BOOTSTRAP_SIDECAR_HEADER_LEN as u64 + record_len + 1,
+            )
+            .unwrap_err(),
+            FormatError::InvalidArchive("bootstrap sidecar exceeds resource cap")
+        );
+    }
+
+    #[test]
+    fn sidecar_size_cap_rejects_sparse_section_above_class_max() {
+        let mut crypto_header = test_crypto_header();
+        crypto_header.index_root_fec_data_shards = 1;
+        crypto_header.index_root_fec_parity_shards = 0;
+        let record_len = crypto_header.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
+        let header = BootstrapSidecarHeader {
+            archive_uuid: [0x31; 16],
+            session_id: [0x42; 16],
+            flags: 0x02,
+            manifest_footer_offset: 0,
+            manifest_footer_length: 0,
+            index_root_records_offset: BOOTSTRAP_SIDECAR_HEADER_LEN as u64,
+            index_root_records_length: record_len * 2,
+            dictionary_records_offset: 0,
+            dictionary_records_length: 0,
+            sidecar_hmac: [0u8; 32],
+            header_crc32c: 0,
+        };
+
+        assert_eq!(
+            validate_sidecar_size_cap(
+                &header,
+                &crypto_header,
+                BOOTSTRAP_SIDECAR_HEADER_LEN as u64 + record_len * 2,
+            )
+            .unwrap_err(),
+            FormatError::InvalidArchive("bootstrap sidecar IndexRoot records exceed resource cap")
         );
     }
 
@@ -3907,6 +4267,14 @@ mod tests {
         let mut header =
             BootstrapSidecarHeader::parse(&sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
         mutate(&mut header);
+        write_signed_sidecar_header(sidecar, master_key, &mut header);
+    }
+
+    fn write_signed_sidecar_header(
+        sidecar: &mut [u8],
+        master_key: &MasterKey,
+        header: &mut BootstrapSidecarHeader,
+    ) {
         header.sidecar_hmac = [0u8; 32];
         let mut header_bytes = header.to_bytes();
         let subkeys =
@@ -3920,6 +4288,84 @@ mod tests {
         );
         header_bytes = header.to_bytes();
         sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN].copy_from_slice(&header_bytes);
+    }
+
+    fn sparse_bootstrap_sidecar(
+        source: &[u8],
+        master_key: &MasterKey,
+        include_manifest: bool,
+        include_index_root: bool,
+        include_dictionary: bool,
+    ) -> Vec<u8> {
+        let source_header =
+            BootstrapSidecarHeader::parse(&source[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
+        let mut sidecar = vec![0u8; BOOTSTRAP_SIDECAR_HEADER_LEN];
+        let mut header = BootstrapSidecarHeader {
+            archive_uuid: source_header.archive_uuid,
+            session_id: source_header.session_id,
+            flags: 0,
+            manifest_footer_offset: 0,
+            manifest_footer_length: 0,
+            index_root_records_offset: 0,
+            index_root_records_length: 0,
+            dictionary_records_offset: 0,
+            dictionary_records_length: 0,
+            sidecar_hmac: [0u8; 32],
+            header_crc32c: 0,
+        };
+
+        if include_manifest {
+            assert!(source_header.has_manifest_footer());
+            let (offset, length) = append_sidecar_section(
+                source,
+                &mut sidecar,
+                source_header.manifest_footer_offset,
+                source_header.manifest_footer_length as u64,
+            );
+            header.flags |= 0x01;
+            header.manifest_footer_offset = offset;
+            header.manifest_footer_length = length as u32;
+        }
+        if include_index_root {
+            assert!(source_header.has_index_root_records());
+            let (offset, length) = append_sidecar_section(
+                source,
+                &mut sidecar,
+                source_header.index_root_records_offset,
+                source_header.index_root_records_length,
+            );
+            header.flags |= 0x02;
+            header.index_root_records_offset = offset;
+            header.index_root_records_length = length;
+        }
+        if include_dictionary {
+            assert!(source_header.has_dictionary_records());
+            let (offset, length) = append_sidecar_section(
+                source,
+                &mut sidecar,
+                source_header.dictionary_records_offset,
+                source_header.dictionary_records_length,
+            );
+            header.flags |= 0x04;
+            header.dictionary_records_offset = offset;
+            header.dictionary_records_length = length;
+        }
+
+        write_signed_sidecar_header(&mut sidecar, master_key, &mut header);
+        sidecar
+    }
+
+    fn append_sidecar_section(
+        source: &[u8],
+        sidecar: &mut Vec<u8>,
+        source_offset: u64,
+        length: u64,
+    ) -> (u64, u64) {
+        let source_offset = source_offset as usize;
+        let length = length as usize;
+        let offset = sidecar.len() as u64;
+        sidecar.extend_from_slice(&source[source_offset..source_offset + length]);
+        (offset, length as u64)
     }
 
     fn mutate_sidecar_manifest(
@@ -4001,6 +4447,45 @@ mod tests {
         let index_record_count = footer.index_root_data_block_count as usize
             + footer.index_root_parity_block_count as usize;
         header.index_root_records_length as usize / index_record_count
+    }
+
+    fn corrupt_object_extent_records(volume: &mut [u8], extent: ObjectExtent) {
+        let volume_header = VolumeHeader::parse(&volume[..VOLUME_HEADER_LEN]).unwrap();
+        assert_eq!(volume_header.volume_index, 0);
+        assert_eq!(volume_header.stripe_width, 1);
+        let crypto_start = volume_header.crypto_header_offset as usize;
+        let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
+        let crypto_header = CryptoHeader::parse(
+            &volume[crypto_start..crypto_end],
+            volume_header.crypto_header_length,
+        )
+        .unwrap();
+        let record_len = crypto_header.fixed.block_size as usize + BLOCK_RECORD_FRAMING_LEN;
+        let record_count = extent.data_block_count as u64 + extent.parity_block_count as u64;
+        for offset in 0..record_count {
+            let block_index = extent.first_block_index + offset;
+            let record_offset = crypto_end + block_index as usize * record_len;
+            volume[record_offset + 16] ^= 0x55;
+        }
+    }
+
+    fn terminal_material_offset(volume: &[u8]) -> usize {
+        let volume_header = VolumeHeader::parse(&volume[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_start = volume_header.crypto_header_offset as usize;
+        let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
+        let crypto_header = CryptoHeader::parse(
+            &volume[crypto_start..crypto_end],
+            volume_header.crypto_header_length,
+        )
+        .unwrap();
+        let (_, offset, _) = parse_stream_block_prefix(
+            volume,
+            crypto_end,
+            crypto_header.fixed.block_size as usize,
+            &volume_header,
+        )
+        .unwrap();
+        offset
     }
 
     #[derive(Debug)]
@@ -4198,7 +4683,7 @@ mod tests {
                 index_root_decompressed_size: index_root_plaintext.len() as u32,
                 manifest_hmac: [0u8; 32],
             },
-            volume_trailer: VolumeTrailer {
+            volume_trailer: Some(VolumeTrailer {
                 archive_uuid,
                 session_id,
                 volume_index: 0,
@@ -4208,7 +4693,7 @@ mod tests {
                 manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
                 closed_at_ns: 0,
                 trailer_hmac: [0u8; 32],
-            },
+            }),
             index_root,
             payload_dictionary: None,
         };
