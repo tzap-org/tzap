@@ -7,6 +7,15 @@ recovery.
 
 ## Install
 
+From Homebrew:
+
+```sh
+brew tap frankmanzhu/tzap https://github.com/frankmanzhu/tzap
+brew install frankmanzhu/tzap/tzap
+```
+
+From crates.io:
+
 ```sh
 cargo install tzap
 ```
