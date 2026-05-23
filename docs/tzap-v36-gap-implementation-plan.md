@@ -55,7 +55,7 @@ corpus coverage, and explicit release gates.
 | ID | Area | Current status | Priority | Required outcome |
 | --- | --- | --- | --- | --- |
 | G01 | Documentation and plan drift | complete | P0 | docs match actual code and no README drawbacks |
-| G02 | Conformance matrix | missing | P0 | map all writer/reader obligations to code/tests/status |
+| G02 | Conformance matrix | complete | P0 | map all writer/reader obligations to code/tests/status |
 | G03 | True streaming writer | partial/in-memory only | P0/P1 | implement sink model or document no true streaming claim |
 | G04 | Sequential non-seekable reader | partial/whole-buffer safe API | P0/P1 | safe provisional-output story and tests |
 | G05 | Bootstrap sidecar authority | partial | P0 | sparse sections and authority precedence match spec |
@@ -135,7 +135,9 @@ Spec anchors:
 - v0.36 writer obligations 1 through 38
 - v0.36 reader obligations 1 through 31
 
-Current gap:
+Status: complete.
+
+Original gap:
 
 The repo has tests and a v36 implementation plan, but there is no durable matrix
 that proves each conformance obligation has:
@@ -146,29 +148,38 @@ that proves each conformance obligation has:
 - CLI/API boundary, if unsupported
 - release status
 
-Implementation work:
+Completed implementation:
 
-1. Add `docs/tzap-v36-conformance-matrix.md`.
-2. Use one row per writer obligation and one row per reader obligation.
-3. Required columns:
+1. Added `docs/tzap-v36-conformance-matrix.md`.
+2. Added one row per writer obligation `W01` through `W38` and one row per
+   reader obligation `R01` through `R31`.
+3. Each row includes:
    - obligation ID
    - short spec requirement
    - code path
    - positive tests
    - negative/mutation tests
-   - status: complete, partial, unsupported, deferred, or unknown
+   - status: `complete`, `partial`, `unsupported`, or `deferred`
    - notes / follow-up issue
-4. Reject "unknown" rows before release.
-5. Any "unsupported" row must link to:
-   - a CLI/API guard test
-   - operational-boundary docs
-   - a stable error category
+4. Marked broad or not-yet-claimed areas honestly:
+   - true streaming writer: `W12` unsupported, `W38` partial
+   - live sequential/provisional output: `R04` and `R20` partial
+   - sparse sidecar authority: `R16` partial
+   - directory entries and cloud mode: `W14` and `R31` partial
+   - tar metadata profile: `W13`, `R13`, and `R23` partial
+   - duplicate-copy recovery: `R27` partial with the explicit mode deferred
+   - fuzz and release gates: tracked in the non-section-29 release evidence
+     table
+5. Added `.gitignore` whitelist for the new tracked docs file.
 
-Tests:
+Tests added:
 
-- Add a lightweight docs test that fails if the matrix is missing writer 1-38
-  or reader 1-31 rows.
-- Add a docs test that fails if any row has status `unknown`.
+- `milestone11_v36_conformance_matrix_covers_section_29_obligations` fails if
+  the matrix is missing any `W01` through `W38` or `R01` through `R31` row, or
+  if an obligation row appears more than once.
+- `milestone11_v36_conformance_matrix_uses_reviewable_statuses` fails if a
+  conformance row uses any status outside `complete`, `partial`, `unsupported`,
+  or `deferred`.
 
 Done criteria:
 

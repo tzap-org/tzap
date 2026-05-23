@@ -360,3 +360,88 @@ fn milestone11_docs_pin_current_g01_boundaries() {
     assert!(!readme.contains("Empty directory inputs"));
     assert!(!readme.contains("writer layouts not emitted yet"));
 }
+
+#[test]
+fn milestone11_v36_conformance_matrix_covers_section_29_obligations() {
+    let matrix = read_workspace_file("docs/tzap-v36-conformance-matrix.md");
+
+    assert!(matrix.contains("## Writer Obligations"));
+    assert!(matrix.contains("## Reader Obligations"));
+    assert!(matrix.contains(
+        "| Obligation ID | Short requirement | Code path | Positive tests | Negative/mutation tests | Status | Notes/follow-up |"
+    ));
+
+    for id in 1..=38 {
+        assert_matrix_row_count(&matrix, &format!("W{id:02}"), 1);
+    }
+    for id in 1..=31 {
+        assert_matrix_row_count(&matrix, &format!("R{id:02}"), 1);
+    }
+}
+
+#[test]
+fn milestone11_v36_conformance_matrix_uses_reviewable_statuses() {
+    let matrix = read_workspace_file("docs/tzap-v36-conformance-matrix.md");
+    let allowed = ["`complete`", "`partial`", "`unsupported`", "`deferred`"];
+    let vague_evidence_phrases = [
+        "smoke tests",
+        "corpus tests",
+        "parser mutations",
+        "mutation cases",
+        "tamper tests",
+        "metadata cap tests",
+        "seekable open tests",
+        "wrong-key reader tests",
+        "round trips",
+        "exact-set mutations",
+        "object extent reader mutations",
+        "parser mutation tests",
+        "parse mutations",
+        "version validation",
+        "tests in `",
+    ];
+    let mut checked_rows = 0usize;
+
+    for line in matrix
+        .lines()
+        .filter(|line| line.starts_with("| W") || line.starts_with("| R"))
+    {
+        let columns: Vec<_> = line.split('|').map(str::trim).collect();
+        assert_eq!(columns.len(), 9, "malformed matrix row: {line}");
+        let status = columns[6];
+        assert!(
+            allowed.contains(&status),
+            "unreviewable matrix status {status:?} in row: {line}"
+        );
+        assert_ne!(
+            status, "`unknown`",
+            "matrix row uses unknown status: {line}"
+        );
+        checked_rows += 1;
+    }
+
+    for phrase in vague_evidence_phrases {
+        assert!(
+            !matrix.contains(phrase),
+            "matrix should cite exact evidence instead of vague phrase {phrase:?}"
+        );
+    }
+
+    assert_eq!(
+        checked_rows,
+        38 + 31,
+        "unexpected number of conformance obligation rows"
+    );
+}
+
+fn assert_matrix_row_count(matrix: &str, id: &str, expected: usize) {
+    let prefix = format!("| {id} |");
+    let actual = matrix
+        .lines()
+        .filter(|line| line.starts_with(&prefix))
+        .count();
+    assert_eq!(
+        actual, expected,
+        "expected {expected} row(s) for {id}, found {actual}"
+    );
+}
