@@ -5154,6 +5154,25 @@ mod tests {
                 structure: "BootstrapSidecarHeader"
             }
         );
+
+        let mut non_covered_sidecar = archive.bootstrap_sidecar.clone();
+        let header =
+            BootstrapSidecarHeader::parse(&non_covered_sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
+        let mut header_bytes = header.to_bytes();
+        header_bytes[124] ^= 0x01;
+        let crc = crc32c(&header_bytes[..124]);
+        header_bytes[124..128].copy_from_slice(&crc.to_le_bytes());
+        non_covered_sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN].copy_from_slice(&header_bytes);
+        let opened = open_archive_with_bootstrap_sidecar(
+            &archive.bytes,
+            &non_covered_sidecar,
+            &master_key(),
+        )
+        .unwrap();
+        assert_eq!(
+            opened.extract_file("hmac-boundary.txt").unwrap(),
+            Some(b"boundary bytes".to_vec())
+        );
     }
 
     #[test]
@@ -5216,6 +5235,84 @@ mod tests {
     }
 
     #[test]
+    fn rejects_same_key_crypto_header_splice_with_session_mismatch() {
+        let base = WriterOptions {
+            archive_uuid: Some([0x11; 16]),
+            session_id: Some([0x22; 16]),
+            ..single_stream_options()
+        };
+        let same_archive = WriterOptions {
+            archive_uuid: Some([0x11; 16]),
+            session_id: Some([0x33; 16]),
+            ..single_stream_options()
+        };
+
+        let first = write_archive(&[RegularFile::new("splice.txt", b"same shape")], &master_key(), base)
+            .unwrap();
+        let second =
+            write_archive(&[RegularFile::new("splice.txt", b"same shape")], &master_key(), same_archive)
+                .unwrap();
+
+        let volume_header = VolumeHeader::parse(&first.bytes[..VOLUME_HEADER_LEN]).unwrap();
+        let second_volume_header =
+            VolumeHeader::parse(&second.bytes[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_start = usize::from(volume_header.crypto_header_offset);
+        let crypto_end = crypto_start + usize::from(volume_header.crypto_header_length);
+        let second_crypto_end = usize::from(second_volume_header.crypto_header_offset)
+            + usize::from(second_volume_header.crypto_header_length);
+        assert_eq!(crypto_end, second_crypto_end);
+
+        let mut spliced = first.bytes.clone();
+        spliced[crypto_start..crypto_end].copy_from_slice(&second.bytes[crypto_start..crypto_end]);
+
+        assert_eq!(
+            open_archive(&spliced, &master_key()).unwrap_err(),
+            FormatError::HmacMismatch {
+                structure: "CryptoHeader"
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_same_key_object_splice_with_session_mismatch() {
+        let first = write_archive(
+            &[RegularFile::new("splice.txt", b"same shape")],
+            &master_key(),
+            WriterOptions {
+                archive_uuid: Some([0x11; 16]),
+                session_id: Some([0x22; 16]),
+                ..single_stream_options()
+            },
+        )
+        .unwrap();
+        let second = write_archive(
+            &[RegularFile::new("splice.txt", b"same shape")],
+            &master_key(),
+            WriterOptions {
+                archive_uuid: Some([0x11; 16]),
+                session_id: Some([0x33; 16]),
+                ..single_stream_options()
+            },
+        )
+        .unwrap();
+
+        let volume_header = VolumeHeader::parse(&first.bytes[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_end = volume_header.crypto_header_offset as usize
+            + usize::from(volume_header.crypto_header_length);
+        let terminal_offset = terminal_material_offset(&first.bytes);
+        let second_terminal_offset = terminal_material_offset(&second.bytes);
+        assert_eq!(terminal_offset, second_terminal_offset);
+
+        let mut spliced = first.bytes.clone();
+        spliced[crypto_end..terminal_offset].copy_from_slice(&second.bytes[crypto_end..terminal_offset]);
+
+        assert_eq!(
+            open_archive(&spliced, &master_key()).unwrap_err(),
+            FormatError::AeadFailure
+        );
+    }
+
+    #[test]
     fn rejects_authenticated_trailer_pointer_and_count_mutations() {
         let archive = write_archive(
             &[RegularFile::new(
@@ -5226,8 +5323,50 @@ mod tests {
             single_stream_options(),
         )
         .unwrap();
+        let strict_options = {
+            let mut options = ReaderOptions::default();
+            options.max_trailing_garbage_scan = 0;
+            options
+        };
+        let bytes = archive.bytes;
+        let manifest_offset = terminal_material_offset(&bytes);
+        let trailer_offset = manifest_offset + MANIFEST_FOOTER_LEN;
 
-        let mut wrong_bytes_written = archive.bytes.clone();
+        let mut wrong_footer_length = bytes.clone();
+        rewrite_volume_trailer(&mut wrong_footer_length, &master_key(), |trailer| {
+            trailer.manifest_footer_length = 42;
+        });
+        assert_eq!(
+            OpenedArchive::open_with_options(
+                &wrong_footer_length,
+                &master_key(),
+                strict_options
+            )
+            .unwrap_err(),
+            FormatError::InvalidManifestFooterLength(42)
+        );
+
+        for (label, offset) in [
+            ("offset before trailer by 1", manifest_offset.saturating_sub(1)),
+            ("offset after trailer", manifest_offset + 1),
+            ("offset at stream start", 0),
+            ("offset at trailer", trailer_offset),
+            ("offset beyond trailer", trailer_offset + 4),
+        ] {
+            let mut wrong_footer_offset = bytes.clone();
+            rewrite_volume_trailer(&mut wrong_footer_offset, &master_key(), |trailer| {
+                trailer.manifest_footer_offset = offset as u64;
+            });
+            assert_eq!(
+                open_archive(&wrong_footer_offset, &master_key()).unwrap_err(),
+                FormatError::InvalidArchive(
+                    "ManifestFooter does not end at selected trailer"
+                ),
+                "manifest offset case {label}"
+            );
+        }
+
+        let mut wrong_bytes_written = bytes.clone();
         rewrite_volume_trailer(&mut wrong_bytes_written, &master_key(), |trailer| {
             trailer.bytes_written += 1;
         });
@@ -5238,7 +5377,7 @@ mod tests {
             )
         );
 
-        let mut wrong_block_count = archive.bytes.clone();
+        let mut wrong_block_count = bytes.clone();
         rewrite_volume_trailer(&mut wrong_block_count, &master_key(), |trailer| {
             trailer.block_count += 1;
         });
@@ -5249,13 +5388,43 @@ mod tests {
             )
         );
 
-        let mut wrong_footer_offset = archive.bytes;
+        let mut wrong_footer_offset = bytes.clone();
         rewrite_volume_trailer(&mut wrong_footer_offset, &master_key(), |trailer| {
-            trailer.manifest_footer_offset -= 1;
+            trailer.manifest_footer_offset = bytes.len() as u64 + 1024;
         });
         assert_eq!(
             open_archive(&wrong_footer_offset, &master_key()).unwrap_err(),
             FormatError::InvalidArchive("ManifestFooter does not end at selected trailer")
+        );
+    }
+
+    #[test]
+    fn rejects_authenticated_trailer_outside_trailing_scan_cap() {
+        let archive = write_archive(
+            &[RegularFile::new(
+                "trailer-trailing-scan.txt",
+                b"trailer scan boundaries",
+            )],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut options = ReaderOptions::default();
+        options.max_trailing_garbage_scan = 8;
+
+        let mut within_scan = archive.bytes.clone();
+        within_scan.resize(within_scan.len() + options.max_trailing_garbage_scan, 0xAA);
+        let opened = OpenedArchive::open_with_options(&within_scan, &master_key(), options).unwrap();
+        assert_eq!(
+            opened.extract_file("trailer-trailing-scan.txt").unwrap(),
+            Some(b"trailer scan boundaries".to_vec())
+        );
+
+        let mut beyond_scan = within_scan;
+        beyond_scan.push(0xAA);
+        assert_eq!(
+            OpenedArchive::open_with_options(&beyond_scan, &master_key(), options).unwrap_err(),
+            FormatError::InvalidArchive("no authenticated VolumeTrailer found")
         );
     }
 

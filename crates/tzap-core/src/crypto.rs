@@ -567,6 +567,21 @@ mod tests {
         [0x22; 16]
     }
 
+    fn legacy_nonce_info(
+        domain: &[u8],
+        archive_uuid: &[u8; 16],
+        session_id: &[u8; 16],
+        counter: u64,
+    ) -> Vec<u8> {
+        let mut info = Vec::with_capacity(b"tzap-v1-nonce".len() + domain.len() + 16 + 16 + 8);
+        info.extend_from_slice(b"tzap-v1-nonce");
+        info.extend_from_slice(domain);
+        info.extend_from_slice(archive_uuid);
+        info.extend_from_slice(session_id);
+        info.extend_from_slice(&counter.to_le_bytes());
+        info
+    }
+
     #[test]
     fn parses_raw_kdf_params() {
         let (params, consumed) = KdfParams::parse(KdfAlgo::Raw, &0u16.to_le_bytes()).unwrap();
@@ -922,6 +937,65 @@ mod tests {
     }
 
     #[test]
+    fn rejects_old_nonce_info_without_domain_length() {
+        let key = [0x66; SUBKEY_LEN];
+        let nonce_seed = [0x77; SUBKEY_LEN];
+        let uuid = uuid();
+        let session = session();
+        let counter = 7u64;
+        let domain = b"idxroot";
+
+        let ciphertext = encrypt_padded_aead_object(
+            AeadAlgo::AesGcmSiv256,
+            &key,
+            &nonce_seed,
+            domain,
+            &uuid,
+            &session,
+            counter,
+            4096,
+            b"index-root",
+        )
+        .unwrap();
+
+        let mut legacy_nonce = vec![0u8; AeadAlgo::AesGcmSiv256.nonce_len()];
+        Hkdf::<Sha256>::from_prk(&nonce_seed)
+            .unwrap()
+            .expand(
+                &legacy_nonce_info(domain, &uuid, &session, counter),
+                &mut legacy_nonce,
+            )
+            .unwrap();
+        let aad = build_aad(domain, &uuid, &session, counter).unwrap();
+
+        assert_ne!(
+            legacy_nonce,
+            derive_nonce(
+                &nonce_seed,
+                domain,
+                &uuid,
+                &session,
+                counter,
+                AeadAlgo::AesGcmSiv256.nonce_len()
+            )
+            .unwrap(),
+            "legacy nonce info encoding must differ from current encoding"
+        );
+
+        assert_eq!(
+            aead_decrypt(
+                AeadAlgo::AesGcmSiv256,
+                &key,
+                &legacy_nonce,
+                &aad,
+                &ciphertext,
+            )
+            .unwrap_err(),
+            FormatError::AeadFailure
+        );
+    }
+
+    #[test]
     fn aead_round_trips_all_registered_algorithms() {
         for algo in [
             AeadAlgo::AesGcmSiv256,
@@ -1005,6 +1079,50 @@ mod tests {
                 &uuid(),
                 &session(),
                 3,
+                &ciphertext,
+            )
+            .unwrap_err(),
+            FormatError::AeadFailure
+        );
+    }
+
+    #[test]
+    fn rejects_index_root_aad_counter_mismatch() {
+        let key = [0x99; SUBKEY_LEN];
+        let nonce_seed = [0x88; SUBKEY_LEN];
+        let uuid = uuid();
+        let session = session();
+
+        let ciphertext = encrypt_padded_aead_object(
+            AeadAlgo::AesGcmSiv256,
+            &key,
+            &nonce_seed,
+            b"idxroot",
+            &uuid,
+            &session,
+            0,
+            4096,
+            b"index-root-meta",
+        )
+        .unwrap();
+
+        let nonce = derive_nonce(
+            &nonce_seed,
+            b"idxroot",
+            &uuid,
+            &session,
+            0,
+            AeadAlgo::AesGcmSiv256.nonce_len(),
+        )
+        .unwrap();
+        let mismatched_aad = build_aad(b"idxroot", &uuid, &session, 1).unwrap();
+
+        assert_eq!(
+            aead_decrypt(
+                AeadAlgo::AesGcmSiv256,
+                &key,
+                &nonce,
+                &mismatched_aad,
                 &ciphertext,
             )
             .unwrap_err(),
