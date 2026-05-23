@@ -352,6 +352,8 @@ fn milestone11_docs_pin_current_g01_boundaries() {
     assert!(boundaries.contains("# exit 3: io"));
     assert!(boundaries.contains("Empty directory inputs"));
     assert!(boundaries.contains("empty directories\nare omitted"));
+    assert!(boundaries.contains("Cloud directory-prefix optimization"));
+    assert!(boundaries.contains("does not claim optimized directory-prefix operations"));
     assert!(!boundaries.contains("writer layouts not emitted yet"));
 
     assert!(reference
@@ -361,7 +363,16 @@ fn milestone11_docs_pin_current_g01_boundaries() {
 
     assert!(!readme.contains("Archive paths, not archive stdin"));
     assert!(!readme.contains("Empty directory inputs"));
+    assert!(!readme.contains("Cloud directory-prefix optimization"));
+    assert!(!readme.contains("directory-prefix"));
+    assert!(!readme.contains("cloud/object-store optimized"));
+    assert!(!readme.contains("forced-hints"));
     assert!(!readme.contains("writer layouts not emitted yet"));
+
+    assert!(!reference.contains("directory-prefix"));
+    assert!(!reference.contains("cloud/object-store optimized"));
+    assert!(!reference.contains("forced-hints"));
+    assert!(!reference.contains("--cloud-directory-prefix"));
 }
 
 #[test]

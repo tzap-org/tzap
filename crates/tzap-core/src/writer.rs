@@ -48,6 +48,10 @@ const MAX_FILES_PER_INDEX_SHARD: usize = 1_000_000;
 const MAX_HASH_PREFIX_RUN_FILES: usize = 50_000;
 const DEFAULT_DIRECTORY_HINT_ENTRIES_PER_SHARD: usize = 10_000;
 
+fn should_emit_directory_hints(file_count: usize) -> bool {
+    file_count > DIRECTORY_HINT_REQUIRED_FILE_COUNT
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterOptions {
     pub block_size: u32,
@@ -488,7 +492,7 @@ fn write_archive_once(
         next_block_index
     };
 
-    let planned_directory_hint_shards = if tar_members.len() > DIRECTORY_HINT_REQUIRED_FILE_COUNT {
+    let planned_directory_hint_shards = if should_emit_directory_hints(tar_members.len()) {
         build_directory_hint_plaintexts(&shard_file_rows, options)?
     } else {
         Vec::new()
@@ -2442,6 +2446,17 @@ mod tests {
         assert_eq!(table.shard_rows_for_entry(a).unwrap(), &[0, 1]);
         let ab = table.lookup_directory_index(b"a/b").unwrap();
         assert_eq!(table.shard_rows_for_entry(ab).unwrap(), &[0]);
+    }
+
+    #[test]
+    fn directory_hints_are_required_only_above_v36_threshold() {
+        assert!(!should_emit_directory_hints(0));
+        assert!(!should_emit_directory_hints(
+            DIRECTORY_HINT_REQUIRED_FILE_COUNT
+        ));
+        assert!(should_emit_directory_hints(
+            DIRECTORY_HINT_REQUIRED_FILE_COUNT + 1
+        ));
     }
 
     #[test]

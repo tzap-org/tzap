@@ -574,6 +574,14 @@ impl OpenedArchive {
     }
 
     pub fn verify(&self) -> Result<(), FormatError> {
+        if self.index_root.header.file_count > DIRECTORY_HINT_REQUIRED_FILE_COUNT
+            && self.index_root.directory_hint_shards.is_empty()
+        {
+            return Err(FormatError::InvalidArchive(
+                "IndexRoot file_count requires directory hints",
+            ));
+        }
+
         let shards = self.load_all_index_shards()?;
         let mut file_count = 0u64;
         let mut frames = BTreeMap::<u64, FrameEntry>::new();
@@ -607,13 +615,6 @@ impl OpenedArchive {
         if file_count != self.index_root.header.file_count {
             return Err(FormatError::InvalidArchive(
                 "IndexRoot file_count does not match decoded shards",
-            ));
-        }
-        if self.index_root.header.file_count > DIRECTORY_HINT_REQUIRED_FILE_COUNT
-            && self.index_root.directory_hint_shards.is_empty()
-        {
-            return Err(FormatError::InvalidArchive(
-                "IndexRoot file_count requires directory hints",
             ));
         }
         verify_dense_keys(&frames, self.index_root.header.frame_count, "FrameEntry")?;
@@ -3868,6 +3869,85 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_authenticated_archive_missing_required_directory_hints() {
+        let options = WriterOptions {
+            index_root_fec_parity_shards: 0,
+            ..single_stream_options()
+        };
+        let archive = write_archive(
+            &[RegularFile::new("only.txt", b"only payload")],
+            &master_key(),
+            options,
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        assert!(opened.index_root.directory_hint_shards.is_empty());
+
+        let mut root = opened.index_root.clone();
+        root.header.file_count = DIRECTORY_HINT_REQUIRED_FILE_COUNT + 1;
+        root.shards[0].file_count = (DIRECTORY_HINT_REQUIRED_FILE_COUNT + 1) as u32;
+        let root_plaintext = root.to_bytes();
+        IndexRoot::parse(
+            &root_plaintext,
+            false,
+            metadata_limits(&opened.crypto_header),
+        )
+        .unwrap();
+        assert_eq!(
+            root_plaintext.len() as u32,
+            opened.manifest_footer.index_root_decompressed_size
+        );
+
+        let compressed_root = compress_zstd_frame(&root_plaintext, options.zstd_level).unwrap();
+        let mut next_block_index = opened.manifest_footer.index_root_first_block;
+        let replacement = encrypt_test_object(
+            &compressed_root,
+            &opened.subkeys.index_root_key,
+            &opened.subkeys.index_nonce_seed,
+            b"idxroot",
+            0,
+            BlockKind::IndexRootData,
+            &mut next_block_index,
+            &opened.crypto_header,
+            &opened.volume_header,
+        );
+        assert_eq!(
+            replacement.extent.first_block_index,
+            opened.manifest_footer.index_root_first_block
+        );
+        assert_eq!(
+            replacement.extent.data_block_count,
+            opened.manifest_footer.index_root_data_block_count
+        );
+        assert_eq!(
+            replacement.extent.encrypted_size,
+            opened.manifest_footer.index_root_encrypted_size
+        );
+
+        let volume_header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_end = volume_header.crypto_header_offset as usize
+            + volume_header.crypto_header_length as usize;
+        let record_len = opened.crypto_header.block_size as usize + BLOCK_RECORD_FRAMING_LEN;
+        let mut malformed = archive.bytes.clone();
+        for record in replacement.records {
+            let offset = crypto_end + record.block_index as usize * record_len;
+            malformed[offset..offset + record_len].copy_from_slice(&record.to_bytes());
+        }
+
+        let reopened = open_archive(&malformed, &master_key()).unwrap();
+        assert_eq!(
+            reopened.index_root.header.file_count,
+            DIRECTORY_HINT_REQUIRED_FILE_COUNT + 1
+        );
+        assert!(reopened.index_root.directory_hint_shards.is_empty());
+
+        assert_eq!(
+            reopened.verify().unwrap_err(),
+            FormatError::InvalidArchive("IndexRoot file_count requires directory hints")
+        );
+    }
+
+    #[test]
     fn expected_directory_hint_rows_include_ancestors_and_directory_entries() {
         let mut map = DirectoryHintMap::new();
         add_expected_directory_hint_rows(&mut map, 2, b"foo/bar/baz.txt", TarEntryKind::Regular);
@@ -3890,10 +3970,36 @@ mod tests {
 
         validate_directory_hint_tables_against_expected(&[table.clone()], &expected).unwrap();
 
-        let mut incomplete = expected.clone();
-        incomplete.get_mut(&b"foo".to_vec()).unwrap().remove(&1);
+        let mut missing_root = expected.clone();
+        missing_root.remove(&Vec::new());
+        let missing_root_rows = sorted_directory_hint_rows(&missing_root);
+        let missing_root_table = directory_hint_table_from_rows(8, &missing_root_rows, 2);
         assert_eq!(
-            validate_directory_hint_tables_against_expected(&[table], &incomplete).unwrap_err(),
+            validate_directory_hint_tables_against_expected(&[missing_root_table], &expected)
+                .unwrap_err(),
+            FormatError::InvalidArchive("directory hint map does not match decoded files")
+        );
+
+        let mut expected_missing_directory_entry = expected.clone();
+        expected_missing_directory_entry
+            .get_mut(&b"foo".to_vec())
+            .unwrap()
+            .remove(&1);
+        assert_eq!(
+            validate_directory_hint_tables_against_expected(
+                &[table.clone()],
+                &expected_missing_directory_entry,
+            )
+            .unwrap_err(),
+            FormatError::InvalidArchive("directory hint map does not match decoded files")
+        );
+
+        let mut extra = expected.clone();
+        extra.insert(b"foo/extra".to_vec(), BTreeSet::from([0]));
+        let extra_rows = sorted_directory_hint_rows(&extra);
+        let extra_table = directory_hint_table_from_rows(9, &extra_rows, 2);
+        assert_eq!(
+            validate_directory_hint_tables_against_expected(&[extra_table], &expected).unwrap_err(),
             FormatError::InvalidArchive("directory hint map does not match decoded files")
         );
     }

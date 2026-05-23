@@ -2326,6 +2326,98 @@ mod tests {
     }
 
     #[test]
+    fn directory_hint_table_rejects_wrong_hint_shard_identity() {
+        let path = b"dir".to_vec();
+        let table = DirectoryHintTable {
+            header: DirectoryHintTableHeader {
+                version: 1,
+                hint_shard_index: 5,
+                entry_count: 0,
+                entry_table_offset: 0,
+                shard_list_offset: 0,
+                string_pool_offset: 0,
+                string_pool_size: 0,
+            },
+            entries: vec![DirectoryHintEntry {
+                dir_hash: hash_prefix(&path),
+                path_offset: 0,
+                path_length: path.len() as u32,
+                shard_list_start_index: 0,
+                shard_count: 1,
+            }],
+            shard_row_indexes: vec![0],
+            string_pool: path.clone(),
+            entry_paths: vec![path.clone()],
+        };
+        let bytes = table.to_bytes();
+        let locating = DirectoryHintShardEntry {
+            hint_shard_index: 6,
+            first_dir_hash: hash_prefix(&path),
+            last_dir_hash: hash_prefix(&path),
+            first_block_index: 0,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+            decompressed_size: bytes.len() as u32,
+            entry_count: 1,
+        };
+
+        assert_eq!(
+            DirectoryHintTable::parse(&bytes, &locating, 1, MetadataLimits::default()).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "DirectoryHintTable",
+                reason: "hint shard index does not match locating DirectoryHintShardEntry",
+            }
+        );
+    }
+
+    #[test]
+    fn directory_hint_table_rejects_empty_shard_lists() {
+        let path = b"dir".to_vec();
+        let table = DirectoryHintTable {
+            header: DirectoryHintTableHeader {
+                version: 1,
+                hint_shard_index: 0,
+                entry_count: 0,
+                entry_table_offset: 0,
+                shard_list_offset: 0,
+                string_pool_offset: 0,
+                string_pool_size: 0,
+            },
+            entries: vec![DirectoryHintEntry {
+                dir_hash: hash_prefix(&path),
+                path_offset: 0,
+                path_length: path.len() as u32,
+                shard_list_start_index: 0,
+                shard_count: 0,
+            }],
+            shard_row_indexes: Vec::new(),
+            string_pool: path.clone(),
+            entry_paths: vec![path.clone()],
+        };
+        let bytes = table.to_bytes();
+        let locating = DirectoryHintShardEntry {
+            hint_shard_index: 0,
+            first_dir_hash: hash_prefix(&path),
+            last_dir_hash: hash_prefix(&path),
+            first_block_index: 0,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+            decompressed_size: bytes.len() as u32,
+            entry_count: 1,
+        };
+
+        assert_eq!(
+            DirectoryHintTable::parse(&bytes, &locating, 1, MetadataLimits::default()).unwrap_err(),
+            FormatError::InvalidMetadata {
+                structure: "DirectoryHintEntry",
+                reason: "shard count is zero",
+            }
+        );
+    }
+
+    #[test]
     fn candidate_path_lookup_uses_supplied_collision_cap() {
         let path = b"same-prefix.txt";
         let hash = hash_prefix(path);

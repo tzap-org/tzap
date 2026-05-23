@@ -140,6 +140,28 @@ What to do:
 - Add a regular placeholder file if preserving an otherwise empty directory is
   required.
 
+## Cloud directory-prefix optimization
+
+The v0.36 spec defines a cloud/object-store optimized directory-prefix mode
+that requires directory hints even for small archives. The current CLI/API does
+not expose that mode and does not claim optimized directory-prefix operations.
+Directory hints are emitted automatically for large regular-file archives when
+the v0.36 threshold requires them.
+
+Example:
+
+```sh
+tzap create --keyfile project.key -o project.tzap ./project
+# no --cloud-directory-prefix or forced-hints mode exists today
+```
+
+What to do:
+
+- Use exact-path `list`, `verify`, and `extract` operations with the current
+  CLI.
+- Treat future cloud directory-prefix optimization as a separate product
+  feature that must force directory hints below the large-archive threshold.
+
 ## Multi-volume recovery budget
 
 Recovery capacity is chosen when the archive is created. A volume can be omitted

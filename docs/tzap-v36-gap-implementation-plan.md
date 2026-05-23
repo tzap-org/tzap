@@ -60,7 +60,7 @@ corpus coverage, and explicit release gates.
 | G04 | Sequential non-seekable reader | partial/whole-buffer safe API | P0/P1 | safe provisional-output story and tests |
 | G05 | Bootstrap sidecar authority | complete | P0 | sparse sections and authority precedence match spec |
 | G06 | IndexRoot/dictionary sizing | complete | P0 | choose metadata FEC class before CryptoHeader HMAC |
-| G07 | Directory hints and directory entries | partial | P0/P1 | exact hint map, directory entries, and cloud claims settled |
+| G07 | Directory hints and directory entries | complete | P0/P1 | exact hint map, directory entries, and cloud claims settled |
 | G08 | Tar metadata profile | partial | P1 | supported metadata profile documented and tested |
 | G09 | Recovery and duplicate volumes | partial | P1 | default rejection and recovery modes are explicit |
 | G10 | CLI/API boundaries | partial | P0 | help/docs/tests do not imply unsupported behavior |
@@ -104,8 +104,7 @@ Completed implementation:
 2. Updated `docs/tzap-operational-boundaries.md` with precise examples:
    - bootstrap sidecars with multi-volume open input sets are currently not a
      supported CLI path unless G05/G10 implement it
-   - empty directory entries are omitted unless G07 implements directory
-     FileEntry support
+   - empty directory entries are omitted by current CLI/API scope
    - true archive stdin/non-seekable streaming is not exposed unless G03/G04
      implement it
 3. Updated `docs/tzap-cli-reference.md`:
@@ -164,8 +163,9 @@ Completed implementation:
 4. Marked broad or not-yet-claimed areas honestly:
    - true streaming writer: `W12` unsupported, `W38` partial
    - live sequential/provisional output: `R04` and `R20` partial
-   - sparse sidecar authority: `R16` partial
-   - directory entries and cloud mode: `W14` and `R31` partial
+   - sparse sidecar authority: `R16` complete
+   - directory entries and cloud mode: `W14` and `R31` complete by current
+     CLI/API scope
    - tar metadata profile: `W13`, `R13`, and `R23` partial
    - duplicate-copy recovery: `R27` partial with the explicit mode deferred
    - fuzz and release gates: tracked in the non-section-29 release evidence
@@ -511,69 +511,65 @@ Spec anchors:
 - writer obligation 14
 - reader obligations 7, 29, and 31
 
-Current gap:
+Resolution:
 
-The writer emits directory hints for large regular-file archives. It does not
-currently emit FileEntries for empty directories, and the CLI scanner omits
-empty directories. The spec's directory-hint rule includes every ancestor
-directory and every FileEntry path whose decoded main tar entry is itself a
-directory. That second path only matters if directory FileEntries are supported.
+Complete by Option B. The current CLI/API archive input model intentionally
+emits regular-file FileEntries only. The CLI scanner descends through directory
+inputs but does not emit standalone directory FileEntries, so empty directories
+are omitted. This is documented in `docs/tzap-operational-boundaries.md`, not
+the README marketing page.
 
-The spec also requires directory hints when the writer claims cloud/object-store
-optimized directory-prefix operations. The CLI/API should either expose such a
-claim and force hints, or make no such claim.
+The current CLI/API also does not expose or claim the spec's
+cloud/object-store optimized directory-prefix mode, and therefore has no forced
+directory-hint mode for small archives. Directory hints are emitted in `auto`
+form when `file_count > directory_hint_required_file_count`; small archives may
+legally omit them because no cloud directory-prefix claim is made.
 
-Implementation work:
+Implemented evidence:
 
-1. Decide directory FileEntry support:
-   - Option A: support directories as archive entries
-   - Option B: continue omitting empty directories and document that directory
-     FileEntries are not currently emitted
-2. If Option A:
-   - extend the tar model to represent regular files and directories
-   - scan input directories as entries, including empty directories
-   - encode directory tar member groups with canonical one-trailing-slash tar
-     names while storing FileEntry paths without trailing slashes
-   - validate extracted directory FileEntry path and size bindings
-   - make exact lookup of a directory distinct from prefix-descendant lookup
-3. Add a directory hint policy:
-   - `auto`: hints when `file_count > directory_hint_required_file_count`
-   - `always`: hints for cloud/object-store optimized claims
-   - `never`: only if spec permits for small archives and no cloud claim
-4. Strengthen hint map validation:
-   - root hint is canonical
-   - every ancestor of every FileEntry path appears
-   - directory FileEntry paths appear when directory entries are supported
-   - shard list contains sorted unique IndexRoot ShardEntry row indexes, not
-     `shard_index` IDs
-   - no missing, extra, duplicate, or misordered hints
-5. Keep exact file lookup authoritative:
-   - a regular file `foo` must not be treated as directory prefix `foo/`
-   - misleading directory hints cannot create an exact-file match
+1. Writer hint emission is explicit:
+   - `writer.rs::should_emit_directory_hints` uses the strict v0.36 threshold
+     `file_count > directory_hint_required_file_count`.
+   - `writer.rs::build_directory_hint_plaintexts` includes the root and every
+     regular-file ancestor directory and stores shard lists as IndexRoot
+     ShardEntry row indexes.
+2. Reader hint validation is exact:
+   - `reader.rs::validate_directory_hint_tables_against_expected` compares the
+     complete decoded hint map against recomputed FileEntry paths.
+   - Full `verify` rejects missing hints before fallback when
+     `IndexRoot.file_count` exceeds the v0.36 threshold.
+3. Exact lookup remains authoritative:
+   - `reader.rs::extract_member` searches the file table by exact normalized
+     path before any directory-prefix concept.
+   - Corpus tests keep misleading directory hints separate from exact-file
+     lookup.
+4. Foreign archive directory entries are not confused with regular files:
+   - `tar_model.rs::parse_tar_member_group` canonicalizes directory tar paths
+     without a trailing slash.
+   - `reader.rs::add_expected_directory_hint_rows` includes a directory
+     FileEntry path in the recomputed hint map when a decoded foreign tar
+     member is a directory.
 
 Tests:
 
-- Existing exact-file-vs-directory-hint parser tests remain.
-- Writer integration test for a directory with:
-  - regular file `foo`
-  - directory `foo-dir/`
-  - child `foo-dir/bar`
-  - empty directory, if supported
-- Archive over the hint threshold emits root and ancestor hints.
-- Forced cloud hint mode emits hints below the threshold.
-- Full verify rejects missing root hint, missing ancestor hint, extra hint,
-  duplicate hint, misordered hint, and shard indexes that are IDs instead of
-  row indexes.
-- DirectoryHintShardEntry equal-start ordering uses
-  `(first_dir_hash, last_dir_hash, hint_shard_index)`.
-- Hint-shard count and entry-count caps reject before allocation.
+- `writer::tests::writer_builds_directory_hint_rows_for_ancestor_directories`
+- `writer::tests::directory_hints_are_required_only_above_v36_threshold`
+- `reader::tests::verify_rejects_authenticated_archive_missing_required_directory_hints`
+- `reader::tests::expected_directory_hint_rows_include_ancestors_and_directory_entries`
+- `reader::tests::directory_hint_validation_requires_exact_global_map`
+- `reader::tests::directory_hint_validation_rejects_global_order_mismatch`
+- `metadata::tests::rejects_directory_hint_rows_sorted_by_old_v36_key_only`
+- `v36_corpus::exact_file_lookup_is_independent_from_directory_hints`
+- `v36_corpus::exact_directory_entry_and_descendant_hints_have_distinct_authority`
+- `v36_corpus::directory_hint_counter_uniqueness_and_non_row_position_values`
 
-Done criteria:
+Residual risk:
 
-- Directory-entry support is either implemented or explicitly outside current
-  CLI/API scope.
-- Directory hints are exact and verified whenever present.
-- No cloud/object-store optimized claim exists without forced hints.
+- Directory FileEntry emission and empty-directory preservation remain outside
+  current CLI/API scope. Adding that later is a product feature, not an
+  unfinished G07 conformance claim.
+- Broad malformed DirectoryHintTable buffer generation and huge hint stress
+  fixtures remain in G12.
 
 ## G08 - Tar Metadata Profile
 
@@ -883,7 +879,7 @@ Done criteria:
    non-seekable behavior.
 5. G03 and G04: either implement true streaming/provisional APIs or explicitly
    remove those claims from public surfaces.
-6. G07 and G08: settle directory entries, cloud hint claims, and tar metadata.
+6. G08: settle the tar metadata profile.
 7. G09, G12, and G13: harden recovery, fuzzing, interop, and release gates.
 
 ## Release Blocking Rule
