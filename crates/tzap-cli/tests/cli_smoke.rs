@@ -4549,7 +4549,7 @@ fn cli_extract_missing_bootstrap_file_is_an_io_error() {
 }
 
 #[test]
-fn cli_extract_rejects_bootstrap_with_multi_volume_with_unsupported_error() {
+fn cli_create_rejects_bootstrap_out_with_multi_volume_with_unsupported_error() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
     let input = temp.path().join("hello.txt");
@@ -4574,23 +4574,11 @@ fn cli_extract_rejects_bootstrap_with_multi_volume_with_unsupported_error() {
             input.to_str().unwrap(),
         ])
         .assert()
-        .success();
-
-    Command::cargo_bin("tzap")
-        .unwrap()
-        .args([
-            "extract",
-            "--keyfile",
-            keyfile.to_str().unwrap(),
-            "--bootstrap",
-            bootstrap.to_str().unwrap(),
-            archive.with_extension("tzap.000").to_str().unwrap(),
-            "--volume",
-            archive.with_extension("tzap.001").to_str().unwrap(),
-        ])
-        .assert()
         .code(16)
-        .stderr(predicate::str::contains("unsupported-feature"));
+        .stderr(predicate::str::contains("unsupported-feature"))
+        .stderr(predicate::str::contains(
+            "--bootstrap-out is currently supported only for single-volume output",
+        ));
 }
 
 #[test]

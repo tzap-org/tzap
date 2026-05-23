@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -13,9 +15,10 @@ use crate::format::{
     VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::metadata::{
-    hash_prefix, normalize_lookup_file_path, EnvelopeEntry, FileEntry, FrameEntry, IndexRoot,
-    IndexRootHeader, IndexShardHeader, ShardEntry, ENVELOPE_ENTRY_LEN, FILE_ENTRY_LEN,
-    FRAME_ENTRY_LEN, INDEX_SHARD_HEADER_LEN,
+    hash_prefix, normalize_lookup_file_path, DirectoryHintEntry, DirectoryHintShardEntry,
+    DirectoryHintTableHeader, EnvelopeEntry, FileEntry, FrameEntry, IndexRoot, IndexRootHeader,
+    IndexShardHeader, ShardEntry, DIRECTORY_HINT_ENTRY_LEN, DIRECTORY_HINT_TABLE_LEN,
+    ENVELOPE_ENTRY_LEN, FILE_ENTRY_LEN, FRAME_ENTRY_LEN, INDEX_SHARD_HEADER_LEN,
 };
 use crate::padding::suffix_pad_for_aead;
 use crate::wire::{
@@ -41,6 +44,9 @@ const DEFAULT_VOLUME_LOSS_TOLERANCE: u8 = 1;
 const DEFAULT_BIT_ROT_BUFFER_PCT: u8 = 5;
 const DEFAULT_FILES_PER_INDEX_SHARD: usize = 10_000;
 const DIRECTORY_HINT_REQUIRED_FILE_COUNT: usize = 100_000;
+const MAX_FILES_PER_INDEX_SHARD: usize = 1_000_000;
+const MAX_HASH_PREFIX_RUN_FILES: usize = 50_000;
+const DEFAULT_DIRECTORY_HINT_ENTRIES_PER_SHARD: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterOptions {
@@ -135,7 +141,34 @@ struct PayloadFrame {
     offset_in_envelope: u32,
     compressed_size: u32,
     decompressed_size: u32,
+    flags: u32,
     tar_stream_offset: u64,
+}
+
+#[derive(Debug, Clone)]
+struct FileRow {
+    path_hash: [u8; 8],
+    path: Vec<u8>,
+    member_index: usize,
+    member: TarMember,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedIndexShard {
+    shard_index: u64,
+    plaintext: Vec<u8>,
+    file_count: u32,
+    first_path_hash: [u8; 8],
+    last_path_hash: [u8; 8],
+}
+
+#[derive(Debug, Clone)]
+struct PlannedDirectoryHintShard {
+    hint_shard_index: u64,
+    plaintext: Vec<u8>,
+    entry_count: u64,
+    first_dir_hash: [u8; 8],
+    last_dir_hash: [u8; 8],
 }
 
 #[derive(Debug, Clone)]
@@ -245,8 +278,6 @@ fn write_archive_inner(
             .stripe_width
             .max(requested_options.volume_loss_tolerance as u32 + 1);
     }
-    validate_m6_file_scope(files.len())?;
-
     let archive_uuid = requested_options
         .archive_uuid
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
@@ -341,19 +372,25 @@ fn write_archive_once(
         (objects, frames, payload_block_count)
     };
 
-    let (index_shard_extent, shard_entries, frame_count, envelope_count) = if tar_members.is_empty()
-    {
-        (None, Vec::new(), 0u64, 0u64)
+    let (shard_file_rows, planned_index_shards) = if tar_members.is_empty() {
+        (Vec::new(), Vec::new())
     } else {
-        let index_shard_plaintext =
-            build_single_index_shard(&tar_members, &frames, &payload_objects, options)?;
-        let compressed = compress_zstd_frame(&index_shard_plaintext, options.zstd_level)?;
+        let rows = sorted_file_rows(&tar_members);
+        let shard_file_rows = partition_file_rows(rows)?;
+        let planned_index_shards =
+            build_index_shard_plaintexts(&shard_file_rows, &frames, &payload_objects, options)?;
+        (shard_file_rows, planned_index_shards)
+    };
+
+    let mut shard_entries = Vec::with_capacity(planned_index_shards.len());
+    for planned in planned_index_shards {
+        let compressed = compress_zstd_frame(&planned.plaintext, options.zstd_level)?;
         let object = encrypt_object(
             &compressed,
             &subkeys.index_shard_key,
             &subkeys.index_nonce_seed,
             b"idxshard",
-            0,
+            planned.shard_index,
             BlockKind::IndexShardData,
             BlockKind::IndexShardParity,
             options.index_fec_data_shards,
@@ -363,26 +400,21 @@ fn write_archive_once(
             &archive_uuid,
             &session_id,
         )?;
-        let (first_hash, last_hash) = file_hash_bounds(&tar_members)?;
-        let shard_entry = ShardEntry {
-            shard_index: 0,
+        shard_entries.push(ShardEntry {
+            shard_index: planned.shard_index,
             first_block_index: object.first_block_index,
             data_block_count: object.data_block_count,
             parity_block_count: object.parity_block_count,
             encrypted_size: object.encrypted_size,
-            decompressed_size: u32_len(index_shard_plaintext.len(), "IndexShard")?,
-            file_count: u32_len(tar_members.len(), "IndexShard.file_count")?,
-            first_path_hash: first_hash,
-            last_path_hash: last_hash,
-        };
+            decompressed_size: u32_len(planned.plaintext.len(), "IndexShard")?,
+            file_count: planned.file_count,
+            first_path_hash: planned.first_path_hash,
+            last_path_hash: planned.last_path_hash,
+        });
         block_records.extend(object.records.clone());
-        (
-            Some(object),
-            vec![shard_entry],
-            frames.len() as u64,
-            payload_objects.len() as u64,
-        )
-    };
+    }
+    let frame_count = frames.len() as u64;
+    let envelope_count = payload_objects.len() as u64;
 
     let dictionary_extent = if let Some(dictionary) = dictionary {
         let compressed_dictionary = compress_zstd_frame(dictionary, options.zstd_level)?;
@@ -407,6 +439,43 @@ fn write_archive_once(
         None
     };
 
+    let planned_directory_hint_shards = if tar_members.len() > DIRECTORY_HINT_REQUIRED_FILE_COUNT {
+        build_directory_hint_plaintexts(&shard_file_rows, options)?
+    } else {
+        Vec::new()
+    };
+    let mut directory_hint_entries = Vec::with_capacity(planned_directory_hint_shards.len());
+    for planned in planned_directory_hint_shards {
+        let compressed = compress_zstd_frame(&planned.plaintext, options.zstd_level)?;
+        let object = encrypt_object(
+            &compressed,
+            &subkeys.dir_hint_key,
+            &subkeys.index_nonce_seed,
+            b"dirhint",
+            planned.hint_shard_index,
+            BlockKind::DirectoryHintData,
+            BlockKind::DirectoryHintParity,
+            options.index_fec_data_shards,
+            options.index_fec_parity_shards,
+            &mut next_block_index,
+            options,
+            &archive_uuid,
+            &session_id,
+        )?;
+        directory_hint_entries.push(DirectoryHintShardEntry {
+            hint_shard_index: planned.hint_shard_index,
+            first_dir_hash: planned.first_dir_hash,
+            last_dir_hash: planned.last_dir_hash,
+            first_block_index: object.first_block_index,
+            data_block_count: object.data_block_count,
+            parity_block_count: object.parity_block_count,
+            encrypted_size: object.encrypted_size,
+            decompressed_size: u32_len(planned.plaintext.len(), "DirectoryHintTable")?,
+            entry_count: planned.entry_count,
+        });
+        block_records.extend(object.records.clone());
+    }
+
     let index_root_plaintext = build_index_root_plaintext(
         &shard_entries,
         frame_count,
@@ -415,6 +484,7 @@ fn write_archive_once(
         payload_block_count,
         tar_total_size,
         content_sha256,
+        &directory_hint_entries,
         dictionary_extent
             .as_ref()
             .map(|(object, decompressed_size)| (object, *decompressed_size)),
@@ -499,18 +569,20 @@ fn write_archive_once(
         volumes.push(bytes);
     }
 
-    let bootstrap_sidecar = build_bootstrap_sidecar(
-        &subkeys,
-        archive_uuid,
-        session_id,
-        &volume_zero_manifest,
-        &index_root_extent.records,
-        dictionary_extent
-            .as_ref()
-            .map(|(object, _)| object.records.as_slice()),
-    )?;
-
-    let _ = index_shard_extent;
+    let bootstrap_sidecar = if options.stripe_width == 1 {
+        build_bootstrap_sidecar(
+            &subkeys,
+            archive_uuid,
+            session_id,
+            &volume_zero_manifest,
+            &index_root_extent.records,
+            dictionary_extent
+                .as_ref()
+                .map(|(object, _)| object.records.as_slice()),
+        )?
+    } else {
+        Vec::new()
+    };
 
     Ok(WrittenArchive {
         bytes: volumes
@@ -650,20 +722,6 @@ fn plan_writer_options(mut options: WriterOptions) -> Result<WriterOptions, Form
             "index_root_fec_parity_shards",
         )?);
     Ok(options)
-}
-
-fn validate_m6_file_scope(file_count: usize) -> Result<(), FormatError> {
-    if file_count > DIRECTORY_HINT_REQUIRED_FILE_COUNT {
-        return Err(FormatError::WriterUnsupported(
-            "M6 writer does not emit required directory hint shards",
-        ));
-    }
-    if file_count > DEFAULT_FILES_PER_INDEX_SHARD {
-        return Err(FormatError::WriterUnsupported(
-            "M6 writer supports only one default-sized IndexShard",
-        ));
-    }
-    Ok(())
 }
 
 fn build_crypto_header(
@@ -823,14 +881,31 @@ fn build_payload_envelopes(
             .ok_or(FormatError::WriterInvariant(
                 "tar member range is out of bounds",
             ))?;
-        for (chunk_index, chunk) in member_bytes.chunks(chunk_size).enumerate() {
-            let frame = if let Some(dictionary) = dictionary {
-                compress_zstd_frame_with_dictionary(chunk, options.zstd_level, dictionary)?
-            } else {
-                compress_zstd_frame(chunk, options.zstd_level)?
+        let mut member_offset = 0usize;
+        while member_offset < member_bytes.len() {
+            let mut chunk_len = (member_bytes.len() - member_offset).min(chunk_size);
+            let frame = loop {
+                let end = checked_usize_add(member_offset, chunk_len, "payload chunk")?;
+                let chunk = &member_bytes[member_offset..end];
+                let frame = if let Some(dictionary) = dictionary {
+                    compress_zstd_frame_with_dictionary(chunk, options.zstd_level, dictionary)?
+                } else {
+                    compress_zstd_frame(chunk, options.zstd_level)?
+                };
+                if payload_object_can_fit(frame.len(), options)? {
+                    break frame;
+                }
+                if chunk_len == 1 {
+                    return Err(FormatError::WriterUnsupported(
+                        "single-byte payload frame exceeds envelope object limits",
+                    ));
+                }
+                chunk_len = (chunk_len / 2).max(1);
             };
             let next_len = checked_usize_add(current.plaintext.len(), frame.len(), "payload")?;
-            if !current.plaintext.is_empty() && next_len > envelope_target_size {
+            if !current.plaintext.is_empty()
+                && (next_len > envelope_target_size || !payload_object_can_fit(next_len, options)?)
+            {
                 envelopes.push(current);
                 current = PayloadEnvelope {
                     envelope_index: envelopes.len() as u64,
@@ -838,28 +913,40 @@ fn build_payload_envelopes(
                 };
             }
 
+            if current.plaintext.is_empty() && !payload_object_can_fit(frame.len(), options)? {
+                return Err(FormatError::WriterUnsupported(
+                    "payload frame exceeds envelope object limits",
+                ));
+            }
             let offset = u32_len(current.plaintext.len(), "FrameEntry.offset_in_envelope")?;
             current.plaintext.extend_from_slice(&frame);
-            let chunk_start = checked_u64_mul(
-                u64::try_from(chunk_index)
-                    .map_err(|_| FormatError::WriterUnsupported("chunk index"))?,
-                chunk_size as u64,
-                "PayloadFrame.tar_stream_offset",
-            )?;
+            let is_first_member_frame = member_offset == 0;
+            let is_last_member_frame =
+                checked_usize_add(member_offset, chunk_len, "payload chunk")? == member_bytes.len();
+            let mut flags = 0u32;
+            if is_first_member_frame {
+                flags |= 0x0000_0001;
+            }
+            if is_last_member_frame {
+                flags |= 0x0000_0002;
+            }
             frames.push(PayloadFrame {
                 frame_index: next_frame_index,
                 envelope_index: current.envelope_index,
                 member_index,
                 offset_in_envelope: offset,
                 compressed_size: u32_len(frame.len(), "FrameEntry.compressed_size")?,
-                decompressed_size: u32_len(chunk.len(), "FrameEntry.decompressed_size")?,
+                decompressed_size: u32_len(chunk_len, "FrameEntry.decompressed_size")?,
+                flags,
                 tar_stream_offset: checked_u64_add(
                     member.tar_member_group_start,
-                    chunk_start,
+                    u64::try_from(member_offset)
+                        .map_err(|_| FormatError::WriterUnsupported("chunk offset"))?,
                     "PayloadFrame.tar_stream_offset",
                 )?,
             });
             next_frame_index = checked_u64_add(next_frame_index, 1, "PayloadFrame.frame_index")?;
+            member_offset = checked_usize_add(member_offset, chunk_len, "payload chunk")?;
         }
     }
     if !current.plaintext.is_empty() {
@@ -868,61 +955,200 @@ fn build_payload_envelopes(
     Ok((envelopes, frames))
 }
 
-fn build_single_index_shard(
-    members: &[TarMember],
+fn sorted_file_rows(members: &[TarMember]) -> Vec<FileRow> {
+    let mut rows = members
+        .iter()
+        .enumerate()
+        .map(|(member_index, member)| FileRow {
+            path_hash: hash_prefix(&member.path),
+            path: member.path.clone(),
+            member_index,
+            member: member.clone(),
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        (
+            left.path_hash,
+            left.path.as_slice(),
+            left.member.tar_member_group_start,
+        )
+            .cmp(&(
+                right.path_hash,
+                right.path.as_slice(),
+                right.member.tar_member_group_start,
+            ))
+    });
+    rows
+}
+
+fn partition_file_rows(rows: Vec<FileRow>) -> Result<Vec<Vec<FileRow>>, FormatError> {
+    let mut shards = Vec::new();
+    let mut start = 0usize;
+    while start < rows.len() {
+        let mut end = (start + DEFAULT_FILES_PER_INDEX_SHARD).min(rows.len());
+        if end < rows.len() && rows[end - 1].path_hash == rows[end].path_hash {
+            let boundary_hash = rows[end].path_hash;
+            let mut run_start_in_shard = end - 1;
+            while run_start_in_shard > start
+                && rows[run_start_in_shard - 1].path_hash == boundary_hash
+            {
+                run_start_in_shard -= 1;
+            }
+            let mut full_run_start = run_start_in_shard;
+            while full_run_start > 0 && rows[full_run_start - 1].path_hash == boundary_hash {
+                full_run_start -= 1;
+            }
+            let mut full_run_end = end + 1;
+            while full_run_end < rows.len() && rows[full_run_end].path_hash == boundary_hash {
+                full_run_end += 1;
+            }
+            let full_run_len = full_run_end - full_run_start;
+            end = if full_run_len <= MAX_HASH_PREFIX_RUN_FILES {
+                full_run_end
+            } else {
+                (run_start_in_shard + MAX_HASH_PREFIX_RUN_FILES).min(full_run_end)
+            };
+        }
+        if end - start > MAX_FILES_PER_INDEX_SHARD {
+            return Err(FormatError::WriterUnsupported(
+                "hash-prefix collision run exceeds max_files_per_index_shard",
+            ));
+        }
+        shards.push(rows[start..end].to_vec());
+        start = end;
+    }
+    Ok(shards)
+}
+
+fn build_index_shard_plaintexts(
+    shard_rows: &[Vec<FileRow>],
     frames: &[PayloadFrame],
     payloads: &[PayloadObject],
     options: WriterOptions,
-) -> Result<Vec<u8>, FormatError> {
-    let mut file_rows = members
-        .iter()
-        .enumerate()
-        .map(|(member_index, member)| {
-            let path_hash = hash_prefix(&member.path);
-            Ok((path_hash, member.path.clone(), member_index, member.clone()))
-        })
-        .collect::<Result<Vec<_>, FormatError>>()?;
-    file_rows.sort_by(|left, right| {
-        (left.0, left.1.as_slice(), left.3.tar_member_group_start).cmp(&(
-            right.0,
-            right.1.as_slice(),
-            right.3.tar_member_group_start,
-        ))
-    });
+) -> Result<Vec<PlannedIndexShard>, FormatError> {
+    let mut planned = Vec::new();
+    for rows in shard_rows {
+        append_index_shards_for_rows(&mut planned, rows.clone(), frames, payloads, options)?;
+    }
+    Ok(planned)
+}
 
+fn append_index_shards_for_rows(
+    planned: &mut Vec<PlannedIndexShard>,
+    rows: Vec<FileRow>,
+    frames: &[PayloadFrame],
+    payloads: &[PayloadObject],
+    options: WriterOptions,
+) -> Result<(), FormatError> {
+    let shard_index =
+        u64::try_from(planned.len()).map_err(|_| FormatError::WriterUnsupported("shard_index"))?;
+    let candidate = build_index_shard_plaintext(shard_index, &rows, frames, payloads, options)?;
+    let compressed = compress_zstd_frame(&candidate.plaintext, options.zstd_level)?;
+    if index_object_can_fit(compressed.len(), options)? {
+        planned.push(candidate);
+        return Ok(());
+    }
+    if rows.len() == 1 {
+        return Err(FormatError::WriterUnsupported(
+            "single-file IndexShard exceeds index object limits",
+        ));
+    }
+    let split_at = split_sorted_file_rows_for_object_limit(&rows);
+    append_index_shards_for_rows(
+        planned,
+        rows[..split_at].to_vec(),
+        frames,
+        payloads,
+        options,
+    )?;
+    append_index_shards_for_rows(
+        planned,
+        rows[split_at..].to_vec(),
+        frames,
+        payloads,
+        options,
+    )
+}
+
+fn split_sorted_file_rows_for_object_limit(rows: &[FileRow]) -> usize {
+    let midpoint = rows.len() / 2;
+    if rows[midpoint - 1].path_hash != rows[midpoint].path_hash {
+        return midpoint;
+    }
+
+    let boundary_hash = rows[midpoint].path_hash;
+    let mut left = midpoint;
+    while left > 0 && rows[left - 1].path_hash == boundary_hash {
+        left -= 1;
+    }
+    let mut right = midpoint;
+    while right < rows.len() && rows[right].path_hash == boundary_hash {
+        right += 1;
+    }
+
+    match (left > 0, right < rows.len()) {
+        (true, true) if midpoint - left <= right - midpoint => left,
+        (true, true) => right,
+        (true, false) => left,
+        (false, true) => right,
+        (false, false) => midpoint,
+    }
+}
+
+fn build_index_shard_plaintext(
+    shard_index: u64,
+    file_rows: &[FileRow],
+    frames: &[PayloadFrame],
+    payloads: &[PayloadObject],
+    options: WriterOptions,
+) -> Result<PlannedIndexShard, FormatError> {
     let mut string_pool = Vec::new();
     let mut file_entries = Vec::with_capacity(file_rows.len());
-    for (path_hash, path, member_index, member) in file_rows {
+    let mut required_frame_indexes = BTreeSet::new();
+    for row in file_rows {
         let path_offset = u32_len(string_pool.len(), "FileEntry.path_offset")?;
-        string_pool.extend_from_slice(&path);
-        let (first_frame_index, frame_count) = member_frame_range(member_index, frames)?;
+        string_pool.extend_from_slice(&row.path);
+        let (first_frame_index, frame_count) = member_frame_range(row.member_index, frames)?;
+        for offset in 0..frame_count as u64 {
+            required_frame_indexes.insert(checked_u64_add(
+                first_frame_index,
+                offset,
+                "FileEntry.frame_count",
+            )?);
+        }
         file_entries.push(FileEntry {
-            path_hash,
+            path_hash: row.path_hash,
             path_offset,
-            path_length: u32_len(path.len(), "FileEntry.path_length")?,
+            path_length: u32_len(row.path.len(), "FileEntry.path_length")?,
             first_frame_index,
             frame_count,
             offset_in_first_frame_plaintext: 0,
-            tar_member_group_size: member.tar_member_group_size,
-            file_data_size: member.file_data_size,
+            tar_member_group_size: row.member.tar_member_group_size,
+            file_data_size: row.member.file_data_size,
             flags: 0,
         });
     }
 
     let frame_entries = frames
         .iter()
+        .filter(|frame| required_frame_indexes.contains(&frame.frame_index))
         .map(|frame| FrameEntry {
             frame_index: frame.frame_index,
             envelope_index: frame.envelope_index,
             offset_in_envelope: frame.offset_in_envelope,
             compressed_size: frame.compressed_size,
             decompressed_size: frame.decompressed_size,
-            flags: 0x0000_0003,
+            flags: frame.flags,
             tar_stream_offset: frame.tar_stream_offset,
         })
         .collect::<Vec<_>>();
+    let required_envelope_indexes = frame_entries
+        .iter()
+        .map(|frame| frame.envelope_index)
+        .collect::<BTreeSet<_>>();
     let envelope_entries = payloads
         .iter()
+        .filter(|payload| required_envelope_indexes.contains(&payload.envelope_index))
         .map(|payload| {
             let (first_frame_index, frame_count) =
                 envelope_frame_range(payload.envelope_index, frames)?;
@@ -939,14 +1165,29 @@ fn build_single_index_shard(
         })
         .collect::<Result<Vec<_>, FormatError>>()?;
 
-    serialize_index_shard(
-        0,
+    let plaintext = serialize_index_shard(
+        shard_index,
         &file_entries,
         &frame_entries,
         &envelope_entries,
         &string_pool,
         options,
-    )
+    )?;
+    let first_path_hash = file_rows
+        .first()
+        .ok_or(FormatError::WriterInvariant("empty planned IndexShard"))?
+        .path_hash;
+    let last_path_hash = file_rows
+        .last()
+        .ok_or(FormatError::WriterInvariant("empty planned IndexShard"))?
+        .path_hash;
+    Ok(PlannedIndexShard {
+        shard_index,
+        plaintext,
+        file_count: u32_len(file_rows.len(), "IndexShard.file_count")?,
+        first_path_hash,
+        last_path_hash,
+    })
 }
 
 fn serialize_index_shard(
@@ -994,6 +1235,175 @@ fn serialize_index_shard(
     Ok(bytes)
 }
 
+fn build_directory_hint_plaintexts(
+    shard_rows: &[Vec<FileRow>],
+    options: WriterOptions,
+) -> Result<Vec<PlannedDirectoryHintShard>, FormatError> {
+    let mut map = BTreeMap::<Vec<u8>, BTreeSet<u32>>::new();
+    for (shard_row_index, rows) in shard_rows.iter().enumerate() {
+        let shard_row_index = u32::try_from(shard_row_index)
+            .map_err(|_| FormatError::WriterUnsupported("directory hint shard row index"))?;
+        for row in rows {
+            add_directory_hint_rows(&mut map, shard_row_index, &row.path);
+        }
+    }
+
+    let rows = map
+        .into_iter()
+        .map(|(path, shard_rows)| (hash_prefix(&path), path, shard_rows))
+        .collect::<Vec<_>>();
+    let mut rows = rows;
+    rows.sort_by(|left, right| (left.0, left.1.as_slice()).cmp(&(right.0, right.1.as_slice())));
+
+    let mut planned = Vec::new();
+    for chunk in rows.chunks(DEFAULT_DIRECTORY_HINT_ENTRIES_PER_SHARD) {
+        append_directory_hint_shards_for_rows(&mut planned, chunk.to_vec(), options)?;
+    }
+    Ok(planned)
+}
+
+fn append_directory_hint_shards_for_rows(
+    planned: &mut Vec<PlannedDirectoryHintShard>,
+    rows: Vec<([u8; 8], Vec<u8>, BTreeSet<u32>)>,
+    options: WriterOptions,
+) -> Result<(), FormatError> {
+    let hint_shard_index = u64::try_from(planned.len())
+        .map_err(|_| FormatError::WriterUnsupported("hint_shard_index"))?;
+    let candidate = build_directory_hint_plaintext(hint_shard_index, &rows)?;
+    let compressed = compress_zstd_frame(&candidate.plaintext, options.zstd_level)?;
+    if index_object_can_fit(compressed.len(), options)? {
+        planned.push(candidate);
+        return Ok(());
+    }
+    if rows.len() == 1 {
+        return Err(FormatError::WriterUnsupported(
+            "single DirectoryHintEntry exceeds index object limits",
+        ));
+    }
+    let split_at = rows.len() / 2;
+    append_directory_hint_shards_for_rows(planned, rows[..split_at].to_vec(), options)?;
+    append_directory_hint_shards_for_rows(planned, rows[split_at..].to_vec(), options)
+}
+
+fn add_directory_hint_rows(
+    map: &mut BTreeMap<Vec<u8>, BTreeSet<u32>>,
+    shard_row_index: u32,
+    path: &[u8],
+) {
+    map.entry(Vec::new()).or_default().insert(shard_row_index);
+    let mut cursor = 0usize;
+    while let Some(position) = path[cursor..].iter().position(|byte| *byte == b'/') {
+        let slash = cursor + position;
+        if slash > 0 {
+            map.entry(path[..slash].to_vec())
+                .or_default()
+                .insert(shard_row_index);
+        }
+        cursor = slash + 1;
+    }
+}
+
+fn build_directory_hint_plaintext(
+    hint_shard_index: u64,
+    rows: &[([u8; 8], Vec<u8>, BTreeSet<u32>)],
+) -> Result<PlannedDirectoryHintShard, FormatError> {
+    let mut entries = Vec::with_capacity(rows.len());
+    let mut shard_row_indexes = Vec::new();
+    let mut string_pool = Vec::new();
+
+    for (dir_hash, path, shard_rows) in rows {
+        let path_offset = if path.is_empty() {
+            0
+        } else {
+            u64::try_from(string_pool.len())
+                .map_err(|_| FormatError::WriterUnsupported("DirectoryHintEntry.path_offset"))?
+        };
+        if !path.is_empty() {
+            string_pool.extend_from_slice(path);
+        }
+        let shard_list_start_index = u32_len(
+            shard_row_indexes.len(),
+            "DirectoryHintEntry.shard_list_start_index",
+        )?;
+        shard_row_indexes.extend(shard_rows.iter().copied());
+        entries.push(DirectoryHintEntry {
+            dir_hash: *dir_hash,
+            path_offset,
+            path_length: u32_len(path.len(), "DirectoryHintEntry.path_length")?,
+            shard_list_start_index,
+            shard_count: u32_len(shard_rows.len(), "DirectoryHintEntry.shard_count")?,
+        });
+    }
+
+    let plaintext = serialize_directory_hint_table(
+        hint_shard_index,
+        &entries,
+        &shard_row_indexes,
+        &string_pool,
+    )?;
+    let first_dir_hash = rows
+        .first()
+        .ok_or(FormatError::WriterInvariant("empty directory hint shard"))?
+        .0;
+    let last_dir_hash = rows
+        .last()
+        .ok_or(FormatError::WriterInvariant("empty directory hint shard"))?
+        .0;
+    Ok(PlannedDirectoryHintShard {
+        hint_shard_index,
+        plaintext,
+        entry_count: rows.len() as u64,
+        first_dir_hash,
+        last_dir_hash,
+    })
+}
+
+fn serialize_directory_hint_table(
+    hint_shard_index: u64,
+    entries: &[DirectoryHintEntry],
+    shard_row_indexes: &[u32],
+    string_pool: &[u8],
+) -> Result<Vec<u8>, FormatError> {
+    let entry_table_offset = table_offset(entries.len(), DIRECTORY_HINT_TABLE_LEN)?;
+    let shard_list_cursor = checked_usize_add(
+        DIRECTORY_HINT_TABLE_LEN,
+        entries.len() * DIRECTORY_HINT_ENTRY_LEN,
+        "DirectoryHintTable",
+    )?;
+    let shard_list_offset = table_offset(shard_row_indexes.len(), shard_list_cursor)?;
+    let string_pool_cursor = checked_usize_add(
+        shard_list_cursor,
+        shard_row_indexes.len() * 4,
+        "DirectoryHintTable",
+    )?;
+    let string_pool_offset = if string_pool.is_empty() {
+        0
+    } else {
+        u64::try_from(string_pool_cursor)
+            .map_err(|_| FormatError::WriterUnsupported("DirectoryHintTable.string_pool_offset"))?
+    };
+    let header = DirectoryHintTableHeader {
+        version: 1,
+        hint_shard_index,
+        entry_count: entries.len() as u64,
+        entry_table_offset: entry_table_offset as u64,
+        shard_list_offset: shard_list_offset as u64,
+        string_pool_offset,
+        string_pool_size: string_pool.len() as u64,
+    };
+
+    let mut bytes = Vec::with_capacity(string_pool_cursor + string_pool.len());
+    bytes.extend_from_slice(&header.to_bytes());
+    for entry in entries {
+        bytes.extend_from_slice(&entry.to_bytes());
+    }
+    for row in shard_row_indexes {
+        bytes.extend_from_slice(&row.to_le_bytes());
+    }
+    bytes.extend_from_slice(string_pool);
+    Ok(bytes)
+}
+
 fn build_index_root_plaintext(
     shard_entries: &[ShardEntry],
     frame_count: u64,
@@ -1002,6 +1412,7 @@ fn build_index_root_plaintext(
     payload_block_count: u64,
     tar_total_size: u64,
     content_sha256: [u8; 32],
+    directory_hint_entries: &[DirectoryHintShardEntry],
     dictionary_extent: Option<(&EncryptedObject, u32)>,
 ) -> Vec<u8> {
     let mut header = IndexRootHeader::empty();
@@ -1021,9 +1432,80 @@ fn build_index_root_plaintext(
     let root = IndexRoot {
         header,
         shards: shard_entries.to_vec(),
-        directory_hint_shards: Vec::new(),
+        directory_hint_shards: directory_hint_entries.to_vec(),
     };
     root.to_bytes()
+}
+
+fn payload_object_can_fit(payload_len: usize, options: WriterOptions) -> Result<bool, FormatError> {
+    encrypted_object_can_fit(
+        payload_len,
+        options.fec_data_shards,
+        options.fec_parity_shards,
+        options,
+    )
+}
+
+fn index_object_can_fit(payload_len: usize, options: WriterOptions) -> Result<bool, FormatError> {
+    encrypted_object_can_fit(
+        payload_len,
+        options.index_fec_data_shards,
+        options.index_fec_parity_shards,
+        options,
+    )
+}
+
+fn encrypted_object_can_fit(
+    payload_len: usize,
+    data_shard_max: u16,
+    parity_shard_max: u16,
+    options: WriterOptions,
+) -> Result<bool, FormatError> {
+    let data_block_count = encrypted_data_block_count(payload_len, options)?;
+    if data_block_count > data_shard_max as u32 {
+        return Ok(false);
+    }
+    let required_parity = compute_parity(data_block_count as u64, options)?;
+    if required_parity > parity_shard_max as u32 {
+        return Ok(false);
+    }
+    let total = checked_u64_add(
+        data_block_count as u64,
+        required_parity as u64,
+        "encrypted object shard total overflow",
+    )?;
+    Ok(total <= MAX_REED_SOLOMON_GF16_SHARDS)
+}
+
+fn encrypted_data_block_count(
+    payload_len: usize,
+    options: WriterOptions,
+) -> Result<u32, FormatError> {
+    let block_size = options.block_size as usize;
+    let tag_len = options.aead_algo.tag_len();
+    let total_before_padding =
+        payload_len
+            .checked_add(tag_len)
+            .ok_or(FormatError::WriterUnsupported(
+                "encrypted object size overflow",
+            ))?;
+    let remainder = total_before_padding % block_size;
+    let encrypted_size = if remainder == 0 {
+        total_before_padding
+            .checked_add(block_size)
+            .ok_or(FormatError::WriterUnsupported(
+                "encrypted object size overflow",
+            ))?
+    } else {
+        total_before_padding
+            .checked_add(block_size - remainder)
+            .ok_or(FormatError::WriterUnsupported(
+                "encrypted object size overflow",
+            ))?
+    };
+    let encrypted_size = u32_len(encrypted_size, "encrypted_size")
+        .map_err(|_| FormatError::WriterUnsupported("encrypted object exceeds u32 size limit"))?;
+    Ok(encrypted_size / options.block_size)
 }
 
 fn encrypt_object(
@@ -1516,20 +1998,6 @@ fn envelope_frame_range(
     Ok((first, u32_len(count, "EnvelopeEntry.frame_count")?))
 }
 
-fn file_hash_bounds(members: &[TarMember]) -> Result<([u8; 8], [u8; 8]), FormatError> {
-    let first = members
-        .iter()
-        .map(|member| hash_prefix(&member.path))
-        .min()
-        .ok_or(FormatError::WriterInvariant("missing first hash"))?;
-    let last = members
-        .iter()
-        .map(|member| hash_prefix(&member.path))
-        .max()
-        .ok_or(FormatError::WriterInvariant("missing last hash"))?;
-    Ok((first, last))
-}
-
 fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(bytes);
     let mut out = [0u8; 32];
@@ -1572,6 +2040,7 @@ fn checked_u64_add(lhs: u64, rhs: u64, field: &'static str) -> Result<u64, Forma
 mod tests {
     use super::*;
     use crate::crypto::{verify_hmac, Subkeys};
+    use crate::metadata::{DirectoryHintTable, MetadataLimits};
     use crate::reader::open_archive;
     use crate::tar_model::parse_tar_member_group;
     use crate::wire::CryptoHeader;
@@ -1595,22 +2064,109 @@ mod tests {
     }
 
     #[test]
-    fn m6_scope_rejects_archives_that_require_directory_hints() {
-        assert_eq!(
-            validate_m6_file_scope(DIRECTORY_HINT_REQUIRED_FILE_COUNT + 1).unwrap_err(),
-            FormatError::WriterUnsupported(
-                "M6 writer does not emit required directory hint shards"
-            )
-        );
+    fn writer_partitions_multiple_default_sized_index_shards() {
+        let members = (0..=DEFAULT_FILES_PER_INDEX_SHARD)
+            .map(|idx| TarMember {
+                path: format!("file-{idx:05}.txt").into_bytes(),
+                tar_member_group_start: idx as u64 * 512,
+                tar_member_group_size: 512,
+                file_data_size: 0,
+            })
+            .collect::<Vec<_>>();
+
+        let shards = partition_file_rows(sorted_file_rows(&members)).unwrap();
+
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0].len(), DEFAULT_FILES_PER_INDEX_SHARD);
+        assert_eq!(shards[1].len(), 1);
     }
 
     #[test]
-    fn m6_scope_rejects_archives_that_need_multiple_default_sized_index_shards() {
-        assert!(validate_m6_file_scope(DEFAULT_FILES_PER_INDEX_SHARD).is_ok());
-        assert_eq!(
-            validate_m6_file_scope(DEFAULT_FILES_PER_INDEX_SHARD + 1).unwrap_err(),
-            FormatError::WriterUnsupported("M6 writer supports only one default-sized IndexShard")
-        );
+    fn writer_extends_shard_for_bounded_hash_prefix_run() {
+        let mut rows = Vec::new();
+        rows.extend((0..9_000).map(|idx| test_file_row(idx, [0u8; 8])));
+        rows.extend((9_000..54_000).map(|idx| test_file_row(idx, [1u8; 8])));
+        rows.push(test_file_row(54_000, [2u8; 8]));
+
+        let shards = partition_file_rows(rows).unwrap();
+
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0].len(), 54_000);
+        assert!(shards[0]
+            .iter()
+            .skip(9_000)
+            .all(|row| row.path_hash == [1u8; 8]));
+        assert_eq!(shards[1][0].path_hash, [2u8; 8]);
+    }
+
+    #[test]
+    fn writer_splits_oversized_hash_prefix_run_at_writer_ceiling() {
+        let rows = (0..MAX_HASH_PREFIX_RUN_FILES + 1)
+            .map(|idx| test_file_row(idx, [7u8; 8]))
+            .collect::<Vec<_>>();
+
+        let shards = partition_file_rows(rows).unwrap();
+
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0].len(), MAX_HASH_PREFIX_RUN_FILES);
+        assert_eq!(shards[1].len(), 1);
+    }
+
+    #[test]
+    fn writer_builds_directory_hint_rows_for_ancestor_directories() {
+        let shard_rows = vec![
+            vec![FileRow {
+                path_hash: hash_prefix(b"a/b/one.txt"),
+                path: b"a/b/one.txt".to_vec(),
+                member_index: 0,
+                member: TarMember {
+                    path: b"a/b/one.txt".to_vec(),
+                    tar_member_group_start: 0,
+                    tar_member_group_size: 512,
+                    file_data_size: 0,
+                },
+            }],
+            vec![FileRow {
+                path_hash: hash_prefix(b"a/c/two.txt"),
+                path: b"a/c/two.txt".to_vec(),
+                member_index: 1,
+                member: TarMember {
+                    path: b"a/c/two.txt".to_vec(),
+                    tar_member_group_start: 512,
+                    tar_member_group_size: 512,
+                    file_data_size: 0,
+                },
+            }],
+        ];
+
+        let options = plan_writer_options(WriterOptions::default()).unwrap();
+        let planned = build_directory_hint_plaintexts(&shard_rows, options).unwrap();
+        assert_eq!(planned.len(), 1);
+        let locating = DirectoryHintShardEntry {
+            hint_shard_index: planned[0].hint_shard_index,
+            first_dir_hash: planned[0].first_dir_hash,
+            last_dir_hash: planned[0].last_dir_hash,
+            first_block_index: 0,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: 4096,
+            decompressed_size: planned[0].plaintext.len() as u32,
+            entry_count: planned[0].entry_count,
+        };
+        let table = DirectoryHintTable::parse(
+            &planned[0].plaintext,
+            &locating,
+            2,
+            MetadataLimits::default(),
+        )
+        .unwrap();
+
+        let root = table.lookup_directory_index(b"").unwrap();
+        assert_eq!(table.shard_rows_for_entry(root).unwrap(), &[0, 1]);
+        let a = table.lookup_directory_index(b"a").unwrap();
+        assert_eq!(table.shard_rows_for_entry(a).unwrap(), &[0, 1]);
+        let ab = table.lookup_directory_index(b"a/b").unwrap();
+        assert_eq!(table.shard_rows_for_entry(ab).unwrap(), &[0]);
     }
 
     #[test]
@@ -1663,6 +2219,29 @@ mod tests {
         assert_eq!(opened.extract_file("large.bin").unwrap(), Some(data));
         opened.verify().unwrap();
         assert!(opened.index_root.header.envelope_count > 1);
+    }
+
+    #[test]
+    fn split_member_frames_carry_exact_boundary_flags() {
+        let data = deterministic_bytes(12 * 1024);
+        let files = [RegularFile::new("large.bin", &data)];
+        let options = WriterOptions {
+            chunk_size: 1024,
+            envelope_target_size: 64 * 1024,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            ..WriterOptions::default()
+        };
+        let (tar_stream, members) = build_tar_stream(&files, options.max_path_length).unwrap();
+        let (_, frames) = build_payload_envelopes(&tar_stream, &members, options, None).unwrap();
+
+        assert!(frames.len() > 2);
+        assert_eq!(frames.first().unwrap().flags, 0x0000_0001);
+        assert_eq!(frames.last().unwrap().flags, 0x0000_0002);
+        assert!(frames[1..frames.len() - 1]
+            .iter()
+            .all(|frame| frame.flags == 0));
     }
 
     #[test]
@@ -1814,5 +2393,20 @@ mod tests {
             out.push((state >> 24) as u8);
         }
         out
+    }
+
+    fn test_file_row(idx: usize, path_hash: [u8; 8]) -> FileRow {
+        let path = format!("file-{idx:05}.txt").into_bytes();
+        FileRow {
+            path_hash,
+            path: path.clone(),
+            member_index: idx,
+            member: TarMember {
+                path,
+                tar_member_group_start: idx as u64 * 512,
+                tar_member_group_size: 512,
+                file_data_size: 0,
+            },
+        }
     }
 }

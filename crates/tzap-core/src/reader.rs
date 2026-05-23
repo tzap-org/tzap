@@ -570,15 +570,11 @@ impl OpenedArchive {
             ));
         }
 
-        let tar_len = to_usize(self.index_root.header.tar_total_size, "tar stream")?;
-        if tar_len > self.options.max_verify_tar_size {
-            return Err(FormatError::ReaderUnsupported(
-                "verify tar stream exceeds configured in-memory cap",
-            ));
-        }
-        let mut tar_stream = vec![0u8; tar_len];
-        let mut covered = vec![false; tar_len];
-        let mut envelope_cache = HashMap::<u64, Vec<u8>>::new();
+        let tar_len = self.index_root.header.tar_total_size;
+        let mut content_hasher = Sha256::new();
+        let mut tar_cursor = 0u64;
+        let mut cached_envelope_index = None;
+        let mut cached_envelope_plaintext = Vec::new();
 
         for frame in frames.values() {
             let envelope =
@@ -587,40 +583,37 @@ impl OpenedArchive {
                     .ok_or(FormatError::InvalidArchive(
                         "FrameEntry references missing EnvelopeEntry",
                     ))?;
-            if !envelope_cache.contains_key(&envelope.envelope_index) {
-                envelope_cache.insert(
-                    envelope.envelope_index,
-                    self.load_payload_envelope(envelope)?,
-                );
+            if cached_envelope_index != Some(envelope.envelope_index) {
+                cached_envelope_plaintext = self.load_payload_envelope(envelope)?;
+                cached_envelope_index = Some(envelope.envelope_index);
             }
-            let envelope_plaintext = envelope_cache
-                .get(&envelope.envelope_index)
-                .expect("inserted above");
             let compressed = slice(
-                envelope_plaintext,
+                &cached_envelope_plaintext,
                 frame.offset_in_envelope as usize,
                 frame.compressed_size as usize,
                 "FrameEntry",
             )?;
             let decoded = self.decompress_payload_frame(compressed, frame.decompressed_size)?;
-            let start = to_usize(frame.tar_stream_offset, "tar stream")?;
-            let end = checked_add(start, decoded.len(), "tar stream")?;
-            if end > tar_stream.len() {
+            if frame.tar_stream_offset != tar_cursor {
+                return Err(FormatError::InvalidArchive(
+                    "decoded frames leave tar gap or overlap",
+                ));
+            }
+            tar_cursor = tar_cursor
+                .checked_add(decoded.len() as u64)
+                .ok_or(FormatError::InvalidArchive("tar stream size overflow"))?;
+            if tar_cursor > tar_len {
                 return Err(FormatError::InvalidArchive(
                     "FrameEntry exceeds IndexRoot tar_total_size",
                 ));
             }
-            if covered[start..end].iter().any(|value| *value) {
-                return Err(FormatError::InvalidArchive("decoded frames overlap"));
-            }
-            tar_stream[start..end].copy_from_slice(&decoded);
-            covered[start..end].fill(true);
+            content_hasher.update(&decoded);
         }
 
-        if covered.iter().any(|value| !*value) {
+        if tar_cursor != tar_len {
             return Err(FormatError::InvalidArchive("decoded frames leave tar gap"));
         }
-        if sha256_bytes(&tar_stream) != self.index_root.header.content_sha256 {
+        if content_hasher.finalize().as_slice() != self.index_root.header.content_sha256 {
             return Err(FormatError::InvalidArchive(
                 "IndexRoot content_sha256 does not match decoded tar stream",
             ));
@@ -2496,21 +2489,19 @@ fn validate_envelope_frame_coverage(
 
 fn validate_file_extent_coverage_ranges(
     extents: &[(u64, u64)],
-    tar_len: usize,
+    tar_len: u64,
 ) -> Result<(), FormatError> {
     let mut ranges = Vec::with_capacity(extents.len());
     for (start, len) in extents {
-        let start = to_usize(*start, "FileEntry")?;
-        let len = to_usize(*len, "FileEntry")?;
-        let end = checked_add(start, len, "FileEntry")?;
+        let end = checked_u64_add(*start, *len, "FileEntry")?;
         if end > tar_len {
             return Err(FormatError::InvalidArchive(
                 "FileEntry extent exceeds IndexRoot tar_total_size",
             ));
         }
-        ranges.push((start, end));
+        ranges.push((*start, end));
     }
-    validate_exact_coverage_ranges(
+    validate_exact_coverage_ranges_u64(
         &mut ranges,
         tar_len,
         "FileEntry extents do not cover tar stream exactly",
@@ -2617,6 +2608,25 @@ fn validate_exact_coverage_ranges(
     Ok(())
 }
 
+fn validate_exact_coverage_ranges_u64(
+    ranges: &mut [(u64, u64)],
+    expected_end: u64,
+    reason: &'static str,
+) -> Result<(), FormatError> {
+    ranges.sort_unstable();
+    let mut cursor = 0u64;
+    for (start, end) in ranges.iter().copied() {
+        if start != cursor || end < start {
+            return Err(FormatError::InvalidArchive(reason));
+        }
+        cursor = end;
+    }
+    if cursor != expected_end {
+        return Err(FormatError::InvalidArchive(reason));
+    }
+    Ok(())
+}
+
 fn object_block_range(
     first_block_index: u64,
     data_block_count: u32,
@@ -2663,6 +2673,7 @@ fn utf8_path(bytes: &[u8]) -> Result<String, FormatError> {
         .map_err(|_| FormatError::UnsafeArchivePath)
 }
 
+#[cfg(test)]
 fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(bytes);
     let mut out = [0u8; 32];
@@ -3107,6 +3118,23 @@ mod tests {
             opened.extract_file("verify-cap.txt").unwrap_err(),
             FormatError::ReaderUnsupported("total extraction size exceeds configured cap")
         );
+    }
+
+    #[test]
+    fn verify_streams_past_legacy_in_memory_tar_cap() {
+        let data = vec![0x5a; 4096];
+        let archive = write_archive(
+            &[RegularFile::new("verify-large.txt", &data)],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut options = ReaderOptions::default();
+        options.max_verify_tar_size = 1;
+        let opened =
+            OpenedArchive::open_with_options(&archive.bytes, &master_key(), options).unwrap();
+
+        opened.verify().unwrap();
     }
 
     #[test]

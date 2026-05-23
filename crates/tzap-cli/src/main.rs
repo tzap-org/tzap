@@ -518,6 +518,12 @@ fn run(cli: Cli) -> Result<()> {
             options.chunk_size = parse_size_u32(&chunk_size, "chunk-size")?;
             options.envelope_target_size = parse_size_u32(&envelope_size, "envelope-size")?;
             options.block_size = parse_size_u32(&block_size, "block-size")?;
+            if bootstrap_out.is_some() && (volumes.unwrap_or(1) > 1 || volume_size.is_some()) {
+                return Err(FormatError::WriterUnsupported(
+                    "--bootstrap-out is currently supported only for single-volume output",
+                )
+                .into());
+            }
 
             ensure_create_output_paths_can_be_written(
                 &output,
@@ -612,6 +618,12 @@ fn run(cli: Cli) -> Result<()> {
 
             write_archive_outputs(&output, &archive.volumes)?;
             if let Some(path) = bootstrap_out {
+                if archive.bootstrap_sidecar.is_empty() {
+                    return Err(FormatError::WriterUnsupported(
+                        "bootstrap output is unavailable for this archive shape",
+                    )
+                    .into());
+                }
                 fs::write(&path, &archive.bootstrap_sidecar)
                     .with_context(|| format!("failed to write bootstrap sidecar {path}"))?;
             }
