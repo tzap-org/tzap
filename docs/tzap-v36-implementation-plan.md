@@ -297,10 +297,13 @@ Deliverables:
 - Complete: full HMAC/AEAD/suffix-padding/ReedSolomonGF16 path for payload,
   IndexShard, and IndexRoot objects.
 - Complete: valid empty archive construction path.
-- Complete: explicit M6 rejection guard for archives that would require
-  directory hint shards or more than one IndexShard.
-- Complete: writer smoke tests for empty archive bootstrap structures and M6
-  scope guards.
+- Complete: multi-IndexShard emission for large regular-file archives.
+- Complete: directory hint shard emission for large regular-file archives when
+  the v0.36 threshold requires hints.
+- Complete: cap-aware splitting for payload, IndexShard, and directory hint
+  objects before object/FEC limits.
+- Complete: writer smoke tests for empty archive bootstrap structures,
+  multi-IndexShard metadata, directory hints, and split object boundaries.
 
 Acceptance:
 
@@ -423,8 +426,10 @@ Acceptance:
 
 Completed implementation:
 
-- Added writer-side bootstrap sidecar emission for the current
-  single-volume, dictionary-free reference writer.
+- Added writer-side bootstrap sidecar emission for the current single-volume
+  writer path. Dictionary BlockRecord copies were added with dictionary support.
+  The CLI `--bootstrap-out` flag intentionally rejects multi-volume output
+  until the multi-volume sidecar authority path is implemented and tested.
 - Added authenticated sidecar bootstrap opening with packed cursor,
   sidecar HMAC, sidecar ManifestFooter HMAC/identity, and exact IndexRoot
   BlockRecord validation.
@@ -535,7 +540,9 @@ Completed implementation:
 - `tzap create` writes single-volume archives to the requested output path and
   striped multi-volume archives as `BASENAME.NNN` files.
 - `tzap create --bootstrap-out FILE` writes the v0.36 bootstrap sidecar emitted
-  by the writer.
+  by the writer for single-volume archives. The CLI rejects `--bootstrap-out`
+  together with `--volumes > 1` or `--volume-size` with
+  `unsupported-feature`.
 - `tzap create --dictionary FILE` routes through the dictionary writer.
 - `tzap create --password-stdin` emits Argon2id KdfParams in CryptoHeader;
   `--keyfile` remains raw 32-byte master-key mode.

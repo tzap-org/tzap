@@ -11,3 +11,4 @@ fuzz/target/
 !/docs/tzap-cli-ux-production-readiness-plan.md
 !/docs/tzap-operational-boundaries.md
 !/docs/tzap-v36-implementation-plan.md
+!/docs/tzap-v36-gap-implementation-plan.md

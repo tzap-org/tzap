@@ -36,10 +36,17 @@ Useful flags:
 - `--bit-rot-buffer-pct`: recovery budget as percentage
 - `--argon2-*`: passphrase derivation tuning
 - `--dictionary`: optional zstd dictionary
-- `--bootstrap-out`: sidecar output path
+- `--bootstrap-out`: sidecar output path for single-volume archives only
 - `--compression-level`, `--chunk-size`, `--envelope-size`, `--block-size`
 - `--dry-run`: print planned actions without writing bytes
 - `--force`: allow overwrite of outputs and bootstrap
+
+Notes:
+
+- `--bootstrap-out` rejects `--volumes > 1` and `--volume-size` with
+  `unsupported-feature`.
+- Multi-volume recovery is available only within the `--volume-loss-tolerance`
+  and FEC budget chosen when the archive is created.
 
 ## Command: extract
 
@@ -60,6 +67,12 @@ Useful flags:
 - `--bootstrap`: bootstrap sidecar path
 - `--volume`: additional multi-volume input paths
 
+Notes:
+
+- Archive input comes from file paths. `-` is not an archive stdin sentinel.
+- `--bootstrap` is for single-volume open paths. Multi-volume open paths should
+  pass volume files and omit the sidecar.
+
 ## Command: list
 
 Inspect archive content paths:
@@ -79,6 +92,12 @@ Useful flags:
 - `--bootstrap`: bootstrap sidecar path
 - `--volume`: additional multi-volume input paths
 
+Notes:
+
+- Archive input comes from file paths. `-` is not an archive stdin sentinel.
+- `--bootstrap` is for single-volume open paths. Multi-volume open paths should
+  pass volume files and omit the sidecar.
+
 ## Command: verify
 
 Validate archive integrity and recovery profile:
@@ -95,6 +114,14 @@ Useful flags:
 - `--json`: machine-readable status output
 - `--quiet`: suppress success summary
 - `--bootstrap`: bootstrap sidecar path
+
+Notes:
+
+- Archive input comes from file paths. `-` is not an archive stdin sentinel.
+- `--bootstrap` is for single-volume open paths. Multi-volume open paths should
+  pass volume files and omit the sidecar.
+- Multi-volume recovery succeeds only when available inputs stay within the
+  archive's configured volume-loss tolerance and FEC budget.
 
 ## Command: keygen
 

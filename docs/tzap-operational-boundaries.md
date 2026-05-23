@@ -49,12 +49,15 @@ What to do:
   you need a specific profile.
 - Keep `--chunk-size <= --envelope-size`.
 - Increase very small `--volume-size` values.
-- For very large file tables that need writer layouts not emitted yet, split the
-  input set into multiple archives.
+- Large regular-file input sets are supported. The writer emits multiple
+  IndexShard objects and directory-hint shards when the v0.36 layout requires
+  them.
+- If `tzap create` still returns `unsupported-feature`, check the exact resource
+  choice in the diagnostic and the additional boundaries below.
 
 ## Bootstrap sidecars and multi-volume inputs
 
-Bootstrap sidecars are supported for single archive inputs:
+Bootstrap sidecars are created and consumed only with single-volume CLI paths:
 
 ```sh
 tzap create \
@@ -69,7 +72,7 @@ tzap list \
   archive.tzap
 ```
 
-Do not combine a bootstrap sidecar with a multi-volume open input set:
+Do not request `--bootstrap-out` while creating multi-volume output:
 
 ```sh
 tzap create \
@@ -78,7 +81,12 @@ tzap create \
   --bootstrap-out archive.tzap.bootstrap \
   -o archive.tzap \
   ./project
+# exit 16: unsupported-feature
+```
 
+Do not combine `--bootstrap` with a multi-volume open input set:
+
+```sh
 tzap list \
   --keyfile project.key \
   --bootstrap archive.tzap.bootstrap \
@@ -89,9 +97,48 @@ tzap list \
 
 What to do:
 
-- For single-volume workflows, use `--bootstrap` when the sidecar is useful.
+- For single-volume workflows, use `--bootstrap-out` on create and `--bootstrap`
+  on list, verify, or extract when the sidecar is useful.
 - For multi-volume workflows, pass the available volume files and omit
-  `--bootstrap`.
+  `--bootstrap-out` and `--bootstrap`.
+
+## Archive paths, not archive stdin
+
+Archive inputs are opened from file paths. The current CLI does not expose `-`
+as archive stdin, and it does not expose a streaming non-seekable archive input
+mode. `--password-stdin` reads only the passphrase.
+
+Example:
+
+```sh
+tzap list --keyfile project.key -
+# exit 3: io, because "-" is treated as a literal file path
+```
+
+What to do:
+
+- Store the archive bytes in a file and pass that path to `tzap`.
+- Use `--bootstrap` only with a real single-volume archive path.
+
+## Empty directory inputs
+
+The current CLI scanner descends into directory inputs and archives regular file
+members. It does not emit standalone directory FileEntries, so empty directories
+are omitted from the created archive.
+
+Example:
+
+```sh
+mkdir -p project/empty
+tzap create --keyfile project.key -o project.tzap ./project
+tzap list --keyfile project.key project.tzap
+# project/empty is not listed unless it contains a regular file
+```
+
+What to do:
+
+- Add a regular placeholder file if preserving an otherwise empty directory is
+  required.
 
 ## Multi-volume recovery budget
 

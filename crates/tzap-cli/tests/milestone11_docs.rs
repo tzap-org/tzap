@@ -315,3 +315,48 @@ fn milestone11_reference_file_mentions_unsupported_feature_limits() {
     assert!(boundaries.contains("Multi-volume recovery budget"));
     assert!(reference.contains("Global options"));
 }
+
+#[test]
+fn milestone11_docs_pin_current_g01_boundaries() {
+    let readme = read_workspace_file("README.md");
+    let reference = read_workspace_file("docs/tzap-cli-reference.md");
+    let boundaries = read_workspace_file("docs/tzap-operational-boundaries.md");
+    let implementation_plan = read_workspace_file("docs/tzap-v36-implementation-plan.md");
+
+    assert!(
+        implementation_plan.contains("multi-IndexShard emission for large regular-file archives")
+    );
+    assert!(implementation_plan
+        .contains("directory hint shard emission for large regular-file archives"));
+    assert!(implementation_plan
+        .contains("`tzap create --bootstrap-out FILE` writes the v0.36 bootstrap sidecar"));
+    assert!(implementation_plan.contains("single-volume archives"));
+    assert!(!implementation_plan.contains("writer layouts not emitted yet"));
+    assert!(!implementation_plan
+        .contains("explicit M6 rejection guard for archives that would require"));
+    assert!(!implementation_plan
+        .contains("archives that would require directory hint shards or more than one IndexShard"));
+
+    assert!(boundaries.contains("Large regular-file input sets are supported"));
+    assert!(boundaries.contains("multiple\n  IndexShard objects"));
+    assert!(
+        boundaries.contains("Do not request `--bootstrap-out` while creating multi-volume output")
+    );
+    assert!(boundaries.contains("Do not combine `--bootstrap` with a multi-volume open input set"));
+    assert!(boundaries.contains("Archive paths, not archive stdin"));
+    assert!(boundaries.contains("`-`\nas archive stdin"));
+    assert!(boundaries.contains("# exit 16: unsupported-feature"));
+    assert!(boundaries.contains("# exit 3: io"));
+    assert!(boundaries.contains("Empty directory inputs"));
+    assert!(boundaries.contains("empty directories\nare omitted"));
+    assert!(!boundaries.contains("writer layouts not emitted yet"));
+
+    assert!(reference
+        .contains("`--bootstrap-out`: sidecar output path for single-volume archives only"));
+    assert!(reference.contains("`-` is not an archive stdin sentinel"));
+    assert!(reference.contains("volume-loss tolerance and FEC budget"));
+
+    assert!(!readme.contains("Archive paths, not archive stdin"));
+    assert!(!readme.contains("Empty directory inputs"));
+    assert!(!readme.contains("writer layouts not emitted yet"));
+}
