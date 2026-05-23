@@ -11,6 +11,16 @@ fn read_workspace_file(path: &str) -> String {
         .replace("\r\n", "\n")
 }
 
+fn assert_contains_in_order(text: &str, labels: &[&str]) {
+    let mut offset = 0usize;
+    for label in labels {
+        let relative = text[offset..]
+            .find(label)
+            .unwrap_or_else(|| panic!("missing {label:?} after byte offset {offset}"));
+        offset += relative + label.len();
+    }
+}
+
 #[test]
 fn milestone10_ci_workflow_has_cross_platform_matrix() {
     let workflow = read_workspace_file(".github/workflows/ci.yml");
@@ -75,10 +85,52 @@ fn milestone10_release_workflow_uses_pinned_baseline_runners() {
 fn milestone10_release_workflow_has_smoke_checks() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
 
-    assert!(workflow.contains("Smoke test build"));
+    assert!(workflow.contains("preflight:"));
+    assert!(workflow.contains("needs: preflight"));
+    assert_eq!(workflow.matches("run_smoke: true").count(), 5);
+    for command in [
+        "cargo fmt --all -- --check",
+        "cargo check --workspace --all-targets --locked",
+        "cargo test --workspace --locked",
+        "cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked",
+        "cargo check --manifest-path fuzz/Cargo.toml --bins --features libfuzzer --locked",
+    ] {
+        assert!(
+            workflow.contains(command),
+            "release workflow missing preflight command {command:?}"
+        );
+    }
+
+    assert!(workflow.contains("Smoke test artifact (Unix)"));
+    assert!(workflow.contains("Smoke test artifact (Windows)"));
     assert!(workflow.contains("--version"));
     assert!(workflow.contains("--help"));
     assert!(workflow.contains("tzap.exe"));
+    assert!(workflow.contains("tar -xzf \"dist/${{ matrix.archive }}\""));
+    assert!(workflow.contains("Expand-Archive -Path \"dist/${{ matrix.archive }}\""));
+    assert!(workflow.contains(
+        "create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8 --argon2-parallelism 1"
+    ));
+    assert!(workflow.contains("list --password-stdin"));
+    assert!(workflow.contains("verify --password-stdin"));
+    assert!(workflow.contains("extract --password-stdin --directory"));
+    assert!(workflow.contains("grep -F \"input.txt\""));
+    assert!(workflow.contains("release smoke list output did not include input.txt"));
+    assert!(workflow.contains("cmp \"$WORKDIR/input.txt\" \"$WORKDIR/out/input.txt\""));
+    assert!(workflow.contains("release smoke payload mismatch"));
+    assert!(!workflow.contains("Smoke test build"));
+    assert_contains_in_order(
+        &workflow,
+        &[
+            "Package Unix",
+            "Smoke test artifact (Unix)",
+            "Generate checksum (Unix)",
+            "Package Windows",
+            "Smoke test artifact (Windows)",
+            "Generate checksum (Windows)",
+            "Upload asset",
+        ],
+    );
 }
 
 #[test]
@@ -91,6 +143,21 @@ fn milestone10_release_workflow_uploads_checksum_artifacts() {
     assert!(workflow.contains("dist/${{ matrix.archive }}.sha256"));
     assert!(workflow.contains("Merge checksum manifest"));
     assert!(workflow.contains("SHA256SUMS"));
+    assert_contains_in_order(
+        &workflow,
+        &["homebrew:", "needs: build", "brew install --formula"],
+    );
+    assert_contains_in_order(
+        &workflow,
+        &[
+            "publish:",
+            "needs:",
+            "- build",
+            "- homebrew",
+            "Merge checksum manifest",
+            "Publish release",
+        ],
+    );
 }
 
 #[test]

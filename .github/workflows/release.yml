@@ -9,8 +9,40 @@ permissions:
   contents: write
 
 jobs:
+  preflight:
+    name: Release gate checks
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - name: Run fuzz smoke
+        run: cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked
+
+      - name: Check libFuzzer targets
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins --features libfuzzer --locked
+
   build:
     name: Build ${{ matrix.name }}
+    needs: preflight
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -78,25 +110,30 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --locked --release -p tzap --target ${{ matrix.target }}
 
-      - name: Smoke test build
-        if: runner.os != 'Windows' && matrix.run_smoke
-        run: |
-          ./target/${{ matrix.target }}/release/tzap --version
-          ./target/${{ matrix.target }}/release/tzap --help
-
-      - name: Smoke test build (Windows)
-        if: runner.os == 'Windows' && matrix.run_smoke
-        shell: pwsh
-        run: |
-          & "target/${{ matrix.target }}/release/tzap.exe" --version
-          & "target/${{ matrix.target }}/release/tzap.exe" --help
-
       - name: Package Unix
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist package
           cp target/${{ matrix.target }}/release/tzap package/tzap
           tar -czf "dist/${{ matrix.archive }}" -C package tzap
+
+      - name: Smoke test artifact (Unix)
+        if: runner.os != 'Windows' && matrix.run_smoke
+        run: |
+          set -euo pipefail
+          WORKDIR="$(mktemp -d)"
+          mkdir -p "$WORKDIR/bin"
+          tar -xzf "dist/${{ matrix.archive }}" -C "$WORKDIR/bin"
+          BIN="$WORKDIR/bin/tzap"
+          chmod +x "$BIN"
+          printf 'release smoke payload\n' > "$WORKDIR/input.txt"
+          "$BIN" --version
+          "$BIN" --help
+          printf 'release-smoke-passphrase\n' | "$BIN" create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8 --argon2-parallelism 1 -o "$WORKDIR/smoke.tzap" "$WORKDIR/input.txt"
+          printf 'release-smoke-passphrase\n' | "$BIN" list --password-stdin "$WORKDIR/smoke.tzap" | grep -F "input.txt"
+          printf 'release-smoke-passphrase\n' | "$BIN" verify --password-stdin "$WORKDIR/smoke.tzap"
+          printf 'release-smoke-passphrase\n' | "$BIN" extract --password-stdin --directory "$WORKDIR/out" "$WORKDIR/smoke.tzap" input.txt
+          cmp "$WORKDIR/input.txt" "$WORKDIR/out/input.txt"
 
       - name: Generate checksum (Unix)
         if: runner.os != 'Windows'
@@ -116,6 +153,28 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/tzap.exe" package/tzap.exe
           Compress-Archive -Path package/tzap.exe -DestinationPath "dist/${{ matrix.archive }}"
 
+      - name: Smoke test artifact (Windows)
+        if: runner.os == 'Windows' && matrix.run_smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $workdir = Join-Path $env:RUNNER_TEMP "tzap-release-smoke"
+          Remove-Item -Recurse -Force $workdir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force (Join-Path $workdir "bin") | Out-Null
+          Expand-Archive -Path "dist/${{ matrix.archive }}" -DestinationPath (Join-Path $workdir "bin") -Force
+          $bin = Join-Path $workdir "bin/tzap.exe"
+          Set-Content -NoNewline -Path (Join-Path $workdir "input.txt") -Value "release smoke payload`n"
+          & $bin --version
+          & $bin --help
+          "release-smoke-passphrase`n" | & $bin create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8 --argon2-parallelism 1 -o (Join-Path $workdir "smoke.tzap") (Join-Path $workdir "input.txt")
+          $list = "release-smoke-passphrase`n" | & $bin list --password-stdin (Join-Path $workdir "smoke.tzap")
+          if ($list -notmatch "input.txt") { throw "release smoke list output did not include input.txt" }
+          "release-smoke-passphrase`n" | & $bin verify --password-stdin (Join-Path $workdir "smoke.tzap")
+          "release-smoke-passphrase`n" | & $bin extract --password-stdin --directory (Join-Path $workdir "out") (Join-Path $workdir "smoke.tzap") input.txt
+          $original = Get-Content -Raw -Path (Join-Path $workdir "input.txt")
+          $restored = Get-Content -Raw -Path (Join-Path $workdir "out/input.txt")
+          if ($original -ne $restored) { throw "release smoke payload mismatch" }
+
       - name: Generate checksum (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -131,10 +190,80 @@ jobs:
             dist/${{ matrix.archive }}
             dist/${{ matrix.archive }}.sha256
 
+  homebrew:
+    name: Test Homebrew formula ${{ matrix.name }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-x86_64
+            os: macos-15-intel
+          - name: macos-aarch64
+            os: macos-14
+          - name: linux-x86_64
+            os: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Download assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Install Linuxbrew
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl file git procps
+          NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+          echo "/home/linuxbrew/.linuxbrew/sbin" >> "$GITHUB_PATH"
+
+      - name: Point formula at built artifacts
+        run: |
+          ruby - <<'RUBY'
+          require "digest"
+
+          tag = ENV.fetch("GITHUB_REF_NAME")
+          version = tag.delete_prefix("v")
+          dist = File.expand_path("dist")
+          artifacts = {
+            "macos-aarch64" => File.join(dist, "tzap-#{tag}-macos-aarch64.tar.gz"),
+            "macos-x86_64" => File.join(dist, "tzap-#{tag}-macos-x86_64.tar.gz"),
+            "linux-x86_64" => File.join(dist, "tzap-#{tag}-linux-x86_64.tar.gz"),
+          }
+
+          formula = File.read("Formula/tzap.rb")
+          formula.sub!(/version "[^"]+"/, %(version "#{version}"))
+          artifacts.each do |platform, path|
+            raise "missing release artifact #{path}" unless File.file?(path)
+
+            sha = Digest::SHA256.file(path).hexdigest
+            pattern = /(url ")[^"]*tzap-[^"]+-#{Regexp.escape(platform)}\.tar\.gz("\n\s+sha256 ")[0-9a-f]+(")/
+            replaced = formula.sub!(pattern) { "#{$1}file://#{path}#{$2}#{sha}#{$3}" }
+            raise "formula did not contain #{platform} URL and checksum" unless replaced
+          end
+          File.write("Formula/tzap.rb", formula)
+          RUBY
+
+      - name: Test formula
+        run: |
+          brew uninstall --force tzap || true
+          brew install --formula ./Formula/tzap.rb
+          brew test --formula ./Formula/tzap.rb
+
   publish:
     name: Publish GitHub release
     runs-on: ubuntu-22.04
-    needs: build
+    needs:
+      - build
+      - homebrew
 
     steps:
       - name: Download assets

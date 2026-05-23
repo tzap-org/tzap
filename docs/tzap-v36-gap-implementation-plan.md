@@ -65,7 +65,7 @@ and explicit release gates.
 | G10 | CLI/API boundaries | complete | P0 | help/docs/tests do not imply unsupported behavior |
 | G11 | v36 corpus coverage | complete | P0 | every section 28.1 case tracked as covered/missing/deferred |
 | G12 | Fuzzing and mutation harness | complete | P1/P2 | fuzz targets and smoke gates cover parsers and mutations |
-| G13 | Interop and release gate | partial | P0/P2 | release checklist blocks unverified conformance claims |
+| G13 | Interop and release gate | complete | P0/P2 | release checklist blocks unverified conformance claims |
 
 ## G01 - Documentation and Plan Drift
 
@@ -284,7 +284,7 @@ provisional-output API.
 This closes G04 as a current-release boundary, not as full live sequential
 reader conformance. The conformance matrix keeps R04/R20 `partial` because live
 archive stdin/provisional output would be future product work, and the remaining
-sequential mutation fixtures are release-gated by G13.
+sequential mutation fixtures are tracked in D01.
 
 The CLI uses archive file paths for `list`, `verify`, and `extract`. It does not
 expose archive stdin, live non-seekable extraction, provisional stdout events, or
@@ -423,7 +423,7 @@ Deferred related work:
   would be a new product feature. The current CLI rejects that combination
   before reading archive inputs.
 - Broad near-u64 arithmetic and boundary-byte mutation expansion is
-  release-gated by G13; the implemented reader path uses checked arithmetic and
+  tracked in D01; the implemented reader path uses checked arithmetic and
   present-section cap accounting.
 
 Done criteria:
@@ -476,7 +476,7 @@ Deferred related work:
   choose conservative maxima, pre-scan/spool, or reject before first write; if
   final metadata exceeds the selected class, fail finalization with a clear
   error and no clean trailer/footer.
-- Reader mutation-matrix expansion is release-gated by G13:
+- Reader mutation-matrix expansion is tracked in D01:
   encrypted size equals data blocks times block size with checked arithmetic,
   class maxima are enforced before FEC repair, and zero-data metadata objects
   reject before decrypt/decompress.
@@ -491,9 +491,9 @@ Tests:
 - Actual metadata object where data plus parity exceeds 65,535 rejects even when
   the individual configured maxima fit in u16.
 - Mutated ManifestFooter `index_root_encrypted_size` reader fixtures are
-  release-gated by G13.
+  tracked in D01.
 - Metadata object trailing zstd/skippable/concatenated/decompressed-size
-  mutation expansion is release-gated by G13.
+  mutation expansion is tracked in D01.
 
 Done criteria:
 
@@ -582,7 +582,7 @@ Residual risk:
   current CLI/API scope. Adding that later is a product feature, not an
   unfinished G07 conformance claim.
 - Broad malformed DirectoryHintTable buffer generation and huge hint stress
-  fixtures are release-gated by G13.
+  fixtures are tracked in D01.
 
 ## G08 - Tar Metadata Profile
 
@@ -641,7 +641,7 @@ Tests:
 
 Remaining work:
 
-- Broad mutation/fuzz expansion for tar metadata is release-gated by G13.
+- Broad mutation/fuzz expansion for tar metadata is tracked in D01.
 - Future filesystem restoration of ownership, xattrs, ACLs, sparse files,
   nanosecond timestamps, or directory FileEntry creation would be new feature
   work and must update this profile and its diagnostics.
@@ -716,7 +716,7 @@ Tests:
 Remaining work:
 
 - Broad malformed-buffer, identity-splice, and fixture-generator expansion is
-  release-gated by G13.
+  tracked in D01.
 - A future duplicate-copy recovery mode would be a new feature and must prove
   byte-for-byte identity for the requested operation before accepting duplicate
   volume indexes.
@@ -781,7 +781,7 @@ Tests:
 Remaining work:
 
 - Broad generated corpus coverage for sequential, streaming, and
-  directory-prefix edge cases is release-gated by G13.
+  directory-prefix edge cases is tracked in D01.
 - Any future archive-stdin, live stdout streaming, append-only sink, multipart
   sink, multi-volume sidecar, or directory FileEntry creation feature must add a
   new product design, docs, diagnostics, and tests instead of relying on the
@@ -812,7 +812,8 @@ Completed implementation:
    - status: `covered`, `partial`, `missing`, or `deferred`
    - follow-up gap link for every open case
 3. Kept the tracker honest: cases with aspirational or incomplete evidence stay
-   `partial`, `missing`, or `deferred` and link to G03 through G13.
+   `partial`, `missing`, or `deferred` and link to a closed gap boundary or
+   the D01 post-release corpus backlog.
 4. Added docs tests in `crates/tzap-cli/tests/milestone11_docs.rs` that:
    - require representative section 28.1 cases to remain present
    - require exactly 113 tracker rows for the current v0.36 spec
@@ -826,8 +827,8 @@ Done criteria:
 - Every section 28.1 case has a status.
 - Missing cases become work items, not reviewer folklore.
 - Corpus tracker now carries the corpus-level evidence map. The conformance
-  matrix remains the section 29 obligation map and can cite tracker rows as G03
-  through G13 close.
+  matrix remains the section 29 obligation map and can cite tracker rows as
+  closed gap boundaries or D01 follow-up work.
 
 ## G12 - Fuzzing and Mutation Harness
 
@@ -869,7 +870,7 @@ Closed implementation:
 5. Added the fuzz smoke to Ubuntu CI and documented both the CI smoke command
    and bounded local `cargo fuzz run --features libfuzzer ...` commands in
    `fuzz/README.md`.
-6. Moved still-open broad corpus follow-ups to G13 so G12 closes only the
+6. Moved still-open broad corpus follow-ups to D01 so G12 closes only the
    fuzz/mutation harness infrastructure and does not hide release-blocking
    corpus evidence.
 
@@ -893,24 +894,18 @@ Spec anchors:
 - all v0.36 conformance sections
 - package/release workflows
 
-Current gap:
+Status: complete.
+
+Original gap:
 
 The project can build and release artifacts, but format conformance and release
 readiness need one gate that combines tests, docs, corpus, packaging, and
 interop. Otherwise it is too easy to tag a release while a spec gap is known but
 not documented.
 
-Current progress:
+Closed implementation:
 
-- `docs/tzap-v36-release-gate.md` now exists and includes the fuzz smoke,
-  libFuzzer target compile check, workspace checks, evidence-doc checks,
-  release wording guidance, artifact gate, and distribution gate.
-- G13 remains open until artifact/interop evidence and final release workflow
-  checks are all pinned.
-
-Implementation work:
-
-1. Keep `docs/tzap-v36-release-gate.md` current with the release checklist:
+1. Added `docs/tzap-v36-release-gate.md` with the release checklist:
    - conformance matrix has no `unknown`
    - P0 gaps closed or explicitly unsupported with tests/docs
    - v36 corpus tracker has no untriaged cases
@@ -921,26 +916,35 @@ Implementation work:
    - generated checksums exist
    - Homebrew formula/test path verified for macOS and Linuxbrew if claimed
    - Linux and Windows portable artifacts are smoke-tested if claimed
-2. Add release wording guidance:
+2. Added release wording guidance:
    - "implements v0.36 archive layout with documented unsupported surfaces" is
      acceptable while P1/P2 work remains
    - "fully v0.36 conformant" requires all P0/P1 conformance rows complete or
      formally deferred without public feature claims
-3. Add interop fixtures:
-   - deterministic golden archives
-   - dictionary archive with sidecar
-   - multi-volume recoverable archive
-   - large multi-shard archive
-   - directory-hint archive
-   - empty archive
+3. Tightened `.github/workflows/release.yml` so every claimed target artifact
+   is packaged, unpacked, and then smoke-tested with `tzap --version` plus a
+   create/list/verify/extract round trip before checksum generation and upload.
+4. Added a release workflow preflight job that runs the required formatting,
+   workspace check, workspace tests, fuzz smoke, and libFuzzer target compile
+   checks on the tagged commit before artifact builds start.
+5. Added a Homebrew/Linuxbrew formula gate that rewrites the checked-in formula
+   to the built artifacts, installs it on macOS x86_64, macOS arm64, and Linux
+   x86_64, then runs the formula test before the GitHub release publish job.
+6. Moved remaining broad corpus expansion out of G13 and into
+   `docs/tzap-v36-deferred-corpus-backlog.md` as D01. Those rows are still
+   visible release-wording blockers, but G13 no longer owns unresolved corpus
+   implementation work.
+7. Existing v36 corpus, CLI smoke, milestone workflow, and docs tests now pin
+   the release evidence trail.
 
 Tests:
 
-- Release workflow test confirms the cross-platform matrix includes all claimed
-  targets.
-- Artifact smoke tests run `tzap --version`, create/list/verify/extract on each
-  claimed platform.
-- Homebrew/Linuxbrew test is required only if the docs claim that install path.
+- `milestone10_release_workflow_has_all_release_archives`
+- `milestone10_release_workflow_targets_distinct_build_triples`
+- `milestone10_release_workflow_has_smoke_checks`
+- `milestone10_release_workflow_uploads_checksum_artifacts`
+- `milestone10_release_workflow_uses_pinned_baseline_runners`
+- `milestone11_docs_pin_current_g13_release_gate`
 
 Done criteria:
 

@@ -465,7 +465,7 @@ fn milestone11_docs_pin_current_g04_non_seekable_boundary() {
     assert!(matrix.contains("| R20 |"));
     assert!(matrix.contains("| `partial` | Whole-buffer API returns decoded bytes"));
     assert!(matrix.contains(
-        "Skipped-metadata, non-authoritative terminal, and multi-envelope CRC-boundary fixtures are release-gated by G13"
+        "Skipped-metadata, non-authoritative terminal, and multi-envelope CRC-boundary fixtures are tracked in D01"
     ));
 
     let forbidden_claims = [
@@ -723,7 +723,7 @@ fn milestone11_v36_corpus_tracker_uses_reviewable_statuses() {
             );
         } else {
             assert!(
-                row[7].contains("[G"),
+                row[7].contains("[G") || row[7].contains("[D"),
                 "open corpus row must link to a follow-up gap: {row:?}"
             );
         }
@@ -891,10 +891,131 @@ fn milestone11_docs_pin_current_g12_fuzz_gate() {
     assert!(release_gate.contains("## Required Pre-Tag Checks"));
     assert!(release_gate.contains("## Release Wording"));
     assert!(release_gate.contains("fully v0.36 conformant"));
-    assert!(tracker.contains("[G13]"));
+    assert!(tracker.contains("[D01]"));
+    assert!(!tracker.contains("[G13]"));
     assert!(!tracker.contains("[G12]"));
     assert!(plan.contains("## G12 - Fuzzing and Mutation Harness"));
     assert!(plan.contains("Status: complete."));
+}
+
+#[test]
+fn milestone11_docs_pin_current_g13_release_gate() {
+    let release_gate = read_workspace_file("docs/tzap-v36-release-gate.md");
+    let release_workflow = read_workspace_file(".github/workflows/release.yml");
+    let formula = read_workspace_file("Formula/tzap.rb");
+    let matrix = read_workspace_file("docs/tzap-v36-conformance-matrix.md");
+    let tracker = read_workspace_file("docs/tzap-v36-corpus-tracker.md");
+    let deferred_backlog = read_workspace_file("docs/tzap-v36-deferred-corpus-backlog.md");
+    let plan = read_workspace_file("docs/tzap-v36-gap-implementation-plan.md");
+    let readme = read_workspace_file("README.md");
+    let gitignore = read_workspace_file(".gitignore");
+
+    for command in [
+        "cargo fmt --all -- --check",
+        "cargo check --workspace --all-targets --locked",
+        "cargo test --workspace --locked",
+        "cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked",
+        "cargo check --manifest-path fuzz/Cargo.toml --bins --features libfuzzer --locked",
+    ] {
+        assert!(
+            release_gate.contains(command),
+            "release gate missing required pre-tag command {command:?}"
+        );
+    }
+
+    for target in [
+        "Linux x86_64 GNU",
+        "Linux x86_64 musl",
+        "macOS x86_64",
+        "macOS arm64",
+        "Windows x86_64",
+    ] {
+        assert!(
+            release_gate.contains(target),
+            "release gate missing target artifact {target:?}"
+        );
+    }
+
+    assert!(release_gate.contains("## Evidence Documents"));
+    assert!(release_gate.contains("## Release Wording"));
+    assert!(release_gate.contains("## Artifact Gate"));
+    assert!(release_gate.contains("## Distribution Gate"));
+    assert!(release_gate.contains("Before promotion, confirm the latest `main` CI run passed"));
+    assert!(release_gate
+        .contains("Open `partial`, `missing`, or `deferred` corpus rows are release blockers"));
+    assert!(release_gate
+        .contains("\"implements the v0.36 archive layout with documented unsupported surfaces\""));
+    assert!(release_gate.contains("\"fully v0.36 conformant\""));
+    assert!(release_gate.contains("\"complete v0.36 implementation\""));
+    assert!(release_gate.contains("Each generated `.tar.gz` or `.zip` artifact must be unpacked"));
+    assert!(release_gate.contains("before checksum generation"));
+    assert!(release_gate.contains("Treat any skipped artifact smoke"));
+    assert!(release_gate.contains("merged `SHA256SUMS` as a release blocker"));
+
+    assert!(release_workflow.contains("Smoke test artifact (Unix)"));
+    assert!(release_workflow.contains("Smoke test artifact (Windows)"));
+    assert!(release_workflow.contains("preflight:"));
+    assert!(release_workflow.contains("needs: preflight"));
+    assert!(release_workflow.contains("tar -xzf \"dist/${{ matrix.archive }}\""));
+    assert!(release_workflow.contains("Expand-Archive -Path \"dist/${{ matrix.archive }}\""));
+    assert!(release_workflow.contains("\"$BIN\" --version"));
+    assert!(release_workflow.contains("\"$BIN\" --help"));
+    assert!(release_workflow.contains("& $bin --version"));
+    assert!(release_workflow.contains("& $bin --help"));
+    assert!(release_workflow.contains(
+        "printf 'release-smoke-passphrase\\n' | \"$BIN\" create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8 --argon2-parallelism 1"
+    ));
+    assert!(release_workflow.contains(
+        "\"release-smoke-passphrase`n\" | & $bin create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8 --argon2-parallelism 1"
+    ));
+    assert!(release_workflow.contains("list --password-stdin"));
+    assert!(release_workflow.contains("verify --password-stdin"));
+    assert!(release_workflow.contains("extract --password-stdin --directory"));
+    assert!(release_workflow.contains("grep -F \"input.txt\""));
+    assert!(release_workflow.contains("release smoke list output did not include input.txt"));
+    assert!(release_workflow.contains("cmp \"$WORKDIR/input.txt\" \"$WORKDIR/out/input.txt\""));
+    assert!(release_workflow.contains("release smoke payload mismatch"));
+    assert!(release_workflow.contains("Generate checksum (Unix)"));
+    assert!(release_workflow.contains("Generate checksum (Windows)"));
+    assert!(release_workflow.contains("SHA256SUMS"));
+    assert!(release_workflow.contains("homebrew:"));
+    assert!(release_workflow.contains("Point formula at built artifacts"));
+    assert!(release_workflow.contains("NONINTERACTIVE=1 /bin/bash"));
+    assert!(release_workflow.contains("brew install --formula ./Formula/tzap.rb"));
+    assert!(release_workflow.contains("brew test --formula ./Formula/tzap.rb"));
+    assert!(release_workflow.contains("- homebrew"));
+
+    assert!(formula.contains("v#{version}/tzap-v#{version}-macos-aarch64.tar.gz"));
+    assert!(formula.contains("v#{version}/tzap-v#{version}-macos-x86_64.tar.gz"));
+    assert!(formula.contains("v#{version}/tzap-v#{version}-linux-x86_64.tar.gz"));
+    assert!(formula.contains("pipe_output("));
+    assert!(formula.contains("create --password-stdin --argon2-t-cost 1"));
+    assert!(formula.contains("list --password-stdin"));
+    assert!(formula.contains("verify --password-stdin"));
+    assert!(formula.contains("extract --password-stdin --directory"));
+
+    assert!(matrix.contains("| G13 release gate | `complete` |"));
+    assert!(matrix.contains(
+        "unpacks each artifact for `tzap --version` plus create/list/verify/extract smoke"
+    ));
+    assert!(matrix.contains("milestone11_docs::milestone11_docs_pin_current_g13_release_gate"));
+    assert!(plan.contains("## G13 - Interop and Release Gate"));
+    assert!(plan.contains("Status: complete."));
+    assert!(
+        plan.contains("is packaged, unpacked, and then smoke-tested with `tzap --version` plus a")
+    );
+    assert!(plan.contains("before checksum generation and upload"));
+    assert!(plan.contains("release workflow preflight job"));
+    assert!(tracker.contains("[D01]"));
+    assert!(!tracker.contains("[G13]"));
+    assert!(deferred_backlog.contains("## D01 - Post-Release Corpus Expansion"));
+    assert!(deferred_backlog.contains("C016 zero-data encrypted objects"));
+    assert!(deferred_backlog.contains("C023 header/trailer identity binding"));
+    assert!(deferred_backlog.contains("C096 duplicate local table consistency"));
+    assert!(deferred_backlog.contains("C104 sidecar cap arithmetic"));
+    assert!(gitignore.contains("!/docs/tzap-v36-deferred-corpus-backlog.md"));
+    assert!(!readme.contains("fully v0.36 conformant"));
+    assert!(!readme.contains("complete v0.36 implementation"));
 }
 
 fn assert_matrix_row_count(matrix: &str, id: &str, expected: usize) {

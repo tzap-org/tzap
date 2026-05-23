@@ -12,7 +12,7 @@ workflows.
 Run these from the repository root before creating a v0.36 release tag:
 
 ```sh
-cargo fmt --check
+cargo fmt --all -- --check
 cargo check --workspace --all-targets --locked
 cargo test --workspace --locked
 cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked
@@ -20,7 +20,11 @@ cargo check --manifest-path fuzz/Cargo.toml --bins --features libfuzzer --locked
 ```
 
 The GitHub CI workflow must run the same workspace checks and the fuzz smoke on
-pushes to `main`.
+pushes to `main`. The tag-triggered release workflow must also run these checks
+in its `preflight` job before building artifacts.
+
+Before promotion, confirm the latest `main` CI run passed after the final gate
+commit.
 
 ## Evidence Documents
 
@@ -64,11 +68,25 @@ README claims:
 - macOS arm64
 - Windows x86_64
 
-Each artifact must smoke-test `tzap --version` plus a create/list/verify/extract
-round trip during the release workflow or before promotion.
+Each generated `.tar.gz` or `.zip` artifact must be unpacked during the release
+workflow before checksum generation. The unpacked binary must smoke-test
+`tzap --version` plus a create/list/verify/extract round trip. The round trip
+must use passphrase mode with low Argon2 costs suitable for CI, verify the
+archive, extract one file, and compare the restored payload to the original.
+Treat any skipped artifact smoke, missing per-artifact `.sha256`, or missing
+merged `SHA256SUMS` as a release blocker.
 
 ## Distribution Gate
 
 Homebrew or Linuxbrew installation can be advertised only after the formula path
-is tested for the claimed platform. The release owner should run the formula
-test against the final tag or release artifact, not a local checkout-only path.
+is tested for the claimed platform. The release workflow must test
+`Formula/tzap.rb` against the built release artifacts on macOS x86_64, macOS
+arm64, and Linux x86_64 before publishing the GitHub release.
+
+## Final Decision
+
+A tag is safe only when every required pre-tag command passes, the release
+workflow artifact smoke passes on all claimed targets, checksum artifacts are
+present, the Homebrew/Linuxbrew formula gate passes for claimed platforms, and
+public release wording stays within the supported-surface language when any
+corpus tracker row remains `partial`, `missing`, or `deferred`.
