@@ -49,17 +49,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: linux-x86_64
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            archive: tzap-${{ github.ref_name }}-linux-x86_64.tar.gz
-            run_smoke: true
-            macosx_deployment_target: ""
-            rustflags: ""
           - name: linux-x86_64-musl
             os: ubuntu-22.04
             target: x86_64-unknown-linux-musl
             archive: tzap-${{ github.ref_name }}-linux-x86_64-musl.tar.gz
+            builder: cargo
+            emulator: ""
+            run_smoke: true
+            macosx_deployment_target: ""
+            rustflags: ""
+          - name: linux-aarch64-musl
+            os: ubuntu-22.04
+            target: aarch64-unknown-linux-musl
+            archive: tzap-${{ github.ref_name }}-linux-aarch64-musl.tar.gz
+            builder: cross
+            emulator: qemu-aarch64-static
             run_smoke: true
             macosx_deployment_target: ""
             rustflags: ""
@@ -67,6 +71,8 @@ jobs:
             os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tzap-${{ github.ref_name }}-macos-x86_64.tar.gz
+            builder: cargo
+            emulator: ""
             run_smoke: true
             macosx_deployment_target: "10.12"
             rustflags: ""
@@ -74,6 +80,8 @@ jobs:
             os: macos-14
             target: aarch64-apple-darwin
             archive: tzap-${{ github.ref_name }}-macos-aarch64.tar.gz
+            builder: cargo
+            emulator: ""
             run_smoke: true
             macosx_deployment_target: "11.0"
             rustflags: ""
@@ -81,7 +89,18 @@ jobs:
             os: windows-2022
             target: x86_64-pc-windows-msvc
             archive: tzap-${{ github.ref_name }}-windows-x86_64.zip
+            builder: cargo
+            emulator: ""
             run_smoke: true
+            macosx_deployment_target: ""
+            rustflags: "-C target-feature=+crt-static"
+          - name: windows-aarch64
+            os: windows-2022
+            target: aarch64-pc-windows-msvc
+            archive: tzap-${{ github.ref_name }}-windows-aarch64.zip
+            builder: cargo
+            emulator: ""
+            run_smoke: false
             macosx_deployment_target: ""
             rustflags: "-C target-feature=+crt-static"
 
@@ -104,11 +123,26 @@ jobs:
           sudo apt-get install -y musl-tools
           echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
 
-      - name: Build
+      - name: Install QEMU
+        if: matrix.emulator != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        run: cargo install cross --locked
+
+      - name: Build with cargo
+        if: matrix.builder == 'cargo'
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --locked --release -p tzap --target ${{ matrix.target }}
+
+      - name: Build with cross
+        if: matrix.builder == 'cross'
+        run: cross build --locked --release -p tzap --target ${{ matrix.target }}
 
       - name: Package Unix
         if: runner.os != 'Windows'
@@ -126,13 +160,20 @@ jobs:
           tar -xzf "dist/${{ matrix.archive }}" -C "$WORKDIR/bin"
           BIN="$WORKDIR/bin/tzap"
           chmod +x "$BIN"
+          run_tzap() {
+            if [ -n "${{ matrix.emulator }}" ]; then
+              "${{ matrix.emulator }}" "$BIN" "$@"
+            else
+              "$BIN" "$@"
+            fi
+          }
           printf 'release smoke payload\n' > "$WORKDIR/input.txt"
-          "$BIN" --version
-          "$BIN" --help
-          printf 'release-smoke-passphrase\n' | "$BIN" create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8 --argon2-parallelism 1 -o "$WORKDIR/smoke.tzap" "$WORKDIR/input.txt"
-          printf 'release-smoke-passphrase\n' | "$BIN" list --password-stdin "$WORKDIR/smoke.tzap" | grep -F "input.txt"
-          printf 'release-smoke-passphrase\n' | "$BIN" verify --password-stdin "$WORKDIR/smoke.tzap"
-          printf 'release-smoke-passphrase\n' | "$BIN" extract --password-stdin --directory "$WORKDIR/out" "$WORKDIR/smoke.tzap" input.txt
+          run_tzap --version
+          run_tzap --help
+          printf 'release-smoke-passphrase\n' | run_tzap create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8 --argon2-parallelism 1 -o "$WORKDIR/smoke.tzap" "$WORKDIR/input.txt"
+          printf 'release-smoke-passphrase\n' | run_tzap list --password-stdin "$WORKDIR/smoke.tzap" | grep -F "input.txt"
+          printf 'release-smoke-passphrase\n' | run_tzap verify --password-stdin "$WORKDIR/smoke.tzap"
+          printf 'release-smoke-passphrase\n' | run_tzap extract --password-stdin --directory "$WORKDIR/out" "$WORKDIR/smoke.tzap" input.txt
           cmp "$WORKDIR/input.txt" "$WORKDIR/out/input.txt"
 
       - name: Generate checksum (Unix)
@@ -203,7 +244,7 @@ jobs:
             os: macos-15-intel
           - name: macos-aarch64
             os: macos-14
-          - name: linux-x86_64
+          - name: linux-x86_64-musl
             os: ubuntu-22.04
 
     steps:
@@ -236,7 +277,7 @@ jobs:
           artifacts = {
             "macos-aarch64" => File.join(dist, "tzap-#{tag}-macos-aarch64.tar.gz"),
             "macos-x86_64" => File.join(dist, "tzap-#{tag}-macos-x86_64.tar.gz"),
-            "linux-x86_64" => File.join(dist, "tzap-#{tag}-linux-x86_64.tar.gz"),
+            "linux-x86_64-musl" => File.join(dist, "tzap-#{tag}-linux-x86_64-musl.tar.gz"),
           }
 
           formula = File.read("Formula/tzap.rb")

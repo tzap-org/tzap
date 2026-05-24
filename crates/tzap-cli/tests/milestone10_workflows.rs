@@ -30,10 +30,26 @@ fn milestone10_ci_workflow_has_cross_platform_matrix() {
     assert!(workflow.contains("os: macos-15-intel"));
     assert!(workflow.contains("os: macos-14"));
     assert!(workflow.contains("os: windows-2022"));
+    assert!(workflow.contains("release-artifacts:"));
+    assert!(workflow.contains("Release artifact ${{ matrix.name }}"));
+    assert!(workflow.contains("x86_64-unknown-linux-musl"));
+    assert!(workflow.contains("aarch64-unknown-linux-musl"));
+    assert!(workflow.contains("x86_64-pc-windows-msvc"));
+    assert!(workflow.contains("aarch64-pc-windows-msvc"));
+    assert!(workflow.contains("Install musl tools"));
+    assert!(workflow.contains("CC_x86_64_unknown_linux_musl=musl-gcc"));
+    assert!(workflow.contains("Install QEMU"));
+    assert!(workflow.contains("qemu-aarch64-static"));
+    assert!(workflow.contains("Install cross"));
+    assert!(
+        workflow.contains("cross build --locked --release -p tzap --target ${{ matrix.target }}")
+    );
+    assert!(workflow.contains("Smoke test release binary"));
     assert!(workflow.contains("matrix.run_fmt"));
     assert!(workflow.contains("cargo fmt --all -- --check"));
     assert!(workflow.contains("cargo check --workspace --all-targets --locked"));
     assert!(workflow.contains("cargo test --workspace --locked"));
+    assert!(workflow.contains("cmp \"$WORKDIR/input.txt\" \"$WORKDIR/out/input.txt\""));
     assert!(!workflow.contains("ubuntu-latest"));
     assert!(!workflow.contains("macos-latest"));
     assert!(!workflow.contains("windows-latest"));
@@ -43,22 +59,26 @@ fn milestone10_ci_workflow_has_cross_platform_matrix() {
 fn milestone10_release_workflow_has_all_release_archives() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
 
-    assert!(workflow.contains("tzap-${{ github.ref_name }}-linux-x86_64.tar.gz"));
     assert!(workflow.contains("tzap-${{ github.ref_name }}-linux-x86_64-musl.tar.gz"));
+    assert!(workflow.contains("tzap-${{ github.ref_name }}-linux-aarch64-musl.tar.gz"));
     assert!(workflow.contains("tzap-${{ github.ref_name }}-macos-x86_64.tar.gz"));
     assert!(workflow.contains("tzap-${{ github.ref_name }}-macos-aarch64.tar.gz"));
     assert!(workflow.contains("tzap-${{ github.ref_name }}-windows-x86_64.zip"));
+    assert!(workflow.contains("tzap-${{ github.ref_name }}-windows-aarch64.zip"));
+    assert!(!workflow.contains("tzap-${{ github.ref_name }}-linux-x86_64.tar.gz"));
 }
 
 #[test]
 fn milestone10_release_workflow_targets_distinct_build_triples() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
 
-    assert!(workflow.contains("x86_64-unknown-linux-gnu"));
     assert!(workflow.contains("x86_64-unknown-linux-musl"));
+    assert!(workflow.contains("aarch64-unknown-linux-musl"));
     assert!(workflow.contains("x86_64-apple-darwin"));
     assert!(workflow.contains("aarch64-apple-darwin"));
     assert!(workflow.contains("x86_64-pc-windows-msvc"));
+    assert!(workflow.contains("aarch64-pc-windows-msvc"));
+    assert!(!workflow.contains("x86_64-unknown-linux-gnu"));
 }
 
 #[test]
@@ -75,6 +95,8 @@ fn milestone10_release_workflow_uses_pinned_baseline_runners() {
     assert!(workflow.contains(r#"macosx_deployment_target: "11.0""#));
     assert!(workflow.contains("musl-tools"));
     assert!(workflow.contains("CC_x86_64_unknown_linux_musl=musl-gcc"));
+    assert!(workflow.contains("qemu-user-static"));
+    assert!(workflow.contains("cargo install cross --locked"));
     assert!(workflow.contains("target-feature=+crt-static"));
     assert!(!workflow.contains("ubuntu-latest"));
     assert!(!workflow.contains("macos-latest"));

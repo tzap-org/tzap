@@ -55,3 +55,126 @@ jobs:
       - name: Check libFuzzer targets
         if: ${{ matrix.run_fmt }}
         run: cargo check --manifest-path fuzz/Cargo.toml --bins --features libfuzzer --locked
+
+  release-artifacts:
+    name: Release artifact ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64-musl
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            builder: cargo
+            emulator: ""
+            run_smoke: true
+            macosx_deployment_target: ""
+            rustflags: ""
+          - name: linux-aarch64-musl
+            os: ubuntu-22.04
+            target: aarch64-unknown-linux-musl
+            builder: cross
+            emulator: qemu-aarch64-static
+            run_smoke: true
+            macosx_deployment_target: ""
+            rustflags: ""
+          - name: macos-x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            builder: cargo
+            emulator: ""
+            run_smoke: true
+            macosx_deployment_target: "10.12"
+            rustflags: ""
+          - name: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            builder: cargo
+            emulator: ""
+            run_smoke: true
+            macosx_deployment_target: "11.0"
+            rustflags: ""
+          - name: windows-x86_64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            builder: cargo
+            emulator: ""
+            run_smoke: true
+            macosx_deployment_target: ""
+            rustflags: "-C target-feature=+crt-static"
+          - name: windows-aarch64
+            os: windows-2022
+            target: aarch64-pc-windows-msvc
+            builder: cargo
+            emulator: ""
+            run_smoke: false
+            macosx_deployment_target: ""
+            rustflags: "-C target-feature=+crt-static"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Install QEMU
+        if: matrix.emulator != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        run: cargo install cross --locked
+
+      - name: Build release binary with cargo
+        if: matrix.builder == 'cargo'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --locked --release -p tzap --target ${{ matrix.target }}
+
+      - name: Build release binary with cross
+        if: matrix.builder == 'cross'
+        run: cross build --locked --release -p tzap --target ${{ matrix.target }}
+
+      - name: Smoke test release binary
+        if: matrix.run_smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKDIR="$(mktemp -d)"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            BIN="target/${{ matrix.target }}/release/tzap.exe"
+          else
+            BIN="target/${{ matrix.target }}/release/tzap"
+          fi
+          run_tzap() {
+            if [ -n "${{ matrix.emulator }}" ]; then
+              "${{ matrix.emulator }}" "$BIN" "$@"
+            else
+              "$BIN" "$@"
+            fi
+          }
+          printf 'ci release smoke payload\n' > "$WORKDIR/input.txt"
+          run_tzap --version
+          run_tzap --help
+          printf 'ci-release-smoke-passphrase\n' | run_tzap create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8 --argon2-parallelism 1 -o "$WORKDIR/smoke.tzap" "$WORKDIR/input.txt"
+          printf 'ci-release-smoke-passphrase\n' | run_tzap list --password-stdin "$WORKDIR/smoke.tzap" | grep -F "input.txt"
+          printf 'ci-release-smoke-passphrase\n' | run_tzap verify --password-stdin "$WORKDIR/smoke.tzap"
+          printf 'ci-release-smoke-passphrase\n' | run_tzap extract --password-stdin --directory "$WORKDIR/out" "$WORKDIR/smoke.tzap" input.txt
+          cmp "$WORKDIR/input.txt" "$WORKDIR/out/input.txt"

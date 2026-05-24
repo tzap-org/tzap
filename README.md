@@ -108,12 +108,11 @@ case "$ARCH_RAW" in
     ;;
 esac
 
-if [ "$OS" = linux ] && [ "$ARCH" = aarch64 ]; then
-  echo "no Linux aarch64 release artifact is published yet"
-  exit 1
+if [ "$OS" = linux ]; then
+  ASSET="tzap-${VERSION}-linux-${ARCH}-musl.tar.gz"
+else
+  ASSET="tzap-${VERSION}-${OS}-${ARCH}.tar.gz"
 fi
-
-ASSET="tzap-${VERSION}-${OS}-${ARCH}.tar.gz"
 # On Windows, pick the ".zip" artifact name from the table below.
 curl -L -o tzap.tar.gz \
   "https://github.com/frankmanzhu/tzap/releases/download/${VERSION}/${ASSET}"
@@ -126,18 +125,19 @@ Supported target artifacts:
 
 | Platform | Artifact |
 | --- | --- |
-| Linux x86_64 | `tzap-vX.Y.Z-linux-x86_64.tar.gz` |
 | Linux x86_64 static/musl | `tzap-vX.Y.Z-linux-x86_64-musl.tar.gz` |
+| Linux aarch64 static/musl | `tzap-vX.Y.Z-linux-aarch64-musl.tar.gz` |
 | macOS x86_64 | `tzap-vX.Y.Z-macos-x86_64.tar.gz` |
 | macOS aarch64 | `tzap-vX.Y.Z-macos-aarch64.tar.gz` |
 | Windows x86_64 | `tzap-vX.Y.Z-windows-x86_64.zip` |
+| Windows aarch64 | `tzap-vX.Y.Z-windows-aarch64.zip` |
 
 Release artifacts are built on pinned baseline runners instead of moving
 `*-latest` labels: `ubuntu-22.04`, `macos-15-intel`, `macos-14`, and
 `windows-2022`. macOS builds set `MACOSX_DEPLOYMENT_TARGET=10.12` for
-x86_64 and `MACOSX_DEPLOYMENT_TARGET=11.0` for aarch64. Linux publishes both
-glibc and static musl x86_64 artifacts; Windows release builds use the static
-CRT.
+x86_64 and `MACOSX_DEPLOYMENT_TARGET=11.0` for aarch64. Linux publishes
+static musl artifacts for x86_64 and aarch64; Windows release builds use the
+static CRT.
 
 tzap requires Rust 1.85 or newer.
 

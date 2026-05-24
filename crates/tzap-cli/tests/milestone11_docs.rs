@@ -44,8 +44,10 @@ fn milestone11_readme_has_exit_code_and_platform_sections() {
     let readme = read_workspace_file("README.md");
 
     assert!(readme.contains("Supported target artifacts:"));
-    assert!(readme.contains("| Linux x86_64 |"));
+    assert!(readme.contains("| Linux x86_64 static/musl |"));
+    assert!(readme.contains("| Linux aarch64 static/musl |"));
     assert!(readme.contains("| Windows x86_64 |"));
+    assert!(readme.contains("| Windows aarch64 |"));
 
     assert!(readme.contains("| 2 | usage | Invalid args / command-line usage |"));
     assert!(readme.contains("| 10 | wrong-key | Wrong passphrase or key for archive |"));
