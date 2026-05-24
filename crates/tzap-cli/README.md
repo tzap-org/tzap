@@ -47,6 +47,10 @@ tzap verify --keyfile project.key --trusted-public-key root.public.hex signed.tz
 tzap verify --public-no-key --trusted-public-key root.public.hex signed.tzap
 ```
 
+The CLI composes `tzap-core` with `tzap-plugin-signing` for Ed25519 RootAuth
+signing. Library users can choose `tzap-core` for archive workflows or compose
+it with `tzap-plugin-signing` for signed RootAuth workflows.
+
 Extract files safely into a destination directory:
 
 ```sh
@@ -75,9 +79,9 @@ tzap verify --keyfile project.key project.tzap.000 project.tzap.001 project.tzap
 
 ## Safety
 
-`tzap extract` rejects unsafe archive paths and does not overwrite existing files
-unless `--overwrite` is provided. Keep passphrases and raw keyfiles separate from
-archive data; raw-key archives require the original 32-byte key.
+`tzap extract` applies safe path validation and overwrite protection;
+`--overwrite` enables explicit replacement. Keep passphrases and raw keyfiles
+separate from archive data; raw-key archives require the original 32-byte key.
 
 ## More Information
 
@@ -85,3 +89,4 @@ archive data; raw-key archives require the original 32-byte key.
 - CLI reference: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-cli-reference.md>
 - Format specification: <https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv41.md>
 - Library crate: <https://crates.io/crates/tzap-core>
+- Signing plugin crate: <https://crates.io/crates/tzap-plugin-signing>

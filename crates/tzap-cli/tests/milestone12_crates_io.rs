@@ -51,13 +51,14 @@ fn manifest_array_values(manifest: &str, key: &str) -> Vec<String> {
 fn assert_package_metadata(
     manifest_path: &str,
     crate_name: &str,
+    expected_version: &str,
     docs_url: &str,
     expected_description_fragment: &str,
 ) {
     let manifest = read_workspace_file(manifest_path);
 
     assert!(manifest.contains(&format!("name = \"{crate_name}\"")));
-    assert!(manifest.contains("version = \"0.1.0\""));
+    assert!(manifest.contains(&format!("version = \"{expected_version}\"")));
     assert!(manifest.contains("repository.workspace = true"));
     assert!(manifest.contains(&format!("documentation = \"{docs_url}\"")));
     assert_eq!(manifest_string_value(&manifest, "readme"), "README.md");
@@ -84,22 +85,36 @@ fn milestone12_manifests_have_crates_io_metadata() {
     assert_package_metadata(
         "crates/tzap-core/Cargo.toml",
         "tzap-core",
+        "0.1.1",
         "https://docs.rs/tzap-core",
         "Core library",
     );
     assert_package_metadata(
         "crates/tzap-cli/Cargo.toml",
         "tzap",
+        "0.1.1",
         "https://docs.rs/tzap",
         "Command-line tool",
+    );
+    assert_package_metadata(
+        "crates/tzap-plugin-signing/Cargo.toml",
+        "tzap-plugin-signing",
+        "0.1.0",
+        "https://docs.rs/tzap-plugin-signing",
+        "Signing profiles",
     );
 }
 
 #[test]
-fn milestone12_cli_uses_versioned_core_dependency_for_publish() {
+fn milestone12_publish_dependencies_are_versioned() {
     let manifest = read_workspace_file("crates/tzap-cli/Cargo.toml");
+    let plugin_manifest = read_workspace_file("crates/tzap-plugin-signing/Cargo.toml");
 
-    assert!(manifest.contains(r#"tzap-core = { path = "../tzap-core", version = "0.1.0" }"#));
+    assert!(manifest.contains(r#"tzap-core = { path = "../tzap-core", version = "0.1.1" }"#));
+    assert!(manifest.contains(
+        r#"tzap-plugin-signing = { path = "../tzap-plugin-signing", version = "0.1.0" }"#
+    ));
+    assert!(plugin_manifest.contains(r#"tzap-core = { path = "../tzap-core", version = "0.1.1" }"#));
 }
 
 #[test]
@@ -108,6 +123,7 @@ fn milestone12_keywords_and_categories_fit_crates_io_limits() {
         "Cargo.toml",
         "crates/tzap-core/Cargo.toml",
         "crates/tzap-cli/Cargo.toml",
+        "crates/tzap-plugin-signing/Cargo.toml",
     ] {
         let manifest = read_workspace_file(manifest_path);
         let keywords = manifest_array_values(&manifest, "keywords");
@@ -139,6 +155,7 @@ fn milestone12_package_readmes_render_without_workspace_paths() {
     let root_readme = read_workspace_file("README.md");
     let cli_readme = read_workspace_file("crates/tzap-cli/README.md");
     let core_readme = read_workspace_file("crates/tzap-core/README.md");
+    let signing_readme = read_workspace_file("crates/tzap-plugin-signing/README.md");
 
     assert!(root_readme.contains("cargo install tzap"));
     assert!(cli_readme.contains("# tzap"));
@@ -147,8 +164,12 @@ fn milestone12_package_readmes_render_without_workspace_paths() {
     assert!(core_readme.contains("# tzap-core"));
     assert!(core_readme.contains("use tzap_core::"));
     assert!(core_readme.contains("write_archive"));
+    assert!(core_readme.contains("standalone archive foundation"));
+    assert!(signing_readme.contains("# tzap-plugin-signing"));
+    assert!(signing_readme.contains("tzap-plugin-signing = \"0.1.0\""));
+    assert!(signing_readme.contains("authenticator_value_for_request"));
 
-    for readme in [cli_readme, core_readme] {
+    for readme in [cli_readme, core_readme, signing_readme] {
         assert!(
             !readme.contains("../"),
             "package README should use publish-safe links"
@@ -162,7 +183,11 @@ fn milestone12_package_readmes_render_without_workspace_paths() {
 
 #[test]
 fn milestone12_package_trees_are_small_and_focused() {
-    for package_dir in ["crates/tzap-core", "crates/tzap-cli"] {
+    for package_dir in [
+        "crates/tzap-core",
+        "crates/tzap-cli",
+        "crates/tzap-plugin-signing",
+    ] {
         let package_dir = workspace_file(package_dir);
         let mut pending = vec![package_dir.clone()];
         while let Some(path) = pending.pop() {
@@ -202,6 +227,7 @@ fn milestone12_package_trees_are_small_and_focused() {
 fn milestone12_public_package_docs_do_not_link_private_docs() {
     let root_readme = read_workspace_file("README.md");
     let cli_readme = read_workspace_file("crates/tzap-cli/README.md");
+    let signing_readme = read_workspace_file("crates/tzap-plugin-signing/README.md");
     let root_manifest = read_workspace_file("Cargo.toml");
 
     assert!(root_manifest.contains(
@@ -211,8 +237,11 @@ fn milestone12_public_package_docs_do_not_link_private_docs() {
     assert!(root_readme.contains("public-docs/tzap-cli-reference.md"));
     assert!(cli_readme.contains("specs/tzap-format-revisedv41.md"));
     assert!(cli_readme.contains("public-docs/tzap-cli-reference.md"));
+    assert!(signing_readme.contains("specs/tzap-format-revisedv41.md"));
     assert!(!root_readme.contains("](docs/"));
     assert!(!root_readme.contains("blob/main/docs/"));
     assert!(!cli_readme.contains("](docs/"));
     assert!(!cli_readme.contains("blob/main/docs/"));
+    assert!(!signing_readme.contains("](docs/"));
+    assert!(!signing_readme.contains("blob/main/docs/"));
 }

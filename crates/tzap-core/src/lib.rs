@@ -11,7 +11,6 @@ pub mod metadata;
 pub mod padding;
 pub mod reader;
 pub mod root_auth;
-pub mod signing;
 pub mod tar_model;
 pub mod wire;
 pub mod writer;
@@ -25,11 +24,6 @@ pub use reader::{
     open_non_seekable_archive, public_no_key_verify_archive_with,
     public_no_key_verify_volumes_with, sequential_extract_tar_stream, ArchiveEntry, OpenedArchive,
     PublicNoKeyVerification, ReaderOptions, RootAuthVerification,
-};
-pub use signing::{
-    ed25519_authenticator_value, ed25519_signing_input, verify_ed25519_after_root_auth,
-    verify_ed25519_root_auth, Ed25519RootAuthOutcome, Ed25519VerificationMode,
-    ED25519_AUTHENTICATOR_ID, ED25519_AUTHENTICATOR_VALUE_LEN,
 };
 pub use tar_model::{MetadataDiagnostic, SafeExtractionOptions, TarEntryKind};
 pub use writer::{

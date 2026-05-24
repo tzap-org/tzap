@@ -1,6 +1,6 @@
 [package]
 name = "tzap-core"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -19,7 +19,6 @@ argon2.workspace = true
 byteorder.workspace = true
 chacha20poly1305.workspace = true
 crc32c.workspace = true
-ed25519-dalek.workspace = true
 hex.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
@@ -28,7 +27,6 @@ sha2.workspace = true
 subtle.workspace = true
 tar.workspace = true
 thiserror.workspace = true
-tzap-plugin-signing = { path = "../tzap-plugin-signing", version = "0.1.0" }
 unicode-normalization.workspace = true
 uuid.workspace = true
 zeroize.workspace = true

@@ -14,6 +14,8 @@ categories = ["cryptography"]
 
 [dependencies]
 ed25519-dalek.workspace = true
+sha2.workspace = true
+tzap-core = { path = "../tzap-core", version = "0.1.1" }
 
 [dev-dependencies]
 rand.workspace = true

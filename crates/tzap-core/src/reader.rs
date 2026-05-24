@@ -5051,19 +5051,36 @@ mod tests {
         DirectoryHintEntry, DirectoryHintTableHeader, IndexRootHeader, IndexShardHeader,
         ENVELOPE_ENTRY_LEN, FILE_ENTRY_LEN, FRAME_ENTRY_LEN, INDEX_SHARD_HEADER_LEN,
     };
-    use crate::signing::{
-        ed25519_authenticator_value, verify_ed25519_root_auth, Ed25519RootAuthOutcome,
-        Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID, ED25519_AUTHENTICATOR_VALUE_LEN,
-    };
     use crate::writer::{
         write_archive, write_archive_with_dictionary, write_archive_with_root_auth, RegularFile,
-        RootAuthWriterConfig, WriterOptions,
+        RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions,
     };
-    use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
 
     fn master_key() -> MasterKey {
         MasterKey::from_raw_key(&[0x42; 32]).unwrap()
+    }
+
+    const TEST_ROOT_AUTH_ID: u16 = 0xe001;
+    const TEST_ROOT_AUTH_VALUE_LEN: u32 = 32;
+
+    fn test_root_auth_config() -> RootAuthWriterConfig<'static> {
+        RootAuthWriterConfig {
+            authenticator_id: TEST_ROOT_AUTH_ID,
+            signer_identity_type: 0,
+            signer_identity: &[],
+            authenticator_value_length: TEST_ROOT_AUTH_VALUE_LEN,
+        }
+    }
+
+    fn test_root_auth_value(request: &RootAuthSigningRequest) -> Vec<u8> {
+        request.archive_root.to_vec()
+    }
+
+    fn test_root_auth_verifies(footer: &RootAuthFooterV1, archive_root: &[u8; 32]) -> bool {
+        footer.authenticator_id == TEST_ROOT_AUTH_ID
+            && footer.signer_identity_type == 0
+            && footer.signer_identity_bytes.is_empty()
+            && footer.authenticator_value.as_slice() == archive_root
     }
 
     fn dictionary() -> &'static [u8] {
@@ -5498,35 +5515,20 @@ mod tests {
     }
 
     #[test]
-    fn ed25519_root_auth_verifies_key_holding_and_public_no_key_modes() {
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let public_key = signing_key.verifying_key().to_bytes();
+    fn root_auth_verifies_key_holding_and_public_no_key_modes() {
         let archive = write_archive_with_root_auth(
             &[RegularFile::new("signed.txt", b"ed25519 payload")],
             &master_key(),
             single_stream_options(),
-            RootAuthWriterConfig {
-                authenticator_id: ED25519_AUTHENTICATOR_ID,
-                signer_identity_type: 1,
-                signer_identity: &public_key,
-                authenticator_value_length: ED25519_AUTHENTICATOR_VALUE_LEN,
-            },
-            |request| Ok(ed25519_authenticator_value(&signing_key, request).to_vec()),
+            test_root_auth_config(),
+            |request| Ok(test_root_auth_value(request)),
         )
         .unwrap();
 
         let opened = open_archive(&archive.bytes, &master_key()).unwrap();
         let root_auth = opened
             .verify_root_auth_with(|footer, archive_root| {
-                Ok(matches!(
-                    verify_ed25519_root_auth(
-                        footer,
-                        archive_root,
-                        Some(public_key),
-                        Ed25519VerificationMode::KeyHoldingRootAuth,
-                    )?,
-                    Ed25519RootAuthOutcome::RootAuthContentVerified { .. }
-                ))
+                Ok(test_root_auth_verifies(footer, archive_root))
             })
             .unwrap();
         assert_eq!(
@@ -5535,15 +5537,7 @@ mod tests {
         );
 
         let public = public_no_key_verify_archive_with(&archive.bytes, |footer, archive_root| {
-            Ok(matches!(
-                verify_ed25519_root_auth(
-                    footer,
-                    archive_root,
-                    Some(public_key),
-                    Ed25519VerificationMode::PublicNoKey,
-                )?,
-                Ed25519RootAuthOutcome::PublicDataBlockCommitmentVerified { .. }
-            ))
+            Ok(test_root_auth_verifies(footer, archive_root))
         })
         .unwrap();
         assert_eq!(public.archive_root, root_auth.archive_root);
@@ -5551,8 +5545,6 @@ mod tests {
 
     #[test]
     fn root_auth_verifies_with_tolerated_missing_volume_after_fec_repair() {
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let public_key = signing_key.verifying_key().to_bytes();
         let options = WriterOptions {
             block_size: 4096,
             chunk_size: 16 * 1024,
@@ -5572,28 +5564,15 @@ mod tests {
             &[RegularFile::new("missing-volume.txt", b"recover me")],
             &master_key(),
             options,
-            RootAuthWriterConfig {
-                authenticator_id: ED25519_AUTHENTICATOR_ID,
-                signer_identity_type: 1,
-                signer_identity: &public_key,
-                authenticator_value_length: ED25519_AUTHENTICATOR_VALUE_LEN,
-            },
-            |request| Ok(ed25519_authenticator_value(&signing_key, request).to_vec()),
+            test_root_auth_config(),
+            |request| Ok(test_root_auth_value(request)),
         )
         .unwrap();
 
         let opened = open_archive_volumes(&[archive.volumes[0].as_slice()], &master_key()).unwrap();
         opened
             .verify_root_auth_with(|footer, archive_root| {
-                Ok(matches!(
-                    verify_ed25519_root_auth(
-                        footer,
-                        archive_root,
-                        Some(public_key),
-                        Ed25519VerificationMode::KeyHoldingRootAuth,
-                    )?,
-                    Ed25519RootAuthOutcome::RootAuthContentVerified { .. }
-                ))
+                Ok(test_root_auth_verifies(footer, archive_root))
             })
             .unwrap();
     }

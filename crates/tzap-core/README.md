@@ -4,8 +4,26 @@
 It owns wire parsing, metadata validation, compression, encryption, FEC recovery
 structures, archive writing, archive opening, and safe extraction primitives.
 
-Use this crate when an application needs direct access to tzap archives without
-shelling out to the `tzap` CLI.
+Use this crate as the direct Rust API for tzap archives in applications,
+services, backup tools, and custom workflows. Add companion RootAuth signing
+crates when origin-authenticated signatures are part of your product.
+
+## Install
+
+```toml
+[dependencies]
+tzap-core = "0.1.1"
+```
+
+## What It Provides
+
+- v41 archive writing and opening
+- AEAD encryption, HMAC authentication, and KDF handling
+- zstd compression and dictionary support
+- multi-volume layout and FEC recovery
+- bootstrap sidecar parsing and verification
+- safe extraction and tar metadata normalization
+- RootAuth writer request, footer, and verifier callback surfaces
 
 ## Example
 
@@ -30,14 +48,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Scope
+## RootAuth Integration
 
-The crate provides the reference behavior for the v0.41 format. It is designed
-for archive creation, verification, metadata inspection, random-access file
-restore, sequential reading, multi-volume recovery, and bootstrap sidecar flows.
-RootAuth signing profiles live in `tzap-plugin-signing`; `tzap-core` computes
-the v41 signing input and keeps compatibility helpers for the Ed25519 raw
-profile.
+`tzap-core` is the standalone archive foundation. It exposes writer request,
+footer, and verification callback surfaces, so signing profiles compose cleanly
+through companion crates.
+
+For Ed25519 RootAuth signing, pair this crate with
+[`tzap-plugin-signing`](https://crates.io/crates/tzap-plugin-signing). The core
+crate recomputes archive roots and gates when a plugin verifier may claim full
+RootAuth or public no-key verification.
 
 ## More Information
 
