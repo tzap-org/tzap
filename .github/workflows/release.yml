@@ -255,8 +255,12 @@ jobs:
       - name: Test formula
         run: |
           brew uninstall --force tzap || true
-          brew install --formula ./Formula/tzap.rb
-          brew test --formula ./Formula/tzap.rb
+          brew untap frankmanzhu/tzap-release-test || true
+          brew tap-new --no-git frankmanzhu/tzap-release-test
+          TAP_DIR="$(brew --repository frankmanzhu/tzap-release-test)"
+          cp Formula/tzap.rb "$TAP_DIR/Formula/tzap.rb"
+          brew install --formula frankmanzhu/tzap-release-test/tzap
+          brew test frankmanzhu/tzap-release-test/tzap
 
   publish:
     name: Publish GitHub release
