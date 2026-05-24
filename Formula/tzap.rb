@@ -7,19 +7,20 @@ class Tzap < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/frankmanzhu/tzap/releases/download/v#{version}/tzap-v#{version}-macos-aarch64.tar.gz"
-      sha256 "d92f6a005ebada34869157555161d25663e88df8cfd9d9b6832d6511d2d90b36"
+      sha256 "4809c6037faf016d472d07ec4152319e237a38cd234847f8ae27c5fcf30feb3a"
     else
       url "https://github.com/frankmanzhu/tzap/releases/download/v#{version}/tzap-v#{version}-macos-x86_64.tar.gz"
-      sha256 "bb065264811e39f43fe2b50d1fdcf64273dc57b37b7a7e3f4ae7061df6324064"
+      sha256 "8704ca96ece54cd9cc8f5e112564d3ca83095fe8e13a7fc4cb026801f659c135"
     end
   end
 
   on_linux do
     if Hardware::CPU.intel?
       url "https://github.com/frankmanzhu/tzap/releases/download/v#{version}/tzap-v#{version}-linux-x86_64-musl.tar.gz"
-      sha256 "03867e9b538bdff74c442e11a2c9484cfe8f9e840589495d5cf35cabd2d9a793"
+      sha256 "ba110ccba260007f75f35dd452f0deecc9d5689f07df55216777000666cef829"
     else
-      odie "Linux aarch64 release artifacts are not published yet"
+      url "https://github.com/frankmanzhu/tzap/releases/download/v#{version}/tzap-v#{version}-linux-aarch64-musl.tar.gz"
+      sha256 "c867ad5f95fed20eb73d5150ae1b65161758786dc817209adfdd7c1c4440c700"
     end
   end
 

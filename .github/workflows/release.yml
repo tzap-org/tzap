@@ -277,6 +277,7 @@ jobs:
           artifacts = {
             "macos-aarch64" => File.join(dist, "tzap-#{tag}-macos-aarch64.tar.gz"),
             "macos-x86_64" => File.join(dist, "tzap-#{tag}-macos-x86_64.tar.gz"),
+            "linux-aarch64-musl" => File.join(dist, "tzap-#{tag}-linux-aarch64-musl.tar.gz"),
             "linux-x86_64-musl" => File.join(dist, "tzap-#{tag}-linux-x86_64-musl.tar.gz"),
           }
 
