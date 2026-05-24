@@ -4,8 +4,8 @@ use tzap_core::crypto::{
 };
 use tzap_core::fec::encode_parity_gf16;
 use tzap_core::format::{
-    AeadAlgo, FormatError, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, MASTER_KEY_LEN, SUBKEY_LEN,
-    VOLUME_FORMAT_REV, VOLUME_HEADER_LEN,
+    AeadAlgo, FormatError, CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION,
+    MASTER_KEY_LEN, SUBKEY_LEN, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN,
 };
 use tzap_core::metadata::{
     hash_prefix, normalize_lookup_directory_path, normalize_lookup_file_path,
@@ -15,7 +15,7 @@ use tzap_core::metadata::{
 };
 use tzap_core::reader::{open_archive, open_archive_volumes};
 use tzap_core::tar_model::parse_tar_member_group;
-use tzap_core::wire::{CryptoHeader, VolumeHeader};
+use tzap_core::wire::{CriticalRecoveryLocator, CryptoHeader, VolumeHeader};
 use tzap_core::writer::{write_archive, write_archive_with_dictionary, RegularFile, WriterOptions};
 
 fn master_key() -> MasterKey {
@@ -32,6 +32,23 @@ fn deterministic_options(seed: u8) -> WriterOptions {
         bit_rot_buffer_pct: 0,
         ..WriterOptions::default()
     }
+}
+
+fn final_locator(volume: &[u8]) -> CriticalRecoveryLocator {
+    let final_offset = volume.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
+    CriticalRecoveryLocator::parse(
+        &volume[final_offset..final_offset + CRITICAL_RECOVERY_LOCATOR_LEN],
+    )
+    .unwrap()
+}
+
+fn corrupt_v41_terminal_recovery(volume: &mut [u8]) {
+    let locator = final_locator(volume);
+    let final_offset = volume.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
+    let mirror_offset = final_offset - CRITICAL_RECOVERY_LOCATOR_LEN;
+    volume[locator.cmra_offset as usize] ^= 0x55;
+    volume[mirror_offset] ^= 0x55;
+    volume[final_offset] ^= 0x55;
 }
 
 #[test]
@@ -88,11 +105,16 @@ fn mutation_fixture_generator_rejects_authentication_and_revision_mutations() {
     );
 
     let mut trailer_hmac = archive.bytes.clone();
-    let trailer_hmac_offset = trailer_hmac.len() - 32;
+    let trailer_hmac_offset = final_locator(&trailer_hmac).volume_trailer_offset as usize + 96;
     trailer_hmac[trailer_hmac_offset] ^= 0x01;
+    open_archive(&trailer_hmac, &master_key())
+        .unwrap()
+        .verify()
+        .unwrap();
+    corrupt_v41_terminal_recovery(&mut trailer_hmac);
     assert_eq!(
         open_archive(&trailer_hmac, &master_key()).unwrap_err(),
-        FormatError::InvalidArchive("no authenticated VolumeTrailer found")
+        FormatError::InvalidArchive("no valid v41 CMRA candidate found")
     );
 
     let mut payload_tamper = archive.bytes.clone();
@@ -910,7 +932,7 @@ fn fec_effective_object_ceiling_is_enforced() {
 }
 
 #[test]
-fn volume_format_revision_freshness_is_pinned_to_v36() {
+fn volume_format_revision_freshness_is_pinned_to_current_revision() {
     let base = VolumeHeader {
         format_version: FORMAT_VERSION,
         volume_format_rev: VOLUME_FORMAT_REV,
@@ -924,7 +946,7 @@ fn volume_format_revision_freshness_is_pinned_to_v36() {
     };
     VolumeHeader::parse(&base.to_bytes()).unwrap();
 
-    for rev in [35, 37] {
+    for rev in [VOLUME_FORMAT_REV - 1, VOLUME_FORMAT_REV + 1] {
         let mut mutated = base.clone();
         mutated.volume_format_rev = rev;
         assert_eq!(

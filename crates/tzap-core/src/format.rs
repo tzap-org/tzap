@@ -1,12 +1,25 @@
 use thiserror::Error;
 
 pub const FORMAT_VERSION: u16 = 1;
-pub const VOLUME_FORMAT_REV: u16 = 36;
+pub const VOLUME_FORMAT_REV: u16 = 41;
 
 pub const VOLUME_HEADER_LEN: usize = 128;
 pub const CRYPTO_HEADER_FIXED_LEN: usize = 76;
 pub const MANIFEST_FOOTER_LEN: usize = 136;
 pub const VOLUME_TRAILER_LEN: usize = 128;
+pub const ROOT_AUTH_FOOTER_FIXED_LEN: usize = 318;
+pub const ROOT_AUTH_SPEC_ID: [u8; 24] = *b"tzap-root-auth-v0.17\0\0\0\0";
+pub const CRITICAL_METADATA_IMAGE_FIXED_LEN: usize = 320;
+pub const SERIALIZED_REGION_HEADER_LEN: usize = 16;
+pub const IMAGE_CRC_LEN: usize = 4;
+pub const CRITICAL_METADATA_RECOVERY_HEADER_LEN: usize = 116;
+pub const CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN: usize = 16;
+pub const CRITICAL_RECOVERY_LOCATOR_LEN: usize = 128;
+pub const LOCATOR_PAIR_LEN: usize = CRITICAL_RECOVERY_LOCATOR_LEN * 2;
+pub const READER_MAX_ROOT_AUTH_FOOTER_LEN: u32 = 64 * 1024;
+pub const READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN: u32 = 4096;
+pub const READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN: u32 = 8192;
+pub const READER_MAX_CMRA_PARITY_PCT: u32 = 100;
 pub const BOOTSTRAP_SIDECAR_HEADER_LEN: usize = 128;
 pub const BLOCK_RECORD_FRAMING_LEN: usize = 20;
 pub const CRYPTO_HEADER_HMAC_LEN: usize = 32;
@@ -228,10 +241,10 @@ pub enum FormatError {
     )]
     CryptoHeaderLengthMismatch { fixed: u32, volume: u32 },
 
-    #[error("compression algorithm {0:?} is not valid for v0.36")]
+    #[error("compression algorithm {0:?} is not valid for v0.41")]
     UnsupportedCompressionForV36(CompressionAlgo),
 
-    #[error("FEC algorithm {0:?} is not valid for v0.36")]
+    #[error("FEC algorithm {0:?} is not valid for v0.41")]
     UnsupportedFecForV36(FecAlgo),
 
     #[error("invalid boolean field {field}={value}")]
@@ -261,7 +274,7 @@ pub enum FormatError {
         envelope_target_size: u32,
     },
 
-    #[error("block_size {0} is below the v0.36 minimum")]
+    #[error("block_size {0} is below the v0.41 minimum")]
     BlockSizeTooSmall(u32),
 
     #[error("block_size {0} must be even")]

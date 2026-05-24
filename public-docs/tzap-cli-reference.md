@@ -3,7 +3,7 @@
 This document is a compact command reference for `tzap` operators and automation.
 
 - **Version**: from binary metadata (`tzap --version`)
-- **Revision**: format v0.36
+- **Revision**: format v0.41
 
 ## Global options
 
@@ -23,6 +23,9 @@ printf '%s\n' "$TZAP_PASSPHRASE" | \
 # Raw key source
 tzap create --keyfile project.key -o backup.tzap ./project
 
+# Signed RootAuth archive
+tzap create --keyfile project.key --signing-key root.signing.hex -o backup.tzap ./project
+
 # Multi-volume recovery settings
 tzap create --keyfile project.key --volumes 3 --volume-loss-tolerance 1 -o backup.tzap ./project
 ```
@@ -36,6 +39,7 @@ Useful flags:
 - `--bit-rot-buffer-pct`: recovery budget as percentage
 - `--argon2-*`: passphrase derivation tuning
 - `--dictionary`: optional zstd dictionary
+- `--signing-key`: Ed25519 signing seed for v41 RootAuth
 - `--bootstrap-out`: sidecar output path for single-volume archives only
 - `--compression-level`, `--chunk-size`, `--envelope-size`, `--block-size`
 - `--dry-run`: print planned actions without writing bytes
@@ -128,16 +132,28 @@ tzap verify --keyfile project.key project.tzap project.tzap.001
 printf '%s\n' "$TZAP_PASSPHRASE" | tzap verify --password-stdin project.tzap
 
 tzap verify --json --keyfile project.key backup.tzap.000 backup.tzap.001 backup.tzap.002
+tzap verify --keyfile project.key --trusted-public-key root.public.hex backup.tzap
+tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap
 ```
 
 Useful flags:
 
 - `--json`: machine-readable status output
 - `--quiet`: suppress success summary
+- `--trusted-public-key`: verify Ed25519 RootAuth with a trusted public key
+- `--public-no-key`: verify public v41 RootAuth commitments without the archive key
 - `--bootstrap`: bootstrap sidecar path
 
 Notes:
 
+- Key-holding verification uses `--keyfile`, `--password`, or
+  `--password-stdin`. Add `--trusted-public-key` to require RootAuth content
+  verification after ordinary archive integrity verification.
+- Public no-key verification requires `--public-no-key --trusted-public-key`.
+  It does not use archive key material or bootstrap sidecars, and reports the
+  public v41 diagnostics `public_data_block_commitment_verified`,
+  `public_physical_completeness_unverified`, and
+  `public_recovery_margin_unchecked` on success.
 - Verification reports unsupported local tar metadata profiles to stderr as
   `tzap: degraded-metadata: ...` after the archive structure and content verify.
 - Archive input comes from file paths. `-` is not an archive stdin sentinel.
@@ -163,6 +179,20 @@ Useful flags:
 - `--output`: write keyfile to disk
 - `--stdout`: print 64 lowercase hex chars plus newline
 - `--force`: replace existing keyfile output
+
+## Command: signing-keygen
+
+Generate an Ed25519 RootAuth signing keypair:
+
+```sh
+tzap signing-keygen --secret-output root.signing.hex --public-output root.public.hex
+```
+
+Useful flags:
+
+- `--secret-output`: write the 32-byte signing seed as 64 lowercase hex chars
+- `--public-output`: write the 32-byte public key as 64 lowercase hex chars
+- `--force`: replace existing keypair outputs
 
 ## Operational boundaries
 

@@ -1,6 +1,6 @@
 # tzap-core
 
-`tzap-core` is the Rust library implementation of the tzap v0.36 archive format.
+`tzap-core` is the Rust library implementation of the tzap v0.41 archive format.
 It owns wire parsing, metadata validation, compression, encryption, FEC recovery
 structures, archive writing, archive opening, and safe extraction primitives.
 
@@ -32,12 +32,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Scope
 
-The crate provides the reference behavior for the v0.36 format. It is designed
+The crate provides the reference behavior for the v0.41 format. It is designed
 for archive creation, verification, metadata inspection, random-access file
 restore, sequential reading, multi-volume recovery, and bootstrap sidecar flows.
 
 ## More Information
 
 - Repository: <https://github.com/frankmanzhu/tzap>
-- Format specification: <https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv36.md>
+- Format specification: <https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv41.md>
 - CLI crate: <https://crates.io/crates/tzap>

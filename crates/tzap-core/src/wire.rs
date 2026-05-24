@@ -3,13 +3,17 @@ use crc32c::crc32c;
 use crate::crypto::KdfParams;
 use crate::format::{
     AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, FormatError, KdfAlgo, BLOCK_RECORD_FRAMING_LEN,
-    BOOTSTRAP_SIDECAR_HEADER_LEN, CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_EXTENSION_MAX_VALUE_LEN,
-    CRYPTO_HEADER_FIXED_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, MANIFEST_FOOTER_LEN,
-    READER_MAX_BLOCK_SIZE, READER_MAX_CHUNK_SIZE, READER_MAX_CRYPTO_HEADER_LEN,
-    READER_MAX_ENVELOPE_TARGET_SIZE, READER_MAX_FEC_CLASS_SHARDS,
+    BOOTSTRAP_SIDECAR_HEADER_LEN, CRITICAL_METADATA_IMAGE_FIXED_LEN,
+    CRITICAL_METADATA_RECOVERY_HEADER_LEN, CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN,
+    CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_EXTENSION_MAX_VALUE_LEN,
+    CRYPTO_HEADER_FIXED_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, IMAGE_CRC_LEN,
+    MANIFEST_FOOTER_LEN, READER_MAX_BLOCK_SIZE, READER_MAX_CHUNK_SIZE,
+    READER_MAX_CRYPTO_HEADER_LEN, READER_MAX_ENVELOPE_TARGET_SIZE, READER_MAX_FEC_CLASS_SHARDS,
     READER_MAX_INDEX_FEC_CLASS_SHARDS, READER_MAX_INDEX_ROOT_FEC_CLASS_SHARDS,
-    READER_MAX_PATH_LENGTH, READER_MAX_STRIPE_WIDTH, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN,
-    VOLUME_TRAILER_LEN,
+    READER_MAX_PATH_LENGTH, READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN,
+    READER_MAX_ROOT_AUTH_FOOTER_LEN, READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN,
+    READER_MAX_STRIPE_WIDTH, ROOT_AUTH_FOOTER_FIXED_LEN, ROOT_AUTH_SPEC_ID,
+    SERIALIZED_REGION_HEADER_LEN, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 
 const TZAP_MAGIC: [u8; 4] = *b"TZAP";
@@ -17,7 +21,12 @@ const TZCH_MAGIC: [u8; 4] = *b"TZCH";
 const TZBK_MAGIC: [u8; 4] = *b"TZBK";
 const TZMF_MAGIC: [u8; 4] = *b"TZMF";
 const TZVT_MAGIC: [u8; 4] = *b"TZVT";
+const TZRA_MAGIC: [u8; 4] = *b"TZRA";
 const TZBS_MAGIC: [u8; 4] = *b"TZBS";
+const TZMI_MAGIC: [u8; 4] = *b"TZMI";
+const TZCR_MAGIC: [u8; 4] = *b"TZCR";
+const TZCS_MAGIC: [u8; 4] = *b"TZCS";
+const TZCL_MAGIC: [u8; 4] = *b"TZCL";
 
 const BLOCK_LAST_DATA_FLAG: u8 = 0x01;
 const BLOCK_RESERVED_FLAGS: u8 = !BLOCK_LAST_DATA_FLAG;
@@ -286,11 +295,7 @@ impl CryptoHeaderFixed {
         if self.block_size % 2 != 0 {
             return Err(FormatError::OddBlockSize(self.block_size));
         }
-        validate_fec_class_data_shards(
-            "fec_data_shards",
-            self.fec_data_shards,
-            self.block_size,
-        )?;
+        validate_fec_class_data_shards("fec_data_shards", self.fec_data_shards, self.block_size)?;
         validate_fec_class_data_shards(
             "index_fec_data_shards",
             self.index_fec_data_shards,
@@ -644,6 +649,9 @@ pub struct VolumeTrailer {
     pub manifest_footer_offset: u64,
     pub manifest_footer_length: u32,
     pub closed_at_ns: i64,
+    pub root_auth_footer_offset: u64,
+    pub root_auth_footer_length: u32,
+    pub root_auth_flags: u32,
     pub trailer_hmac: [u8; 32],
 }
 
@@ -651,11 +659,17 @@ impl VolumeTrailer {
     pub fn parse(bytes: &[u8]) -> Result<Self, FormatError> {
         expect_len("VolumeTrailer", VOLUME_TRAILER_LEN, bytes.len())?;
         expect_magic("VolumeTrailer", TZVT_MAGIC, &bytes[0..4])?;
-        expect_zero("VolumeTrailer", &bytes[76..96])?;
+        expect_zero("VolumeTrailer", &bytes[92..96])?;
         let manifest_footer_length = read_u32(bytes, 64)?;
         if manifest_footer_length != MANIFEST_FOOTER_LEN as u32 {
             return Err(FormatError::InvalidManifestFooterLength(
                 manifest_footer_length,
+            ));
+        }
+        let root_auth_flags = read_u32(bytes, 88)?;
+        if root_auth_flags & !0x0000_0001 != 0 {
+            return Err(FormatError::InvalidArchive(
+                "VolumeTrailer root_auth_flags has unknown bits",
             ));
         }
 
@@ -668,6 +682,9 @@ impl VolumeTrailer {
             manifest_footer_offset: read_u64(bytes, 56)?,
             manifest_footer_length,
             closed_at_ns: read_i64(bytes, 68)?,
+            root_auth_footer_offset: read_u64(bytes, 76)?,
+            root_auth_footer_length: read_u32(bytes, 84)?,
+            root_auth_flags,
             trailer_hmac: read_array_32(bytes, 96)?,
         })
     }
@@ -683,7 +700,698 @@ impl VolumeTrailer {
         write_u64(&mut bytes, 56, self.manifest_footer_offset);
         write_u32(&mut bytes, 64, self.manifest_footer_length);
         write_i64(&mut bytes, 68, self.closed_at_ns);
+        write_u64(&mut bytes, 76, self.root_auth_footer_offset);
+        write_u32(&mut bytes, 84, self.root_auth_footer_length);
+        write_u32(&mut bytes, 88, self.root_auth_flags);
         bytes[96..128].copy_from_slice(&self.trailer_hmac);
+        bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootAuthFooterV1 {
+    pub archive_uuid: [u8; 16],
+    pub session_id: [u8; 16],
+    pub authenticator_id: u16,
+    pub signer_identity_type: u16,
+    pub signer_identity_bytes: Vec<u8>,
+    pub authenticator_value: Vec<u8>,
+    pub total_data_block_count: u64,
+    pub critical_metadata_digest: [u8; 32],
+    pub index_digest: [u8; 32],
+    pub fec_layout_digest: [u8; 32],
+    pub data_block_merkle_root: [u8; 32],
+    pub signer_identity_digest: [u8; 32],
+    pub archive_root: [u8; 32],
+    pub footer_crc32c: u32,
+}
+
+impl RootAuthFooterV1 {
+    pub fn footer_length(&self) -> Result<u32, FormatError> {
+        root_auth_footer_length(
+            self.signer_identity_bytes.len(),
+            self.authenticator_value.len(),
+        )
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, FormatError> {
+        validate_root_auth_variable_lengths(
+            self.signer_identity_bytes.len(),
+            self.authenticator_value.len(),
+        )?;
+        let footer_length = self.footer_length()?;
+        let mut bytes = vec![0u8; footer_length as usize];
+        bytes[0..4].copy_from_slice(&TZRA_MAGIC);
+        write_u16(&mut bytes, 4, 1);
+        bytes[6..30].copy_from_slice(&ROOT_AUTH_SPEC_ID);
+        write_u32(&mut bytes, 30, footer_length);
+        write_u32(&mut bytes, 34, 0);
+        bytes[38..54].copy_from_slice(&self.archive_uuid);
+        bytes[54..70].copy_from_slice(&self.session_id);
+        write_u16(&mut bytes, 70, FORMAT_VERSION);
+        write_u16(&mut bytes, 72, VOLUME_FORMAT_REV);
+        write_u16(&mut bytes, 74, self.authenticator_id);
+        write_u16(&mut bytes, 76, self.signer_identity_type);
+        write_u32(
+            &mut bytes,
+            78,
+            u32::try_from(self.signer_identity_bytes.len()).map_err(|_| {
+                FormatError::InvalidArchive("RootAuthFooterV1 signer identity length overflow")
+            })?,
+        );
+        write_u32(
+            &mut bytes,
+            82,
+            u32::try_from(self.authenticator_value.len()).map_err(|_| {
+                FormatError::InvalidArchive("RootAuthFooterV1 authenticator length overflow")
+            })?,
+        );
+        write_u64(&mut bytes, 86, self.total_data_block_count);
+        bytes[94..126].copy_from_slice(&self.critical_metadata_digest);
+        bytes[126..158].copy_from_slice(&self.index_digest);
+        bytes[158..190].copy_from_slice(&self.fec_layout_digest);
+        bytes[190..222].copy_from_slice(&self.data_block_merkle_root);
+        bytes[222..254].copy_from_slice(&self.signer_identity_digest);
+        bytes[254..286].copy_from_slice(&self.archive_root);
+        let signer_start = ROOT_AUTH_FOOTER_FIXED_LEN;
+        let signer_end = signer_start + self.signer_identity_bytes.len();
+        bytes[signer_start..signer_end].copy_from_slice(&self.signer_identity_bytes);
+        let auth_end = signer_end + self.authenticator_value.len();
+        bytes[signer_end..auth_end].copy_from_slice(&self.authenticator_value);
+        let crc = crc32c(&bytes[..auth_end]);
+        write_u32(&mut bytes, auth_end, crc);
+        Ok(bytes)
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, FormatError> {
+        if bytes.len() > READER_MAX_ROOT_AUTH_FOOTER_LEN as usize {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "RootAuthFooterV1 length",
+                cap: READER_MAX_ROOT_AUTH_FOOTER_LEN as u64,
+                actual: bytes.len() as u64,
+            });
+        }
+        let min_len = ROOT_AUTH_FOOTER_FIXED_LEN + 4;
+        if bytes.len() < min_len {
+            return Err(FormatError::InvalidLength {
+                structure: "RootAuthFooterV1",
+                expected: min_len,
+                actual: bytes.len(),
+            });
+        }
+        expect_magic("RootAuthFooterV1", TZRA_MAGIC, &bytes[0..4])?;
+        let version = read_u16(bytes, 4)?;
+        if version != 1 {
+            return Err(FormatError::UnsupportedFormatVersion(version));
+        }
+        if read_array_24(bytes, 6)? != ROOT_AUTH_SPEC_ID {
+            return Err(FormatError::InvalidArchive(
+                "RootAuthFooterV1 root_auth_spec_id is unsupported",
+            ));
+        }
+        let footer_length = read_u32(bytes, 30)?;
+        if footer_length as usize != bytes.len() {
+            return Err(FormatError::InvalidLength {
+                structure: "RootAuthFooterV1",
+                expected: footer_length as usize,
+                actual: bytes.len(),
+            });
+        }
+        if read_u32(bytes, 34)? != 0 {
+            return Err(FormatError::InvalidArchive(
+                "RootAuthFooterV1 flags must be zero",
+            ));
+        }
+        let format_version = read_u16(bytes, 70)?;
+        if format_version != FORMAT_VERSION {
+            return Err(FormatError::UnsupportedFormatVersion(format_version));
+        }
+        let volume_format_rev = read_u16(bytes, 72)?;
+        if volume_format_rev != VOLUME_FORMAT_REV {
+            return Err(FormatError::UnsupportedVolumeFormatRevision(
+                volume_format_rev,
+            ));
+        }
+        let signer_identity_length = read_u32(bytes, 78)?;
+        let authenticator_value_length = read_u32(bytes, 82)?;
+        validate_root_auth_variable_lengths(
+            signer_identity_length as usize,
+            authenticator_value_length as usize,
+        )?;
+        let expected = root_auth_footer_length(
+            signer_identity_length as usize,
+            authenticator_value_length as usize,
+        )?;
+        if expected != footer_length {
+            return Err(FormatError::InvalidLength {
+                structure: "RootAuthFooterV1",
+                expected: expected as usize,
+                actual: footer_length as usize,
+            });
+        }
+        expect_zero("RootAuthFooterV1", &bytes[286..318])?;
+        let crc_offset = bytes.len() - 4;
+        expect_crc(
+            "RootAuthFooterV1",
+            &bytes[..crc_offset],
+            read_u32(bytes, crc_offset)?,
+        )?;
+
+        let signer_start = ROOT_AUTH_FOOTER_FIXED_LEN;
+        let signer_end = signer_start + signer_identity_length as usize;
+        let auth_end = signer_end + authenticator_value_length as usize;
+        Ok(Self {
+            archive_uuid: read_array_16(bytes, 38)?,
+            session_id: read_array_16(bytes, 54)?,
+            authenticator_id: read_u16(bytes, 74)?,
+            signer_identity_type: read_u16(bytes, 76)?,
+            signer_identity_bytes: bytes[signer_start..signer_end].to_vec(),
+            authenticator_value: bytes[signer_end..auth_end].to_vec(),
+            total_data_block_count: read_u64(bytes, 86)?,
+            critical_metadata_digest: read_array_32(bytes, 94)?,
+            index_digest: read_array_32(bytes, 126)?,
+            fec_layout_digest: read_array_32(bytes, 158)?,
+            data_block_merkle_root: read_array_32(bytes, 190)?,
+            signer_identity_digest: read_array_32(bytes, 222)?,
+            archive_root: read_array_32(bytes, 254)?,
+            footer_crc32c: read_u32(bytes, crc_offset)?,
+        })
+    }
+}
+
+fn root_auth_footer_length(
+    signer_identity_len: usize,
+    authenticator_value_len: usize,
+) -> Result<u32, FormatError> {
+    let len = ROOT_AUTH_FOOTER_FIXED_LEN
+        .checked_add(signer_identity_len)
+        .and_then(|value| value.checked_add(authenticator_value_len))
+        .and_then(|value| value.checked_add(4))
+        .ok_or(FormatError::InvalidArchive(
+            "RootAuthFooterV1 length overflow",
+        ))?;
+    if len > READER_MAX_ROOT_AUTH_FOOTER_LEN as usize {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "RootAuthFooterV1 length",
+            cap: READER_MAX_ROOT_AUTH_FOOTER_LEN as u64,
+            actual: len as u64,
+        });
+    }
+    u32::try_from(len).map_err(|_| FormatError::InvalidArchive("RootAuthFooterV1 length overflow"))
+}
+
+fn validate_root_auth_variable_lengths(
+    signer_identity_len: usize,
+    authenticator_value_len: usize,
+) -> Result<(), FormatError> {
+    if signer_identity_len > READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN as usize {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "RootAuthFooterV1 signer identity length",
+            cap: READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN as u64,
+            actual: signer_identity_len as u64,
+        });
+    }
+    if authenticator_value_len > READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN as usize {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "RootAuthFooterV1 authenticator value length",
+            cap: READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN as u64,
+            actual: authenticator_value_len as u64,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerializedRegion {
+    pub region_type: u16,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+}
+
+impl SerializedRegion {
+    pub fn encoded_len(&self) -> usize {
+        SERIALIZED_REGION_HEADER_LEN + self.bytes.len()
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, FormatError> {
+        let length = u32::try_from(self.bytes.len())
+            .map_err(|_| FormatError::InvalidArchive("SerializedRegion length exceeds u32"))?;
+        let mut bytes = vec![0u8; self.encoded_len()];
+        write_u16(&mut bytes, 0, self.region_type);
+        write_u64(&mut bytes, 4, self.offset);
+        write_u32(&mut bytes, 12, length);
+        bytes[SERIALIZED_REGION_HEADER_LEN..].copy_from_slice(&self.bytes);
+        Ok(bytes)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriticalMetadataImage {
+    pub archive_uuid: [u8; 16],
+    pub session_id: [u8; 16],
+    pub volume_index: u32,
+    pub stripe_width: u32,
+    pub layout_flags: u32,
+    pub volume_header_offset: u64,
+    pub volume_header_length: u32,
+    pub crypto_header_offset: u64,
+    pub crypto_header_length: u32,
+    pub block_records_offset: u64,
+    pub block_records_length: u64,
+    pub block_count: u64,
+    pub manifest_footer_offset: u64,
+    pub manifest_footer_length: u32,
+    pub root_auth_footer_offset: u64,
+    pub root_auth_footer_length: u32,
+    pub volume_trailer_offset: u64,
+    pub volume_trailer_length: u32,
+    pub body_bytes_before_cmra: u64,
+    pub volume_header_sha256: [u8; 32],
+    pub crypto_header_sha256: [u8; 32],
+    pub manifest_footer_sha256: [u8; 32],
+    pub root_auth_footer_sha256: [u8; 32],
+    pub volume_trailer_sha256: [u8; 32],
+    pub regions: Vec<SerializedRegion>,
+}
+
+impl CriticalMetadataImage {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, FormatError> {
+        let region_count = u16::try_from(self.regions.len()).map_err(|_| {
+            FormatError::InvalidArchive("CriticalMetadataImage has too many regions")
+        })?;
+        let variable_len = self.regions.iter().try_fold(0usize, |total, region| {
+            total
+                .checked_add(region.encoded_len())
+                .ok_or(FormatError::InvalidArchive(
+                    "CriticalMetadataImage length overflow",
+                ))
+        })?;
+        let mut bytes = vec![
+            0u8;
+            CRITICAL_METADATA_IMAGE_FIXED_LEN
+                .checked_add(variable_len)
+                .and_then(|value| value.checked_add(IMAGE_CRC_LEN))
+                .ok_or(FormatError::InvalidArchive(
+                    "CriticalMetadataImage length overflow",
+                ))?
+        ];
+        bytes[0..4].copy_from_slice(&TZMI_MAGIC);
+        write_u16(&mut bytes, 4, 1);
+        write_u16(&mut bytes, 6, VOLUME_FORMAT_REV);
+        bytes[8..24].copy_from_slice(&self.archive_uuid);
+        bytes[24..40].copy_from_slice(&self.session_id);
+        write_u32(&mut bytes, 40, self.volume_index);
+        write_u32(&mut bytes, 44, self.stripe_width);
+        write_u32(&mut bytes, 48, self.layout_flags);
+        write_u64(&mut bytes, 52, self.volume_header_offset);
+        write_u32(&mut bytes, 60, self.volume_header_length);
+        write_u64(&mut bytes, 64, self.crypto_header_offset);
+        write_u32(&mut bytes, 72, self.crypto_header_length);
+        write_u64(&mut bytes, 76, self.block_records_offset);
+        write_u64(&mut bytes, 84, self.block_records_length);
+        write_u64(&mut bytes, 92, self.block_count);
+        write_u64(&mut bytes, 100, self.manifest_footer_offset);
+        write_u32(&mut bytes, 108, self.manifest_footer_length);
+        write_u64(&mut bytes, 112, self.root_auth_footer_offset);
+        write_u32(&mut bytes, 120, self.root_auth_footer_length);
+        write_u64(&mut bytes, 124, self.volume_trailer_offset);
+        write_u32(&mut bytes, 132, self.volume_trailer_length);
+        write_u64(&mut bytes, 136, self.body_bytes_before_cmra);
+        bytes[144..176].copy_from_slice(&self.volume_header_sha256);
+        bytes[176..208].copy_from_slice(&self.crypto_header_sha256);
+        bytes[208..240].copy_from_slice(&self.manifest_footer_sha256);
+        bytes[240..272].copy_from_slice(&self.root_auth_footer_sha256);
+        bytes[272..304].copy_from_slice(&self.volume_trailer_sha256);
+        write_u16(&mut bytes, 304, region_count);
+
+        let mut cursor = CRITICAL_METADATA_IMAGE_FIXED_LEN;
+        for region in &self.regions {
+            let region_bytes = region.to_bytes()?;
+            let end = cursor + region_bytes.len();
+            bytes[cursor..end].copy_from_slice(&region_bytes);
+            cursor = end;
+        }
+        let crc = crc32c(&bytes[..cursor]);
+        write_u32(&mut bytes, cursor, crc);
+        Ok(bytes)
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, FormatError> {
+        if bytes.len() < CRITICAL_METADATA_IMAGE_FIXED_LEN + IMAGE_CRC_LEN {
+            return Err(FormatError::InvalidLength {
+                structure: "CriticalMetadataImageV1",
+                expected: CRITICAL_METADATA_IMAGE_FIXED_LEN + IMAGE_CRC_LEN,
+                actual: bytes.len(),
+            });
+        }
+        expect_magic("CriticalMetadataImageV1", TZMI_MAGIC, &bytes[0..4])?;
+        let version = read_u16(bytes, 4)?;
+        if version != 1 {
+            return Err(FormatError::UnsupportedFormatVersion(version));
+        }
+        let volume_format_rev = read_u16(bytes, 6)?;
+        if volume_format_rev != VOLUME_FORMAT_REV {
+            return Err(FormatError::UnsupportedVolumeFormatRevision(
+                volume_format_rev,
+            ));
+        }
+        let layout_flags = read_u32(bytes, 48)?;
+        if layout_flags & !0x0000_0001 != 0 {
+            return Err(FormatError::InvalidArchive(
+                "CriticalMetadataImage layout_flags has unknown bits",
+            ));
+        }
+        expect_zero("CriticalMetadataImageV1", &bytes[306..320])?;
+        let expected_crc_offset =
+            bytes
+                .len()
+                .checked_sub(IMAGE_CRC_LEN)
+                .ok_or(FormatError::InvalidArchive(
+                    "CriticalMetadataImage length underflow",
+                ))?;
+        expect_crc(
+            "CriticalMetadataImageV1",
+            &bytes[..expected_crc_offset],
+            read_u32(bytes, expected_crc_offset)?,
+        )?;
+
+        let serialized_region_count = read_u16(bytes, 304)? as usize;
+        let mut cursor = CRITICAL_METADATA_IMAGE_FIXED_LEN;
+        let mut regions = Vec::with_capacity(serialized_region_count);
+        for _ in 0..serialized_region_count {
+            if cursor + SERIALIZED_REGION_HEADER_LEN > expected_crc_offset {
+                return Err(FormatError::InvalidLength {
+                    structure: "SerializedRegion",
+                    expected: cursor + SERIALIZED_REGION_HEADER_LEN,
+                    actual: bytes.len(),
+                });
+            }
+            let region_type = read_u16(bytes, cursor)?;
+            if read_u16(bytes, cursor + 2)? != 0 {
+                return Err(FormatError::NonZeroReserved {
+                    structure: "SerializedRegion",
+                });
+            }
+            let offset = read_u64(bytes, cursor + 4)?;
+            let length = read_u32(bytes, cursor + 12)? as usize;
+            cursor += SERIALIZED_REGION_HEADER_LEN;
+            let end = cursor
+                .checked_add(length)
+                .ok_or(FormatError::InvalidArchive(
+                    "SerializedRegion length overflow",
+                ))?;
+            if end > expected_crc_offset {
+                return Err(FormatError::InvalidLength {
+                    structure: "SerializedRegion",
+                    expected: end,
+                    actual: bytes.len(),
+                });
+            }
+            regions.push(SerializedRegion {
+                region_type,
+                offset,
+                bytes: bytes[cursor..end].to_vec(),
+            });
+            cursor = end;
+        }
+        if cursor != expected_crc_offset {
+            return Err(FormatError::InvalidArchive(
+                "CriticalMetadataImage has trailing region bytes",
+            ));
+        }
+
+        Ok(Self {
+            archive_uuid: read_array_16(bytes, 8)?,
+            session_id: read_array_16(bytes, 24)?,
+            volume_index: read_u32(bytes, 40)?,
+            stripe_width: read_u32(bytes, 44)?,
+            layout_flags,
+            volume_header_offset: read_u64(bytes, 52)?,
+            volume_header_length: read_u32(bytes, 60)?,
+            crypto_header_offset: read_u64(bytes, 64)?,
+            crypto_header_length: read_u32(bytes, 72)?,
+            block_records_offset: read_u64(bytes, 76)?,
+            block_records_length: read_u64(bytes, 84)?,
+            block_count: read_u64(bytes, 92)?,
+            manifest_footer_offset: read_u64(bytes, 100)?,
+            manifest_footer_length: read_u32(bytes, 108)?,
+            root_auth_footer_offset: read_u64(bytes, 112)?,
+            root_auth_footer_length: read_u32(bytes, 120)?,
+            volume_trailer_offset: read_u64(bytes, 124)?,
+            volume_trailer_length: read_u32(bytes, 132)?,
+            body_bytes_before_cmra: read_u64(bytes, 136)?,
+            volume_header_sha256: read_array_32(bytes, 144)?,
+            crypto_header_sha256: read_array_32(bytes, 176)?,
+            manifest_footer_sha256: read_array_32(bytes, 208)?,
+            root_auth_footer_sha256: read_array_32(bytes, 240)?,
+            volume_trailer_sha256: read_array_32(bytes, 272)?,
+            regions,
+        })
+    }
+
+    pub fn region(&self, region_type: u16) -> Option<&SerializedRegion> {
+        self.regions
+            .iter()
+            .find(|region| region.region_type == region_type)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CriticalMetadataRecoveryHeader {
+    pub shard_size: u32,
+    pub data_shard_count: u16,
+    pub parity_shard_count: u16,
+    pub image_length: u32,
+    pub archive_uuid_hint: [u8; 16],
+    pub session_id_hint: [u8; 16],
+    pub volume_index_hint: u32,
+    pub image_sha256: [u8; 32],
+    pub header_crc32c: u32,
+}
+
+impl CriticalMetadataRecoveryHeader {
+    pub fn parse(bytes: &[u8]) -> Result<Self, FormatError> {
+        expect_len(
+            "CriticalMetadataRecoveryHeader",
+            CRITICAL_METADATA_RECOVERY_HEADER_LEN,
+            bytes.len(),
+        )?;
+        expect_magic("CriticalMetadataRecoveryHeader", TZCR_MAGIC, &bytes[0..4])?;
+        let version = read_u16(bytes, 4)?;
+        if version != 1 {
+            return Err(FormatError::UnsupportedFormatVersion(version));
+        }
+        let fec_algo = read_u16(bytes, 6)?;
+        if fec_algo != FecAlgo::ReedSolomonGF16 as u16 {
+            return Err(FormatError::UnknownFecAlgo(fec_algo));
+        }
+        expect_zero("CriticalMetadataRecoveryHeader", &bytes[88..112])?;
+        expect_crc(
+            "CriticalMetadataRecoveryHeader",
+            &bytes[..112],
+            read_u32(bytes, 112)?,
+        )?;
+        Ok(Self {
+            shard_size: read_u32(bytes, 8)?,
+            data_shard_count: read_u16(bytes, 12)?,
+            parity_shard_count: read_u16(bytes, 14)?,
+            image_length: read_u32(bytes, 16)?,
+            archive_uuid_hint: read_array_16(bytes, 20)?,
+            session_id_hint: read_array_16(bytes, 36)?,
+            volume_index_hint: read_u32(bytes, 52)?,
+            image_sha256: read_array_32(bytes, 56)?,
+            header_crc32c: read_u32(bytes, 112)?,
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; CRITICAL_METADATA_RECOVERY_HEADER_LEN] {
+        let mut bytes = [0u8; CRITICAL_METADATA_RECOVERY_HEADER_LEN];
+        bytes[0..4].copy_from_slice(&TZCR_MAGIC);
+        write_u16(&mut bytes, 4, 1);
+        write_u16(&mut bytes, 6, FecAlgo::ReedSolomonGF16 as u16);
+        write_u32(&mut bytes, 8, self.shard_size);
+        write_u16(&mut bytes, 12, self.data_shard_count);
+        write_u16(&mut bytes, 14, self.parity_shard_count);
+        write_u32(&mut bytes, 16, self.image_length);
+        bytes[20..36].copy_from_slice(&self.archive_uuid_hint);
+        bytes[36..52].copy_from_slice(&self.session_id_hint);
+        write_u32(&mut bytes, 52, self.volume_index_hint);
+        bytes[56..88].copy_from_slice(&self.image_sha256);
+        let crc = crc32c(&bytes[..112]);
+        write_u32(&mut bytes, 112, crc);
+        bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriticalMetadataRecoveryShard {
+    pub shard_index: u16,
+    pub shard_role: u8,
+    pub shard_payload_length: u32,
+    pub payload: Vec<u8>,
+    pub shard_crc32c: u32,
+}
+
+impl CriticalMetadataRecoveryShard {
+    pub fn parse(bytes: &[u8], shard_size: usize) -> Result<Self, FormatError> {
+        let expected = CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN
+            .checked_add(shard_size)
+            .ok_or(FormatError::InvalidArchive("CMRA shard length overflow"))?;
+        expect_len("CriticalMetadataRecoveryShard", expected, bytes.len())?;
+        expect_magic("CriticalMetadataRecoveryShard", TZCS_MAGIC, &bytes[0..4])?;
+        if bytes[7] != 0 {
+            return Err(FormatError::NonZeroReserved {
+                structure: "CriticalMetadataRecoveryShard",
+            });
+        }
+        let shard_role = bytes[6];
+        if shard_role > 1 {
+            return Err(FormatError::InvalidArchive(
+                "CriticalMetadataRecoveryShard has unknown role",
+            ));
+        }
+        expect_crc(
+            "CriticalMetadataRecoveryShard",
+            &[
+                &bytes[..12],
+                &bytes[CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN..],
+            ]
+            .concat(),
+            read_u32(bytes, 12)?,
+        )?;
+        let shard_payload_length = read_u32(bytes, 8)?;
+        if shard_payload_length as usize > shard_size {
+            return Err(FormatError::InvalidArchive(
+                "CriticalMetadataRecoveryShard payload length exceeds shard size",
+            ));
+        }
+        Ok(Self {
+            shard_index: read_u16(bytes, 4)?,
+            shard_role,
+            shard_payload_length,
+            payload: bytes[CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN..].to_vec(),
+            shard_crc32c: read_u32(bytes, 12)?,
+        })
+    }
+
+    pub fn to_bytes(&self, shard_size: usize) -> Result<Vec<u8>, FormatError> {
+        if self.payload.len() != shard_size {
+            return Err(FormatError::InvalidArchive(
+                "CriticalMetadataRecoveryShard payload length mismatch",
+            ));
+        }
+        let mut bytes = vec![0u8; CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN + shard_size];
+        bytes[0..4].copy_from_slice(&TZCS_MAGIC);
+        write_u16(&mut bytes, 4, self.shard_index);
+        bytes[6] = self.shard_role;
+        write_u32(&mut bytes, 8, self.shard_payload_length);
+        bytes[CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN..].copy_from_slice(&self.payload);
+        let mut covered = Vec::with_capacity(12 + shard_size);
+        covered.extend_from_slice(&bytes[..12]);
+        covered.extend_from_slice(&bytes[CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN..]);
+        let crc = crc32c(&covered);
+        write_u32(&mut bytes, 12, crc);
+        Ok(bytes)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CriticalRecoveryLocator {
+    pub cmra_offset: u64,
+    pub cmra_length: u32,
+    pub volume_trailer_offset: u64,
+    pub body_bytes_before_cmra: u64,
+    pub archive_uuid_hint: [u8; 16],
+    pub session_id_hint: [u8; 16],
+    pub volume_index_hint: u32,
+    pub locator_sequence: u32,
+    pub cmra_shard_size: u32,
+    pub cmra_data_shard_count: u16,
+    pub cmra_parity_shard_count: u16,
+    pub cmra_image_length: u32,
+    pub cmra_image_sha256: [u8; 32],
+    pub locator_crc32c: u32,
+}
+
+impl CriticalRecoveryLocator {
+    pub fn parse(bytes: &[u8]) -> Result<Self, FormatError> {
+        expect_len(
+            "CriticalRecoveryLocator",
+            CRITICAL_RECOVERY_LOCATOR_LEN,
+            bytes.len(),
+        )?;
+        expect_magic("CriticalRecoveryLocator", TZCL_MAGIC, &bytes[0..4])?;
+        let version = read_u16(bytes, 4)?;
+        if version != 1 {
+            return Err(FormatError::UnsupportedFormatVersion(version));
+        }
+        let volume_format_rev = read_u16(bytes, 6)?;
+        if volume_format_rev != VOLUME_FORMAT_REV {
+            return Err(FormatError::UnsupportedVolumeFormatRevision(
+                volume_format_rev,
+            ));
+        }
+        if read_u16(bytes, 20)? != CRITICAL_METADATA_RECOVERY_HEADER_LEN as u16 {
+            return Err(FormatError::InvalidArchive(
+                "CriticalRecoveryLocator CMRA header length is invalid",
+            ));
+        }
+        let fec_algo = read_u16(bytes, 22)?;
+        if fec_algo != FecAlgo::ReedSolomonGF16 as u16 {
+            return Err(FormatError::UnknownFecAlgo(fec_algo));
+        }
+        let locator_sequence = read_u32(bytes, 76)?;
+        if locator_sequence > 1 {
+            return Err(FormatError::InvalidArchive(
+                "CriticalRecoveryLocator has invalid sequence",
+            ));
+        }
+        expect_crc(
+            "CriticalRecoveryLocator",
+            &bytes[..124],
+            read_u32(bytes, 124)?,
+        )?;
+
+        Ok(Self {
+            cmra_offset: read_u64(bytes, 8)?,
+            cmra_length: read_u32(bytes, 16)?,
+            volume_trailer_offset: read_u64(bytes, 24)?,
+            body_bytes_before_cmra: read_u64(bytes, 32)?,
+            archive_uuid_hint: read_array_16(bytes, 40)?,
+            session_id_hint: read_array_16(bytes, 56)?,
+            volume_index_hint: read_u32(bytes, 72)?,
+            locator_sequence,
+            cmra_shard_size: read_u32(bytes, 80)?,
+            cmra_data_shard_count: read_u16(bytes, 84)?,
+            cmra_parity_shard_count: read_u16(bytes, 86)?,
+            cmra_image_length: read_u32(bytes, 88)?,
+            cmra_image_sha256: read_array_32(bytes, 92)?,
+            locator_crc32c: read_u32(bytes, 124)?,
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; CRITICAL_RECOVERY_LOCATOR_LEN] {
+        let mut bytes = [0u8; CRITICAL_RECOVERY_LOCATOR_LEN];
+        bytes[0..4].copy_from_slice(&TZCL_MAGIC);
+        write_u16(&mut bytes, 4, 1);
+        write_u16(&mut bytes, 6, VOLUME_FORMAT_REV);
+        write_u64(&mut bytes, 8, self.cmra_offset);
+        write_u32(&mut bytes, 16, self.cmra_length);
+        write_u16(&mut bytes, 20, CRITICAL_METADATA_RECOVERY_HEADER_LEN as u16);
+        write_u16(&mut bytes, 22, FecAlgo::ReedSolomonGF16 as u16);
+        write_u64(&mut bytes, 24, self.volume_trailer_offset);
+        write_u64(&mut bytes, 32, self.body_bytes_before_cmra);
+        bytes[40..56].copy_from_slice(&self.archive_uuid_hint);
+        bytes[56..72].copy_from_slice(&self.session_id_hint);
+        write_u32(&mut bytes, 72, self.volume_index_hint);
+        write_u32(&mut bytes, 76, self.locator_sequence);
+        write_u32(&mut bytes, 80, self.cmra_shard_size);
+        write_u16(&mut bytes, 84, self.cmra_data_shard_count);
+        write_u16(&mut bytes, 86, self.cmra_parity_shard_count);
+        write_u32(&mut bytes, 88, self.cmra_image_length);
+        bytes[92..124].copy_from_slice(&self.cmra_image_sha256);
+        let crc = crc32c(&bytes[..124]);
+        write_u32(&mut bytes, 124, crc);
         bytes
     }
 }
@@ -921,6 +1629,20 @@ fn read_array_16(bytes: &[u8], offset: usize) -> Result<[u8; 16], FormatError> {
             .ok_or(FormatError::InvalidLength {
                 structure: "array16",
                 expected: offset + 16,
+                actual: bytes.len(),
+            })?,
+    );
+    Ok(value)
+}
+
+fn read_array_24(bytes: &[u8], offset: usize) -> Result<[u8; 24], FormatError> {
+    let mut value = [0u8; 24];
+    value.copy_from_slice(
+        bytes
+            .get(offset..offset + 24)
+            .ok_or(FormatError::InvalidLength {
+                structure: "array24",
+                expected: offset + 24,
                 actual: bytes.len(),
             })?,
     );
@@ -1200,6 +1922,9 @@ mod tests {
             manifest_footer_offset: 9_864,
             manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
             closed_at_ns: 123,
+            root_auth_footer_offset: 0,
+            root_auth_footer_length: 0,
+            root_auth_flags: 0,
             trailer_hmac: [0xbb; 32],
         };
         let mut trailer_bytes = trailer.to_bytes();
@@ -1870,6 +2595,9 @@ mod tests {
             manifest_footer_offset: 9_864,
             manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
             closed_at_ns: 123,
+            root_auth_footer_offset: 0,
+            root_auth_footer_length: 0,
+            root_auth_flags: 0,
             trailer_hmac: [0xbb; 32],
         };
         let parsed = VolumeTrailer::parse(&trailer.to_bytes()).unwrap();
@@ -1881,6 +2609,54 @@ mod tests {
             VolumeTrailer::parse(&bad.to_bytes()).unwrap_err(),
             FormatError::InvalidManifestFooterLength(100)
         );
+    }
+
+    #[test]
+    fn root_auth_footer_round_trips_and_validates_crc_and_lengths() {
+        let footer = RootAuthFooterV1 {
+            archive_uuid: uuid(),
+            session_id: session(),
+            authenticator_id: 2,
+            signer_identity_type: 1,
+            signer_identity_bytes: b"public-key".to_vec(),
+            authenticator_value: vec![0x5a; 68],
+            total_data_block_count: 7,
+            critical_metadata_digest: [1; 32],
+            index_digest: [2; 32],
+            fec_layout_digest: [3; 32],
+            data_block_merkle_root: [4; 32],
+            signer_identity_digest: [5; 32],
+            archive_root: [6; 32],
+            footer_crc32c: 0,
+        };
+        let bytes = footer.to_bytes().unwrap();
+        let parsed = RootAuthFooterV1::parse(&bytes).unwrap();
+        assert_eq!(parsed.archive_uuid, uuid());
+        assert_eq!(parsed.signer_identity_bytes, b"public-key");
+        assert_eq!(parsed.authenticator_value, vec![0x5a; 68]);
+        assert_eq!(parsed.footer_length().unwrap() as usize, bytes.len());
+
+        let mut bad_crc = bytes.clone();
+        bad_crc[100] ^= 0x40;
+        assert_eq!(
+            RootAuthFooterV1::parse(&bad_crc).unwrap_err(),
+            FormatError::BadCrc {
+                structure: "RootAuthFooterV1"
+            }
+        );
+
+        let mut bad_len = bytes;
+        write_u32(&mut bad_len, 30, 1);
+        let crc_offset = bad_len.len() - 4;
+        let crc = crc32c(&bad_len[..crc_offset]);
+        write_u32(&mut bad_len, crc_offset, crc);
+        assert!(matches!(
+            RootAuthFooterV1::parse(&bad_len).unwrap_err(),
+            FormatError::InvalidLength {
+                structure: "RootAuthFooterV1",
+                ..
+            }
+        ));
     }
 
     #[test]

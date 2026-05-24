@@ -69,7 +69,9 @@ pub fn validate_exact_zstd_frame(compressed: &[u8]) -> Result<(), FormatError> {
     Ok(())
 }
 
-fn validate_metadata_decompressed_size(expected_decompressed_size: usize) -> Result<(), FormatError> {
+fn validate_metadata_decompressed_size(
+    expected_decompressed_size: usize,
+) -> Result<(), FormatError> {
     if expected_decompressed_size > u32::MAX as usize {
         Err(FormatError::ReaderResourceLimitExceeded {
             field: "decompressed_size",

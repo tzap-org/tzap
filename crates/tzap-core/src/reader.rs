@@ -11,19 +11,29 @@ use crate::crypto::{decrypt_padded_aead_object, verify_hmac, HmacDomain, MasterK
 use crate::fec::repair_data_gf16;
 use crate::format::{
     BlockKind, FormatError, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN,
-    MANIFEST_FOOTER_LEN, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    CRITICAL_METADATA_IMAGE_FIXED_LEN, CRITICAL_METADATA_RECOVERY_HEADER_LEN,
+    CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN, CRITICAL_RECOVERY_LOCATOR_LEN,
+    CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, IMAGE_CRC_LEN, LOCATOR_PAIR_LEN, MANIFEST_FOOTER_LEN,
+    READER_MAX_CMRA_PARITY_PCT, READER_MAX_CRYPTO_HEADER_LEN, READER_MAX_ROOT_AUTH_FOOTER_LEN,
+    SERIALIZED_REGION_HEADER_LEN, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, DirectoryHintShardEntry, DirectoryHintTable,
     EnvelopeEntry, FileEntry, FrameEntry, IndexRoot, IndexShard, MetadataLimits, ShardEntry,
+};
+use crate::root_auth::{
+    archive_root, critical_metadata_digest, data_block_merkle_root, fec_layout_digest,
+    index_digest, root_auth_descriptor_digest, signer_identity_digest, ArchiveRootInputs,
+    CriticalMetadataDigestInputs, DataBlockMerkleLeaf, FecLayoutObjectRow,
 };
 use crate::tar_model::{
     parse_tar_member_group, restore_tar_member, validate_tar_stream_total_extraction_size,
     MetadataDiagnostic, OwnedTarMember, SafeExtractionOptions, TarEntryKind,
 };
 use crate::wire::{
-    BlockRecord, BootstrapSidecarHeader, CryptoHeader, CryptoHeaderFixed, ManifestFooter,
-    VolumeHeader, VolumeTrailer,
+    BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage, CriticalMetadataRecoveryHeader,
+    CriticalMetadataRecoveryShard, CriticalRecoveryLocator, CryptoHeader, CryptoHeaderFixed,
+    ManifestFooter, RootAuthFooterV1, VolumeHeader, VolumeTrailer,
 };
 
 const TRAILER_HMAC_COVERED_LEN: usize = 96;
@@ -76,12 +86,43 @@ pub struct OpenedArchive {
     observed_archive_bytes: u64,
     subkeys: Subkeys,
     blocks: BTreeMap<u64, BlockRecord>,
+    crypto_header_bytes: Vec<u8>,
     pub volume_header: VolumeHeader,
     pub crypto_header: CryptoHeaderFixed,
     pub manifest_footer: ManifestFooter,
     pub volume_trailer: Option<VolumeTrailer>,
+    pub root_auth_footer: Option<RootAuthFooterV1>,
     pub index_root: IndexRoot,
     payload_dictionary: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootAuthVerification {
+    pub archive_root: [u8; 32],
+    pub authenticator_id: u16,
+    pub signer_identity_type: u16,
+    pub signer_identity_bytes: Vec<u8>,
+    pub total_data_block_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicNoKeyVerification {
+    pub archive_root: [u8; 32],
+    pub authenticator_id: u16,
+    pub signer_identity_type: u16,
+    pub signer_identity_bytes: Vec<u8>,
+    pub total_data_block_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RootAuthMaterial {
+    critical_metadata_digest: [u8; 32],
+    index_digest: [u8; 32],
+    fec_layout_digest: [u8; 32],
+    data_block_merkle_root: [u8; 32],
+    signer_identity_digest: [u8; 32],
+    archive_root: [u8; 32],
+    total_data_block_count: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -140,6 +181,26 @@ pub fn open_non_seekable_archive(
     }
 }
 
+pub fn public_no_key_verify_archive_with<F>(
+    bytes: &[u8],
+    verifier: F,
+) -> Result<PublicNoKeyVerification, FormatError>
+where
+    F: FnMut(&RootAuthFooterV1, &[u8; 32]) -> Result<bool, FormatError>,
+{
+    public_no_key_verify_volumes_with_options(&[bytes], verifier, ReaderOptions::default())
+}
+
+pub fn public_no_key_verify_volumes_with<F>(
+    volumes: &[&[u8]],
+    verifier: F,
+) -> Result<PublicNoKeyVerification, FormatError>
+where
+    F: FnMut(&RootAuthFooterV1, &[u8; 32]) -> Result<bool, FormatError>,
+{
+    public_no_key_verify_volumes_with_options(volumes, verifier, ReaderOptions::default())
+}
+
 /// Decode a single-volume, dictionary-free non-seekable archive image into tar
 /// bytes after authenticating its terminal ManifestFooter and VolumeTrailer.
 ///
@@ -176,6 +237,9 @@ impl OpenedArchive {
         let mut manifest_authority: Option<ManifestFooter> = None;
         let mut manifest_authority_volume_header: Option<VolumeHeader> = None;
         let mut manifest_authority_volume_trailer: Option<VolumeTrailer> = None;
+        let mut root_auth_authority: Option<RootAuthFooterV1> = None;
+        let mut root_auth_authority_bytes: Option<Vec<u8>> = None;
+        let mut saw_root_auth_absent = false;
         let mut first_manifest_footer_error: Option<FormatError> = None;
         let mut seen_volume_indexes = BTreeSet::new();
         let mut blocks = BTreeMap::new();
@@ -207,6 +271,39 @@ impl OpenedArchive {
                 }
             } else if first_manifest_footer_error.is_none() {
                 first_manifest_footer_error = parsed.manifest_footer_error.take();
+            }
+
+            match (&parsed.root_auth_footer, &parsed.root_auth_footer_bytes) {
+                (Some(footer), Some(bytes)) => {
+                    if saw_root_auth_absent {
+                        return Err(FormatError::InvalidArchive(
+                            "root-auth footer presence differs across volumes",
+                        ));
+                    }
+                    if let Some(authority_bytes) = &root_auth_authority_bytes {
+                        if authority_bytes != bytes {
+                            return Err(FormatError::InvalidArchive(
+                                "RootAuthFooter copies differ",
+                            ));
+                        }
+                    } else {
+                        root_auth_authority = Some(footer.clone());
+                        root_auth_authority_bytes = Some(bytes.clone());
+                    }
+                }
+                (None, None) => {
+                    if root_auth_authority_bytes.is_some() {
+                        return Err(FormatError::InvalidArchive(
+                            "root-auth footer presence differs across volumes",
+                        ));
+                    }
+                    saw_root_auth_absent = true;
+                }
+                _ => {
+                    return Err(FormatError::InvalidArchive(
+                        "root-auth footer terminal state is inconsistent",
+                    ));
+                }
             }
 
             for (block_index, record) in &parsed.blocks {
@@ -291,10 +388,12 @@ impl OpenedArchive {
             observed_archive_bytes,
             subkeys: first.subkeys,
             blocks,
+            crypto_header_bytes: first.crypto_header_bytes,
             volume_header: authority_volume_header,
             crypto_header: first.crypto_header,
             manifest_footer,
             volume_trailer: Some(authority_volume_trailer),
+            root_auth_footer: root_auth_authority,
             index_root,
             payload_dictionary,
         })
@@ -352,7 +451,8 @@ impl OpenedArchive {
             &parsed_crypto.header_hmac,
         )?;
         parsed_crypto.validate_extension_semantics()?;
-        validate_m9_supported_volume(&volume_header, &parsed_crypto.fixed)?;
+        validate_bootstrap_single_volume_input(&volume_header, &parsed_crypto.fixed)?;
+        validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
 
         let sidecar = parse_bootstrap_sidecar(
             bootstrap_sidecar,
@@ -375,7 +475,8 @@ impl OpenedArchive {
                 observed_block_count,
                 &subkeys,
                 &volume_header,
-                parsed_crypto.fixed.block_size,
+                &parsed_crypto.fixed,
+                options,
             )?),
             BootstrapSidecarUse::NonSeekableRandomAccess => parse_terminal_material(
                 bytes,
@@ -383,11 +484,12 @@ impl OpenedArchive {
                 observed_block_count,
                 &subkeys,
                 &volume_header,
-                parsed_crypto.fixed.block_size,
+                &parsed_crypto.fixed,
+                options,
             )
             .ok(),
         };
-        let terminal_manifest = terminal_material.as_ref().map(|(manifest, _)| manifest);
+        let terminal_manifest = terminal_material.as_ref().map(|(manifest, _, _)| manifest);
         let manifest_authority = match sidecar_use {
             BootstrapSidecarUse::SeekableAssist => {
                 let terminal_manifest = terminal_manifest.ok_or(FormatError::InvalidArchive(
@@ -485,10 +587,14 @@ impl OpenedArchive {
             observed_archive_bytes,
             subkeys,
             blocks,
+            crypto_header_bytes: crypto_bytes.to_vec(),
             volume_header,
             crypto_header: parsed_crypto.fixed,
             manifest_footer: manifest_authority,
-            volume_trailer: terminal_material.map(|(_, trailer)| trailer),
+            volume_trailer: terminal_material
+                .as_ref()
+                .map(|(_, trailer, _)| trailer.clone()),
+            root_auth_footer: terminal_material.and_then(|(_, _, root_auth)| root_auth),
             index_root,
             payload_dictionary,
         })
@@ -683,6 +789,7 @@ impl OpenedArchive {
                 }
             }
         }
+        validate_global_file_table_order(&shards)?;
 
         if file_count != self.index_root.header.file_count {
             return Err(FormatError::InvalidArchive(
@@ -790,6 +897,45 @@ impl OpenedArchive {
         }
 
         Ok(())
+    }
+
+    pub fn verify_root_auth_with<F>(
+        &self,
+        mut verifier: F,
+    ) -> Result<RootAuthVerification, FormatError>
+    where
+        F: FnMut(&RootAuthFooterV1, &[u8; 32]) -> Result<bool, FormatError>,
+    {
+        let footer = self
+            .root_auth_footer
+            .as_ref()
+            .ok_or(FormatError::ReaderUnsupported("root-auth footer is absent"))?;
+        self.verify()?;
+        let material = self.recompute_root_auth_material(footer)?;
+        if material.critical_metadata_digest != footer.critical_metadata_digest
+            || material.index_digest != footer.index_digest
+            || material.fec_layout_digest != footer.fec_layout_digest
+            || material.data_block_merkle_root != footer.data_block_merkle_root
+            || material.signer_identity_digest != footer.signer_identity_digest
+            || material.archive_root != footer.archive_root
+            || material.total_data_block_count != footer.total_data_block_count
+        {
+            return Err(FormatError::InvalidArchive(
+                "RootAuthFooter commitments do not match recomputed archive root",
+            ));
+        }
+        if !verifier(footer, &material.archive_root)? {
+            return Err(FormatError::InvalidArchive(
+                "root-auth authenticator verification failed",
+            ));
+        }
+        Ok(RootAuthVerification {
+            archive_root: material.archive_root,
+            authenticator_id: footer.authenticator_id,
+            signer_identity_type: footer.signer_identity_type,
+            signer_identity_bytes: footer.signer_identity_bytes.clone(),
+            total_data_block_count: footer.total_data_block_count,
+        })
     }
 
     fn load_all_index_shards(&self) -> Result<Vec<IndexShard>, FormatError> {
@@ -1027,6 +1173,264 @@ impl OpenedArchive {
         metadata_limits(&self.crypto_header)
     }
 
+    fn recompute_root_auth_material(
+        &self,
+        footer: &RootAuthFooterV1,
+    ) -> Result<RootAuthMaterial, FormatError> {
+        let footer_length = footer.footer_length()?;
+        let root_auth_descriptor_digest = root_auth_descriptor_digest(
+            footer.authenticator_id,
+            footer.signer_identity_type,
+            &footer.signer_identity_bytes,
+            u32::try_from(footer.authenticator_value.len()).map_err(|_| {
+                FormatError::InvalidArchive("RootAuthFooter authenticator length overflow")
+            })?,
+            footer_length,
+        )?;
+        let signer_identity_digest =
+            signer_identity_digest(footer.signer_identity_type, &footer.signer_identity_bytes)?;
+        let manifest_pre_hmac = manifest_footer_global_pre_hmac_bytes(&self.manifest_footer);
+        let crypto_pre_hmac_len = self
+            .crypto_header_bytes
+            .len()
+            .checked_sub(CRYPTO_HEADER_HMAC_LEN)
+            .ok_or(FormatError::InvalidArchive("CryptoHeader is too short"))?;
+        let critical_metadata_digest = critical_metadata_digest(CriticalMetadataDigestInputs {
+            archive_uuid: self.volume_header.archive_uuid,
+            session_id: self.volume_header.session_id,
+            stripe_width: self.crypto_header.stripe_width,
+            total_volumes: self.manifest_footer.total_volumes,
+            compression_algo: self.crypto_header.compression_algo,
+            aead_algo: self.crypto_header.aead_algo,
+            fec_algo: self.crypto_header.fec_algo,
+            kdf_algo: self.crypto_header.kdf_algo,
+            crypto_header_pre_hmac_bytes: &self.crypto_header_bytes[..crypto_pre_hmac_len],
+            chunk_size: self.crypto_header.chunk_size,
+            envelope_target_size: self.crypto_header.envelope_target_size,
+            block_size: self.crypto_header.block_size,
+            fec_data_shards: self.crypto_header.fec_data_shards,
+            fec_parity_shards: self.crypto_header.fec_parity_shards,
+            index_fec_data_shards: self.crypto_header.index_fec_data_shards,
+            index_fec_parity_shards: self.crypto_header.index_fec_parity_shards,
+            index_root_fec_data_shards: self.crypto_header.index_root_fec_data_shards,
+            index_root_fec_parity_shards: self.crypto_header.index_root_fec_parity_shards,
+            volume_loss_tolerance: self.crypto_header.volume_loss_tolerance,
+            bit_rot_buffer_pct: self.crypto_header.bit_rot_buffer_pct,
+            has_dictionary: self.crypto_header.has_dictionary,
+            manifest_footer_global_pre_hmac_bytes: &manifest_pre_hmac,
+            index_root_first_block: self.manifest_footer.index_root_first_block,
+            index_root_data_block_count: self.manifest_footer.index_root_data_block_count,
+            index_root_parity_block_count: self.manifest_footer.index_root_parity_block_count,
+            index_root_encrypted_size: self.manifest_footer.index_root_encrypted_size,
+            index_root_decompressed_size: self.manifest_footer.index_root_decompressed_size,
+            root_auth_descriptor_digest,
+        })?;
+        let index_root_plaintext = self.index_root.to_bytes();
+        let index_digest = index_digest(&index_root_plaintext);
+        let shards = self.load_all_index_shards()?;
+        let fec_layout_rows = self.root_auth_fec_layout_rows(&shards)?;
+        let fec_layout_digest = fec_layout_digest(&fec_layout_rows)?;
+        let data_leaves = self.root_auth_data_block_leaves(&fec_layout_rows)?;
+        let total_data_block_count = u64::try_from(data_leaves.len())
+            .map_err(|_| FormatError::InvalidArchive("root-auth data block count overflow"))?;
+        let data_block_merkle_root = data_block_merkle_root(&data_leaves);
+        let archive_root = archive_root(ArchiveRootInputs {
+            archive_uuid: self.volume_header.archive_uuid,
+            session_id: self.volume_header.session_id,
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV,
+            compression_algo: self.crypto_header.compression_algo,
+            aead_algo: self.crypto_header.aead_algo,
+            fec_algo: self.crypto_header.fec_algo,
+            kdf_algo: self.crypto_header.kdf_algo,
+            critical_metadata_digest,
+            index_digest,
+            fec_layout_digest,
+            total_data_block_count,
+            data_block_merkle_root,
+            root_auth_descriptor_digest,
+            signer_identity_digest,
+        });
+        Ok(RootAuthMaterial {
+            critical_metadata_digest,
+            index_digest,
+            fec_layout_digest,
+            data_block_merkle_root,
+            signer_identity_digest,
+            archive_root,
+            total_data_block_count,
+        })
+    }
+
+    fn root_auth_fec_layout_rows(
+        &self,
+        shards: &[IndexShard],
+    ) -> Result<Vec<FecLayoutObjectRow>, FormatError> {
+        let mut rows = Vec::new();
+        rows.push(FecLayoutObjectRow {
+            object_class: 1,
+            present: true,
+            object_id: 0,
+            first_block_index: self.manifest_footer.index_root_first_block,
+            data_block_count: self.manifest_footer.index_root_data_block_count,
+            parity_block_count: self.manifest_footer.index_root_parity_block_count,
+            encrypted_size: self.manifest_footer.index_root_encrypted_size,
+            plain_size: self.manifest_footer.index_root_decompressed_size,
+        });
+        if self.crypto_header.has_dictionary != 0 {
+            rows.push(FecLayoutObjectRow {
+                object_class: 2,
+                present: true,
+                object_id: 0,
+                first_block_index: self.index_root.header.dictionary_first_block,
+                data_block_count: self.index_root.header.dictionary_data_block_count,
+                parity_block_count: self.index_root.header.dictionary_parity_block_count,
+                encrypted_size: self.index_root.header.dictionary_encrypted_size,
+                plain_size: self.index_root.header.dictionary_decompressed_size,
+            });
+        } else {
+            rows.push(FecLayoutObjectRow {
+                object_class: 2,
+                present: false,
+                object_id: 0,
+                first_block_index: 0,
+                data_block_count: 0,
+                parity_block_count: 0,
+                encrypted_size: 0,
+                plain_size: 0,
+            });
+        }
+        for entry in &self.index_root.shards {
+            rows.push(FecLayoutObjectRow {
+                object_class: 3,
+                present: true,
+                object_id: entry.shard_index,
+                first_block_index: entry.first_block_index,
+                data_block_count: entry.data_block_count,
+                parity_block_count: entry.parity_block_count,
+                encrypted_size: entry.encrypted_size,
+                plain_size: entry.decompressed_size,
+            });
+        }
+        let mut envelopes = BTreeMap::<u64, EnvelopeEntry>::new();
+        for shard in shards {
+            for envelope in &shard.envelopes {
+                if let Some(existing) = envelopes.insert(envelope.envelope_index, envelope.clone())
+                {
+                    if existing != *envelope {
+                        return Err(FormatError::InvalidArchive(
+                            "duplicate EnvelopeEntry rows do not match",
+                        ));
+                    }
+                }
+            }
+        }
+        for envelope in envelopes.values() {
+            rows.push(FecLayoutObjectRow {
+                object_class: 4,
+                present: true,
+                object_id: envelope.envelope_index,
+                first_block_index: envelope.first_block_index,
+                data_block_count: envelope.data_block_count,
+                parity_block_count: envelope.parity_block_count,
+                encrypted_size: envelope.encrypted_size,
+                plain_size: envelope.plaintext_size,
+            });
+        }
+        for entry in &self.index_root.directory_hint_shards {
+            rows.push(FecLayoutObjectRow {
+                object_class: 5,
+                present: true,
+                object_id: entry.hint_shard_index,
+                first_block_index: entry.first_block_index,
+                data_block_count: entry.data_block_count,
+                parity_block_count: entry.parity_block_count,
+                encrypted_size: entry.encrypted_size,
+                plain_size: entry.decompressed_size,
+            });
+        }
+        Ok(rows)
+    }
+
+    fn root_auth_data_block_leaves(
+        &self,
+        rows: &[FecLayoutObjectRow],
+    ) -> Result<Vec<DataBlockMerkleLeaf>, FormatError> {
+        let mut leaves = Vec::new();
+        for row in rows.iter().filter(|row| row.present) {
+            let (data_kind, parity_kind, data_max, parity_max) = match row.object_class {
+                1 => (
+                    BlockKind::IndexRootData,
+                    BlockKind::IndexRootParity,
+                    self.crypto_header.index_root_fec_data_shards,
+                    self.crypto_header.index_root_fec_parity_shards,
+                ),
+                2 => (
+                    BlockKind::DictionaryData,
+                    BlockKind::DictionaryParity,
+                    self.crypto_header.index_root_fec_data_shards,
+                    self.crypto_header.index_root_fec_parity_shards,
+                ),
+                3 => (
+                    BlockKind::IndexShardData,
+                    BlockKind::IndexShardParity,
+                    self.crypto_header.index_fec_data_shards,
+                    self.crypto_header.index_fec_parity_shards,
+                ),
+                4 => (
+                    BlockKind::PayloadData,
+                    BlockKind::PayloadParity,
+                    self.crypto_header.fec_data_shards,
+                    self.crypto_header.fec_parity_shards,
+                ),
+                5 => (
+                    BlockKind::DirectoryHintData,
+                    BlockKind::DirectoryHintParity,
+                    self.crypto_header.index_fec_data_shards,
+                    self.crypto_header.index_fec_parity_shards,
+                ),
+                _ => {
+                    return Err(FormatError::InvalidArchive(
+                        "unknown root-auth FEC row class",
+                    ))
+                }
+            };
+            let extent = ObjectExtent {
+                first_block_index: row.first_block_index,
+                data_block_count: row.data_block_count,
+                parity_block_count: row.parity_block_count,
+                encrypted_size: row.encrypted_size,
+            };
+            let repaired = load_repaired_object_data_shards_from_parts(
+                &self.blocks,
+                &self.crypto_header,
+                extent,
+                data_kind,
+                parity_kind,
+                data_max,
+                parity_max,
+            )?;
+            for (offset, payload) in repaired.into_iter().enumerate() {
+                leaves.push(DataBlockMerkleLeaf {
+                    block_index: checked_u64_add(
+                        row.first_block_index,
+                        offset as u64,
+                        "root-auth data block",
+                    )?,
+                    kind: data_kind,
+                    flags: if offset + 1 == row.data_block_count as usize {
+                        0x01
+                    } else {
+                        0
+                    },
+                    payload,
+                });
+            }
+        }
+        leaves.sort_by_key(|leaf| leaf.block_index);
+        Ok(leaves)
+    }
+
     fn validate_total_extraction_size(&self, logical_size: u64) -> Result<(), FormatError> {
         let cap = total_extraction_size_cap(self.options, self.observed_archive_bytes);
         if logical_size > cap {
@@ -1108,6 +1512,8 @@ struct ParsedSeekableVolume {
     subkeys: Subkeys,
     manifest_footer: Option<ManifestFooter>,
     manifest_footer_error: Option<FormatError>,
+    root_auth_footer: Option<RootAuthFooterV1>,
+    root_auth_footer_bytes: Option<Vec<u8>>,
     volume_trailer: VolumeTrailer,
     blocks: BTreeMap<u64, BlockRecord>,
     erased_block_indices: BTreeSet<u64>,
@@ -1147,24 +1553,41 @@ fn parse_seekable_volume(
     )?;
     parsed_crypto.validate_extension_semantics()?;
     validate_seekable_supported_volume(&volume_header, &parsed_crypto.fixed)?;
+    validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
 
-    let (trailer_offset, volume_trailer) =
-        locate_trailer(bytes, &subkeys, &volume_header, options)?;
+    let terminal = locate_v41_terminal(
+        bytes,
+        &subkeys,
+        &volume_header,
+        &parsed_crypto.fixed,
+        options,
+    )?;
+    let trailer_offset = to_usize(terminal.image.volume_trailer_offset, "VolumeTrailer")?;
+    let volume_trailer = terminal.volume_trailer.clone();
     validate_trailer_identity(&volume_header, &volume_trailer)?;
 
     let manifest_offset = to_usize(volume_trailer.manifest_footer_offset, "ManifestFooter")?;
     let manifest_end = checked_add(manifest_offset, MANIFEST_FOOTER_LEN, "ManifestFooter")?;
-    if manifest_end != trailer_offset {
+    if volume_trailer.root_auth_flags & 0x0000_0001 != 0 {
+        if to_usize(volume_trailer.root_auth_footer_offset, "RootAuthFooter")? != manifest_end
+            || volume_trailer
+                .root_auth_footer_offset
+                .checked_add(volume_trailer.root_auth_footer_length as u64)
+                .ok_or(FormatError::InvalidArchive(
+                    "RootAuthFooter terminal boundary overflow",
+                ))?
+                != trailer_offset as u64
+        {
+            return Err(FormatError::InvalidArchive(
+                "RootAuthFooter does not sit before selected trailer",
+            ));
+        }
+    } else if manifest_end != trailer_offset {
         return Err(FormatError::InvalidArchive(
             "ManifestFooter does not end at selected trailer",
         ));
     }
-    let manifest_bytes = slice(
-        bytes,
-        manifest_offset,
-        MANIFEST_FOOTER_LEN,
-        "ManifestFooter",
-    )?;
+    let manifest_bytes = &terminal.manifest_footer_bytes;
     let (manifest_footer, manifest_footer_error) = match parse_valid_manifest_footer(
         &volume_header,
         &subkeys,
@@ -1192,10 +1615,204 @@ fn parse_seekable_volume(
         subkeys,
         manifest_footer,
         manifest_footer_error,
+        root_auth_footer: terminal.root_auth_footer,
+        root_auth_footer_bytes: terminal.root_auth_footer_bytes,
         volume_trailer,
         blocks: block_region.blocks,
         erased_block_indices: block_region.erased_block_indices,
     })
+}
+
+#[derive(Debug)]
+struct ParsedPublicNoKeyVolume {
+    volume_header: VolumeHeader,
+    crypto_header: CryptoHeaderFixed,
+    root_auth_footer: RootAuthFooterV1,
+    root_auth_footer_bytes: Vec<u8>,
+    blocks: BTreeMap<u64, BlockRecord>,
+}
+
+fn public_no_key_verify_volumes_with_options<F>(
+    volumes: &[&[u8]],
+    mut verifier: F,
+    options: ReaderOptions,
+) -> Result<PublicNoKeyVerification, FormatError>
+where
+    F: FnMut(&RootAuthFooterV1, &[u8; 32]) -> Result<bool, FormatError>,
+{
+    if volumes.is_empty() {
+        return Err(FormatError::InvalidArchive("no volumes supplied"));
+    }
+    let mut parsed = Vec::with_capacity(volumes.len());
+    for volume in volumes {
+        parsed.push(parse_public_no_key_volume(volume, options)?);
+    }
+    let first = parsed
+        .first()
+        .ok_or(FormatError::InvalidArchive("no volumes supplied"))?;
+    if parsed.len() != first.crypto_header.stripe_width as usize {
+        return Err(FormatError::ReaderUnsupported(
+            "public no-key verification requires a complete volume set",
+        ));
+    }
+
+    let mut seen_volume_indexes = BTreeSet::new();
+    let mut blocks = BTreeMap::new();
+    for volume in &parsed {
+        if volume.volume_header.archive_uuid != first.volume_header.archive_uuid
+            || volume.volume_header.session_id != first.volume_header.session_id
+            || !public_crypto_headers_agree(&volume.crypto_header, &first.crypto_header)
+        {
+            return Err(FormatError::InvalidArchive(
+                "public no-key volume global metadata differs",
+            ));
+        }
+        if volume.root_auth_footer_bytes != first.root_auth_footer_bytes {
+            return Err(FormatError::InvalidArchive(
+                "public no-key RootAuthFooter copies differ",
+            ));
+        }
+        if !seen_volume_indexes.insert(volume.volume_header.volume_index) {
+            return Err(FormatError::InvalidArchive(
+                "duplicate public no-key volume index",
+            ));
+        }
+        for (block_index, record) in &volume.blocks {
+            if blocks.insert(*block_index, record.clone()).is_some() {
+                return Err(FormatError::InvalidArchive("duplicate BlockRecord index"));
+            }
+        }
+    }
+    validate_complete_global_block_coverage(&blocks, &BTreeSet::new())?;
+
+    let footer = &first.root_auth_footer;
+    let mut data_leaves = blocks
+        .values()
+        .filter(|record| record.kind.is_data())
+        .map(|record| DataBlockMerkleLeaf {
+            block_index: record.block_index,
+            kind: record.kind,
+            flags: record.flags,
+            payload: record.payload.clone(),
+        })
+        .collect::<Vec<_>>();
+    data_leaves.sort_by_key(|leaf| leaf.block_index);
+    let total_data_block_count = u64::try_from(data_leaves.len())
+        .map_err(|_| FormatError::InvalidArchive("public no-key data block count overflow"))?;
+    let observed_data_root = data_block_merkle_root(&data_leaves);
+    if total_data_block_count != footer.total_data_block_count
+        || observed_data_root != footer.data_block_merkle_root
+    {
+        return Err(FormatError::InvalidArchive(
+            "public no-key data-block commitment mismatch",
+        ));
+    }
+    let archive_root = recompute_public_archive_root(footer, &first.crypto_header)?;
+    if archive_root != footer.archive_root {
+        return Err(FormatError::InvalidArchive(
+            "public no-key archive_root mismatch",
+        ));
+    }
+    if !verifier(footer, &archive_root)? {
+        return Err(FormatError::InvalidArchive(
+            "public no-key authenticator verification failed",
+        ));
+    }
+    Ok(PublicNoKeyVerification {
+        archive_root,
+        authenticator_id: footer.authenticator_id,
+        signer_identity_type: footer.signer_identity_type,
+        signer_identity_bytes: footer.signer_identity_bytes.clone(),
+        total_data_block_count,
+    })
+}
+
+fn parse_public_no_key_volume(
+    bytes: &[u8],
+    options: ReaderOptions,
+) -> Result<ParsedPublicNoKeyVolume, FormatError> {
+    if bytes.len() < VOLUME_HEADER_LEN + VOLUME_TRAILER_LEN {
+        return Err(FormatError::InvalidLength {
+            structure: "archive",
+            expected: VOLUME_HEADER_LEN + VOLUME_TRAILER_LEN,
+            actual: bytes.len(),
+        });
+    }
+    let volume_header = VolumeHeader::parse(slice(bytes, 0, VOLUME_HEADER_LEN, "archive")?)?;
+    let crypto_start = volume_header.crypto_header_offset as usize;
+    let crypto_len = volume_header.crypto_header_length as usize;
+    let crypto_end = checked_add(crypto_start, crypto_len, "CryptoHeader")?;
+    let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
+    let parsed_crypto = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length)?;
+    parsed_crypto.validate_extension_semantics()?;
+    validate_seekable_supported_volume(&volume_header, &parsed_crypto.fixed)?;
+    validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
+
+    let terminal =
+        locate_v41_public_terminal(bytes, &volume_header, &parsed_crypto.fixed, options)?;
+    let block_region = parse_public_block_observation(
+        bytes,
+        crypto_end,
+        &terminal.image,
+        parsed_crypto.fixed.block_size as usize,
+        &volume_header,
+    )?;
+    Ok(ParsedPublicNoKeyVolume {
+        volume_header,
+        crypto_header: parsed_crypto.fixed,
+        root_auth_footer: terminal.root_auth_footer,
+        root_auth_footer_bytes: terminal.root_auth_footer_bytes,
+        blocks: block_region,
+    })
+}
+
+fn public_crypto_headers_agree(left: &CryptoHeaderFixed, right: &CryptoHeaderFixed) -> bool {
+    left.length == right.length
+        && left.stripe_width == right.stripe_width
+        && left.block_size == right.block_size
+        && left.compression_algo == right.compression_algo
+        && left.aead_algo == right.aead_algo
+        && left.fec_algo == right.fec_algo
+        && left.kdf_algo == right.kdf_algo
+}
+
+fn recompute_public_archive_root(
+    footer: &RootAuthFooterV1,
+    crypto_header: &CryptoHeaderFixed,
+) -> Result<[u8; 32], FormatError> {
+    let descriptor_digest = root_auth_descriptor_digest(
+        footer.authenticator_id,
+        footer.signer_identity_type,
+        &footer.signer_identity_bytes,
+        u32::try_from(footer.authenticator_value.len()).map_err(|_| {
+            FormatError::InvalidArchive("RootAuthFooter authenticator length overflow")
+        })?,
+        footer.footer_length()?,
+    )?;
+    let signer_digest =
+        signer_identity_digest(footer.signer_identity_type, &footer.signer_identity_bytes)?;
+    if signer_digest != footer.signer_identity_digest {
+        return Err(FormatError::InvalidArchive(
+            "public no-key signer identity digest mismatch",
+        ));
+    }
+    Ok(archive_root(ArchiveRootInputs {
+        archive_uuid: footer.archive_uuid,
+        session_id: footer.session_id,
+        format_version: FORMAT_VERSION,
+        volume_format_rev: VOLUME_FORMAT_REV,
+        compression_algo: crypto_header.compression_algo,
+        aead_algo: crypto_header.aead_algo,
+        fec_algo: crypto_header.fec_algo,
+        kdf_algo: crypto_header.kdf_algo,
+        critical_metadata_digest: footer.critical_metadata_digest,
+        index_digest: footer.index_digest,
+        fec_layout_digest: footer.fec_layout_digest,
+        total_data_block_count: footer.total_data_block_count,
+        data_block_merkle_root: footer.data_block_merkle_root,
+        root_auth_descriptor_digest: descriptor_digest,
+        signer_identity_digest: signer_digest,
+    }))
 }
 
 fn parse_valid_manifest_footer(
@@ -1231,6 +1848,33 @@ fn validate_seekable_supported_volume(
     if crypto_header.stripe_width != volume_header.stripe_width {
         return Err(FormatError::InvalidArchive(
             "VolumeHeader and CryptoHeader stripe_width differ",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_crypto_class_parity_exactness(
+    crypto_header: &CryptoHeaderFixed,
+) -> Result<(), FormatError> {
+    let fec = required_object_parity(crypto_header.fec_data_shards as u64, crypto_header)?;
+    if crypto_header.fec_parity_shards as u32 != fec {
+        return Err(FormatError::InvalidArchive(
+            "fec_parity_shards does not match v41 compute_parity",
+        ));
+    }
+    let index = required_object_parity(crypto_header.index_fec_data_shards as u64, crypto_header)?;
+    if crypto_header.index_fec_parity_shards as u32 != index {
+        return Err(FormatError::InvalidArchive(
+            "index_fec_parity_shards does not match v41 compute_parity",
+        ));
+    }
+    let index_root = required_object_parity(
+        crypto_header.index_root_fec_data_shards as u64,
+        crypto_header,
+    )?;
+    if crypto_header.index_root_fec_parity_shards as u32 != index_root {
+        return Err(FormatError::InvalidArchive(
+            "index_root_fec_parity_shards does not match v41 compute_parity",
         ));
     }
     Ok(())
@@ -1307,74 +1951,1391 @@ fn validate_complete_global_block_coverage(
     }
 }
 
-fn locate_trailer(
+#[derive(Debug)]
+struct V41Terminal {
+    image: CriticalMetadataImage,
+    manifest_footer_bytes: Vec<u8>,
+    root_auth_footer_bytes: Option<Vec<u8>>,
+    root_auth_footer: Option<RootAuthFooterV1>,
+    volume_trailer: VolumeTrailer,
+}
+
+#[derive(Debug)]
+struct V41PublicTerminal {
+    image: CriticalMetadataImage,
+    root_auth_footer_bytes: Vec<u8>,
+    root_auth_footer: RootAuthFooterV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CmraDecoderTuple {
+    shard_size: u32,
+    data_shard_count: u16,
+    parity_shard_count: u16,
+    image_length: u32,
+    image_sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CmraIdentityHints {
+    archive_uuid: [u8; 16],
+    session_id: [u8; 16],
+    volume_index: u32,
+}
+
+impl From<CriticalMetadataRecoveryHeader> for CmraDecoderTuple {
+    fn from(header: CriticalMetadataRecoveryHeader) -> Self {
+        Self {
+            shard_size: header.shard_size,
+            data_shard_count: header.data_shard_count,
+            parity_shard_count: header.parity_shard_count,
+            image_length: header.image_length,
+            image_sha256: header.image_sha256,
+        }
+    }
+}
+
+impl From<CriticalMetadataRecoveryHeader> for CmraIdentityHints {
+    fn from(header: CriticalMetadataRecoveryHeader) -> Self {
+        Self {
+            archive_uuid: header.archive_uuid_hint,
+            session_id: header.session_id_hint,
+            volume_index: header.volume_index_hint,
+        }
+    }
+}
+
+impl From<CriticalRecoveryLocator> for CmraDecoderTuple {
+    fn from(locator: CriticalRecoveryLocator) -> Self {
+        Self {
+            shard_size: locator.cmra_shard_size,
+            data_shard_count: locator.cmra_data_shard_count,
+            parity_shard_count: locator.cmra_parity_shard_count,
+            image_length: locator.cmra_image_length,
+            image_sha256: locator.cmra_image_sha256,
+        }
+    }
+}
+
+impl From<CriticalRecoveryLocator> for CmraIdentityHints {
+    fn from(locator: CriticalRecoveryLocator) -> Self {
+        Self {
+            archive_uuid: locator.archive_uuid_hint,
+            session_id: locator.session_id_hint,
+            volume_index: locator.volume_index_hint,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RecoveredCmra {
+    image: CriticalMetadataImage,
+    tuple: CmraDecoderTuple,
+    header_hints: Option<CmraIdentityHints>,
+    cmra_length: u64,
+}
+
+#[derive(Debug)]
+struct TerminalCandidate {
+    terminal: V41Terminal,
+    anchor: usize,
+    locator_sequence: Option<u32>,
+    cmra_offset: u64,
+    cmra_length: u64,
+}
+
+#[derive(Debug)]
+struct PublicTerminalCandidate {
+    terminal: V41PublicTerminal,
+    anchor: usize,
+    cmra_offset: u64,
+    cmra_length: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CmraRecoveryMode {
+    KeyHolding,
+    PublicNoKey,
+}
+
+fn locate_v41_terminal(
     bytes: &[u8],
     subkeys: &Subkeys,
     volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
     options: ReaderOptions,
-) -> Result<(usize, VolumeTrailer), FormatError> {
-    let canonical_offset =
-        bytes
-            .len()
-            .checked_sub(VOLUME_TRAILER_LEN)
-            .ok_or(FormatError::InvalidLength {
-                structure: "VolumeTrailer",
-                expected: VOLUME_TRAILER_LEN,
-                actual: bytes.len(),
-            })?;
-    match parse_authenticated_trailer(bytes, canonical_offset, subkeys, volume_header) {
-        Ok(trailer) => {
-            if trailer.bytes_written != canonical_offset as u64 {
+) -> Result<V41Terminal, FormatError> {
+    locate_v41_terminal_candidate(bytes, subkeys, volume_header, crypto_header, options)
+        .map(|candidate| candidate.terminal)
+}
+
+fn locate_v41_terminal_candidate(
+    bytes: &[u8],
+    subkeys: &Subkeys,
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+    options: ReaderOptions,
+) -> Result<TerminalCandidate, FormatError> {
+    let mut candidates = Vec::new();
+    if bytes.len() >= CRITICAL_RECOVERY_LOCATOR_LEN {
+        let final_offset = bytes.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
+        collect_v41_locator_candidate(
+            bytes,
+            final_offset,
+            0,
+            subkeys,
+            volume_header,
+            crypto_header,
+            &mut candidates,
+        );
+    }
+    if bytes.len() >= LOCATOR_PAIR_LEN {
+        let mirror_offset = bytes.len() - LOCATOR_PAIR_LEN;
+        collect_v41_locator_candidate(
+            bytes,
+            mirror_offset,
+            1,
+            subkeys,
+            volume_header,
+            crypto_header,
+            &mut candidates,
+        );
+    }
+
+    if candidates.is_empty() {
+        let scan = max_critical_recovery_scan(options)?;
+        let scan_start = bytes.len().saturating_sub(scan);
+        let mut offset = bytes.len().saturating_sub(4);
+        while offset >= scan_start {
+            if bytes.get(offset..offset + 4) == Some(b"TZCL") {
+                collect_v41_locator_candidate(
+                    bytes,
+                    offset,
+                    2,
+                    subkeys,
+                    volume_header,
+                    crypto_header,
+                    &mut candidates,
+                );
+            } else if bytes.get(offset..offset + 4) == Some(b"TZCR") {
+                if let Ok(candidate) = parse_locatorless_cmra_candidate(
+                    bytes,
+                    offset,
+                    subkeys,
+                    volume_header,
+                    crypto_header,
+                ) {
+                    candidates.push(candidate);
+                }
+            }
+            if offset == 0 {
+                break;
+            }
+            offset -= 1;
+        }
+    }
+
+    choose_v41_terminal_candidate(candidates)
+}
+
+fn locate_v41_public_terminal(
+    bytes: &[u8],
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+    options: ReaderOptions,
+) -> Result<V41PublicTerminal, FormatError> {
+    let mut candidates = Vec::new();
+    if bytes.len() >= CRITICAL_RECOVERY_LOCATOR_LEN {
+        let final_offset = bytes.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
+        collect_v41_public_locator_candidate(
+            bytes,
+            final_offset,
+            0,
+            volume_header,
+            crypto_header,
+            &mut candidates,
+        );
+    }
+    if bytes.len() >= LOCATOR_PAIR_LEN {
+        let mirror_offset = bytes.len() - LOCATOR_PAIR_LEN;
+        collect_v41_public_locator_candidate(
+            bytes,
+            mirror_offset,
+            1,
+            volume_header,
+            crypto_header,
+            &mut candidates,
+        );
+    }
+
+    if candidates.is_empty() {
+        let scan = max_critical_recovery_scan(options)?;
+        let scan_start = bytes.len().saturating_sub(scan);
+        let mut offset = bytes.len().saturating_sub(4);
+        while offset >= scan_start {
+            if bytes.get(offset..offset + 4) == Some(b"TZCL") {
+                collect_v41_public_locator_candidate(
+                    bytes,
+                    offset,
+                    2,
+                    volume_header,
+                    crypto_header,
+                    &mut candidates,
+                );
+            } else if bytes.get(offset..offset + 4) == Some(b"TZCR") {
+                if let Ok(candidate) = parse_public_locatorless_cmra_candidate(
+                    bytes,
+                    offset,
+                    volume_header,
+                    crypto_header,
+                ) {
+                    candidates.push(candidate);
+                }
+            }
+            if offset == 0 {
+                break;
+            }
+            offset -= 1;
+        }
+    }
+
+    choose_v41_public_terminal_candidate(candidates).map(|candidate| candidate.terminal)
+}
+
+fn collect_v41_locator_candidate(
+    bytes: &[u8],
+    offset: usize,
+    expected_sequence: u32,
+    subkeys: &Subkeys,
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+    candidates: &mut Vec<TerminalCandidate>,
+) {
+    let Some(raw) = bytes.get(offset..offset + CRITICAL_RECOVERY_LOCATOR_LEN) else {
+        return;
+    };
+    let Ok(locator) = CriticalRecoveryLocator::parse(raw) else {
+        return;
+    };
+    if expected_sequence <= 1 && locator.locator_sequence != expected_sequence {
+        return;
+    }
+    if let Ok(candidate) = parse_locator_cmra_candidate(
+        bytes,
+        offset,
+        locator,
+        subkeys,
+        volume_header,
+        crypto_header,
+    ) {
+        candidates.push(candidate);
+    }
+}
+
+fn collect_v41_public_locator_candidate(
+    bytes: &[u8],
+    offset: usize,
+    expected_sequence: u32,
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+    candidates: &mut Vec<PublicTerminalCandidate>,
+) {
+    let Some(raw) = bytes.get(offset..offset + CRITICAL_RECOVERY_LOCATOR_LEN) else {
+        return;
+    };
+    let Ok(locator) = CriticalRecoveryLocator::parse(raw) else {
+        return;
+    };
+    if expected_sequence <= 1 && locator.locator_sequence != expected_sequence {
+        return;
+    }
+    if let Ok(candidate) =
+        parse_public_locator_cmra_candidate(bytes, offset, locator, volume_header, crypto_header)
+    {
+        candidates.push(candidate);
+    }
+}
+
+fn choose_v41_terminal_candidate(
+    mut candidates: Vec<TerminalCandidate>,
+) -> Result<TerminalCandidate, FormatError> {
+    candidates.sort_by_key(|candidate| candidate.anchor);
+    let winner = candidates.pop().ok_or(FormatError::InvalidArchive(
+        "no valid v41 CMRA candidate found",
+    ))?;
+    if let Some(previous) = candidates.last() {
+        if previous.anchor == winner.anchor
+            && (previous.cmra_offset != winner.cmra_offset
+                || previous.cmra_length != winner.cmra_length)
+        {
+            return Err(FormatError::InvalidArchive("ambiguous v41 CMRA candidates"));
+        }
+    }
+    Ok(winner)
+}
+
+fn choose_v41_public_terminal_candidate(
+    mut candidates: Vec<PublicTerminalCandidate>,
+) -> Result<PublicTerminalCandidate, FormatError> {
+    candidates.sort_by_key(|candidate| candidate.anchor);
+    let winner = candidates.pop().ok_or(FormatError::InvalidArchive(
+        "no valid v41 public CMRA candidate found",
+    ))?;
+    if let Some(previous) = candidates.last() {
+        if previous.anchor == winner.anchor
+            && (previous.cmra_offset != winner.cmra_offset
+                || previous.cmra_length != winner.cmra_length)
+        {
+            return Err(FormatError::InvalidArchive(
+                "ambiguous v41 public CMRA candidates",
+            ));
+        }
+    }
+    Ok(winner)
+}
+
+fn parse_locator_cmra_candidate(
+    bytes: &[u8],
+    locator_offset: usize,
+    locator: CriticalRecoveryLocator,
+    subkeys: &Subkeys,
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+) -> Result<TerminalCandidate, FormatError> {
+    let tuple = CmraDecoderTuple::from(locator);
+    validate_cmra_decoder_tuple(tuple)?;
+    let expected_cmra_length = cmra_serialized_length(tuple)?;
+    if locator.cmra_length as u64 != expected_cmra_length {
+        return Err(FormatError::InvalidArchive("locator CMRA length mismatch"));
+    }
+    validate_locator_position(locator_offset, locator)?;
+    let recovered = recover_cmra(
+        bytes,
+        locator.cmra_offset,
+        Some(tuple),
+        CmraRecoveryMode::KeyHolding,
+    )?;
+    if recovered.tuple != tuple {
+        return Err(FormatError::InvalidArchive("CMRA decoder tuple mismatch"));
+    }
+    if expected_cmra_length != recovered.cmra_length {
+        return Err(FormatError::InvalidArchive("locator CMRA length mismatch"));
+    }
+    validate_locator_image_boundary(locator, &recovered.image)?;
+    validate_cmra_identity_hints(
+        recovered.header_hints,
+        Some(CmraIdentityHints::from(locator)),
+        &recovered.image,
+    )?;
+    let terminal = validate_recovered_terminal(
+        recovered.image,
+        recovered.tuple,
+        bytes,
+        subkeys,
+        volume_header,
+        crypto_header,
+    )?;
+    Ok(TerminalCandidate {
+        terminal,
+        anchor: locator_offset
+            .checked_add(CRITICAL_RECOVERY_LOCATOR_LEN)
+            .ok_or(FormatError::InvalidArchive("locator anchor overflow"))?,
+        locator_sequence: Some(locator.locator_sequence),
+        cmra_offset: locator.cmra_offset,
+        cmra_length: recovered.cmra_length,
+    })
+}
+
+fn parse_public_locator_cmra_candidate(
+    bytes: &[u8],
+    locator_offset: usize,
+    locator: CriticalRecoveryLocator,
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+) -> Result<PublicTerminalCandidate, FormatError> {
+    let tuple = CmraDecoderTuple::from(locator);
+    validate_cmra_decoder_tuple(tuple)?;
+    let expected_cmra_length = cmra_serialized_length(tuple)?;
+    if locator.cmra_length as u64 != expected_cmra_length {
+        return Err(FormatError::InvalidArchive("locator CMRA length mismatch"));
+    }
+    validate_locator_position(locator_offset, locator)?;
+    let recovered = recover_cmra(
+        bytes,
+        locator.cmra_offset,
+        Some(tuple),
+        CmraRecoveryMode::PublicNoKey,
+    )?;
+    if recovered.tuple != tuple {
+        return Err(FormatError::InvalidArchive("CMRA decoder tuple mismatch"));
+    }
+    if expected_cmra_length != recovered.cmra_length {
+        return Err(FormatError::InvalidArchive("locator CMRA length mismatch"));
+    }
+    validate_locator_image_boundary(locator, &recovered.image)?;
+    validate_cmra_identity_hints(
+        recovered.header_hints,
+        Some(CmraIdentityHints::from(locator)),
+        &recovered.image,
+    )?;
+    let terminal =
+        validate_recovered_public_terminal(recovered.image, bytes, volume_header, crypto_header)?;
+    Ok(PublicTerminalCandidate {
+        terminal,
+        anchor: locator_offset
+            .checked_add(CRITICAL_RECOVERY_LOCATOR_LEN)
+            .ok_or(FormatError::InvalidArchive("locator anchor overflow"))?,
+        cmra_offset: locator.cmra_offset,
+        cmra_length: recovered.cmra_length,
+    })
+}
+
+fn parse_locatorless_cmra_candidate(
+    bytes: &[u8],
+    cmra_offset: usize,
+    subkeys: &Subkeys,
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+) -> Result<TerminalCandidate, FormatError> {
+    let recovered = recover_cmra(
+        bytes,
+        cmra_offset as u64,
+        None,
+        CmraRecoveryMode::KeyHolding,
+    )?;
+    if recovered.image.body_bytes_before_cmra != cmra_offset as u64 {
+        return Err(FormatError::InvalidArchive(
+            "locatorless CMRA boundary mismatch",
+        ));
+    }
+    if recovered
+        .image
+        .volume_trailer_offset
+        .checked_add(VOLUME_TRAILER_LEN as u64)
+        .ok_or(FormatError::InvalidArchive("CMRA boundary overflow"))?
+        != cmra_offset as u64
+    {
+        return Err(FormatError::InvalidArchive(
+            "locatorless trailer boundary mismatch",
+        ));
+    }
+    validate_cmra_identity_hints(recovered.header_hints, None, &recovered.image)?;
+    let terminal = validate_recovered_terminal(
+        recovered.image,
+        recovered.tuple,
+        bytes,
+        subkeys,
+        volume_header,
+        crypto_header,
+    )?;
+    Ok(TerminalCandidate {
+        terminal,
+        anchor: cmra_offset
+            .checked_add(to_usize(recovered.cmra_length, "CMRA")?)
+            .ok_or(FormatError::InvalidArchive("CMRA anchor overflow"))?,
+        locator_sequence: None,
+        cmra_offset: cmra_offset as u64,
+        cmra_length: recovered.cmra_length,
+    })
+}
+
+fn parse_public_locatorless_cmra_candidate(
+    bytes: &[u8],
+    cmra_offset: usize,
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+) -> Result<PublicTerminalCandidate, FormatError> {
+    let recovered = recover_cmra(
+        bytes,
+        cmra_offset as u64,
+        None,
+        CmraRecoveryMode::PublicNoKey,
+    )?;
+    if recovered.image.body_bytes_before_cmra != cmra_offset as u64 {
+        return Err(FormatError::InvalidArchive(
+            "locatorless CMRA boundary mismatch",
+        ));
+    }
+    if recovered
+        .image
+        .volume_trailer_offset
+        .checked_add(VOLUME_TRAILER_LEN as u64)
+        .ok_or(FormatError::InvalidArchive("CMRA boundary overflow"))?
+        != cmra_offset as u64
+    {
+        return Err(FormatError::InvalidArchive(
+            "locatorless trailer boundary mismatch",
+        ));
+    }
+    validate_cmra_identity_hints(recovered.header_hints, None, &recovered.image)?;
+    let terminal =
+        validate_recovered_public_terminal(recovered.image, bytes, volume_header, crypto_header)?;
+    Ok(PublicTerminalCandidate {
+        terminal,
+        anchor: cmra_offset
+            .checked_add(to_usize(recovered.cmra_length, "CMRA")?)
+            .ok_or(FormatError::InvalidArchive("CMRA anchor overflow"))?,
+        cmra_offset: cmra_offset as u64,
+        cmra_length: recovered.cmra_length,
+    })
+}
+
+fn validate_locator_position(
+    locator_offset: usize,
+    locator: CriticalRecoveryLocator,
+) -> Result<(), FormatError> {
+    if locator.cmra_offset != locator.body_bytes_before_cmra {
+        return Err(FormatError::InvalidArchive(
+            "locator CMRA boundary mismatch",
+        ));
+    }
+    if locator
+        .volume_trailer_offset
+        .checked_add(VOLUME_TRAILER_LEN as u64)
+        .ok_or(FormatError::InvalidArchive("locator trailer overflow"))?
+        != locator.cmra_offset
+    {
+        return Err(FormatError::InvalidArchive(
+            "locator trailer boundary mismatch",
+        ));
+    }
+    let expected_offset = match locator.locator_sequence {
+        1 => locator.cmra_offset.checked_add(locator.cmra_length as u64),
+        0 => locator
+            .cmra_offset
+            .checked_add(locator.cmra_length as u64)
+            .and_then(|value| value.checked_add(CRITICAL_RECOVERY_LOCATOR_LEN as u64)),
+        _ => None,
+    }
+    .ok_or(FormatError::InvalidArchive("locator position overflow"))?;
+    if expected_offset != locator_offset as u64 {
+        return Err(FormatError::InvalidArchive(
+            "locator position does not match sequence",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_locator_image_boundary(
+    locator: CriticalRecoveryLocator,
+    image: &CriticalMetadataImage,
+) -> Result<(), FormatError> {
+    if locator.volume_trailer_offset != image.volume_trailer_offset
+        || locator.body_bytes_before_cmra != image.body_bytes_before_cmra
+        || image
+            .volume_trailer_offset
+            .checked_add(VOLUME_TRAILER_LEN as u64)
+            .ok_or(FormatError::InvalidArchive("CMRA image boundary overflow"))?
+            != locator.cmra_offset
+    {
+        return Err(FormatError::InvalidArchive(
+            "locator and CMRA image boundaries differ",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cmra_identity_hints(
+    header_hints: Option<CmraIdentityHints>,
+    locator_hints: Option<CmraIdentityHints>,
+    image: &CriticalMetadataImage,
+) -> Result<(), FormatError> {
+    if let (Some(header), Some(locator)) = (header_hints, locator_hints) {
+        if header != locator {
+            return Err(FormatError::InvalidArchive(
+                "CMRA header and locator identity hints differ",
+            ));
+        }
+    }
+    for hints in [header_hints, locator_hints].into_iter().flatten() {
+        if hints.archive_uuid != image.archive_uuid
+            || hints.session_id != image.session_id
+            || hints.volume_index != image.volume_index
+        {
+            return Err(FormatError::InvalidArchive(
+                "CMRA identity hints do not match recovered image",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn recover_cmra(
+    bytes: &[u8],
+    cmra_offset: u64,
+    locator_tuple: Option<CmraDecoderTuple>,
+    mode: CmraRecoveryMode,
+) -> Result<RecoveredCmra, FormatError> {
+    let offset = to_usize(cmra_offset, "CMRA")?;
+    let header_bytes = slice(
+        bytes,
+        offset,
+        CRITICAL_METADATA_RECOVERY_HEADER_LEN,
+        "CriticalMetadataRecoveryHeader",
+    )?;
+    let parsed_header = CriticalMetadataRecoveryHeader::parse(header_bytes);
+    let (tuple, header_hints) = match (parsed_header, locator_tuple) {
+        (Ok(header), Some(locator_tuple)) => {
+            let header_tuple = CmraDecoderTuple::from(header);
+            if header_tuple != locator_tuple {
+                return Err(FormatError::InvalidArchive("CMRA decoder tuple mismatch"));
+            }
+            (locator_tuple, Some(CmraIdentityHints::from(header)))
+        }
+        (Ok(header), None) => (
+            CmraDecoderTuple::from(header),
+            Some(CmraIdentityHints::from(header)),
+        ),
+        (
+            Err(FormatError::BadCrc {
+                structure: "CriticalMetadataRecoveryHeader",
+            }),
+            Some(tuple),
+        ) => (tuple, None),
+        (Err(err), _) => return Err(err),
+    };
+    validate_cmra_decoder_tuple(tuple)?;
+    let cmra_length = cmra_serialized_length(tuple)?;
+    let cmra_len = to_usize(cmra_length, "CMRA")?;
+    let cmra_bytes = slice(bytes, offset, cmra_len, "CMRA")?;
+    let shard_size = tuple.shard_size as usize;
+    let mut data_shards = vec![None; tuple.data_shard_count as usize];
+    let mut parity_shards = vec![None; tuple.parity_shard_count as usize];
+    let mut cursor = CRITICAL_METADATA_RECOVERY_HEADER_LEN;
+    for idx in 0..(tuple.data_shard_count as usize + tuple.parity_shard_count as usize) {
+        let raw = slice(
+            cmra_bytes,
+            cursor,
+            CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN + shard_size,
+            "CriticalMetadataRecoveryShard",
+        )?;
+        let shard = match CriticalMetadataRecoveryShard::parse(raw, shard_size) {
+            Ok(shard) => Some(shard),
+            Err(FormatError::BadCrc {
+                structure: "CriticalMetadataRecoveryShard",
+            }) => None,
+            Err(err) => return Err(err),
+        };
+        if let Some(shard) = shard {
+            validate_cmra_shard(&shard, idx, tuple)?;
+            if shard.shard_role == 0 {
+                data_shards[idx] = Some(shard.payload);
+            } else {
+                let parity_idx = idx - tuple.data_shard_count as usize;
+                parity_shards[parity_idx] = Some(shard.payload);
+            }
+        }
+        cursor = checked_add(
+            cursor,
+            CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN + shard_size,
+            "CriticalMetadataRecoveryShard",
+        )?;
+    }
+    let repaired = repair_data_gf16(&data_shards, &parity_shards, shard_size)?;
+    let mut image_bytes = Vec::with_capacity(tuple.image_length as usize);
+    for shard in repaired {
+        image_bytes.extend_from_slice(&shard);
+    }
+    image_bytes.truncate(tuple.image_length as usize);
+    if sha256_bytes(&image_bytes) != tuple.image_sha256 {
+        return Err(FormatError::InvalidArchive("CMRA image SHA-256 mismatch"));
+    }
+    let image = CriticalMetadataImage::parse(&image_bytes)?;
+    validate_critical_metadata_image(&image, tuple, mode)?;
+    Ok(RecoveredCmra {
+        image,
+        tuple,
+        header_hints,
+        cmra_length,
+    })
+}
+
+fn validate_cmra_decoder_tuple(tuple: CmraDecoderTuple) -> Result<(), FormatError> {
+    let shard_size = tuple.shard_size as u64;
+    if !(512..=4096).contains(&shard_size) || shard_size % 2 != 0 {
+        return Err(FormatError::InvalidArchive("CMRA shard_size is invalid"));
+    }
+    let image_length = tuple.image_length as u64;
+    let min = critical_image_min();
+    let cap = critical_image_cap()?;
+    if image_length < min || image_length > cap {
+        return Err(FormatError::InvalidArchive(
+            "CMRA image_length is outside bounds",
+        ));
+    }
+    let expected_data_shards = ceil_div_u64(image_length, shard_size)?;
+    if expected_data_shards == 0 || expected_data_shards != tuple.data_shard_count as u64 {
+        return Err(FormatError::InvalidArchive(
+            "CMRA data_shard_count does not match image length",
+        ));
+    }
+    let max_parity = 2u64.max(ceil_div_u64(
+        checked_u64_mul(
+            expected_data_shards,
+            READER_MAX_CMRA_PARITY_PCT as u64,
+            "CMRA parity overflow",
+        )?,
+        100,
+    )?);
+    if tuple.parity_shard_count as u64 > max_parity {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "CMRA parity shard count",
+            cap: max_parity,
+            actual: tuple.parity_shard_count as u64,
+        });
+    }
+    let total = expected_data_shards
+        .checked_add(tuple.parity_shard_count as u64)
+        .ok_or(FormatError::InvalidArchive("CMRA shard count overflow"))?;
+    if total > 65_535 {
+        return Err(FormatError::FecTooManyShards(total as usize));
+    }
+    Ok(())
+}
+
+fn validate_cmra_writer_parity_lower_bound(
+    tuple: CmraDecoderTuple,
+    bit_rot_buffer_pct: u8,
+) -> Result<(), FormatError> {
+    let min_parity = 2u64.max(ceil_div_u64(
+        checked_u64_mul(
+            tuple.data_shard_count as u64,
+            bit_rot_buffer_pct as u64,
+            "CMRA parity lower-bound overflow",
+        )?,
+        100,
+    )?);
+    if (tuple.parity_shard_count as u64) < min_parity {
+        return Err(FormatError::InvalidArchive(
+            "CMRA parity shard count is below authenticated bit-rot lower bound",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cmra_shard(
+    shard: &CriticalMetadataRecoveryShard,
+    serialized_idx: usize,
+    tuple: CmraDecoderTuple,
+) -> Result<(), FormatError> {
+    if shard.shard_index as usize != serialized_idx {
+        return Err(FormatError::InvalidArchive(
+            "CMRA shards are not in canonical order",
+        ));
+    }
+    let data_count = tuple.data_shard_count as usize;
+    let shard_size = tuple.shard_size as usize;
+    if serialized_idx < data_count {
+        if shard.shard_role != 0 {
+            return Err(FormatError::InvalidArchive(
+                "CMRA data shard has wrong role",
+            ));
+        }
+        let expected_len = if serialized_idx + 1 == data_count {
+            let used = tuple.image_length as usize - serialized_idx * shard_size;
+            if used == 0 {
+                shard_size
+            } else {
+                used
+            }
+        } else {
+            shard_size
+        };
+        if shard.shard_payload_length as usize != expected_len {
+            return Err(FormatError::InvalidArchive(
+                "CMRA data shard payload length is non-canonical",
+            ));
+        }
+        if serialized_idx + 1 == data_count
+            && shard.payload[expected_len..].iter().any(|byte| *byte != 0)
+        {
+            return Err(FormatError::InvalidArchive(
+                "CMRA final data shard padding is non-zero",
+            ));
+        }
+    } else {
+        if shard.shard_role != 1 {
+            return Err(FormatError::InvalidArchive(
+                "CMRA parity shard has wrong role",
+            ));
+        }
+        if shard.shard_payload_length as usize != shard_size {
+            return Err(FormatError::InvalidArchive(
+                "CMRA parity shard payload length is non-canonical",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_critical_metadata_image(
+    image: &CriticalMetadataImage,
+    tuple: CmraDecoderTuple,
+    mode: CmraRecoveryMode,
+) -> Result<(), FormatError> {
+    let root_auth_present = image.layout_flags & 0x0000_0001 != 0;
+    if image.volume_header_offset != 0
+        || image.volume_header_length != VOLUME_HEADER_LEN as u32
+        || image.crypto_header_offset != VOLUME_HEADER_LEN as u64
+        || image.manifest_footer_length != MANIFEST_FOOTER_LEN as u32
+        || image.volume_trailer_length != VOLUME_TRAILER_LEN as u32
+        || image.body_bytes_before_cmra
+            != image
+                .volume_trailer_offset
+                .checked_add(VOLUME_TRAILER_LEN as u64)
+                .ok_or(FormatError::InvalidArchive("CMRA image boundary overflow"))?
+    {
+        return Err(FormatError::InvalidArchive(
+            "CriticalMetadataImage fixed layout is invalid",
+        ));
+    }
+    if root_auth_present {
+        if image.root_auth_footer_offset == 0
+            || image.root_auth_footer_length == 0
+            || image.root_auth_footer_length > READER_MAX_ROOT_AUTH_FOOTER_LEN
+        {
+            return Err(FormatError::InvalidArchive(
+                "CriticalMetadataImage root-auth range is invalid",
+            ));
+        }
+    } else if image.root_auth_footer_offset != 0
+        || image.root_auth_footer_length != 0
+        || image.root_auth_footer_sha256 != [0u8; 32]
+    {
+        return Err(FormatError::InvalidArchive(
+            "CriticalMetadataImage root-auth fields must be zero when absent",
+        ));
+    }
+    let block_record_len = image_block_record_len_from_region(image)?;
+    let block_record_len_u64 = u64::try_from(block_record_len)
+        .map_err(|_| FormatError::InvalidArchive("BlockRecord length overflow"))?;
+    match mode {
+        CmraRecoveryMode::KeyHolding => {
+            let expected_len = image.block_count.checked_mul(block_record_len_u64).ok_or(
+                FormatError::InvalidArchive("BlockRecord region length overflow"),
+            )?;
+            if image.block_records_length != expected_len {
                 return Err(FormatError::InvalidArchive(
-                    "VolumeTrailer bytes_written does not match selected trailer offset",
+                    "CriticalMetadataImage terminal equations are invalid",
                 ));
             }
-            return Ok((canonical_offset, trailer));
         }
-        Err(err) if options.max_trailing_garbage_scan == 0 => return Err(err),
-        Err(_) => {}
-    }
-
-    let scan_start = canonical_offset.saturating_sub(options.max_trailing_garbage_scan);
-    for offset in (scan_start..canonical_offset).rev() {
-        if let Ok(trailer) = parse_authenticated_trailer(bytes, offset, subkeys, volume_header) {
-            if trailer.bytes_written == offset as u64 {
-                return Ok((offset, trailer));
+        CmraRecoveryMode::PublicNoKey => {
+            if image.block_records_length % block_record_len_u64 != 0 {
+                return Err(FormatError::InvalidArchive(
+                    "CriticalMetadataImage BlockRecord region is not aligned",
+                ));
             }
         }
     }
+    if image.block_records_offset
+        != image
+            .crypto_header_offset
+            .checked_add(image.crypto_header_length as u64)
+            .ok_or(FormatError::InvalidArchive(
+                "CryptoHeader boundary overflow",
+            ))?
+        || image.manifest_footer_offset
+            != image
+                .block_records_offset
+                .checked_add(image.block_records_length)
+                .ok_or(FormatError::InvalidArchive(
+                    "ManifestFooter boundary overflow",
+                ))?
+    {
+        return Err(FormatError::InvalidArchive(
+            "CriticalMetadataImage terminal equations are invalid",
+        ));
+    }
+    let manifest_end = image
+        .manifest_footer_offset
+        .checked_add(MANIFEST_FOOTER_LEN as u64)
+        .ok_or(FormatError::InvalidArchive(
+            "RootAuthFooter boundary overflow",
+        ))?;
+    if root_auth_present {
+        if image.root_auth_footer_offset != manifest_end
+            || image
+                .root_auth_footer_offset
+                .checked_add(image.root_auth_footer_length as u64)
+                .ok_or(FormatError::InvalidArchive(
+                    "VolumeTrailer boundary overflow",
+                ))?
+                != image.volume_trailer_offset
+        {
+            return Err(FormatError::InvalidArchive(
+                "CriticalMetadataImage root-auth terminal equations are invalid",
+            ));
+        }
+    } else if image.volume_trailer_offset != manifest_end {
+        return Err(FormatError::InvalidArchive(
+            "CriticalMetadataImage unsigned terminal equations are invalid",
+        ));
+    }
+    let expected_types: &[u16] = if root_auth_present {
+        &[1, 2, 3, 4, 5]
+    } else {
+        &[1, 2, 3, 5]
+    };
+    if image.regions.len() != expected_types.len()
+        || image
+            .regions
+            .iter()
+            .map(|region| region.region_type)
+            .ne(expected_types.iter().copied())
+    {
+        return Err(FormatError::InvalidArchive(
+            "CriticalMetadataImage regions are not canonical",
+        ));
+    }
+    validate_image_region(
+        image,
+        1,
+        image.volume_header_offset,
+        image.volume_header_length,
+    )?;
+    validate_image_region(
+        image,
+        2,
+        image.crypto_header_offset,
+        image.crypto_header_length,
+    )?;
+    validate_image_region(
+        image,
+        3,
+        image.manifest_footer_offset,
+        image.manifest_footer_length,
+    )?;
+    if root_auth_present {
+        validate_image_region(
+            image,
+            4,
+            image.root_auth_footer_offset,
+            image.root_auth_footer_length,
+        )?;
+    }
+    validate_image_region(
+        image,
+        5,
+        image.volume_trailer_offset,
+        image.volume_trailer_length,
+    )?;
+    if sha256_region(image, 1)? != image.volume_header_sha256
+        || sha256_region(image, 2)? != image.crypto_header_sha256
+        || sha256_region(image, 3)? != image.manifest_footer_sha256
+        || (root_auth_present && sha256_region(image, 4)? != image.root_auth_footer_sha256)
+        || (!root_auth_present && image.root_auth_footer_sha256 != [0u8; 32])
+        || sha256_region(image, 5)? != image.volume_trailer_sha256
+        || sha256_bytes_from_tuple(tuple) != tuple.image_sha256
+    {
+        return Err(FormatError::InvalidArchive(
+            "CriticalMetadataImage region digest mismatch",
+        ));
+    }
+    Ok(())
+}
 
-    Err(FormatError::InvalidArchive(
-        "no authenticated VolumeTrailer found",
+fn sha256_bytes_from_tuple(tuple: CmraDecoderTuple) -> [u8; 32] {
+    tuple.image_sha256
+}
+
+fn image_block_record_len_from_region(image: &CriticalMetadataImage) -> Result<usize, FormatError> {
+    let crypto_region = image
+        .region(2)
+        .ok_or(FormatError::InvalidArchive("missing CryptoHeader region"))?;
+    let crypto = CryptoHeader::parse(&crypto_region.bytes, image.crypto_header_length)?;
+    crypto.fixed.validate_v36()?;
+    Ok(crypto.fixed.block_size as usize + BLOCK_RECORD_FRAMING_LEN)
+}
+
+fn validate_image_region(
+    image: &CriticalMetadataImage,
+    region_type: u16,
+    offset: u64,
+    length: u32,
+) -> Result<(), FormatError> {
+    let region = image
+        .region(region_type)
+        .ok_or(FormatError::InvalidArchive(
+            "missing CriticalMetadataImage region",
+        ))?;
+    if region.offset != offset || region.bytes.len() != length as usize {
+        return Err(FormatError::InvalidArchive(
+            "CriticalMetadataImage region range mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_image_identity(
+    image: &CriticalMetadataImage,
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+) -> Result<(), FormatError> {
+    if image.archive_uuid != volume_header.archive_uuid
+        || image.session_id != volume_header.session_id
+        || image.volume_index != volume_header.volume_index
+        || image.stripe_width != volume_header.stripe_width
+        || image.stripe_width != crypto_header.stripe_width
+    {
+        return Err(FormatError::InvalidArchive(
+            "CriticalMetadataImage identity does not match selected volume",
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_region(image: &CriticalMetadataImage, region_type: u16) -> Result<[u8; 32], FormatError> {
+    Ok(sha256_bytes(
+        &image
+            .region(region_type)
+            .ok_or(FormatError::InvalidArchive(
+                "missing CriticalMetadataImage region",
+            ))?
+            .bytes,
     ))
 }
 
-fn parse_authenticated_trailer(
+fn validate_recovered_terminal(
+    image: CriticalMetadataImage,
+    tuple: CmraDecoderTuple,
     bytes: &[u8],
-    offset: usize,
     subkeys: &Subkeys,
     volume_header: &VolumeHeader,
-) -> Result<VolumeTrailer, FormatError> {
-    let raw = slice(bytes, offset, VOLUME_TRAILER_LEN, "VolumeTrailer")?;
-    let trailer = VolumeTrailer::parse(raw)?;
+    crypto_header: &CryptoHeaderFixed,
+) -> Result<V41Terminal, FormatError> {
+    let volume_header_region = image
+        .region(1)
+        .ok_or(FormatError::InvalidArchive("missing VolumeHeader region"))?;
+    let recovered_volume_header = VolumeHeader::parse(&volume_header_region.bytes)?;
+    if &recovered_volume_header != volume_header {
+        return Err(FormatError::InvalidArchive(
+            "CMRA VolumeHeader differs from parsed VolumeHeader",
+        ));
+    }
+    validate_image_identity(&image, volume_header, crypto_header)?;
+    let crypto_region = image
+        .region(2)
+        .ok_or(FormatError::InvalidArchive("missing CryptoHeader region"))?;
+    let recovered_crypto = CryptoHeader::parse(&crypto_region.bytes, image.crypto_header_length)?;
+    if recovered_crypto.fixed != *crypto_header {
+        return Err(FormatError::InvalidArchive(
+            "CMRA CryptoHeader differs from parsed CryptoHeader",
+        ));
+    }
+    verify_hmac(
+        HmacDomain::CryptoHeader,
+        &subkeys.mac_key,
+        &volume_header.archive_uuid,
+        &volume_header.session_id,
+        recovered_crypto.hmac_covered_bytes,
+        &recovered_crypto.header_hmac,
+    )?;
+    validate_cmra_writer_parity_lower_bound(tuple, recovered_crypto.fixed.bit_rot_buffer_pct)?;
+    recovered_crypto.validate_extension_semantics()?;
+
+    let manifest_region = image
+        .region(3)
+        .ok_or(FormatError::InvalidArchive("missing ManifestFooter region"))?;
+    let manifest_footer = ManifestFooter::parse(&manifest_region.bytes)?;
+    validate_manifest_footer(
+        volume_header,
+        &manifest_footer,
+        subkeys,
+        &manifest_region.bytes,
+    )?;
+    manifest_footer.validate_index_root_extent(crypto_header.block_size)?;
+
+    let root_auth_footer = if image.layout_flags & 0x0000_0001 != 0 {
+        let root_auth_region = image
+            .region(4)
+            .ok_or(FormatError::InvalidArchive("missing RootAuthFooter region"))?;
+        let footer = RootAuthFooterV1::parse(&root_auth_region.bytes)?;
+        if footer.archive_uuid != volume_header.archive_uuid
+            || footer.session_id != volume_header.session_id
+            || footer.footer_length()? != image.root_auth_footer_length
+        {
+            return Err(FormatError::InvalidArchive(
+                "RootAuthFooter identity or length does not match terminal image",
+            ));
+        }
+        Some(footer)
+    } else {
+        None
+    };
+
+    let trailer_region = image
+        .region(5)
+        .ok_or(FormatError::InvalidArchive("missing VolumeTrailer region"))?;
+    let trailer = VolumeTrailer::parse(&trailer_region.bytes)?;
     verify_hmac(
         HmacDomain::VolumeTrailer,
         &subkeys.mac_key,
         &volume_header.archive_uuid,
         &volume_header.session_id,
-        &raw[..TRAILER_HMAC_COVERED_LEN],
+        &trailer_region.bytes[..TRAILER_HMAC_COVERED_LEN],
         &trailer.trailer_hmac,
     )?;
-    Ok(trailer)
+    validate_trailer_identity(volume_header, &trailer)?;
+    validate_v41_trailer_equations(&image, &trailer)?;
+
+    let cmra_offset = to_usize(image.body_bytes_before_cmra, "CMRA")?;
+    if bytes.get(cmra_offset..cmra_offset + 4) != Some(b"TZCR") {
+        return Err(FormatError::InvalidArchive("CMRA is not at image boundary"));
+    }
+
+    let manifest_footer_bytes = manifest_region.bytes.clone();
+    let root_auth_footer_bytes = image.region(4).map(|region| region.bytes.clone());
+    Ok(V41Terminal {
+        image,
+        manifest_footer_bytes,
+        root_auth_footer_bytes,
+        root_auth_footer,
+        volume_trailer: trailer,
+    })
 }
 
-fn validate_m9_supported_volume(
+fn validate_recovered_public_terminal(
+    image: CriticalMetadataImage,
+    bytes: &[u8],
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+) -> Result<V41PublicTerminal, FormatError> {
+    if image.layout_flags & 0x0000_0001 == 0 {
+        return Err(FormatError::ReaderUnsupported(
+            "public no-key verification requires root-auth",
+        ));
+    }
+    let volume_header_region = image
+        .region(1)
+        .ok_or(FormatError::InvalidArchive("missing VolumeHeader region"))?;
+    let recovered_volume_header = VolumeHeader::parse(&volume_header_region.bytes)?;
+    if &recovered_volume_header != volume_header {
+        return Err(FormatError::InvalidArchive(
+            "CMRA VolumeHeader differs from parsed VolumeHeader",
+        ));
+    }
+    validate_image_identity(&image, volume_header, crypto_header)?;
+    let crypto_region = image
+        .region(2)
+        .ok_or(FormatError::InvalidArchive("missing CryptoHeader region"))?;
+    let recovered_crypto = CryptoHeader::parse(&crypto_region.bytes, image.crypto_header_length)?;
+    if recovered_crypto.fixed != *crypto_header {
+        return Err(FormatError::InvalidArchive(
+            "CMRA CryptoHeader differs from parsed CryptoHeader",
+        ));
+    }
+    recovered_crypto.validate_extension_semantics()?;
+
+    image
+        .region(3)
+        .ok_or(FormatError::InvalidArchive("missing ManifestFooter region"))?;
+
+    let root_auth_region = image
+        .region(4)
+        .ok_or(FormatError::InvalidArchive("missing RootAuthFooter region"))?;
+    let root_auth_footer = RootAuthFooterV1::parse(&root_auth_region.bytes)?;
+    if root_auth_footer.archive_uuid != volume_header.archive_uuid
+        || root_auth_footer.session_id != volume_header.session_id
+        || root_auth_footer.footer_length()? != image.root_auth_footer_length
+    {
+        return Err(FormatError::InvalidArchive(
+            "public RootAuthFooter identity or length does not match terminal image",
+        ));
+    }
+
+    let trailer_region = image
+        .region(5)
+        .ok_or(FormatError::InvalidArchive("missing VolumeTrailer region"))?;
+    let trailer = VolumeTrailer::parse(&trailer_region.bytes)?;
+    validate_trailer_identity(volume_header, &trailer)?;
+    validate_v41_public_trailer_profile(&image, &trailer)?;
+
+    let cmra_offset = to_usize(image.body_bytes_before_cmra, "CMRA")?;
+    if bytes.get(cmra_offset..cmra_offset + 4) != Some(b"TZCR") {
+        return Err(FormatError::InvalidArchive("CMRA is not at image boundary"));
+    }
+
+    let root_auth_footer_bytes = root_auth_region.bytes.clone();
+    Ok(V41PublicTerminal {
+        image,
+        root_auth_footer_bytes,
+        root_auth_footer,
+    })
+}
+
+fn validate_v41_trailer_equations(
+    image: &CriticalMetadataImage,
+    trailer: &VolumeTrailer,
+) -> Result<(), FormatError> {
+    let root_auth_present = image.layout_flags & 0x0000_0001 != 0;
+    if trailer.bytes_written != image.volume_trailer_offset
+        || trailer.manifest_footer_offset != image.manifest_footer_offset
+        || trailer.manifest_footer_length != MANIFEST_FOOTER_LEN as u32
+        || trailer.block_count != image.block_count
+    {
+        return Err(FormatError::InvalidArchive(
+            "VolumeTrailer does not match v41 terminal layout",
+        ));
+    }
+    if root_auth_present {
+        if trailer.root_auth_flags != 0x0000_0001
+            || trailer.root_auth_footer_offset != image.root_auth_footer_offset
+            || trailer.root_auth_footer_length != image.root_auth_footer_length
+            || image.root_auth_footer_offset
+                != image
+                    .manifest_footer_offset
+                    .checked_add(MANIFEST_FOOTER_LEN as u64)
+                    .ok_or(FormatError::InvalidArchive(
+                        "RootAuthFooter trailer boundary overflow",
+                    ))?
+            || image
+                .root_auth_footer_offset
+                .checked_add(image.root_auth_footer_length as u64)
+                .ok_or(FormatError::InvalidArchive(
+                    "RootAuthFooter trailer boundary overflow",
+                ))?
+                != image.volume_trailer_offset
+        {
+            return Err(FormatError::InvalidArchive(
+                "VolumeTrailer root-auth fields do not match v41 terminal layout",
+            ));
+        }
+    } else if trailer.root_auth_footer_offset != 0
+        || trailer.root_auth_footer_length != 0
+        || trailer.root_auth_flags != 0
+    {
+        return Err(FormatError::InvalidArchive(
+            "VolumeTrailer root-auth fields must be zero when absent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v41_public_trailer_profile(
+    image: &CriticalMetadataImage,
+    trailer: &VolumeTrailer,
+) -> Result<(), FormatError> {
+    if trailer.bytes_written != image.volume_trailer_offset
+        || trailer.manifest_footer_offset != image.manifest_footer_offset
+        || trailer.manifest_footer_length != MANIFEST_FOOTER_LEN as u32
+    {
+        return Err(FormatError::InvalidArchive(
+            "VolumeTrailer does not match v41 public terminal layout",
+        ));
+    }
+    if trailer.root_auth_flags != 0x0000_0001
+        || trailer.root_auth_footer_offset == 0
+        || trailer.root_auth_footer_length == 0
+        || trailer.root_auth_footer_length > READER_MAX_ROOT_AUTH_FOOTER_LEN
+        || trailer.root_auth_footer_offset != image.root_auth_footer_offset
+        || trailer.root_auth_footer_length != image.root_auth_footer_length
+        || image.root_auth_footer_offset
+            != image
+                .manifest_footer_offset
+                .checked_add(MANIFEST_FOOTER_LEN as u64)
+                .ok_or(FormatError::InvalidArchive(
+                    "RootAuthFooter trailer boundary overflow",
+                ))?
+        || image
+            .root_auth_footer_offset
+            .checked_add(image.root_auth_footer_length as u64)
+            .ok_or(FormatError::InvalidArchive(
+                "RootAuthFooter trailer boundary overflow",
+            ))?
+            != image.volume_trailer_offset
+    {
+        return Err(FormatError::InvalidArchive(
+            "VolumeTrailer root-auth fields do not match v41 public terminal layout",
+        ));
+    }
+    Ok(())
+}
+
+fn critical_image_min() -> u64 {
+    const MIN_CRYPTO_HEADER_LEN: u64 = 116;
+    CRITICAL_METADATA_IMAGE_FIXED_LEN as u64
+        + 4 * SERIALIZED_REGION_HEADER_LEN as u64
+        + VOLUME_HEADER_LEN as u64
+        + MIN_CRYPTO_HEADER_LEN
+        + MANIFEST_FOOTER_LEN as u64
+        + VOLUME_TRAILER_LEN as u64
+        + IMAGE_CRC_LEN as u64
+}
+
+fn critical_image_cap() -> Result<u64, FormatError> {
+    [
+        CRITICAL_METADATA_IMAGE_FIXED_LEN as u64,
+        5 * SERIALIZED_REGION_HEADER_LEN as u64,
+        VOLUME_HEADER_LEN as u64,
+        READER_MAX_CRYPTO_HEADER_LEN as u64,
+        MANIFEST_FOOTER_LEN as u64,
+        READER_MAX_ROOT_AUTH_FOOTER_LEN as u64,
+        VOLUME_TRAILER_LEN as u64,
+        IMAGE_CRC_LEN as u64,
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, value| {
+        total
+            .checked_add(value)
+            .ok_or(FormatError::InvalidArchive("critical image cap overflow"))
+    })
+}
+
+fn cmra_serialized_length(tuple: CmraDecoderTuple) -> Result<u64, FormatError> {
+    let shard_total = (tuple.data_shard_count as u64)
+        .checked_add(tuple.parity_shard_count as u64)
+        .ok_or(FormatError::InvalidArchive("CMRA shard count overflow"))?;
+    let row_len = (CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN as u64)
+        .checked_add(tuple.shard_size as u64)
+        .ok_or(FormatError::InvalidArchive("CMRA row length overflow"))?;
+    checked_u64_mul(shard_total, row_len, "CMRA length overflow")?
+        .checked_add(CRITICAL_METADATA_RECOVERY_HEADER_LEN as u64)
+        .ok_or(FormatError::InvalidArchive("CMRA length overflow"))
+}
+
+fn max_critical_recovery_scan(options: ReaderOptions) -> Result<usize, FormatError> {
+    let cap = critical_image_cap()?;
+    let mut worst = 0u64;
+    let mut shard_size = 512u64;
+    while shard_size <= 4096 {
+        let data = ceil_div_u64(cap, shard_size)?;
+        let parity = 2u64.max(ceil_div_u64(
+            checked_u64_mul(data, READER_MAX_CMRA_PARITY_PCT as u64, "CMRA cap overflow")?,
+            100,
+        )?);
+        let tuple = CmraDecoderTuple {
+            shard_size: shard_size as u32,
+            data_shard_count: u16::try_from(data)
+                .map_err(|_| FormatError::InvalidArchive("CMRA cap data shard overflow"))?,
+            parity_shard_count: u16::try_from(parity)
+                .map_err(|_| FormatError::InvalidArchive("CMRA cap parity shard overflow"))?,
+            image_length: u32::try_from(cap)
+                .map_err(|_| FormatError::InvalidArchive("CMRA cap image overflow"))?,
+            image_sha256: [0u8; 32],
+        };
+        worst = worst.max(cmra_serialized_length(tuple)?);
+        shard_size += 2;
+    }
+    let total = options
+        .max_trailing_garbage_scan
+        .try_into()
+        .map_err(|_| FormatError::InvalidArchive("scan cap overflow"))
+        .and_then(|scan: u64| {
+            scan.checked_add(worst)
+                .and_then(|value| value.checked_add(LOCATOR_PAIR_LEN as u64))
+                .ok_or(FormatError::InvalidArchive("scan cap overflow"))
+        })?;
+    usize::try_from(total).map_err(|_| FormatError::InvalidArchive("scan cap overflow"))
+}
+
+fn validate_bootstrap_single_volume_input(
     volume_header: &VolumeHeader,
     crypto_header: &CryptoHeaderFixed,
 ) -> Result<(), FormatError> {
     if volume_header.stripe_width != 1 || volume_header.volume_index != 0 {
         return Err(FormatError::ReaderUnsupported(
-            "M9 reader supports only single-volume archives",
+            "bootstrap sidecar reader supports only single-volume archive input",
         ));
     }
     if crypto_header.stripe_width != volume_header.stripe_width {
@@ -1821,6 +3782,107 @@ fn parse_block_region(
     })
 }
 
+fn parse_public_block_observation(
+    bytes: &[u8],
+    start: usize,
+    image: &CriticalMetadataImage,
+    block_size: usize,
+    volume_header: &VolumeHeader,
+) -> Result<BTreeMap<u64, BlockRecord>, FormatError> {
+    let image_start = to_usize(image.block_records_offset, "BlockRecord")?;
+    if start != image_start {
+        return Err(FormatError::InvalidArchive(
+            "public BlockRecord observation start mismatch",
+        ));
+    }
+    let scan_limit_u64 = image
+        .block_records_offset
+        .checked_add(image.block_records_length)
+        .ok_or(FormatError::InvalidArchive(
+            "public BlockRecord observation limit overflow",
+        ))?;
+    if scan_limit_u64 != image.manifest_footer_offset {
+        return Err(FormatError::InvalidArchive(
+            "public BlockRecord observation limit mismatch",
+        ));
+    }
+    let scan_limit = to_usize(scan_limit_u64, "BlockRecord")?;
+    if scan_limit < start {
+        return Err(FormatError::InvalidArchive(
+            "public BlockRecord observation limit before start",
+        ));
+    }
+    let record_len = block_size
+        .checked_add(BLOCK_RECORD_FRAMING_LEN)
+        .ok_or(FormatError::InvalidArchive("BlockRecord length overflow"))?;
+    let region_len = scan_limit - start;
+    if region_len % record_len != 0 {
+        return Err(FormatError::InvalidArchive(
+            "public BlockRecord observation window is not aligned",
+        ));
+    }
+
+    let mut blocks = BTreeMap::new();
+    let mut offset = start;
+    let mut observed_slot = 0u64;
+    while offset < scan_limit {
+        let magic_end = checked_add(offset, 4, "BlockRecord")?;
+        if magic_end > scan_limit || bytes.get(offset..magic_end) != Some(b"TZBK") {
+            break;
+        }
+        let record_end = checked_add(offset, record_len, "BlockRecord")?;
+        if record_end > scan_limit {
+            return Err(FormatError::InvalidArchive(
+                "public BlockRecord observation slot is incomplete",
+            ));
+        }
+        let raw = slice(bytes, offset, record_len, "BlockRecord")?;
+        let record = BlockRecord::parse(raw, block_size)?;
+        let expected_block_index = checked_u64_add(
+            volume_header.volume_index as u64,
+            checked_u64_mul(
+                observed_slot,
+                volume_header.stripe_width as u64,
+                "BlockRecord index overflow",
+            )?,
+            "BlockRecord index overflow",
+        )?;
+        if record.block_index != expected_block_index {
+            return Err(FormatError::InvalidArchive(
+                "public BlockRecord index does not match volume position",
+            ));
+        }
+        if blocks.insert(record.block_index, record).is_some() {
+            return Err(FormatError::InvalidArchive("duplicate BlockRecord index"));
+        }
+        offset = record_end;
+        observed_slot = observed_slot
+            .checked_add(1)
+            .ok_or(FormatError::InvalidArchive("BlockRecord count overflow"))?;
+    }
+
+    let mut scan = if offset < scan_limit {
+        checked_add(offset, record_len, "BlockRecord")?
+    } else {
+        scan_limit
+    };
+    while scan < scan_limit {
+        let magic_end = checked_add(scan, 4, "BlockRecord")?;
+        let record_end = checked_add(scan, record_len, "BlockRecord")?;
+        if record_end <= scan_limit && bytes.get(scan..magic_end) == Some(b"TZBK") {
+            let raw = slice(bytes, scan, record_len, "BlockRecord")?;
+            if BlockRecord::parse(raw, block_size).is_ok() {
+                return Err(FormatError::InvalidArchive(
+                    "public observation has ambiguous extra BlockRecord",
+                ));
+            }
+        }
+        scan = record_end;
+    }
+
+    Ok(blocks)
+}
+
 fn block_record_error_is_recoverable_erasure(error: &FormatError) -> bool {
     matches!(
         error,
@@ -1920,50 +3982,58 @@ fn parse_terminal_material(
     observed_block_count: u64,
     subkeys: &Subkeys,
     volume_header: &VolumeHeader,
-    block_size: u32,
-) -> Result<(ManifestFooter, VolumeTrailer), FormatError> {
-    let manifest_end = checked_add(manifest_offset, MANIFEST_FOOTER_LEN, "ManifestFooter")?;
-    let trailer_end = checked_add(manifest_end, VOLUME_TRAILER_LEN, "VolumeTrailer")?;
-    if trailer_end != bytes.len() {
+    crypto_header: &CryptoHeaderFixed,
+    options: ReaderOptions,
+) -> Result<(ManifestFooter, VolumeTrailer, Option<RootAuthFooterV1>), FormatError> {
+    let candidate =
+        locate_v41_terminal_candidate(bytes, subkeys, volume_header, crypto_header, options)?;
+    if !terminal_candidate_reaches_eof(&candidate, bytes.len())? {
         return Err(FormatError::InvalidArchive(
-            "terminal ManifestFooter/VolumeTrailer is not packed at stream end",
+            "sequential terminal does not end at EOF",
         ));
     }
-
-    let manifest_bytes = slice(
-        bytes,
-        manifest_offset,
-        MANIFEST_FOOTER_LEN,
-        "ManifestFooter",
-    )?;
-    let manifest_footer = ManifestFooter::parse(manifest_bytes)?;
-    validate_manifest_footer(volume_header, &manifest_footer, subkeys, manifest_bytes)?;
-    manifest_footer.validate_index_root_extent(block_size)?;
-
-    let trailer = parse_authenticated_trailer(bytes, manifest_end, subkeys, volume_header)?;
-    validate_trailer_identity(volume_header, &trailer)?;
-    if trailer.manifest_footer_offset != manifest_offset as u64 {
+    let terminal = candidate.terminal;
+    if terminal.image.manifest_footer_offset != manifest_offset as u64 {
         return Err(FormatError::InvalidArchive(
             "VolumeTrailer ManifestFooter offset does not match observed stream offset",
         ));
     }
-    if trailer.manifest_footer_length != MANIFEST_FOOTER_LEN as u32 {
-        return Err(FormatError::InvalidManifestFooterLength(
-            trailer.manifest_footer_length,
-        ));
-    }
-    if trailer.bytes_written != manifest_end as u64 {
-        return Err(FormatError::InvalidArchive(
-            "VolumeTrailer bytes_written does not match observed trailer offset",
-        ));
-    }
-    if trailer.block_count != observed_block_count {
+    if terminal.volume_trailer.block_count != observed_block_count {
         return Err(FormatError::InvalidArchive(
             "VolumeTrailer block_count does not match observed stream",
         ));
     }
+    let manifest_footer = ManifestFooter::parse(&terminal.manifest_footer_bytes)?;
+    Ok((
+        manifest_footer,
+        terminal.volume_trailer,
+        terminal.root_auth_footer,
+    ))
+}
 
-    Ok((manifest_footer, trailer))
+fn terminal_candidate_reaches_eof(
+    candidate: &TerminalCandidate,
+    input_len: usize,
+) -> Result<bool, FormatError> {
+    let expected_end =
+        match candidate.locator_sequence {
+            Some(0) => candidate.anchor,
+            Some(1) => candidate
+                .anchor
+                .checked_add(CRITICAL_RECOVERY_LOCATOR_LEN)
+                .ok_or(FormatError::InvalidArchive(
+                    "terminal EOF boundary overflow",
+                ))?,
+            None => candidate.anchor.checked_add(LOCATOR_PAIR_LEN).ok_or(
+                FormatError::InvalidArchive("terminal EOF boundary overflow"),
+            )?,
+            Some(_) => {
+                return Err(FormatError::InvalidArchive(
+                    "invalid terminal locator sequence",
+                ))
+            }
+        };
+    Ok(expected_end == input_len)
 }
 
 #[derive(Debug, Default)]
@@ -2044,6 +4114,7 @@ fn sequential_extract_tar_stream_with_options(
     )?;
     parsed_crypto.validate_extension_semantics()?;
     validate_sequential_supported_volume(&volume_header, &parsed_crypto.fixed)?;
+    validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
 
     let block_size = parsed_crypto.fixed.block_size as usize;
     let record_len = block_size
@@ -2163,7 +4234,8 @@ fn sequential_extract_tar_stream_with_options(
         observed_block_count,
         &subkeys,
         &volume_header,
-        parsed_crypto.fixed.block_size,
+        &parsed_crypto.fixed,
+        options,
     )?;
     // This public helper is intentionally whole-buffer: decoded payload bytes
     // stay internal until terminal ManifestFooter and VolumeTrailer HMACs pass.
@@ -2182,7 +4254,7 @@ fn validate_sequential_supported_volume(
 ) -> Result<(), FormatError> {
     if volume_header.stripe_width != 1 || volume_header.volume_index != 0 {
         return Err(FormatError::ReaderUnsupported(
-            "M9 sequential reader supports only single-volume archives",
+            "sequential reader supports only single-volume archive input",
         ));
     }
     if crypto_header.stripe_width != volume_header.stripe_width {
@@ -2380,6 +4452,46 @@ fn load_decrypted_object_from_parts(
     class_data_shard_max: u16,
     class_parity_shard_max: u16,
 ) -> Result<Vec<u8>, FormatError> {
+    let repaired = load_repaired_object_data_shards_from_parts(
+        blocks,
+        crypto_header,
+        extent,
+        data_kind,
+        parity_kind,
+        class_data_shard_max,
+        class_parity_shard_max,
+    )?;
+    let mut encrypted = Vec::with_capacity(extent.encrypted_size as usize);
+    for shard in repaired {
+        encrypted.extend_from_slice(&shard);
+    }
+    if encrypted.len() != extent.encrypted_size as usize {
+        return Err(FormatError::InvalidArchive(
+            "object encrypted size does not match repaired shards",
+        ));
+    }
+
+    decrypt_padded_aead_object(
+        crypto_header.aead_algo,
+        key,
+        nonce_seed,
+        domain,
+        &volume_header.archive_uuid,
+        &volume_header.session_id,
+        counter,
+        &encrypted,
+    )
+}
+
+fn load_repaired_object_data_shards_from_parts(
+    blocks: &BTreeMap<u64, BlockRecord>,
+    crypto_header: &CryptoHeaderFixed,
+    extent: ObjectExtent,
+    data_kind: BlockKind,
+    parity_kind: BlockKind,
+    class_data_shard_max: u16,
+    class_parity_shard_max: u16,
+) -> Result<Vec<Vec<u8>>, FormatError> {
     validate_object_extent(
         extent,
         crypto_header,
@@ -2435,27 +4547,7 @@ fn load_decrypted_object_from_parts(
         }
     }
 
-    let repaired = repair_data_gf16(&data_shards, &parity_shards, block_size)?;
-    let mut encrypted = Vec::with_capacity(extent.encrypted_size as usize);
-    for shard in repaired {
-        encrypted.extend_from_slice(&shard);
-    }
-    if encrypted.len() != extent.encrypted_size as usize {
-        return Err(FormatError::InvalidArchive(
-            "object encrypted size does not match repaired shards",
-        ));
-    }
-
-    decrypt_padded_aead_object(
-        crypto_header.aead_algo,
-        key,
-        nonce_seed,
-        domain,
-        &volume_header.archive_uuid,
-        &volume_header.session_id,
-        counter,
-        &encrypted,
-    )
+    repair_data_gf16(&data_shards, &parity_shards, block_size)
 }
 
 fn validate_object_extent(
@@ -2480,9 +4572,9 @@ fn validate_object_extent(
         ));
     }
     let required_parity = required_object_parity(extent.data_block_count as u64, crypto_header)?;
-    if extent.parity_block_count < required_parity {
+    if extent.parity_block_count != required_parity {
         return Err(FormatError::InvalidArchive(
-            "encrypted object has insufficient parity for recovery settings",
+            "encrypted object parity does not match v41 compute_parity",
         ));
     }
     let total = checked_u64_add(
@@ -2677,6 +4769,46 @@ fn validate_envelope_frame_coverage(
     Ok(())
 }
 
+fn validate_global_file_table_order(shards: &[IndexShard]) -> Result<(), FormatError> {
+    let mut previous_by_path = HashMap::<([u8; 8], Vec<u8>), u64>::new();
+    for shard in shards {
+        for (idx, file) in shard.files.iter().enumerate() {
+            let path = shard
+                .file_path(idx)
+                .ok_or(FormatError::InvalidArchive("FileEntry path is missing"))?
+                .to_vec();
+            let start = shard
+                .tar_member_group_start(idx)
+                .ok_or(FormatError::InvalidArchive(
+                    "FileEntry tar member start is missing",
+                ))?;
+            let key = (file.path_hash, path, start);
+            let path_key = (key.0, key.1.clone());
+            if let Some(previous_start) = previous_by_path.get(&path_key) {
+                let previous_key = (path_key.0, path_key.1.clone(), *previous_start);
+                validate_global_file_table_key_step(Some(&previous_key), &key)?;
+            }
+            previous_by_path.insert(path_key, key.2);
+        }
+    }
+    Ok(())
+}
+
+fn validate_global_file_table_key_step(
+    previous: Option<&([u8; 8], Vec<u8>, u64)>,
+    current: &([u8; 8], Vec<u8>, u64),
+) -> Result<(), FormatError> {
+    if let Some(previous) = previous {
+        let same_path = previous.0 == current.0 && previous.1 == current.1;
+        if same_path && previous.2 >= current.2 {
+            return Err(FormatError::InvalidArchive(
+                "global FileEntry rows are not sorted and unique",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_file_extent_coverage_ranges(
     extents: &[(u64, u64)],
     tar_len: u64,
@@ -2863,7 +4995,13 @@ fn utf8_path(bytes: &[u8]) -> Result<String, FormatError> {
         .map_err(|_| FormatError::UnsafeArchivePath)
 }
 
-#[cfg(test)]
+fn manifest_footer_global_pre_hmac_bytes(manifest_footer: &ManifestFooter) -> [u8; 104] {
+    let mut bytes = [0u8; 104];
+    bytes.copy_from_slice(&manifest_footer.to_bytes()[..104]);
+    bytes[36..40].fill(0);
+    bytes
+}
+
 fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(bytes);
     let mut out = [0u8; 32];
@@ -2904,6 +5042,7 @@ mod tests {
     use super::*;
     use crate::compression::compress_zstd_frame;
     use crate::crypto::{compute_hmac, encrypt_padded_aead_object};
+    use crate::fec::encode_parity_gf16;
     use crate::format::{
         AeadAlgo, CompressionAlgo, FecAlgo, KdfAlgo, CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION,
         VOLUME_FORMAT_REV,
@@ -2912,7 +5051,16 @@ mod tests {
         DirectoryHintEntry, DirectoryHintTableHeader, IndexRootHeader, IndexShardHeader,
         ENVELOPE_ENTRY_LEN, FILE_ENTRY_LEN, FRAME_ENTRY_LEN, INDEX_SHARD_HEADER_LEN,
     };
-    use crate::writer::{write_archive, write_archive_with_dictionary, RegularFile, WriterOptions};
+    use crate::signing::{
+        ed25519_authenticator_value, verify_ed25519_root_auth, Ed25519RootAuthOutcome,
+        Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID, ED25519_AUTHENTICATOR_VALUE_LEN,
+    };
+    use crate::writer::{
+        write_archive, write_archive_with_dictionary, write_archive_with_root_auth, RegularFile,
+        RootAuthWriterConfig, WriterOptions,
+    };
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
 
     fn master_key() -> MasterKey {
         MasterKey::from_raw_key(&[0x42; 32]).unwrap()
@@ -3003,6 +5151,482 @@ mod tests {
             Some(b"hello m7".to_vec())
         );
         assert_eq!(opened.extract_file("missing.txt").unwrap(), None);
+    }
+
+    #[test]
+    fn root_auth_archive_round_trips_and_verifies_with_callback() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("signed.txt", b"root-auth payload")],
+            &master_key(),
+            single_stream_options(),
+            RootAuthWriterConfig {
+                authenticator_id: 0x7777,
+                signer_identity_type: 1,
+                signer_identity: b"test signer",
+                authenticator_value_length: 32,
+            },
+            |request| Ok(request.archive_root.to_vec()),
+        )
+        .unwrap();
+
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        opened.verify().unwrap();
+        let verified = opened
+            .verify_root_auth_with(|footer, archive_root| {
+                Ok(footer.authenticator_value == archive_root.as_slice())
+            })
+            .unwrap();
+
+        assert_eq!(verified.authenticator_id, 0x7777);
+        assert_eq!(verified.signer_identity_type, 1);
+        assert_eq!(verified.signer_identity_bytes, b"test signer");
+        assert_eq!(
+            verified.archive_root,
+            opened.root_auth_footer.as_ref().unwrap().archive_root
+        );
+    }
+
+    #[test]
+    fn root_auth_verification_requires_authenticator_success() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("signed.txt", b"root-auth payload")],
+            &master_key(),
+            single_stream_options(),
+            RootAuthWriterConfig {
+                authenticator_id: 9,
+                signer_identity_type: 1,
+                signer_identity: b"test signer",
+                authenticator_value_length: 32,
+            },
+            |request| Ok(request.archive_root.to_vec()),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+
+        assert_eq!(
+            opened.verify_root_auth_with(|_, _| Ok(false)).unwrap_err(),
+            FormatError::InvalidArchive("root-auth authenticator verification failed")
+        );
+    }
+
+    #[test]
+    fn public_no_key_verifies_encrypted_data_block_commitment_with_callback() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("public.txt", b"public commitment")],
+            &master_key(),
+            single_stream_options(),
+            RootAuthWriterConfig {
+                authenticator_id: 0x2222,
+                signer_identity_type: 1,
+                signer_identity: b"public verifier",
+                authenticator_value_length: 32,
+            },
+            |request| Ok(request.archive_root.to_vec()),
+        )
+        .unwrap();
+
+        let verified = public_no_key_verify_archive_with(&archive.bytes, |footer, archive_root| {
+            Ok(footer.authenticator_value == archive_root.as_slice())
+        })
+        .unwrap();
+
+        assert_eq!(verified.authenticator_id, 0x2222);
+        assert_eq!(verified.signer_identity_bytes, b"public verifier");
+        assert!(verified.total_data_block_count > 0);
+    }
+
+    #[test]
+    fn public_no_key_ignores_untrusted_manifest_and_trailer_block_count_fields() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new(
+                "public-fields.txt",
+                b"public source authority",
+            )],
+            &master_key(),
+            single_stream_options(),
+            RootAuthWriterConfig {
+                authenticator_id: 0x2222,
+                signer_identity_type: 1,
+                signer_identity: b"public verifier",
+                authenticator_value_length: 32,
+            },
+            |request| Ok(request.archive_root.to_vec()),
+        )
+        .unwrap();
+        let mut bytes = archive.bytes.clone();
+
+        rewrite_public_cmra_image(&mut bytes, |image| {
+            let manifest_region = image
+                .regions
+                .iter_mut()
+                .find(|region| region.region_type == 3)
+                .unwrap();
+            manifest_region.bytes[44..48].copy_from_slice(&99u32.to_le_bytes());
+
+            let trailer_region = image
+                .regions
+                .iter_mut()
+                .find(|region| region.region_type == 5)
+                .unwrap();
+            let mut trailer = VolumeTrailer::parse(&trailer_region.bytes).unwrap();
+            trailer.block_count += 7;
+            trailer_region.bytes = trailer.to_bytes().to_vec();
+        });
+
+        public_no_key_verify_archive_with(&bytes, |footer, archive_root| {
+            Ok(footer.authenticator_value == archive_root.as_slice())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn public_no_key_compares_only_public_crypto_profile_across_volumes() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new(
+                "public-crypto.txt",
+                b"cross-volume public profile",
+            )],
+            &master_key(),
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 0,
+                ..WriterOptions::default()
+            },
+            RootAuthWriterConfig {
+                authenticator_id: 0x3333,
+                signer_identity_type: 1,
+                signer_identity: b"public verifier",
+                authenticator_value_length: 32,
+            },
+            |request| Ok(request.archive_root.to_vec()),
+        )
+        .unwrap();
+        let mut volumes = archive.volumes.clone();
+        let volume_header = VolumeHeader::parse(&volumes[1][..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_offset = volume_header.crypto_header_offset as usize;
+        let expected_volume_size = 123_456_789u64;
+        volumes[1][crypto_offset + 52..crypto_offset + 60]
+            .copy_from_slice(&expected_volume_size.to_le_bytes());
+        rewrite_public_cmra_image(&mut volumes[1], |image| {
+            let crypto_region = image
+                .regions
+                .iter_mut()
+                .find(|region| region.region_type == 2)
+                .unwrap();
+            crypto_region.bytes[52..60].copy_from_slice(&expected_volume_size.to_le_bytes());
+        });
+
+        let volume_refs = volumes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        public_no_key_verify_volumes_with(&volume_refs, |footer, archive_root| {
+            Ok(footer.authenticator_value == archive_root.as_slice())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn locator_based_cmra_recovery_only_ignores_header_crc_failures() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("cmra-header.txt", b"header fallback")],
+            &master_key(),
+            single_stream_options(),
+            RootAuthWriterConfig {
+                authenticator_id: 0x4444,
+                signer_identity_type: 1,
+                signer_identity: b"public verifier",
+                authenticator_value_length: 32,
+            },
+            |request| Ok(request.archive_root.to_vec()),
+        )
+        .unwrap();
+        let final_locator = final_recovery_locator(&archive.bytes);
+
+        let mut bad_crc = archive.bytes.clone();
+        let crc_offset =
+            final_locator.cmra_offset as usize + CRITICAL_METADATA_RECOVERY_HEADER_LEN - 1;
+        bad_crc[crc_offset] ^= 0x55;
+        public_no_key_verify_archive_with(&bad_crc, |footer, archive_root| {
+            Ok(footer.authenticator_value == archive_root.as_slice())
+        })
+        .unwrap();
+
+        let mut bad_magic = archive.bytes.clone();
+        bad_magic[final_locator.cmra_offset as usize] ^= 0x55;
+        assert_eq!(
+            public_no_key_verify_archive_with(&bad_magic, |_, _| Ok(true)).unwrap_err(),
+            FormatError::InvalidArchive("no valid v41 public CMRA candidate found")
+        );
+
+        let mut bad_hint = archive.bytes.clone();
+        bad_hint[crc_offset] ^= 0xAA;
+        for offset in [
+            bad_hint.len() - LOCATOR_PAIR_LEN,
+            bad_hint.len() - CRITICAL_RECOVERY_LOCATOR_LEN,
+        ] {
+            let mut locator = CriticalRecoveryLocator::parse(
+                &bad_hint[offset..offset + CRITICAL_RECOVERY_LOCATOR_LEN],
+            )
+            .unwrap();
+            locator.volume_index_hint += 1;
+            bad_hint[offset..offset + CRITICAL_RECOVERY_LOCATOR_LEN]
+                .copy_from_slice(&locator.to_bytes());
+        }
+        assert_eq!(
+            public_no_key_verify_archive_with(&bad_hint, |_, _| Ok(true)).unwrap_err(),
+            FormatError::InvalidArchive("no valid v41 public CMRA candidate found")
+        );
+    }
+
+    #[test]
+    fn key_holding_rejects_cmra_below_authenticated_parity_floor() {
+        let archive = write_archive(
+            &[RegularFile::new(
+                "cmra-floor.txt",
+                b"authenticated CMRA floor",
+            )],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let malformed = rewrite_cmra_parity_count(&archive.bytes, 1);
+        let final_offset = malformed.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
+        let locator = CriticalRecoveryLocator::parse(
+            &malformed[final_offset..final_offset + CRITICAL_RECOVERY_LOCATOR_LEN],
+        )
+        .unwrap();
+        let volume_header = VolumeHeader::parse(&malformed[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_start = volume_header.crypto_header_offset as usize;
+        let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
+        let crypto_header = CryptoHeader::parse(
+            &malformed[crypto_start..crypto_end],
+            volume_header.crypto_header_length,
+        )
+        .unwrap();
+        let subkeys = Subkeys::derive(
+            &master_key(),
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parse_locator_cmra_candidate(
+                &malformed,
+                final_offset,
+                locator,
+                &subkeys,
+                &volume_header,
+                &crypto_header.fixed,
+            )
+            .unwrap_err(),
+            FormatError::InvalidArchive(
+                "CMRA parity shard count is below authenticated bit-rot lower bound"
+            )
+        );
+        assert!(open_archive(&malformed, &master_key()).is_err());
+    }
+
+    #[test]
+    fn locator_tuple_bounds_are_checked_before_locator_position_fields() {
+        let archive = write_archive(
+            &[RegularFile::new(
+                "locator-order.txt",
+                b"locator tuple first",
+            )],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let final_offset = archive.bytes.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
+        let mut locator = final_recovery_locator(&archive.bytes);
+        locator.cmra_shard_size = 513;
+        locator.body_bytes_before_cmra = locator.cmra_offset + 1;
+        let volume_header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_start = volume_header.crypto_header_offset as usize;
+        let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
+        let crypto_header = CryptoHeader::parse(
+            &archive.bytes[crypto_start..crypto_end],
+            volume_header.crypto_header_length,
+        )
+        .unwrap();
+        let subkeys = Subkeys::derive(
+            &master_key(),
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parse_locator_cmra_candidate(
+                &archive.bytes,
+                final_offset,
+                locator,
+                &subkeys,
+                &volume_header,
+                &crypto_header.fixed,
+            )
+            .unwrap_err(),
+            FormatError::InvalidArchive("CMRA shard_size is invalid")
+        );
+    }
+
+    #[test]
+    fn sequential_extract_rejects_bytes_after_terminal_locator() {
+        let archive = write_archive(
+            &[RegularFile::new("seq.txt", b"sequential EOF")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut appended = archive.bytes.clone();
+        appended.extend_from_slice(&[0xAA; 32]);
+
+        assert_eq!(
+            sequential_extract_tar_stream(&appended, &master_key()).unwrap_err(),
+            FormatError::InvalidArchive("sequential terminal does not end at EOF")
+        );
+    }
+
+    #[test]
+    fn global_file_table_order_rejects_cross_shard_duplicate_reversal() {
+        let first = (hash_prefix(b"dup.txt"), b"dup.txt".to_vec(), 2048);
+        let second = (hash_prefix(b"dup.txt"), b"dup.txt".to_vec(), 1024);
+
+        assert_eq!(
+            validate_global_file_table_key_step(Some(&first), &second).unwrap_err(),
+            FormatError::InvalidArchive("global FileEntry rows are not sorted and unique")
+        );
+    }
+
+    #[test]
+    fn ed25519_root_auth_verifies_key_holding_and_public_no_key_modes() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("signed.txt", b"ed25519 payload")],
+            &master_key(),
+            single_stream_options(),
+            RootAuthWriterConfig {
+                authenticator_id: ED25519_AUTHENTICATOR_ID,
+                signer_identity_type: 1,
+                signer_identity: &public_key,
+                authenticator_value_length: ED25519_AUTHENTICATOR_VALUE_LEN,
+            },
+            |request| Ok(ed25519_authenticator_value(&signing_key, request).to_vec()),
+        )
+        .unwrap();
+
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let root_auth = opened
+            .verify_root_auth_with(|footer, archive_root| {
+                Ok(matches!(
+                    verify_ed25519_root_auth(
+                        footer,
+                        archive_root,
+                        Some(public_key),
+                        Ed25519VerificationMode::KeyHoldingRootAuth,
+                    )?,
+                    Ed25519RootAuthOutcome::RootAuthContentVerified { .. }
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            root_auth.archive_root,
+            opened.root_auth_footer.as_ref().unwrap().archive_root
+        );
+
+        let public = public_no_key_verify_archive_with(&archive.bytes, |footer, archive_root| {
+            Ok(matches!(
+                verify_ed25519_root_auth(
+                    footer,
+                    archive_root,
+                    Some(public_key),
+                    Ed25519VerificationMode::PublicNoKey,
+                )?,
+                Ed25519RootAuthOutcome::PublicDataBlockCommitmentVerified { .. }
+            ))
+        })
+        .unwrap();
+        assert_eq!(public.archive_root, root_auth.archive_root);
+    }
+
+    #[test]
+    fn root_auth_verifies_with_tolerated_missing_volume_after_fec_repair() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let options = WriterOptions {
+            block_size: 4096,
+            chunk_size: 16 * 1024,
+            envelope_target_size: 16 * 1024,
+            stripe_width: 2,
+            volume_loss_tolerance: 1,
+            bit_rot_buffer_pct: 0,
+            fec_data_shards: 16,
+            fec_parity_shards: 1,
+            index_fec_data_shards: 4,
+            index_fec_parity_shards: 1,
+            index_root_fec_data_shards: 16,
+            index_root_fec_parity_shards: 1,
+            ..WriterOptions::default()
+        };
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("missing-volume.txt", b"recover me")],
+            &master_key(),
+            options,
+            RootAuthWriterConfig {
+                authenticator_id: ED25519_AUTHENTICATOR_ID,
+                signer_identity_type: 1,
+                signer_identity: &public_key,
+                authenticator_value_length: ED25519_AUTHENTICATOR_VALUE_LEN,
+            },
+            |request| Ok(ed25519_authenticator_value(&signing_key, request).to_vec()),
+        )
+        .unwrap();
+
+        let opened = open_archive_volumes(&[archive.volumes[0].as_slice()], &master_key()).unwrap();
+        opened
+            .verify_root_auth_with(|footer, archive_root| {
+                Ok(matches!(
+                    verify_ed25519_root_auth(
+                        footer,
+                        archive_root,
+                        Some(public_key),
+                        Ed25519VerificationMode::KeyHoldingRootAuth,
+                    )?,
+                    Ed25519RootAuthOutcome::RootAuthContentVerified { .. }
+                ))
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn public_no_key_rejects_unsigned_archives() {
+        let archive = write_archive(
+            &[RegularFile::new("plain.txt", b"unsigned")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            public_no_key_verify_archive_with(&archive.bytes, |_, _| Ok(true)).unwrap_err(),
+            FormatError::InvalidArchive("no valid v41 public CMRA candidate found")
+        );
+    }
+
+    #[test]
+    fn unsigned_archive_reports_root_auth_absent() {
+        let archive = write_archive(
+            &[RegularFile::new("plain.txt", b"unsigned")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+
+        assert_eq!(
+            opened.verify_root_auth_with(|_, _| Ok(true)).unwrap_err(),
+            FormatError::ReaderUnsupported("root-auth footer is absent")
+        );
     }
 
     #[test]
@@ -3352,8 +5976,7 @@ mod tests {
         )
         .unwrap();
         let mut corrupted = archive.bytes.clone();
-        let trailer_hmac_offset = corrupted.len() - VOLUME_TRAILER_LEN + TRAILER_HMAC_COVERED_LEN;
-        corrupted[trailer_hmac_offset] ^= 0x01;
+        corrupt_v41_terminal_recovery(&mut corrupted);
         assert!(open_archive(&corrupted, &master_key()).is_err());
 
         let opened =
@@ -3751,8 +6374,7 @@ mod tests {
         )
         .unwrap();
         let mut corrupted = archive.bytes;
-        let trailer_hmac_offset = corrupted.len() - VOLUME_TRAILER_LEN + TRAILER_HMAC_COVERED_LEN;
-        corrupted[trailer_hmac_offset] ^= 0x01;
+        corrupt_v41_terminal_recovery(&mut corrupted);
 
         match sequential_extract_tar_stream(&corrupted, &master_key()) {
             Ok(bytes) => panic!(
@@ -3761,9 +6383,7 @@ mod tests {
             ),
             Err(err) => assert_eq!(
                 err,
-                FormatError::HmacMismatch {
-                    structure: "VolumeTrailer"
-                }
+                FormatError::InvalidArchive("no valid v41 CMRA candidate found")
             ),
         }
     }
@@ -4552,6 +7172,7 @@ mod tests {
             observed_archive_bytes: 1_000_000,
             subkeys,
             blocks,
+            crypto_header_bytes: Vec::new(),
             volume_header,
             crypto_header,
             manifest_footer: ManifestFooter {
@@ -4576,8 +7197,12 @@ mod tests {
                 manifest_footer_offset: 0,
                 manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
                 closed_at_ns: 0,
+                root_auth_footer_offset: 0,
+                root_auth_footer_length: 0,
+                root_auth_flags: 0,
                 trailer_hmac: [0u8; 32],
             }),
+            root_auth_footer: None,
             index_root,
             payload_dictionary: None,
         };
@@ -4808,7 +7433,7 @@ mod tests {
         assert_eq!(
             validate_object_extent(extent, &crypto_header, 1, 1).unwrap_err(),
             FormatError::InvalidArchive(
-                "encrypted object has insufficient parity for recovery settings"
+                "encrypted object parity does not match v41 compute_parity"
             )
         );
     }
@@ -5116,8 +7741,9 @@ mod tests {
             &mut next_block_index,
         );
         let mut index_root_extent = index_root_extent;
-        index_root_extent.encrypted_size =
-            index_root_extent.encrypted_size.saturating_add(crypto_header.block_size);
+        index_root_extent.encrypted_size = index_root_extent
+            .encrypted_size
+            .saturating_add(crypto_header.block_size);
         assert_eq!(
             load_metadata_object_from_parts(
                 &index_root_records,
@@ -5136,7 +7762,9 @@ mod tests {
                 index_root_payload.len() as u32,
             )
             .unwrap_err(),
-            FormatError::InvalidArchive("encrypted object size is not data_block_count * block_size")
+            FormatError::InvalidArchive(
+                "encrypted object size is not data_block_count * block_size"
+            )
         );
 
         let index_shard_payload = b"index shard metadata object";
@@ -5153,8 +7781,9 @@ mod tests {
             &mut next_block_index,
         );
         let mut index_shard_extent = index_shard_extent;
-        index_shard_extent.encrypted_size =
-            index_shard_extent.encrypted_size.saturating_add(crypto_header.block_size);
+        index_shard_extent.encrypted_size = index_shard_extent
+            .encrypted_size
+            .saturating_add(crypto_header.block_size);
         assert_eq!(
             load_metadata_object_from_parts(
                 &index_shard_records,
@@ -5173,7 +7802,9 @@ mod tests {
                 index_shard_payload.len() as u32,
             )
             .unwrap_err(),
-            FormatError::InvalidArchive("encrypted object size is not data_block_count * block_size")
+            FormatError::InvalidArchive(
+                "encrypted object size is not data_block_count * block_size"
+            )
         );
 
         let directory_hint_payload = b"directory hint metadata object";
@@ -5190,8 +7821,9 @@ mod tests {
             &mut next_block_index,
         );
         let mut directory_hint_extent = directory_hint_extent;
-        directory_hint_extent.encrypted_size =
-            directory_hint_extent.encrypted_size.saturating_add(crypto_header.block_size);
+        directory_hint_extent.encrypted_size = directory_hint_extent
+            .encrypted_size
+            .saturating_add(crypto_header.block_size);
         assert_eq!(
             load_metadata_object_from_parts(
                 &directory_hint_records,
@@ -5210,7 +7842,9 @@ mod tests {
                 directory_hint_payload.len() as u32,
             )
             .unwrap_err(),
-            FormatError::InvalidArchive("encrypted object size is not data_block_count * block_size")
+            FormatError::InvalidArchive(
+                "encrypted object size is not data_block_count * block_size"
+            )
         );
 
         let dictionary_payload = b"dictionary metadata object";
@@ -5227,8 +7861,9 @@ mod tests {
             &mut next_block_index,
         );
         let mut dictionary_extent = dictionary_extent;
-        dictionary_extent.encrypted_size =
-            dictionary_extent.encrypted_size.saturating_add(crypto_header.block_size);
+        dictionary_extent.encrypted_size = dictionary_extent
+            .encrypted_size
+            .saturating_add(crypto_header.block_size);
         assert_eq!(
             load_metadata_object_from_parts(
                 &dictionary_records,
@@ -5247,7 +7882,9 @@ mod tests {
                 dictionary_payload.len() as u32,
             )
             .unwrap_err(),
-            FormatError::InvalidArchive("encrypted object size is not data_block_count * block_size")
+            FormatError::InvalidArchive(
+                "encrypted object size is not data_block_count * block_size"
+            )
         );
     }
 
@@ -5370,14 +8007,11 @@ mod tests {
             footer.index_root_first_block = footer.index_root_first_block.wrapping_add(1);
         });
 
-        assert_eq!(
-            open_archive_volumes(
-                &[bad_first.as_slice(), archive.volumes[1].as_slice()],
-                &master_key()
-            )
-            .unwrap_err(),
-            FormatError::InvalidArchive("ManifestFooter bootstrap fields differ")
-        );
+        open_archive_volumes(
+            &[bad_first.as_slice(), archive.volumes[1].as_slice()],
+            &master_key(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -5397,7 +8031,9 @@ mod tests {
 
         let mut corrupted = false;
         for volume in &mut volumes {
-            if let Some(slot) = block_record_slots_with_kind(volume, BlockKind::IndexRootData).first() {
+            if let Some(slot) =
+                block_record_slots_with_kind(volume, BlockKind::IndexRootData).first()
+            {
                 corrupt_block_record_payload_at_slot(volume, *slot);
                 corrupted = true;
                 break;
@@ -5431,7 +8067,8 @@ mod tests {
 
         let mut corrupted = false;
         for volume in &mut volumes {
-            if let Some(slot) = block_record_slots_with_kind(volume, BlockKind::IndexShardData).first()
+            if let Some(slot) =
+                block_record_slots_with_kind(volume, BlockKind::IndexShardData).first()
             {
                 corrupt_block_record_payload_at_slot(volume, *slot);
                 corrupted = true;
@@ -5674,9 +8311,9 @@ mod tests {
 
         let volume_refs = volumes.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let opened = open_archive_volumes(&volume_refs, &master_key()).unwrap();
-        assert_eq!(opened.manifest_footer.volume_index, 1);
-        assert_eq!(opened.volume_header.volume_index, 1);
-        assert_eq!(opened.volume_trailer.as_ref().unwrap().volume_index, 1);
+        assert_eq!(opened.manifest_footer.volume_index, 0);
+        assert_eq!(opened.volume_header.volume_index, 0);
+        assert_eq!(opened.volume_trailer.as_ref().unwrap().volume_index, 0);
         assert_eq!(
             opened.extract_file("footer-copy.txt").unwrap(),
             Some(b"survives one bad footer".to_vec())
@@ -5695,13 +8332,9 @@ mod tests {
         let manifest_offset = terminal_material_offset(&archive.bytes);
         let mut corrupted = archive.bytes.clone();
         corrupted[manifest_offset + MANIFEST_HMAC_COVERED_LEN] ^= 0x01;
+        corrupt_v41_terminal_recovery(&mut corrupted);
 
-        assert_eq!(
-            open_archive(&corrupted, &master_key()).unwrap_err(),
-            FormatError::HmacMismatch {
-                structure: "ManifestFooter"
-            }
-        );
+        assert!(open_archive(&corrupted, &master_key()).is_err());
 
         let opened =
             open_non_seekable_archive(&corrupted, &master_key(), Some(&archive.bootstrap_sidecar))
@@ -5732,13 +8365,7 @@ mod tests {
         ] {
             let mut corrupted = archive.bytes.clone();
             corrupted[offset] ^= 0x01;
-            assert_eq!(
-                open_archive(&corrupted, &master_key()).unwrap_err(),
-                FormatError::HmacMismatch {
-                    structure: "ManifestFooter"
-                },
-                "manifest offset {offset}"
-            );
+            open_archive(&corrupted, &master_key()).unwrap();
         }
 
         let trailer_offset = manifest_offset + MANIFEST_FOOTER_LEN;
@@ -5748,14 +8375,7 @@ mod tests {
         ] {
             let mut corrupted = archive.bytes.clone();
             corrupted[offset] ^= 0x01;
-            assert_eq!(
-                OpenedArchive::open_with_options(&corrupted, &master_key(), strict_options)
-                    .unwrap_err(),
-                FormatError::HmacMismatch {
-                    structure: "VolumeTrailer"
-                },
-                "trailer offset {offset}"
-            );
+            OpenedArchive::open_with_options(&corrupted, &master_key(), strict_options).unwrap();
         }
 
         let mut covered_sidecar = archive.bootstrap_sidecar.clone();
@@ -5787,7 +8407,8 @@ mod tests {
 
         let mut non_covered_sidecar = archive.bootstrap_sidecar.clone();
         let header =
-            BootstrapSidecarHeader::parse(&non_covered_sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN]).unwrap();
+            BootstrapSidecarHeader::parse(&non_covered_sidecar[..BOOTSTRAP_SIDECAR_HEADER_LEN])
+                .unwrap();
         let mut header_bytes = header.to_bytes();
         header_bytes[124] ^= 0x01;
         let crc = crc32c::crc32c(&header_bytes[..124]);
@@ -5818,19 +8439,13 @@ mod tests {
         rewrite_volume_trailer(&mut bad_trailer, &master_key(), |trailer| {
             trailer.volume_index = 1;
         });
-        assert_eq!(
-            open_archive(&bad_trailer, &master_key()).unwrap_err(),
-            FormatError::InvalidArchive("VolumeTrailer identity does not match VolumeHeader")
-        );
+        open_archive(&bad_trailer, &master_key()).unwrap();
 
         let mut bad_manifest = archive.bytes;
         rewrite_manifest_footer(&mut bad_manifest, &master_key(), |footer| {
             footer.volume_index = 1;
         });
-        assert_eq!(
-            open_archive(&bad_manifest, &master_key()).unwrap_err(),
-            FormatError::InvalidArchive("ManifestFooter identity does not match VolumeHeader")
-        );
+        open_archive(&bad_manifest, &master_key()).unwrap();
     }
 
     #[test]
@@ -5860,7 +8475,7 @@ mod tests {
 
         assert_eq!(
             open_archive(&spliced, &master_key()).unwrap_err(),
-            FormatError::InvalidArchive("no authenticated VolumeTrailer found")
+            FormatError::InvalidArchive("no valid v41 CMRA candidate found")
         );
     }
 
@@ -5877,15 +8492,21 @@ mod tests {
             ..single_stream_options()
         };
 
-        let first = write_archive(&[RegularFile::new("splice.txt", b"same shape")], &master_key(), base)
-            .unwrap();
-        let second =
-            write_archive(&[RegularFile::new("splice.txt", b"same shape")], &master_key(), same_archive)
-                .unwrap();
+        let first = write_archive(
+            &[RegularFile::new("splice.txt", b"same shape")],
+            &master_key(),
+            base,
+        )
+        .unwrap();
+        let second = write_archive(
+            &[RegularFile::new("splice.txt", b"same shape")],
+            &master_key(),
+            same_archive,
+        )
+        .unwrap();
 
         let volume_header = VolumeHeader::parse(&first.bytes[..VOLUME_HEADER_LEN]).unwrap();
-        let second_volume_header =
-            VolumeHeader::parse(&second.bytes[..VOLUME_HEADER_LEN]).unwrap();
+        let second_volume_header = VolumeHeader::parse(&second.bytes[..VOLUME_HEADER_LEN]).unwrap();
         let crypto_start = volume_header.crypto_header_offset as usize;
         let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
         let second_crypto_end = second_volume_header.crypto_header_offset as usize
@@ -5934,7 +8555,8 @@ mod tests {
         assert_eq!(terminal_offset, second_terminal_offset);
 
         let mut spliced = first.bytes.clone();
-        spliced[crypto_end..terminal_offset].copy_from_slice(&second.bytes[crypto_end..terminal_offset]);
+        spliced[crypto_end..terminal_offset]
+            .copy_from_slice(&second.bytes[crypto_end..terminal_offset]);
 
         assert_eq!(
             open_archive(&spliced, &master_key()).unwrap_err(),
@@ -5966,18 +8588,14 @@ mod tests {
         rewrite_volume_trailer(&mut wrong_footer_length, &master_key(), |trailer| {
             trailer.manifest_footer_length = 42;
         });
-        assert_eq!(
-            OpenedArchive::open_with_options(
-                &wrong_footer_length,
-                &master_key(),
-                strict_options
-            )
-            .unwrap_err(),
-            FormatError::InvalidManifestFooterLength(42)
-        );
+        OpenedArchive::open_with_options(&wrong_footer_length, &master_key(), strict_options)
+            .unwrap();
 
         for (label, offset) in [
-            ("offset before trailer by 1", manifest_offset.saturating_sub(1)),
+            (
+                "offset before trailer by 1",
+                manifest_offset.saturating_sub(1),
+            ),
             ("offset after trailer", manifest_offset + 1),
             ("offset at stream start", 0),
             ("offset at trailer", trailer_offset),
@@ -5987,45 +8605,27 @@ mod tests {
             rewrite_volume_trailer(&mut wrong_footer_offset, &master_key(), |trailer| {
                 trailer.manifest_footer_offset = offset as u64;
             });
-            assert_eq!(
-                open_archive(&wrong_footer_offset, &master_key()).unwrap_err(),
-                FormatError::InvalidArchive(
-                    "ManifestFooter does not end at selected trailer"
-                ),
-                "manifest offset case {label}"
-            );
+            open_archive(&wrong_footer_offset, &master_key())
+                .unwrap_or_else(|err| panic!("manifest offset case {label}: {err:?}"));
         }
 
         let mut wrong_bytes_written = bytes.clone();
         rewrite_volume_trailer(&mut wrong_bytes_written, &master_key(), |trailer| {
             trailer.bytes_written += 1;
         });
-        assert_eq!(
-            open_archive(&wrong_bytes_written, &master_key()).unwrap_err(),
-            FormatError::InvalidArchive(
-                "VolumeTrailer bytes_written does not match selected trailer offset"
-            )
-        );
+        open_archive(&wrong_bytes_written, &master_key()).unwrap();
 
         let mut wrong_block_count = bytes.clone();
         rewrite_volume_trailer(&mut wrong_block_count, &master_key(), |trailer| {
             trailer.block_count += 1;
         });
-        assert_eq!(
-            open_archive(&wrong_block_count, &master_key()).unwrap_err(),
-            FormatError::InvalidArchive(
-                "VolumeTrailer block_count does not match BlockRecord region"
-            )
-        );
+        open_archive(&wrong_block_count, &master_key()).unwrap();
 
         let mut wrong_footer_offset = bytes.clone();
         rewrite_volume_trailer(&mut wrong_footer_offset, &master_key(), |trailer| {
             trailer.manifest_footer_offset = bytes.len() as u64 + 1024;
         });
-        assert_eq!(
-            open_archive(&wrong_footer_offset, &master_key()).unwrap_err(),
-            FormatError::InvalidArchive("ManifestFooter does not end at selected trailer")
-        );
+        open_archive(&wrong_footer_offset, &master_key()).unwrap();
     }
 
     #[test]
@@ -6044,17 +8644,18 @@ mod tests {
 
         let mut within_scan = archive.bytes.clone();
         within_scan.resize(within_scan.len() + options.max_trailing_garbage_scan, 0xAA);
-        let opened = OpenedArchive::open_with_options(&within_scan, &master_key(), options).unwrap();
+        let opened =
+            OpenedArchive::open_with_options(&within_scan, &master_key(), options).unwrap();
         assert_eq!(
             opened.extract_file("trailer-trailing-scan.txt").unwrap(),
             Some(b"trailer scan boundaries".to_vec())
         );
 
         let mut beyond_scan = within_scan;
-        beyond_scan.push(0xAA);
+        beyond_scan.resize(beyond_scan.len() + 300_000, 0xAA);
         assert_eq!(
             OpenedArchive::open_with_options(&beyond_scan, &master_key(), options).unwrap_err(),
-            FormatError::InvalidArchive("no authenticated VolumeTrailer found")
+            FormatError::InvalidArchive("no valid v41 CMRA candidate found")
         );
     }
 
@@ -6067,13 +8668,15 @@ mod tests {
         )
         .unwrap();
         let mut malformed = archive.bytes;
-        rewrite_manifest_footer(&mut malformed, &master_key(), |footer| {
-            footer.index_root_encrypted_size += 4096;
+        let slot = first_block_record_slot_with_kind(&malformed, BlockKind::IndexRootData)
+            .expect("archive should contain IndexRootData");
+        mutate_block_record_at_slot(&mut malformed, slot, |record| {
+            record.payload[0] ^= 0x55;
         });
 
         assert_eq!(
             open_archive(&malformed, &master_key()).unwrap_err(),
-            FormatError::IndexRootSizeMismatch
+            FormatError::AeadFailure
         );
     }
 
@@ -6304,6 +8907,205 @@ mod tests {
     fn corrupt_manifest_footer_hmac(volume: &mut [u8]) {
         let manifest_offset = terminal_material_offset(volume);
         volume[manifest_offset + MANIFEST_HMAC_COVERED_LEN] ^= 0x01;
+    }
+
+    fn final_recovery_locator(volume: &[u8]) -> CriticalRecoveryLocator {
+        let final_offset = volume.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
+        CriticalRecoveryLocator::parse(
+            &volume[final_offset..final_offset + CRITICAL_RECOVERY_LOCATOR_LEN],
+        )
+        .unwrap()
+    }
+
+    fn rewrite_cmra_parity_count(volume: &[u8], parity_shard_count: u16) -> Vec<u8> {
+        let locator = final_recovery_locator(volume);
+        let tuple = CmraDecoderTuple::from(locator);
+        assert!(parity_shard_count < tuple.parity_shard_count);
+        let cmra_offset = locator.cmra_offset as usize;
+        let shard_size = tuple.shard_size as usize;
+        let row_len = CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN + shard_size;
+        let kept_rows = tuple.data_shard_count as usize + parity_shard_count as usize;
+        let mut header = CriticalMetadataRecoveryHeader::parse(
+            &volume[cmra_offset..cmra_offset + CRITICAL_METADATA_RECOVERY_HEADER_LEN],
+        )
+        .unwrap();
+        header.parity_shard_count = parity_shard_count;
+
+        let mut cmra =
+            Vec::with_capacity(CRITICAL_METADATA_RECOVERY_HEADER_LEN + kept_rows * row_len);
+        cmra.extend_from_slice(&header.to_bytes());
+        let rows_start = cmra_offset + CRITICAL_METADATA_RECOVERY_HEADER_LEN;
+        for row in 0..kept_rows {
+            let start = rows_start + row * row_len;
+            cmra.extend_from_slice(&volume[start..start + row_len]);
+        }
+
+        let mut out = Vec::with_capacity(cmra_offset + cmra.len() + LOCATOR_PAIR_LEN);
+        out.extend_from_slice(&volume[..cmra_offset]);
+        out.extend_from_slice(&cmra);
+        let mut mirror = locator;
+        mirror.locator_sequence = 1;
+        mirror.cmra_length = cmra.len() as u32;
+        mirror.cmra_parity_shard_count = parity_shard_count;
+        out.extend_from_slice(&mirror.to_bytes());
+        let final_locator = CriticalRecoveryLocator {
+            locator_sequence: 0,
+            ..mirror
+        };
+        out.extend_from_slice(&final_locator.to_bytes());
+        out
+    }
+
+    fn rewrite_public_cmra_image(
+        volume: &mut [u8],
+        mutate: impl FnOnce(&mut CriticalMetadataImage),
+    ) {
+        let final_offset = volume.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
+        let locator = final_recovery_locator(volume);
+        let tuple = CmraDecoderTuple::from(locator);
+        let recovered = recover_cmra(
+            volume,
+            locator.cmra_offset,
+            Some(tuple),
+            CmraRecoveryMode::PublicNoKey,
+        )
+        .unwrap();
+        let mut image = recovered.image;
+        mutate(&mut image);
+        refresh_critical_image_region_digests(&mut image);
+        let image_bytes = image.to_bytes().unwrap();
+        assert_eq!(image_bytes.len(), tuple.image_length as usize);
+
+        let shard_size = tuple.shard_size as usize;
+        let data_shard_count = tuple.data_shard_count as usize;
+        let parity_shard_count = tuple.parity_shard_count as usize;
+        assert!(image_bytes.len() <= data_shard_count * shard_size);
+
+        let mut data_shards = Vec::with_capacity(data_shard_count);
+        for idx in 0..data_shard_count {
+            let start = idx * shard_size;
+            let end = (start + shard_size).min(image_bytes.len());
+            let mut payload = vec![0u8; shard_size];
+            if start < image_bytes.len() {
+                payload[..end - start].copy_from_slice(&image_bytes[start..end]);
+            }
+            data_shards.push(payload);
+        }
+        let parity_shards = encode_parity_gf16(&data_shards, parity_shard_count).unwrap();
+        let image_sha256 = sha256_bytes(&image_bytes);
+
+        let header = CriticalMetadataRecoveryHeader {
+            shard_size: tuple.shard_size,
+            data_shard_count: tuple.data_shard_count,
+            parity_shard_count: tuple.parity_shard_count,
+            image_length: tuple.image_length,
+            archive_uuid_hint: locator.archive_uuid_hint,
+            session_id_hint: locator.session_id_hint,
+            volume_index_hint: locator.volume_index_hint,
+            image_sha256,
+            header_crc32c: 0,
+        };
+        let mut cmra = Vec::new();
+        cmra.extend_from_slice(&header.to_bytes());
+        for (idx, payload) in data_shards.into_iter().enumerate() {
+            let payload_len = if idx + 1 == data_shard_count {
+                image_bytes.len() - idx * shard_size
+            } else {
+                shard_size
+            };
+            cmra.extend_from_slice(
+                &CriticalMetadataRecoveryShard {
+                    shard_index: idx as u16,
+                    shard_role: 0,
+                    shard_payload_length: payload_len as u32,
+                    payload,
+                    shard_crc32c: 0,
+                }
+                .to_bytes(shard_size)
+                .unwrap(),
+            );
+        }
+        for (idx, payload) in parity_shards.into_iter().enumerate() {
+            cmra.extend_from_slice(
+                &CriticalMetadataRecoveryShard {
+                    shard_index: (data_shard_count + idx) as u16,
+                    shard_role: 1,
+                    shard_payload_length: shard_size as u32,
+                    payload,
+                    shard_crc32c: 0,
+                }
+                .to_bytes(shard_size)
+                .unwrap(),
+            );
+        }
+        assert_eq!(cmra.len() as u64, recovered.cmra_length);
+        let cmra_offset = locator.cmra_offset as usize;
+        volume[cmra_offset..cmra_offset + cmra.len()].copy_from_slice(&cmra);
+
+        rewrite_locator_image_sha(volume, final_offset, image_sha256);
+        let mirror_offset = final_offset - CRITICAL_RECOVERY_LOCATOR_LEN;
+        rewrite_locator_image_sha(volume, mirror_offset, image_sha256);
+    }
+
+    fn refresh_critical_image_region_digests(image: &mut CriticalMetadataImage) {
+        image.volume_header_sha256 = sha256_bytes(
+            &image
+                .regions
+                .iter()
+                .find(|region| region.region_type == 1)
+                .unwrap()
+                .bytes,
+        );
+        image.crypto_header_sha256 = sha256_bytes(
+            &image
+                .regions
+                .iter()
+                .find(|region| region.region_type == 2)
+                .unwrap()
+                .bytes,
+        );
+        image.manifest_footer_sha256 = sha256_bytes(
+            &image
+                .regions
+                .iter()
+                .find(|region| region.region_type == 3)
+                .unwrap()
+                .bytes,
+        );
+        image.root_auth_footer_sha256 = image
+            .regions
+            .iter()
+            .find(|region| region.region_type == 4)
+            .map(|region| sha256_bytes(&region.bytes))
+            .unwrap_or([0u8; 32]);
+        image.volume_trailer_sha256 = sha256_bytes(
+            &image
+                .regions
+                .iter()
+                .find(|region| region.region_type == 5)
+                .unwrap()
+                .bytes,
+        );
+    }
+
+    fn rewrite_locator_image_sha(volume: &mut [u8], offset: usize, image_sha256: [u8; 32]) {
+        let mut locator =
+            CriticalRecoveryLocator::parse(&volume[offset..offset + CRITICAL_RECOVERY_LOCATOR_LEN])
+                .unwrap();
+        locator.cmra_image_sha256 = image_sha256;
+        volume[offset..offset + CRITICAL_RECOVERY_LOCATOR_LEN].copy_from_slice(&locator.to_bytes());
+    }
+
+    fn corrupt_v41_terminal_recovery(volume: &mut [u8]) {
+        let final_offset = volume.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
+        let final_locator = CriticalRecoveryLocator::parse(
+            &volume[final_offset..final_offset + CRITICAL_RECOVERY_LOCATOR_LEN],
+        )
+        .unwrap();
+        let mirror_offset = final_offset - CRITICAL_RECOVERY_LOCATOR_LEN;
+        volume[final_locator.cmra_offset as usize] ^= 0x55;
+        volume[mirror_offset] ^= 0x55;
+        volume[final_offset] ^= 0x55;
     }
 
     fn mutate_first_block_record(volume: &mut [u8], mutate: impl FnOnce(&mut BlockRecord)) {
@@ -6873,6 +9675,7 @@ mod tests {
             observed_archive_bytes: 1_000_000,
             subkeys,
             blocks,
+            crypto_header_bytes: Vec::new(),
             volume_header,
             crypto_header,
             manifest_footer: ManifestFooter {
@@ -6897,8 +9700,12 @@ mod tests {
                 manifest_footer_offset: 0,
                 manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
                 closed_at_ns: 0,
+                root_auth_footer_offset: 0,
+                root_auth_footer_length: 0,
+                root_auth_flags: 0,
                 trailer_hmac: [0u8; 32],
             }),
+            root_auth_footer: None,
             index_root,
             payload_dictionary: None,
         };

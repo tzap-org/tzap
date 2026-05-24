@@ -1,5 +1,5 @@
-mod support;
 mod seeds;
+mod support;
 
 use std::error::Error;
 use std::fs;
@@ -16,9 +16,15 @@ const TARGETS: [(&str, fn(&[u8])); 3] = [
 
 const EMBEDDED_SEEDS: [(&str, &[u8]); 5] = [
     ("empty", b""),
-    ("v36-magic-markers", b"TZAPTZCHTZBKTZMFTZVTTZBS"),
+    (
+        "v41-magic-markers",
+        b"TZAPTZCHTZBKTZMFTZVTTZRATZMITZCRTZCSTZCLTZBS",
+    ),
     ("metadata-magic-markers", b"TZIRTZISTZDH"),
-    ("zstd-skippable-marker", &[0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0]),
+    (
+        "zstd-skippable-marker",
+        &[0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0],
+    ),
     ("wide-padding-marker", &[0, 0, 0, 0, 5, 0xff]),
 ];
 
@@ -32,8 +38,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             .find(|(name, _)| *name == seed.target)
             .map(|(_, harness)| *harness)
             .ok_or_else(|| format!("unknown structured seed target {}", seed.target))?;
-        seeds::assert_structured_seed_success(&seed)
-            .map_err(|err| format!("{}/{} did not hit expected valid parse path: {err}", seed.target, seed.name))?;
+        seeds::assert_structured_seed_success(&seed).map_err(|err| {
+            format!(
+                "{}/{} did not hit expected valid parse path: {err}",
+                seed.target, seed.name
+            )
+        })?;
         harness(&seed.bytes);
         total += 1;
         println!("smoke: {}/{}", seed.target, seed.name);
@@ -58,10 +68,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_target_corpus(
-    target_dir: &Path,
-    harness: fn(&[u8]),
-) -> Result<usize, Box<dyn Error>> {
+fn run_target_corpus(target_dir: &Path, harness: fn(&[u8])) -> Result<usize, Box<dyn Error>> {
     let mut seed_paths = fs::read_dir(target_dir)?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<Result<Vec<PathBuf>, _>>()?;

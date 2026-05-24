@@ -69,6 +69,9 @@ pub fn depad_suffix_padding(plaintext: &[u8]) -> Result<&[u8], FormatError> {
                 .try_into()
                 .expect("slice length checked"),
         ) as usize;
+        if pad_len < 255 {
+            return Err(FormatError::InvalidSuffixPadding);
+        }
         (5usize, pad_len)
     };
 
@@ -126,6 +129,14 @@ mod tests {
         let padded = suffix_pad_for_aead(b"hello", 16, 4096).unwrap();
         assert_eq!(padded[padded.len() - 1], 0xff);
         assert_eq!(depad_suffix_padding(&padded).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn rejects_noncanonical_wide_form_padding_below_255() {
+        assert_eq!(
+            depad_suffix_padding(&[0x05, 0x00, 0x00, 0x00, 0xff]).unwrap_err(),
+            FormatError::InvalidSuffixPadding
+        );
     }
 
     #[test]

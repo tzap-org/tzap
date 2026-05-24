@@ -2,15 +2,22 @@
 
 use tzap_core::compression::{decompress_exact_zstd_frame, validate_exact_zstd_frame};
 use tzap_core::format::{
-    BLOCK_RECORD_FRAMING_LEN, CRYPTO_HEADER_FIXED_LEN, MANIFEST_FOOTER_LEN, VOLUME_TRAILER_LEN,
+    BLOCK_RECORD_FRAMING_LEN, CRITICAL_METADATA_IMAGE_FIXED_LEN,
+    CRITICAL_METADATA_RECOVERY_HEADER_LEN, CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN,
+    CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_HEADER_FIXED_LEN, IMAGE_CRC_LEN, MANIFEST_FOOTER_LEN,
+    VOLUME_TRAILER_LEN,
 };
 use tzap_core::metadata::{
     DirectoryHintShardEntry, DirectoryHintTable, IndexRoot, IndexShard, MetadataLimits, ShardEntry,
 };
 use tzap_core::padding::depad_suffix_padding;
+use tzap_core::signing::{
+    verify_ed25519_root_auth, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
+};
 use tzap_core::wire::{
-    BlockRecord, BootstrapSidecarHeader, CryptoHeader, CryptoHeaderFixed, ManifestFooter,
-    VolumeHeader, VolumeTrailer,
+    BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage, CriticalMetadataRecoveryHeader,
+    CriticalMetadataRecoveryShard, CriticalRecoveryLocator, CryptoHeader, CryptoHeaderFixed,
+    ManifestFooter, RootAuthFooterV1, VolumeHeader, VolumeTrailer,
 };
 
 const FUZZ_BLOCK_SIZES: [usize; 4] = [1, 16, 256, 4096];
@@ -20,7 +27,42 @@ pub fn parse_fixed_structures(data: &[u8]) {
     let _ = VolumeHeader::parse(data);
     let _ = ManifestFooter::parse(data);
     let _ = VolumeTrailer::parse(data);
+    let _ = RootAuthFooterV1::parse(data);
+    let _ = CriticalMetadataImage::parse(data);
     let _ = BootstrapSidecarHeader::parse(data);
+
+    if data.len() <= 128 {
+        let footer = RootAuthFooterV1 {
+            archive_uuid: [0; 16],
+            session_id: [0; 16],
+            authenticator_id: ED25519_AUTHENTICATOR_ID,
+            signer_identity_type: 1,
+            signer_identity_bytes: [1; 32].to_vec(),
+            authenticator_value: data.to_vec(),
+            total_data_block_count: 0,
+            critical_metadata_digest: [0; 32],
+            index_digest: [0; 32],
+            fec_layout_digest: [0; 32],
+            data_block_merkle_root: [0; 32],
+            signer_identity_digest: [0; 32],
+            archive_root: [0; 32],
+            footer_crc32c: 0,
+        };
+        let _ = verify_ed25519_root_auth(
+            &footer,
+            &[0; 32],
+            Some([1; 32]),
+            Ed25519VerificationMode::PublicNoKey,
+        );
+    }
+
+    if data.len() >= CRITICAL_METADATA_RECOVERY_HEADER_LEN {
+        let _ =
+            CriticalMetadataRecoveryHeader::parse(&data[..CRITICAL_METADATA_RECOVERY_HEADER_LEN]);
+    }
+    if data.len() >= CRITICAL_RECOVERY_LOCATOR_LEN {
+        let _ = CriticalRecoveryLocator::parse(&data[..CRITICAL_RECOVERY_LOCATOR_LEN]);
+    }
 
     if data.len() <= u32::MAX as usize {
         let declared_len = data.len() as u32;
@@ -45,6 +87,15 @@ pub fn parse_fixed_structures(data: &[u8]) {
     }
     if data.len() >= VOLUME_TRAILER_LEN {
         let _ = VolumeTrailer::parse(&data[..VOLUME_TRAILER_LEN]);
+    }
+    if data.len() >= CRITICAL_METADATA_IMAGE_FIXED_LEN + IMAGE_CRC_LEN {
+        let _ = CriticalMetadataImage::parse(data);
+    }
+    for shard_size in [1usize, 16, 512] {
+        let row_len = CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN + shard_size;
+        if data.len() >= row_len {
+            let _ = CriticalMetadataRecoveryShard::parse(&data[..row_len], shard_size);
+        }
     }
 }
 
@@ -83,8 +134,8 @@ pub fn parse_metadata(data: &[u8]) {
 pub fn parse_compressed_and_padding(data: &[u8]) {
     let _ = validate_exact_zstd_frame(data);
     if data.len() >= 4 {
-        let expected_size = u32::from_le_bytes(data[..4].try_into().expect("slice length checked"))
-            as usize;
+        let expected_size =
+            u32::from_le_bytes(data[..4].try_into().expect("slice length checked")) as usize;
         let expected_size = expected_size.min(MAX_FUZZ_DECOMPRESSED_SIZE);
         let _ = validate_exact_zstd_frame(&data[4..]);
         let _ = decompress_exact_zstd_frame(&data[4..], expected_size);

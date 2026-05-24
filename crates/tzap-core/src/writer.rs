@@ -10,9 +10,9 @@ use crate::crypto::{
 use crate::fec::encode_parity_gf16;
 use crate::format::{
     AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, FormatError, KdfAlgo, BLOCK_RECORD_FRAMING_LEN,
-    BOOTSTRAP_SIDECAR_HEADER_LEN, CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_HEADER_FIXED_LEN,
-    CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, MANIFEST_FOOTER_LEN, VOLUME_FORMAT_REV,
-    VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    BOOTSTRAP_SIDECAR_HEADER_LEN, CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_EXTENSION_HEADER_LEN,
+    CRYPTO_HEADER_FIXED_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, MANIFEST_FOOTER_LEN,
+    READER_MAX_CMRA_PARITY_PCT, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, DirectoryHintEntry, DirectoryHintShardEntry,
@@ -21,9 +21,15 @@ use crate::metadata::{
     ENVELOPE_ENTRY_LEN, FILE_ENTRY_LEN, FRAME_ENTRY_LEN, INDEX_SHARD_HEADER_LEN,
 };
 use crate::padding::suffix_pad_for_aead;
+use crate::root_auth::{
+    archive_root, critical_metadata_digest, data_block_merkle_root, fec_layout_digest,
+    index_digest, root_auth_descriptor_digest, signer_identity_digest, ArchiveRootInputs,
+    CriticalMetadataDigestInputs, DataBlockMerkleLeaf, FecLayoutObjectRow,
+};
 use crate::wire::{
-    BlockRecord, BootstrapSidecarHeader, CryptoHeaderFixed, ManifestFooter, VolumeHeader,
-    VolumeTrailer,
+    BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage, CriticalMetadataRecoveryHeader,
+    CriticalMetadataRecoveryShard, CriticalRecoveryLocator, CryptoHeader, CryptoHeaderFixed,
+    ManifestFooter, RootAuthFooterV1, SerializedRegion, VolumeHeader, VolumeTrailer,
 };
 
 const TAR_BLOCK_LEN: usize = 512;
@@ -47,6 +53,7 @@ const DIRECTORY_HINT_REQUIRED_FILE_COUNT: usize = 100_000;
 const MAX_FILES_PER_INDEX_SHARD: usize = 1_000_000;
 const MAX_HASH_PREFIX_RUN_FILES: usize = 50_000;
 const DEFAULT_DIRECTORY_HINT_ENTRIES_PER_SHARD: usize = 10_000;
+const CMRA_SHARD_SIZE: usize = 512;
 
 fn should_emit_directory_hints(file_count: usize) -> bool {
     file_count > DIRECTORY_HINT_REQUIRED_FILE_COUNT
@@ -99,6 +106,21 @@ impl Default for WriterOptions {
             closed_at_ns: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootAuthWriterConfig<'a> {
+    pub authenticator_id: u16,
+    pub signer_identity_type: u16,
+    pub signer_identity: &'a [u8],
+    pub authenticator_value_length: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootAuthSigningRequest {
+    pub archive_uuid: [u8; 16],
+    pub session_id: [u8; 16],
+    pub archive_root: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,7 +284,15 @@ pub fn write_archive(
     master_key: &MasterKey,
     options: WriterOptions,
 ) -> Result<WrittenArchive, FormatError> {
-    write_archive_inner(files, master_key, options, None, &KdfParams::Raw)
+    write_archive_inner(
+        files,
+        master_key,
+        options,
+        None,
+        &KdfParams::Raw,
+        None,
+        None,
+    )
 }
 
 pub fn write_archive_with_kdf(
@@ -271,7 +301,95 @@ pub fn write_archive_with_kdf(
     options: WriterOptions,
     kdf_params: &KdfParams,
 ) -> Result<WrittenArchive, FormatError> {
-    write_archive_inner(files, master_key, options, None, kdf_params)
+    write_archive_inner(files, master_key, options, None, kdf_params, None, None)
+}
+
+pub fn write_archive_with_root_auth<F>(
+    files: &[RegularFile<'_>],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    root_auth: RootAuthWriterConfig<'_>,
+    mut authenticator: F,
+) -> Result<WrittenArchive, FormatError>
+where
+    F: FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
+{
+    write_archive_inner(
+        files,
+        master_key,
+        options,
+        None,
+        &KdfParams::Raw,
+        Some(root_auth),
+        Some(&mut authenticator),
+    )
+}
+
+pub fn write_archive_with_root_auth_and_kdf<F>(
+    files: &[RegularFile<'_>],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    kdf_params: &KdfParams,
+    root_auth: RootAuthWriterConfig<'_>,
+    mut authenticator: F,
+) -> Result<WrittenArchive, FormatError>
+where
+    F: FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
+{
+    write_archive_inner(
+        files,
+        master_key,
+        options,
+        None,
+        kdf_params,
+        Some(root_auth),
+        Some(&mut authenticator),
+    )
+}
+
+pub fn write_archive_with_dictionary_and_root_auth<F>(
+    files: &[RegularFile<'_>],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    dictionary: &[u8],
+    root_auth: RootAuthWriterConfig<'_>,
+    mut authenticator: F,
+) -> Result<WrittenArchive, FormatError>
+where
+    F: FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
+{
+    write_archive_inner(
+        files,
+        master_key,
+        options,
+        Some(dictionary),
+        &KdfParams::Raw,
+        Some(root_auth),
+        Some(&mut authenticator),
+    )
+}
+
+pub fn write_archive_with_dictionary_kdf_and_root_auth<F>(
+    files: &[RegularFile<'_>],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    dictionary: &[u8],
+    kdf_params: &KdfParams,
+    root_auth: RootAuthWriterConfig<'_>,
+    mut authenticator: F,
+) -> Result<WrittenArchive, FormatError>
+where
+    F: FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
+{
+    write_archive_inner(
+        files,
+        master_key,
+        options,
+        Some(dictionary),
+        kdf_params,
+        Some(root_auth),
+        Some(&mut authenticator),
+    )
 }
 
 pub fn write_archive_with_dictionary(
@@ -301,6 +419,8 @@ pub fn write_archive_with_dictionary(
         options,
         Some(dictionary),
         &KdfParams::Raw,
+        None,
+        None,
     )
 }
 
@@ -326,7 +446,15 @@ pub fn write_archive_with_dictionary_and_kdf(
             "dictionary decompressed size exceeds u32",
         ));
     }
-    write_archive_inner(files, master_key, options, Some(dictionary), kdf_params)
+    write_archive_inner(
+        files,
+        master_key,
+        options,
+        Some(dictionary),
+        kdf_params,
+        None,
+        None,
+    )
 }
 
 fn write_archive_inner(
@@ -335,6 +463,10 @@ fn write_archive_inner(
     options: WriterOptions,
     dictionary: Option<&[u8]>,
     kdf_params: &KdfParams,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    mut authenticator: Option<
+        &mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
+    >,
 ) -> Result<WrittenArchive, FormatError> {
     let mut requested_options = options;
     if requested_options.target_volume_size.is_some() {
@@ -350,15 +482,30 @@ fn write_archive_inner(
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
     loop {
         let planned_options = plan_writer_options(requested_options)?;
-        let archive = write_archive_once(
-            files,
-            master_key,
-            planned_options,
-            dictionary,
-            kdf_params,
-            archive_uuid,
-            session_id,
-        )?;
+        let archive = match authenticator.as_mut() {
+            Some(signer) => write_archive_once(
+                files,
+                master_key,
+                planned_options,
+                dictionary,
+                kdf_params,
+                archive_uuid,
+                session_id,
+                root_auth,
+                Some(&mut **signer),
+            )?,
+            None => write_archive_once(
+                files,
+                master_key,
+                planned_options,
+                dictionary,
+                kdf_params,
+                archive_uuid,
+                session_id,
+                root_auth,
+                None,
+            )?,
+        };
 
         let Some(target_volume_size) = planned_options.target_volume_size else {
             return Ok(archive);
@@ -380,6 +527,10 @@ fn write_archive_once(
     kdf_params: &KdfParams,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    mut authenticator: Option<
+        &mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
+    >,
 ) -> Result<WrittenArchive, FormatError> {
     let subkeys = Subkeys::derive(master_key, &archive_uuid, &session_id)?;
     let mut next_block_index = 0u64;
@@ -638,8 +789,45 @@ fn write_archive_once(
         striped_records[volume_index].push(record.clone());
     }
 
+    let volume_zero_manifest = build_manifest_footer(
+        &subkeys,
+        archive_uuid,
+        session_id,
+        0,
+        options.stripe_width,
+        &index_root_extent,
+        index_root_plaintext.len(),
+    )?;
+    let root_auth_footer = match root_auth {
+        Some(config) => {
+            let signer = authenticator
+                .as_deref_mut()
+                .ok_or(FormatError::WriterInvariant(
+                    "missing root-auth authenticator",
+                ))?;
+            Some(build_root_auth_footer(
+                config,
+                signer,
+                archive_uuid,
+                session_id,
+                options,
+                &crypto_header,
+                &volume_zero_manifest,
+                &index_root_plaintext,
+                &index_root_extent,
+                actual_dictionary_extent
+                    .as_ref()
+                    .map(|(object, decompressed_size)| (object, *decompressed_size)),
+                &shard_entries,
+                &payload_objects,
+                &directory_hint_entries,
+                &block_records,
+            )?)
+        }
+        None => None,
+    };
+
     let mut volumes = Vec::with_capacity(stripe_width);
-    let mut volume_zero_manifest = [0u8; MANIFEST_FOOTER_LEN];
     for (volume_index, records) in striped_records.iter().enumerate() {
         let volume_index = u32::try_from(volume_index)
             .map_err(|_| FormatError::WriterUnsupported("volume_index"))?;
@@ -654,9 +842,10 @@ fn write_archive_once(
             crypto_header_length: u32_len(crypto_header.len(), "CryptoHeader")?,
             header_crc32c: 0,
         };
+        let volume_header_bytes = volume_header.to_bytes();
 
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&volume_header.to_bytes());
+        bytes.extend_from_slice(&volume_header_bytes);
         bytes.extend_from_slice(&crypto_header);
         for record in records {
             bytes.extend_from_slice(&record.to_bytes());
@@ -674,21 +863,73 @@ fn write_archive_once(
         )?;
         bytes.extend_from_slice(&manifest_footer);
 
-        let bytes_written = bytes.len() as u64;
+        let root_auth_footer_offset = root_auth_footer.as_ref().map(|footer| {
+            let offset = bytes.len() as u64;
+            bytes.extend_from_slice(footer);
+            offset
+        });
+        let root_auth_footer_length = root_auth_footer
+            .as_ref()
+            .map(|footer| u32_len(footer.len(), "RootAuthFooterV1"))
+            .transpose()?;
+        let trailer_offset = bytes.len() as u64;
         let trailer = build_volume_trailer(
             &subkeys,
             archive_uuid,
             session_id,
             volume_index,
             records.len() as u64,
-            bytes_written,
+            trailer_offset,
             manifest_footer_offset,
             options.closed_at_ns,
+            root_auth_footer_offset.zip(root_auth_footer_length),
         );
         bytes.extend_from_slice(&trailer);
+        let cmra_offset = bytes.len() as u64;
+        let cmra = build_v41_cmra(
+            &volume_header_bytes,
+            &crypto_header,
+            records.len() as u64,
+            manifest_footer_offset,
+            &manifest_footer,
+            root_auth_footer_offset,
+            root_auth_footer.as_deref(),
+            trailer_offset,
+            &trailer,
+            cmra_offset,
+            options,
+            archive_uuid,
+            session_id,
+            volume_index,
+        )?;
+        bytes.extend_from_slice(&cmra.bytes);
+        let locator_base = CriticalRecoveryLocator {
+            cmra_offset,
+            cmra_length: u32_len(cmra.bytes.len(), "CMRA")?,
+            volume_trailer_offset: trailer_offset,
+            body_bytes_before_cmra: cmra_offset,
+            archive_uuid_hint: archive_uuid,
+            session_id_hint: session_id,
+            volume_index_hint: volume_index,
+            locator_sequence: 1,
+            cmra_shard_size: cmra.shard_size,
+            cmra_data_shard_count: cmra.data_shard_count,
+            cmra_parity_shard_count: cmra.parity_shard_count,
+            cmra_image_length: cmra.image_length,
+            cmra_image_sha256: cmra.image_sha256,
+            locator_crc32c: 0,
+        };
+        let mirror = locator_base.to_bytes();
+        bytes.extend_from_slice(&mirror);
+        let final_locator = CriticalRecoveryLocator {
+            locator_sequence: 0,
+            ..locator_base
+        }
+        .to_bytes();
+        bytes.extend_from_slice(&final_locator);
 
         if volume_index == 0 {
-            volume_zero_manifest = manifest_footer;
+            debug_assert_eq!(volume_zero_manifest, manifest_footer);
         }
         volumes.push(bytes);
     }
@@ -739,23 +980,15 @@ fn required_stripe_width_for_target(
         .volumes
         .first()
         .ok_or(FormatError::WriterInvariant("no volumes emitted"))?;
-    let volume_header = VolumeHeader::parse(
-        first_volume
-            .get(..VOLUME_HEADER_LEN)
-            .ok_or(FormatError::WriterInvariant("truncated emitted volume"))?,
-    )?;
-    let fixed_volume_overhead = VOLUME_HEADER_LEN as u64
-        + volume_header.crypto_header_length as u64
-        + MANIFEST_FOOTER_LEN as u64
-        + VOLUME_TRAILER_LEN as u64;
-    if target_volume_size <= fixed_volume_overhead {
+    let block_record_len = options.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
+    let current_overhead = v41_emitted_volume_overhead(first_volume, block_record_len)?;
+    if target_volume_size <= current_overhead {
         return Err(FormatError::WriterUnsupported(
             "volume-size is too small for per-volume metadata",
         ));
     }
 
-    let block_record_len = options.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
-    let records_per_volume = (target_volume_size - fixed_volume_overhead) / block_record_len;
+    let records_per_volume = (target_volume_size - current_overhead) / block_record_len;
     if records_per_volume == 0 {
         return Err(FormatError::WriterUnsupported(
             "volume-size is too small for the configured block-size",
@@ -764,10 +997,11 @@ fn required_stripe_width_for_target(
 
     let total_records = archive.volumes.iter().try_fold(0u64, |total, volume| {
         let volume_len = volume.len() as u64;
-        if volume_len < fixed_volume_overhead {
+        let overhead = v41_emitted_volume_overhead(volume, block_record_len)?;
+        if volume_len < overhead {
             return Err(FormatError::WriterInvariant("emitted volume too short"));
         }
-        let record_bytes = volume_len - fixed_volume_overhead;
+        let record_bytes = volume_len - overhead;
         total
             .checked_add(record_bytes / block_record_len)
             .ok_or(FormatError::WriterUnsupported("volume count overflow"))
@@ -778,6 +1012,33 @@ fn required_stripe_width_for_target(
     u32::try_from(required).map_err(|_| FormatError::WriterUnsupported("volume count"))
 }
 
+fn v41_emitted_volume_overhead(volume: &[u8], block_record_len: u64) -> Result<u64, FormatError> {
+    if volume.len() < CRITICAL_RECOVERY_LOCATOR_LEN {
+        return Err(FormatError::WriterInvariant("emitted volume too short"));
+    }
+    let locator_offset = volume.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
+    let locator = CriticalRecoveryLocator::parse(&volume[locator_offset..])?;
+    let trailer_offset = to_usize_writer(locator.volume_trailer_offset, "VolumeTrailer")?;
+    let trailer_end = trailer_offset
+        .checked_add(VOLUME_TRAILER_LEN)
+        .ok_or(FormatError::WriterInvariant("VolumeTrailer overflow"))?;
+    let trailer = VolumeTrailer::parse(volume.get(trailer_offset..trailer_end).ok_or(
+        FormatError::WriterInvariant("truncated emitted VolumeTrailer"),
+    )?)?;
+    let record_bytes =
+        trailer
+            .block_count
+            .checked_mul(block_record_len)
+            .ok_or(FormatError::WriterUnsupported(
+                "volume record byte overflow",
+            ))?;
+    (volume.len() as u64)
+        .checked_sub(record_bytes)
+        .ok_or(FormatError::WriterInvariant(
+            "emitted volume record overflow",
+        ))
+}
+
 pub fn write_empty_archive(master_key: &MasterKey) -> Result<WrittenArchive, FormatError> {
     write_archive(&[], master_key, WriterOptions::default())
 }
@@ -785,7 +1046,7 @@ pub fn write_empty_archive(master_key: &MasterKey) -> Result<WrittenArchive, For
 fn plan_writer_options(mut options: WriterOptions) -> Result<WriterOptions, FormatError> {
     if options.block_size < MIN_BLOCK_SIZE || options.block_size % 2 != 0 {
         return Err(FormatError::WriterUnsupported(
-            "M6 writer requires an even block size of at least 4096",
+            "writer requires an even block size of at least 4096",
         ));
     }
     if options.stripe_width == 0 {
@@ -829,22 +1090,18 @@ fn plan_writer_options(mut options: WriterOptions) -> Result<WriterOptions, Form
     options.index_root_fec_data_shards = options
         .index_root_fec_data_shards
         .max(MIN_INDEX_ROOT_FEC_DATA_SHARDS);
-    options.fec_parity_shards = options.fec_parity_shards.max(compute_parity_u16(
-        options.fec_data_shards as u64,
-        options,
-        "fec_parity_shards",
-    )?);
-    options.index_fec_parity_shards = options.index_fec_parity_shards.max(compute_parity_u16(
+    options.fec_parity_shards =
+        compute_parity_u16(options.fec_data_shards as u64, options, "fec_parity_shards")?;
+    options.index_fec_parity_shards = compute_parity_u16(
         options.index_fec_data_shards as u64,
         options,
         "index_fec_parity_shards",
-    )?);
-    options.index_root_fec_parity_shards =
-        options.index_root_fec_parity_shards.max(compute_parity_u16(
-            options.index_root_fec_data_shards as u64,
-            options,
-            "index_root_fec_parity_shards",
-        )?);
+    )?;
+    options.index_root_fec_parity_shards = compute_parity_u16(
+        options.index_root_fec_data_shards as u64,
+        options,
+        "index_root_fec_parity_shards",
+    )?;
     Ok(options)
 }
 
@@ -1898,6 +2155,241 @@ fn map_metadata_encrypt_error(error: FormatError, kind: MetadataObjectKind) -> F
     }
 }
 
+fn build_root_auth_footer(
+    config: RootAuthWriterConfig<'_>,
+    authenticator: &mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
+    archive_uuid: [u8; 16],
+    session_id: [u8; 16],
+    options: WriterOptions,
+    crypto_header: &[u8],
+    volume_zero_manifest: &[u8; MANIFEST_FOOTER_LEN],
+    index_root_plaintext: &[u8],
+    index_root_extent: &EncryptedObject,
+    dictionary_extent: Option<(&EncryptedObject, u32)>,
+    shard_entries: &[ShardEntry],
+    payload_objects: &[PayloadObject],
+    directory_hint_entries: &[DirectoryHintShardEntry],
+    block_records: &[BlockRecord],
+) -> Result<Vec<u8>, FormatError> {
+    let parsed_crypto =
+        CryptoHeader::parse(crypto_header, u32_len(crypto_header.len(), "CryptoHeader")?)?;
+    let footer_length = root_auth_footer_wire_length(
+        config.signer_identity.len(),
+        config.authenticator_value_length as usize,
+    )?;
+    let root_auth_descriptor_digest = root_auth_descriptor_digest(
+        config.authenticator_id,
+        config.signer_identity_type,
+        config.signer_identity,
+        config.authenticator_value_length,
+        footer_length,
+    )?;
+    let signer_identity_digest =
+        signer_identity_digest(config.signer_identity_type, config.signer_identity)?;
+    let manifest_pre_hmac = manifest_footer_global_pre_hmac_bytes(volume_zero_manifest);
+    let critical_metadata_digest = critical_metadata_digest(CriticalMetadataDigestInputs {
+        archive_uuid,
+        session_id,
+        stripe_width: options.stripe_width,
+        total_volumes: options.stripe_width,
+        compression_algo: parsed_crypto.fixed.compression_algo,
+        aead_algo: parsed_crypto.fixed.aead_algo,
+        fec_algo: parsed_crypto.fixed.fec_algo,
+        kdf_algo: parsed_crypto.fixed.kdf_algo,
+        crypto_header_pre_hmac_bytes: parsed_crypto.hmac_covered_bytes,
+        chunk_size: parsed_crypto.fixed.chunk_size,
+        envelope_target_size: parsed_crypto.fixed.envelope_target_size,
+        block_size: parsed_crypto.fixed.block_size,
+        fec_data_shards: parsed_crypto.fixed.fec_data_shards,
+        fec_parity_shards: parsed_crypto.fixed.fec_parity_shards,
+        index_fec_data_shards: parsed_crypto.fixed.index_fec_data_shards,
+        index_fec_parity_shards: parsed_crypto.fixed.index_fec_parity_shards,
+        index_root_fec_data_shards: parsed_crypto.fixed.index_root_fec_data_shards,
+        index_root_fec_parity_shards: parsed_crypto.fixed.index_root_fec_parity_shards,
+        volume_loss_tolerance: parsed_crypto.fixed.volume_loss_tolerance,
+        bit_rot_buffer_pct: parsed_crypto.fixed.bit_rot_buffer_pct,
+        has_dictionary: parsed_crypto.fixed.has_dictionary,
+        manifest_footer_global_pre_hmac_bytes: &manifest_pre_hmac,
+        index_root_first_block: index_root_extent.first_block_index,
+        index_root_data_block_count: index_root_extent.data_block_count,
+        index_root_parity_block_count: index_root_extent.parity_block_count,
+        index_root_encrypted_size: index_root_extent.encrypted_size,
+        index_root_decompressed_size: u32_len(index_root_plaintext.len(), "IndexRoot")?,
+        root_auth_descriptor_digest,
+    })?;
+    let index_digest = index_digest(index_root_plaintext);
+    let fec_layout_rows = writer_fec_layout_rows(
+        index_root_extent,
+        u32_len(index_root_plaintext.len(), "IndexRoot")?,
+        dictionary_extent,
+        shard_entries,
+        payload_objects,
+        directory_hint_entries,
+    );
+    let fec_layout_digest = fec_layout_digest(&fec_layout_rows)?;
+    let mut data_leaves = block_records
+        .iter()
+        .filter(|record| record.kind.is_data())
+        .map(|record| DataBlockMerkleLeaf {
+            block_index: record.block_index,
+            kind: record.kind,
+            flags: record.flags,
+            payload: record.payload.clone(),
+        })
+        .collect::<Vec<_>>();
+    data_leaves.sort_by_key(|leaf| leaf.block_index);
+    let total_data_block_count = u64::try_from(data_leaves.len())
+        .map_err(|_| FormatError::WriterUnsupported("root-auth data block count"))?;
+    let data_block_merkle_root = data_block_merkle_root(&data_leaves);
+    let archive_root = archive_root(ArchiveRootInputs {
+        archive_uuid,
+        session_id,
+        format_version: FORMAT_VERSION,
+        volume_format_rev: VOLUME_FORMAT_REV,
+        compression_algo: parsed_crypto.fixed.compression_algo,
+        aead_algo: parsed_crypto.fixed.aead_algo,
+        fec_algo: parsed_crypto.fixed.fec_algo,
+        kdf_algo: parsed_crypto.fixed.kdf_algo,
+        critical_metadata_digest,
+        index_digest,
+        fec_layout_digest,
+        total_data_block_count,
+        data_block_merkle_root,
+        root_auth_descriptor_digest,
+        signer_identity_digest,
+    });
+    let authenticator_value = authenticator(&RootAuthSigningRequest {
+        archive_uuid,
+        session_id,
+        archive_root,
+    })?;
+    if authenticator_value.len() != config.authenticator_value_length as usize {
+        return Err(FormatError::WriterUnsupported(
+            "root-auth authenticator length mismatch",
+        ));
+    }
+
+    RootAuthFooterV1 {
+        archive_uuid,
+        session_id,
+        authenticator_id: config.authenticator_id,
+        signer_identity_type: config.signer_identity_type,
+        signer_identity_bytes: config.signer_identity.to_vec(),
+        authenticator_value,
+        total_data_block_count,
+        critical_metadata_digest,
+        index_digest,
+        fec_layout_digest,
+        data_block_merkle_root,
+        signer_identity_digest,
+        archive_root,
+        footer_crc32c: 0,
+    }
+    .to_bytes()
+}
+
+fn writer_fec_layout_rows(
+    index_root_extent: &EncryptedObject,
+    index_root_plain_size: u32,
+    dictionary_extent: Option<(&EncryptedObject, u32)>,
+    shard_entries: &[ShardEntry],
+    payload_objects: &[PayloadObject],
+    directory_hint_entries: &[DirectoryHintShardEntry],
+) -> Vec<FecLayoutObjectRow> {
+    let mut rows = Vec::new();
+    rows.push(FecLayoutObjectRow {
+        object_class: 1,
+        present: true,
+        object_id: 0,
+        first_block_index: index_root_extent.first_block_index,
+        data_block_count: index_root_extent.data_block_count,
+        parity_block_count: index_root_extent.parity_block_count,
+        encrypted_size: index_root_extent.encrypted_size,
+        plain_size: index_root_plain_size,
+    });
+    if let Some((dictionary, decompressed_size)) = dictionary_extent {
+        rows.push(FecLayoutObjectRow {
+            object_class: 2,
+            present: true,
+            object_id: 0,
+            first_block_index: dictionary.first_block_index,
+            data_block_count: dictionary.data_block_count,
+            parity_block_count: dictionary.parity_block_count,
+            encrypted_size: dictionary.encrypted_size,
+            plain_size: decompressed_size,
+        });
+    } else {
+        rows.push(FecLayoutObjectRow {
+            object_class: 2,
+            present: false,
+            object_id: 0,
+            first_block_index: 0,
+            data_block_count: 0,
+            parity_block_count: 0,
+            encrypted_size: 0,
+            plain_size: 0,
+        });
+    }
+    for entry in shard_entries {
+        rows.push(FecLayoutObjectRow {
+            object_class: 3,
+            present: true,
+            object_id: entry.shard_index,
+            first_block_index: entry.first_block_index,
+            data_block_count: entry.data_block_count,
+            parity_block_count: entry.parity_block_count,
+            encrypted_size: entry.encrypted_size,
+            plain_size: entry.decompressed_size,
+        });
+    }
+    for payload in payload_objects {
+        rows.push(FecLayoutObjectRow {
+            object_class: 4,
+            present: true,
+            object_id: payload.envelope_index,
+            first_block_index: payload.object.first_block_index,
+            data_block_count: payload.object.data_block_count,
+            parity_block_count: payload.object.parity_block_count,
+            encrypted_size: payload.object.encrypted_size,
+            plain_size: payload.plaintext_size,
+        });
+    }
+    for entry in directory_hint_entries {
+        rows.push(FecLayoutObjectRow {
+            object_class: 5,
+            present: true,
+            object_id: entry.hint_shard_index,
+            first_block_index: entry.first_block_index,
+            data_block_count: entry.data_block_count,
+            parity_block_count: entry.parity_block_count,
+            encrypted_size: entry.encrypted_size,
+            plain_size: entry.decompressed_size,
+        });
+    }
+    rows
+}
+
+fn manifest_footer_global_pre_hmac_bytes(manifest_footer: &[u8; MANIFEST_FOOTER_LEN]) -> [u8; 104] {
+    let mut bytes = [0u8; 104];
+    bytes.copy_from_slice(&manifest_footer[..104]);
+    bytes[36..40].fill(0);
+    bytes
+}
+
+fn root_auth_footer_wire_length(
+    signer_identity_len: usize,
+    authenticator_value_len: usize,
+) -> Result<u32, FormatError> {
+    let len = crate::format::ROOT_AUTH_FOOTER_FIXED_LEN
+        .checked_add(signer_identity_len)
+        .and_then(|value| value.checked_add(authenticator_value_len))
+        .and_then(|value| value.checked_add(4))
+        .ok_or(FormatError::WriterUnsupported(
+            "RootAuthFooterV1 length overflow",
+        ))?;
+    u32::try_from(len).map_err(|_| FormatError::WriterUnsupported("RootAuthFooterV1 length"))
+}
+
 fn build_manifest_footer(
     subkeys: &Subkeys,
     archive_uuid: [u8; 16],
@@ -1941,7 +2433,13 @@ fn build_volume_trailer(
     bytes_written: u64,
     manifest_footer_offset: u64,
     closed_at_ns: i64,
+    root_auth_footer: Option<(u64, u32)>,
 ) -> [u8; VOLUME_TRAILER_LEN] {
+    let (root_auth_footer_offset, root_auth_footer_length, root_auth_flags) = match root_auth_footer
+    {
+        Some((offset, length)) => (offset, length, 0x0000_0001),
+        None => (0, 0, 0),
+    };
     let mut trailer = VolumeTrailer {
         archive_uuid,
         session_id,
@@ -1951,6 +2449,9 @@ fn build_volume_trailer(
         manifest_footer_offset,
         manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
         closed_at_ns,
+        root_auth_footer_offset,
+        root_auth_footer_length,
+        root_auth_flags,
         trailer_hmac: [0u8; 32],
     };
     let mut bytes = trailer.to_bytes();
@@ -1963,6 +2464,235 @@ fn build_volume_trailer(
     );
     bytes = trailer.to_bytes();
     bytes
+}
+
+struct BuiltCmra {
+    bytes: Vec<u8>,
+    shard_size: u32,
+    data_shard_count: u16,
+    parity_shard_count: u16,
+    image_length: u32,
+    image_sha256: [u8; 32],
+}
+
+fn build_v41_cmra(
+    volume_header_bytes: &[u8; VOLUME_HEADER_LEN],
+    crypto_header: &[u8],
+    block_count: u64,
+    manifest_footer_offset: u64,
+    manifest_footer: &[u8; MANIFEST_FOOTER_LEN],
+    root_auth_footer_offset: Option<u64>,
+    root_auth_footer: Option<&[u8]>,
+    trailer_offset: u64,
+    trailer: &[u8; VOLUME_TRAILER_LEN],
+    cmra_offset: u64,
+    options: WriterOptions,
+    archive_uuid: [u8; 16],
+    session_id: [u8; 16],
+    volume_index: u32,
+) -> Result<BuiltCmra, FormatError> {
+    let block_record_len = options.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
+    let block_records_offset = VOLUME_HEADER_LEN as u64 + crypto_header.len() as u64;
+    let block_records_length = checked_u64_mul(
+        block_count,
+        block_record_len,
+        "CMRA BlockRecord length overflow",
+    )?;
+    let manifest_end = manifest_footer_offset
+        .checked_add(MANIFEST_FOOTER_LEN as u64)
+        .ok_or(FormatError::WriterUnsupported("CMRA terminal overflow"))?;
+    let root_auth_footer_length = root_auth_footer
+        .map(|footer| u32_len(footer.len(), "RootAuthFooterV1"))
+        .transpose()?;
+    match (root_auth_footer_offset, root_auth_footer_length) {
+        (Some(offset), Some(length)) => {
+            if manifest_end != offset
+                || offset
+                    .checked_add(length as u64)
+                    .ok_or(FormatError::WriterUnsupported("CMRA terminal overflow"))?
+                    != trailer_offset
+            {
+                return Err(FormatError::WriterInvariant(
+                    "RootAuthFooter does not sit between ManifestFooter and VolumeTrailer",
+                ));
+            }
+        }
+        (None, None) => {
+            if manifest_end != trailer_offset {
+                return Err(FormatError::WriterInvariant(
+                    "ManifestFooter does not end at VolumeTrailer",
+                ));
+            }
+        }
+        _ => {
+            return Err(FormatError::WriterInvariant(
+                "RootAuthFooter offset/bytes mismatch",
+            ));
+        }
+    }
+    let body_bytes_before_cmra = trailer_offset
+        .checked_add(VOLUME_TRAILER_LEN as u64)
+        .ok_or(FormatError::WriterUnsupported("CMRA terminal overflow"))?;
+    if body_bytes_before_cmra != cmra_offset {
+        return Err(FormatError::WriterInvariant(
+            "CMRA does not start after VolumeTrailer",
+        ));
+    }
+
+    let mut regions = vec![
+        SerializedRegion {
+            region_type: 1,
+            offset: 0,
+            bytes: volume_header_bytes.to_vec(),
+        },
+        SerializedRegion {
+            region_type: 2,
+            offset: VOLUME_HEADER_LEN as u64,
+            bytes: crypto_header.to_vec(),
+        },
+        SerializedRegion {
+            region_type: 3,
+            offset: manifest_footer_offset,
+            bytes: manifest_footer.to_vec(),
+        },
+    ];
+    if let (Some(offset), Some(footer)) = (root_auth_footer_offset, root_auth_footer) {
+        regions.push(SerializedRegion {
+            region_type: 4,
+            offset,
+            bytes: footer.to_vec(),
+        });
+    }
+    regions.push(SerializedRegion {
+        region_type: 5,
+        offset: trailer_offset,
+        bytes: trailer.to_vec(),
+    });
+    let image = CriticalMetadataImage {
+        archive_uuid,
+        session_id,
+        volume_index,
+        stripe_width: options.stripe_width,
+        layout_flags: if root_auth_footer.is_some() {
+            0x0000_0001
+        } else {
+            0
+        },
+        volume_header_offset: 0,
+        volume_header_length: VOLUME_HEADER_LEN as u32,
+        crypto_header_offset: VOLUME_HEADER_LEN as u64,
+        crypto_header_length: u32_len(crypto_header.len(), "CryptoHeader")?,
+        block_records_offset,
+        block_records_length,
+        block_count,
+        manifest_footer_offset,
+        manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
+        root_auth_footer_offset: root_auth_footer_offset.unwrap_or(0),
+        root_auth_footer_length: root_auth_footer_length.unwrap_or(0),
+        volume_trailer_offset: trailer_offset,
+        volume_trailer_length: VOLUME_TRAILER_LEN as u32,
+        body_bytes_before_cmra,
+        volume_header_sha256: sha256_bytes(volume_header_bytes),
+        crypto_header_sha256: sha256_bytes(crypto_header),
+        manifest_footer_sha256: sha256_bytes(manifest_footer),
+        root_auth_footer_sha256: root_auth_footer.map(sha256_bytes).unwrap_or([0u8; 32]),
+        volume_trailer_sha256: sha256_bytes(trailer),
+        regions,
+    };
+    let image_bytes = image.to_bytes()?;
+    let image_sha256 = sha256_bytes(&image_bytes);
+    let data_shard_count = ceil_div(image_bytes.len() as u64, CMRA_SHARD_SIZE as u64)?;
+    let data_shard_count_u16 = u16::try_from(data_shard_count)
+        .map_err(|_| FormatError::WriterUnsupported("CMRA data shard count"))?;
+    let parity_lower = cmra_min_parity_shards(data_shard_count, options.bit_rot_buffer_pct)?;
+    let parity_upper = cmra_min_parity_shards(data_shard_count, READER_MAX_CMRA_PARITY_PCT as u8)?;
+    if parity_lower > parity_upper {
+        return Err(FormatError::WriterUnsupported("CMRA parity bounds"));
+    }
+    let parity_shard_count_u16 = u16::try_from(parity_lower)
+        .map_err(|_| FormatError::WriterUnsupported("CMRA parity shard count"))?;
+
+    let mut data_shards = Vec::with_capacity(data_shard_count as usize);
+    for idx in 0..data_shard_count as usize {
+        let start = idx * CMRA_SHARD_SIZE;
+        let end = (start + CMRA_SHARD_SIZE).min(image_bytes.len());
+        let mut shard = vec![0u8; CMRA_SHARD_SIZE];
+        if start < image_bytes.len() {
+            shard[..end - start].copy_from_slice(&image_bytes[start..end]);
+        }
+        data_shards.push(shard);
+    }
+    let parity_shards = encode_parity_gf16(&data_shards, parity_shard_count_u16 as usize)?;
+
+    let header = CriticalMetadataRecoveryHeader {
+        shard_size: CMRA_SHARD_SIZE as u32,
+        data_shard_count: data_shard_count_u16,
+        parity_shard_count: parity_shard_count_u16,
+        image_length: u32_len(image_bytes.len(), "CriticalMetadataImageV1")?,
+        archive_uuid_hint: archive_uuid,
+        session_id_hint: session_id,
+        volume_index_hint: volume_index,
+        image_sha256,
+        header_crc32c: 0,
+    };
+    let mut cmra = Vec::new();
+    cmra.extend_from_slice(&header.to_bytes());
+    for (idx, payload) in data_shards.into_iter().enumerate() {
+        let payload_len = if idx + 1 == data_shard_count as usize {
+            let final_len = image_bytes.len() - idx * CMRA_SHARD_SIZE;
+            if final_len == 0 {
+                CMRA_SHARD_SIZE
+            } else {
+                final_len
+            }
+        } else {
+            CMRA_SHARD_SIZE
+        };
+        cmra.extend_from_slice(
+            &CriticalMetadataRecoveryShard {
+                shard_index: u16::try_from(idx)
+                    .map_err(|_| FormatError::WriterUnsupported("CMRA shard index"))?,
+                shard_role: 0,
+                shard_payload_length: u32_len(payload_len, "CMRA shard payload")?,
+                payload,
+                shard_crc32c: 0,
+            }
+            .to_bytes(CMRA_SHARD_SIZE)?,
+        );
+    }
+    for (idx, payload) in parity_shards.into_iter().enumerate() {
+        let shard_index = data_shard_count
+            .checked_add(idx as u64)
+            .ok_or(FormatError::WriterUnsupported("CMRA shard index overflow"))?;
+        cmra.extend_from_slice(
+            &CriticalMetadataRecoveryShard {
+                shard_index: u16::try_from(shard_index)
+                    .map_err(|_| FormatError::WriterUnsupported("CMRA shard index"))?,
+                shard_role: 1,
+                shard_payload_length: CMRA_SHARD_SIZE as u32,
+                payload,
+                shard_crc32c: 0,
+            }
+            .to_bytes(CMRA_SHARD_SIZE)?,
+        );
+    }
+
+    Ok(BuiltCmra {
+        bytes: cmra,
+        shard_size: CMRA_SHARD_SIZE as u32,
+        data_shard_count: data_shard_count_u16,
+        parity_shard_count: parity_shard_count_u16,
+        image_length: u32_len(image_bytes.len(), "CriticalMetadataImageV1")?,
+        image_sha256,
+    })
+}
+
+fn cmra_min_parity_shards(data_shard_count: u64, pct: u8) -> Result<u64, FormatError> {
+    let by_pct = ceil_div(
+        checked_u64_mul(data_shard_count, pct as u64, "CMRA parity overflow")?,
+        100,
+    )?;
+    Ok(2u64.max(by_pct))
 }
 
 fn compute_object_parity(
@@ -2309,6 +3039,10 @@ fn u32_len(value: usize, field: &'static str) -> Result<u32, FormatError> {
     u32::try_from(value).map_err(|_| FormatError::WriterUnsupported(field))
 }
 
+fn to_usize_writer(value: u64, field: &'static str) -> Result<usize, FormatError> {
+    usize::try_from(value).map_err(|_| FormatError::WriterUnsupported(field))
+}
+
 fn checked_usize_add(lhs: usize, rhs: usize, field: &'static str) -> Result<usize, FormatError> {
     lhs.checked_add(rhs)
         .ok_or(FormatError::WriterUnsupported(field))
@@ -2326,7 +3060,7 @@ mod tests {
     use crate::metadata::{DirectoryHintTable, MetadataLimits};
     use crate::reader::open_archive;
     use crate::tar_model::parse_tar_member_group;
-    use crate::wire::CryptoHeader;
+    use crate::wire::{CriticalRecoveryLocator, CryptoHeader};
 
     #[test]
     fn writer_defaults_use_v36_sizing_and_parallel_mode() {
@@ -2639,8 +3373,13 @@ mod tests {
         )
         .unwrap();
 
-        let trailer_offset = bytes.len() - VOLUME_TRAILER_LEN;
-        let trailer = VolumeTrailer::parse(&bytes[trailer_offset..]).unwrap();
+        let locator =
+            CriticalRecoveryLocator::parse(&bytes[bytes.len() - CRITICAL_RECOVERY_LOCATOR_LEN..])
+                .unwrap();
+        let trailer_offset = locator.volume_trailer_offset as usize;
+        let trailer =
+            VolumeTrailer::parse(&bytes[trailer_offset..trailer_offset + VOLUME_TRAILER_LEN])
+                .unwrap();
         assert_eq!(trailer.bytes_written, trailer_offset as u64);
         verify_hmac(
             HmacDomain::VolumeTrailer,

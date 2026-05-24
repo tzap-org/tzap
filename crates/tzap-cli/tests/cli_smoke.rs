@@ -7,10 +7,13 @@ use predicates::prelude::*;
 use serde_json::Value;
 use tempfile::tempdir;
 use tzap_core::format::{
-    BlockKind, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN, MANIFEST_FOOTER_LEN,
-    VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    BlockKind, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN, VOLUME_HEADER_LEN,
+    VOLUME_TRAILER_LEN,
 };
-use tzap_core::wire::{BlockRecord, BootstrapSidecarHeader, CryptoHeader, VolumeHeader};
+use tzap_core::wire::{
+    BlockRecord, BootstrapSidecarHeader, CriticalRecoveryLocator, CryptoHeader, VolumeHeader,
+    VolumeTrailer,
+};
 use tzap_core::{crypto::compute_hmac, HmacDomain, MasterKey, Subkeys};
 
 const KEY_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
@@ -51,7 +54,11 @@ fn payload_data_record_locations(volume_index: usize, volume: &[u8]) -> Vec<Payl
     .unwrap();
     let block_size = crypto_header.fixed.block_size as usize;
     let record_len = block_size + BLOCK_RECORD_FRAMING_LEN;
-    let manifest_offset = volume.len() - VOLUME_TRAILER_LEN - MANIFEST_FOOTER_LEN;
+    let locator = CriticalRecoveryLocator::parse(&volume[volume.len() - 128..]).unwrap();
+    let trailer_offset = locator.volume_trailer_offset as usize;
+    let trailer =
+        VolumeTrailer::parse(&volume[trailer_offset..trailer_offset + VOLUME_TRAILER_LEN]).unwrap();
+    let manifest_offset = trailer.manifest_footer_offset as usize;
     assert_eq!((manifest_offset - crypto_end) % record_len, 0);
 
     (crypto_end..manifest_offset)
@@ -67,6 +74,35 @@ fn payload_data_record_locations(volume_index: usize, volume: &[u8]) -> Vec<Payl
             })
         })
         .collect()
+}
+
+fn corrupt_first_record_of_kind(volume: &mut [u8], kind: BlockKind) {
+    let volume_header = VolumeHeader::parse(&volume[..VOLUME_HEADER_LEN]).unwrap();
+    let crypto_start = volume_header.crypto_header_offset as usize;
+    let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
+    let crypto_header = CryptoHeader::parse(
+        &volume[crypto_start..crypto_end],
+        volume_header.crypto_header_length,
+    )
+    .unwrap();
+    let block_size = crypto_header.fixed.block_size as usize;
+    let record_len = block_size + BLOCK_RECORD_FRAMING_LEN;
+    let locator = CriticalRecoveryLocator::parse(&volume[volume.len() - 128..]).unwrap();
+    let trailer_offset = locator.volume_trailer_offset as usize;
+    let trailer =
+        VolumeTrailer::parse(&volume[trailer_offset..trailer_offset + VOLUME_TRAILER_LEN]).unwrap();
+    let manifest_offset = trailer.manifest_footer_offset as usize;
+
+    for offset in (crypto_end..manifest_offset).step_by(record_len) {
+        let mut record =
+            BlockRecord::parse(&volume[offset..offset + record_len], block_size).unwrap();
+        if record.kind == kind {
+            record.payload[0] ^= 0x55;
+            volume[offset..offset + record_len].copy_from_slice(&record.to_bytes());
+            return;
+        }
+    }
+    panic!("no {kind:?} record found to corrupt");
 }
 
 fn zero_deterministic_payload_blocks(
@@ -137,7 +173,14 @@ fn assert_no_archive_stream_claims(help: &str) {
 
 #[test]
 fn cli_subcommand_help_paths_are_available() {
-    for command in ["create", "extract", "list", "verify", "keygen"] {
+    for command in [
+        "create",
+        "extract",
+        "list",
+        "verify",
+        "keygen",
+        "signing-keygen",
+    ] {
         Command::cargo_bin("tzap")
             .unwrap()
             .args([command, "--help"])
@@ -171,13 +214,15 @@ fn cli_top_level_help_contains_product_description_and_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Create, list, verify, and extract v36 archives",
+            "Create, list, verify, and extract v41 archives",
         ))
         .stdout(predicate::str::contains("create"))
         .stdout(predicate::str::contains("extract"))
         .stdout(predicate::str::contains("list"))
         .stdout(predicate::str::contains("verify"))
         .stdout(predicate::str::contains("keygen"))
+        .stdout(predicate::str::contains("signing-keygen"))
+        .stdout(predicate::str::contains("--public-no-key"))
         .stdout(predicate::str::contains("K/KB/KiB"))
         .stdout(predicate::str::contains("Exit codes"));
 }
@@ -241,6 +286,7 @@ fn cli_create_help_includes_examples_and_flags() {
     assert!(stdout.contains("--argon2-m-cost-kib <KIB>"));
     assert!(stdout.contains("--argon2-parallelism <COUNT>"));
     assert!(stdout.contains("--dictionary <FILE>"));
+    assert!(stdout.contains("--signing-key <FILE>"));
     assert!(stdout.contains("--bootstrap-out <FILE>"));
     assert!(stdout.contains("--compression-level <LEVEL>"));
     assert!(stdout.contains("--chunk-size <SIZE>"));
@@ -315,6 +361,8 @@ fn cli_verify_help_includes_examples_and_flags() {
     assert!(stdout.contains("--password"));
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
+    assert!(stdout.contains("--trusted-public-key <FILE>"));
+    assert!(stdout.contains("--public-no-key"));
     assert!(stdout.contains("--bootstrap"));
     assert!(stdout.contains("--json"));
     assert!(stdout.contains("--quiet"));
@@ -336,6 +384,24 @@ fn cli_keygen_help_includes_output_and_force_flags() {
     assert!(stdout.contains("Generate a random 32-byte raw key"));
     assert!(stdout.contains("--output <KEYFILE>"));
     assert!(stdout.contains("--stdout"));
+    assert!(stdout.contains("--force"));
+}
+
+#[test]
+fn cli_signing_keygen_help_includes_keypair_outputs() {
+    let output = Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["signing-keygen", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+
+    assert!(stdout.contains("Generate an Ed25519 RootAuth signing keypair"));
+    assert!(stdout.contains("--secret-output <FILE>"));
+    assert!(stdout.contains("--public-output <FILE>"));
     assert!(stdout.contains("--force"));
 }
 
@@ -501,7 +567,7 @@ fn cli_verify_requires_key_source_before_running() {
         .args(["verify", archive.to_str().unwrap()])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("required"));
+        .stderr(predicate::str::contains("exactly one key source"));
 }
 
 #[test]
@@ -833,6 +899,140 @@ fn cli_verify_json_success_reports_machine_readable_summary() {
     let archives = value.get("archives").unwrap().as_array().unwrap();
     assert_eq!(archives.len(), 1);
     assert_eq!(archives[0].as_str().unwrap(), archive.to_str().unwrap());
+}
+
+#[test]
+fn cli_create_signed_archive_and_verify_root_auth_profiles() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let signing_secret = temp.path().join("root.signing.hex");
+    let signing_public = temp.path().join("root.public.hex");
+    let input = temp.path().join("signed.txt");
+    let archive = temp.path().join("signed.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"signed payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "signing-keygen",
+            "--secret-output",
+            signing_secret.to_str().unwrap(),
+            "--public-output",
+            signing_public.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let public_hex = fs::read_to_string(&signing_public).unwrap();
+    assert_eq!(public_hex.trim().len(), 64);
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--signing-key",
+            signing_secret.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("root auth: ed25519 signed"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--trusted-public-key",
+            signing_public.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("OK (1 volume(s), 1 file(s))")
+                .and(predicate::str::contains("root-auth: OK ed25519")),
+        );
+
+    let output = Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--json",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--trusted-public-key",
+            signing_public.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["verification_mode"], "key-holding");
+    assert_eq!(value["root_auth"]["status"], "root_auth_content_verified");
+    assert_eq!(value["root_auth"]["key_id"], public_hex.trim());
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--public-no-key",
+            "--trusted-public-key",
+            signing_public.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("OK public no-key")
+                .and(predicate::str::contains(
+                    "public_data_block_commitment_verified",
+                ))
+                .and(predicate::str::contains(
+                    "public_physical_completeness_unverified",
+                ))
+                .and(predicate::str::contains("public_recovery_margin_unchecked")),
+        );
+
+    let output = Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--json",
+            "--public-no-key",
+            "--trusted-public-key",
+            signing_public.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["verification_mode"], "public-no-key");
+    assert_eq!(
+        value["root_auth"]["status"],
+        "public_data_block_commitment_verified"
+    );
+    assert_eq!(value["root_auth"]["key_id"], public_hex.trim());
+    assert!(value["public_diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry == "public_recovery_margin_unchecked"));
 }
 
 #[test]
@@ -1403,8 +1603,7 @@ fn cli_reports_corrupt_archive_after_header_authentication_succeeds() {
         .success();
 
     let mut bytes = fs::read(&archive).unwrap();
-    let manifest_hmac_offset = bytes.len() - VOLUME_TRAILER_LEN - MANIFEST_FOOTER_LEN + 104;
-    bytes[manifest_hmac_offset] ^= 0x01;
+    corrupt_first_record_of_kind(&mut bytes, BlockKind::PayloadData);
     fs::write(&archive, bytes).unwrap();
 
     Command::cargo_bin("tzap")
@@ -3815,8 +4014,7 @@ fn cli_list_corrupt_archive_reports_corruption() {
         .success();
 
     let mut bytes = fs::read(&archive).unwrap();
-    let footer_start = bytes.len() - MANIFEST_FOOTER_LEN;
-    bytes[footer_start] ^= 0x01;
+    corrupt_first_record_of_kind(&mut bytes, BlockKind::IndexShardData);
     fs::write(&archive, bytes).unwrap();
 
     Command::cargo_bin("tzap")
@@ -4785,8 +4983,7 @@ fn cli_extract_corrupt_archive_reports_corruption() {
         .success();
 
     let mut bytes = fs::read(&archive).unwrap();
-    let footer_start = bytes.len() - MANIFEST_FOOTER_LEN;
-    bytes[footer_start] ^= 0x01;
+    corrupt_first_record_of_kind(&mut bytes, BlockKind::PayloadData);
     fs::write(&archive, bytes).unwrap();
 
     Command::cargo_bin("tzap")
@@ -4796,7 +4993,7 @@ fn cli_extract_corrupt_archive_reports_corruption() {
             "--keyfile",
             keyfile.to_str().unwrap(),
             archive.to_str().unwrap(),
-            "hello.txt",
+            "payload.txt",
         ])
         .assert()
         .code(11)

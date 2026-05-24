@@ -14,7 +14,7 @@ rust-version = "1.85"
 repository = "https://github.com/frankmanzhu/tzap"
 keywords = ["archive", "compression", "encryption", "recovery", "zstd"]
 categories = ["compression", "cryptography", "filesystem"]
-documentation = "https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv36.md"
+documentation = "https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv41.md"
 readme = "README.md"
 
 [workspace.dependencies]
@@ -26,6 +26,7 @@ byteorder = "1"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
 crc32c = "0.6"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
 hkdf = "0.12"
 hmac = "0.12"

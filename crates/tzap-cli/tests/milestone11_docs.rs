@@ -61,11 +61,21 @@ fn milestone11_public_reference_file_exists_and_covers_commands() {
     let cli_readme = read_workspace_file("crates/tzap-cli/README.md");
     let gitignore = read_workspace_file(".gitignore");
 
-    for command in ["create", "extract", "list", "verify", "keygen"] {
+    for command in [
+        "create",
+        "extract",
+        "list",
+        "verify",
+        "keygen",
+        "signing-keygen",
+    ] {
         assert!(reference.contains(&format!("## Command: {command}")));
     }
 
     assert!(reference.contains("--password-stdin"));
+    assert!(reference.contains("--signing-key"));
+    assert!(reference.contains("--trusted-public-key"));
+    assert!(reference.contains("--public-no-key"));
     assert!(reference.contains("--volume"));
     assert!(reference.contains("--dry-run"));
     assert!(reference.contains("JSON output"));
@@ -85,14 +95,14 @@ fn milestone11_public_reference_file_exists_and_covers_commands() {
 
 #[test]
 fn milestone11_public_spec_file_remains_linked() {
-    let spec = read_workspace_file("specs/tzap-format-revisedv36.md");
+    let spec = read_workspace_file("specs/tzap-format-revisedv41.md");
     let root_readme = read_workspace_file("README.md");
     let cli_readme = read_workspace_file("crates/tzap-cli/README.md");
 
-    assert!(spec.contains("### 28.1 Test corpus additions"));
+    assert!(spec.contains("### 28.1 Test corpus additions through v0.41"));
     assert!(spec.contains("## 29. Conformance"));
-    assert!(root_readme.contains("specs/tzap-format-revisedv36.md"));
-    assert!(cli_readme.contains("specs/tzap-format-revisedv36.md"));
+    assert!(root_readme.contains("specs/tzap-format-revisedv41.md"));
+    assert!(cli_readme.contains("specs/tzap-format-revisedv41.md"));
 }
 
 #[test]

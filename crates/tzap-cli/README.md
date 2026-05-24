@@ -1,6 +1,6 @@
 # tzap
 
-`tzap` is the command-line interface for the tzap v0.36 archive format. It
+`tzap` is the command-line interface for the tzap v0.41 archive format. It
 creates, lists, verifies, and extracts encrypted archives with authenticated
 metadata, zstd compression, safe extraction defaults, and optional multi-volume
 recovery.
@@ -20,7 +20,7 @@ From crates.io:
 cargo install tzap
 ```
 
-The CLI requires Rust 1.82 or newer when installing from source.
+The CLI requires Rust 1.85 or newer when installing from source.
 
 ## Quick Start
 
@@ -36,6 +36,15 @@ Inspect and verify the archive:
 ```sh
 tzap list --keyfile project.key project.tzap
 tzap verify --keyfile project.key project.tzap
+```
+
+Create a signed v41 RootAuth archive:
+
+```sh
+tzap signing-keygen --secret-output root.signing.hex --public-output root.public.hex
+tzap create --keyfile project.key --signing-key root.signing.hex -o signed.tzap ./project
+tzap verify --keyfile project.key --trusted-public-key root.public.hex signed.tzap
+tzap verify --public-no-key --trusted-public-key root.public.hex signed.tzap
 ```
 
 Extract files safely into a destination directory:
@@ -74,5 +83,5 @@ archive data; raw-key archives require the original 32-byte key.
 
 - Repository: <https://github.com/frankmanzhu/tzap>
 - CLI reference: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-cli-reference.md>
-- Format specification: <https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv36.md>
+- Format specification: <https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv41.md>
 - Library crate: <https://crates.io/crates/tzap-core>

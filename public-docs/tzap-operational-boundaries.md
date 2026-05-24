@@ -8,7 +8,7 @@ writer or reader path.
 ## Writer shape validation
 
 The writer validates archive layout choices before writing bytes. If a request
-cannot produce a valid v0.36 archive with this implementation, `tzap` exits with
+cannot produce a valid v0.41 archive with this implementation, `tzap` exits with
 `16 unsupported-feature`.
 
 Examples:
@@ -50,7 +50,7 @@ What to do:
 - Keep `--chunk-size <= --envelope-size`.
 - Increase very small `--volume-size` values.
 - Large regular-file input sets are supported. The writer emits multiple
-  IndexShard objects and directory-hint shards when the v0.36 layout requires
+  IndexShard objects and directory-hint shards when the v0.41 layout requires
   them.
 - If `tzap create` still returns `unsupported-feature`, check the exact resource
   choice in the diagnostic and the additional boundaries below.
@@ -106,6 +106,50 @@ What to do:
   on list, verify, or extract when the sidecar is useful.
 - For multi-volume workflows, pass the available volume files and omit
   `--bootstrap-out` and `--bootstrap`.
+
+## Root-authenticated v41 archives
+
+The core library and CLI can create and verify root-authenticated v41 archives
+with the Ed25519 helper profile. CLI signing uses a 32-byte Ed25519 signing seed
+and writes the derived 32-byte public key through `signing-keygen`.
+
+Example CLI flow:
+
+```text
+tzap signing-keygen \
+  --secret-output root.signing.hex \
+  --public-output root.public.hex
+
+tzap create \
+  --keyfile project.key \
+  --signing-key root.signing.hex \
+  -o archive.tzap \
+  ./project
+
+tzap verify \
+  --keyfile project.key \
+  --trusted-public-key root.public.hex \
+  archive.tzap
+
+tzap verify \
+  --public-no-key \
+  --trusted-public-key root.public.hex \
+  archive.tzap
+```
+
+Operational shape:
+
+- `--signing-key` may be combined with raw-key, passphrase, dictionary, and
+  normal volume options.
+- Key-holding RootAuth verification is requested by adding
+  `--trusted-public-key` to ordinary `tzap verify`.
+- Public no-key verification is requested with
+  `--public-no-key --trusted-public-key`. It does not use `--keyfile`,
+  `--password`, `--password-stdin`, or `--bootstrap`.
+- Successful public no-key verification reports
+  `public_data_block_commitment_verified`,
+  `public_physical_completeness_unverified`, and
+  `public_recovery_margin_unchecked`.
 
 ## Archive paths, not archive stdin
 
@@ -210,7 +254,7 @@ What to do:
 
 ## Tar metadata profile
 
-The current v0.36 CLI create path emits regular-file tar member groups. Archive
+The current v0.41 CLI create path emits regular-file tar member groups. Archive
 paths are normalized safe relative UTF-8 paths using `/` separators. Long paths
 and non-ASCII paths are represented with a path-specific local PAX `path` record
 inside the same member group as the file it modifies. The writer does not emit
@@ -253,11 +297,11 @@ payload-only. Callers that surface metadata fidelity should use `list_files`,
 
 ## Cloud directory-prefix optimization
 
-The v0.36 spec defines a cloud/object-store optimized directory-prefix mode
+The v0.41 spec defines a cloud/object-store optimized directory-prefix mode
 that requires directory hints even for small archives. The current CLI/API does
 not expose that mode and does not claim optimized directory-prefix operations.
 Directory hints are emitted automatically for large regular-file archives when
-the v0.36 threshold requires them.
+the v0.41 threshold requires them.
 
 Example:
 

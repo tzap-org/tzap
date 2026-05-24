@@ -1,8 +1,8 @@
 use tzap_core::compression::compress_zstd_frame;
 use tzap_core::format::{
-    AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, KdfAlgo, CRYPTO_EXTENSION_HEADER_LEN,
-    CRYPTO_HEADER_FIXED_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, MANIFEST_FOOTER_LEN,
-    VOLUME_FORMAT_REV, VOLUME_HEADER_LEN,
+    AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, KdfAlgo, CRITICAL_METADATA_RECOVERY_HEADER_LEN,
+    CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_HEADER_FIXED_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION,
+    MANIFEST_FOOTER_LEN, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN,
 };
 use tzap_core::metadata::{
     hash_prefix, DirectoryHintEntry, DirectoryHintShardEntry, DirectoryHintTable,
@@ -13,8 +13,9 @@ use tzap_core::metadata::{
 };
 use tzap_core::padding::suffix_pad_for_aead;
 use tzap_core::wire::{
-    BlockRecord, BootstrapSidecarHeader, CryptoHeaderFixed, ManifestFooter, VolumeHeader,
-    VolumeTrailer,
+    BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage, CriticalMetadataRecoveryHeader,
+    CriticalMetadataRecoveryShard, CriticalRecoveryLocator, CryptoHeaderFixed, ManifestFooter,
+    RootAuthFooterV1, SerializedRegion, VolumeHeader, VolumeTrailer,
 };
 
 pub struct Seed {
@@ -26,16 +27,43 @@ pub struct Seed {
 pub fn structured_seeds() -> Vec<Seed> {
     vec![
         fixed("valid-volume-header", valid_volume_header()),
-        fixed("valid-crypto-header-with-tlv", valid_crypto_header_with_tlv()),
+        fixed(
+            "valid-crypto-header-with-tlv",
+            valid_crypto_header_with_tlv(),
+        ),
         fixed("valid-block-record-crc", valid_block_record()),
         fixed("valid-manifest-footer", valid_manifest_footer()),
+        fixed("valid-root-auth-footer", valid_root_auth_footer()),
+        fixed(
+            "valid-ed25519-authenticator-value",
+            valid_ed25519_authenticator_value(),
+        ),
         fixed("valid-volume-trailer", valid_volume_trailer()),
-        fixed("valid-bootstrap-sidecar-header", valid_bootstrap_sidecar_header()),
+        fixed(
+            "valid-critical-metadata-image",
+            valid_critical_metadata_image(),
+        ),
+        fixed("valid-cmra-header", valid_cmra_header()),
+        fixed("valid-cmra-data-shard", valid_cmra_data_shard()),
+        fixed(
+            "valid-critical-recovery-locator",
+            valid_critical_recovery_locator(),
+        ),
+        fixed(
+            "valid-bootstrap-sidecar-header",
+            valid_bootstrap_sidecar_header(),
+        ),
         metadata("valid-empty-index-root", valid_empty_index_root()),
-        metadata("valid-index-root-with-shard-and-hint", valid_index_root_with_rows()),
+        metadata(
+            "valid-index-root-with-shard-and-hint",
+            valid_index_root_with_rows(),
+        ),
         metadata("valid-index-shard", valid_index_shard()),
         metadata("valid-directory-hint-table", valid_directory_hint_table()),
-        compressed("valid-zstd-frame-with-size-prefix", valid_zstd_frame_with_size_prefix()),
+        compressed(
+            "valid-zstd-frame-with-size-prefix",
+            valid_zstd_frame_with_size_prefix(),
+        ),
         compressed("valid-wide-padding", valid_wide_padding()),
     ]
 }
@@ -59,8 +87,23 @@ pub fn assert_structured_seed_success(seed: &Seed) -> Result<(), String> {
         ("parse_fixed_structures", "valid-manifest-footer") => {
             ManifestFooter::parse(&seed.bytes).map_err(|err| err.to_string())?;
         }
+        ("parse_fixed_structures", "valid-root-auth-footer") => {
+            RootAuthFooterV1::parse(&seed.bytes).map_err(|err| err.to_string())?;
+        }
         ("parse_fixed_structures", "valid-volume-trailer") => {
             VolumeTrailer::parse(&seed.bytes).map_err(|err| err.to_string())?;
+        }
+        ("parse_fixed_structures", "valid-critical-metadata-image") => {
+            CriticalMetadataImage::parse(&seed.bytes).map_err(|err| err.to_string())?;
+        }
+        ("parse_fixed_structures", "valid-cmra-header") => {
+            CriticalMetadataRecoveryHeader::parse(&seed.bytes).map_err(|err| err.to_string())?;
+        }
+        ("parse_fixed_structures", "valid-cmra-data-shard") => {
+            CriticalMetadataRecoveryShard::parse(&seed.bytes, 16).map_err(|err| err.to_string())?;
+        }
+        ("parse_fixed_structures", "valid-critical-recovery-locator") => {
+            CriticalRecoveryLocator::parse(&seed.bytes).map_err(|err| err.to_string())?;
         }
         ("parse_fixed_structures", "valid-bootstrap-sidecar-header") => {
             BootstrapSidecarHeader::parse(&seed.bytes).map_err(|err| err.to_string())?;
@@ -240,6 +283,34 @@ fn valid_manifest_footer() -> Vec<u8> {
     .to_vec()
 }
 
+fn valid_root_auth_footer() -> Vec<u8> {
+    RootAuthFooterV1 {
+        archive_uuid: uuid(),
+        session_id: session(),
+        authenticator_id: 0x0002,
+        signer_identity_type: 1,
+        signer_identity_bytes: [0x11; 32].to_vec(),
+        authenticator_value: [0x22; 68].to_vec(),
+        total_data_block_count: 1,
+        critical_metadata_digest: [0x31; 32],
+        index_digest: [0x32; 32],
+        fec_layout_digest: [0x33; 32],
+        data_block_merkle_root: [0x34; 32],
+        signer_identity_digest: [0x35; 32],
+        archive_root: [0x36; 32],
+        footer_crc32c: 0,
+    }
+    .to_bytes()
+    .expect("fixed root-auth footer seed builds")
+}
+
+fn valid_ed25519_authenticator_value() -> Vec<u8> {
+    let mut value = vec![0u8; 68];
+    value[0..2].copy_from_slice(&1u16.to_le_bytes());
+    value[4..68].copy_from_slice(&[0x23; 64]);
+    value
+}
+
 fn valid_volume_trailer() -> Vec<u8> {
     VolumeTrailer {
         archive_uuid: uuid(),
@@ -250,7 +321,95 @@ fn valid_volume_trailer() -> Vec<u8> {
         manifest_footer_offset: 4096,
         manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
         closed_at_ns: 0,
+        root_auth_footer_offset: 0,
+        root_auth_footer_length: 0,
+        root_auth_flags: 0,
         trailer_hmac: [0xef; 32],
+    }
+    .to_bytes()
+    .to_vec()
+}
+
+fn valid_critical_metadata_image() -> Vec<u8> {
+    CriticalMetadataImage {
+        archive_uuid: uuid(),
+        session_id: session(),
+        volume_index: 0,
+        stripe_width: 1,
+        layout_flags: 0,
+        volume_header_offset: 0,
+        volume_header_length: VOLUME_HEADER_LEN as u32,
+        crypto_header_offset: VOLUME_HEADER_LEN as u64,
+        crypto_header_length: valid_crypto_header_with_tlv().len() as u32,
+        block_records_offset: 256,
+        block_records_length: 4096,
+        block_count: 1,
+        manifest_footer_offset: 4352,
+        manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
+        root_auth_footer_offset: 0,
+        root_auth_footer_length: 0,
+        volume_trailer_offset: 4488,
+        volume_trailer_length: 128,
+        body_bytes_before_cmra: 4616,
+        volume_header_sha256: [0x41; 32],
+        crypto_header_sha256: [0x42; 32],
+        manifest_footer_sha256: [0x43; 32],
+        root_auth_footer_sha256: [0; 32],
+        volume_trailer_sha256: [0x44; 32],
+        regions: vec![SerializedRegion {
+            region_type: 1,
+            offset: 0,
+            bytes: b"VH".to_vec(),
+        }],
+    }
+    .to_bytes()
+    .expect("fixed critical metadata image seed builds")
+}
+
+fn valid_cmra_header() -> Vec<u8> {
+    CriticalMetadataRecoveryHeader {
+        shard_size: 16,
+        data_shard_count: 1,
+        parity_shard_count: 1,
+        image_length: valid_critical_metadata_image().len() as u32,
+        archive_uuid_hint: uuid(),
+        session_id_hint: session(),
+        volume_index_hint: 0,
+        image_sha256: [0x45; 32],
+        header_crc32c: 0,
+    }
+    .to_bytes()
+    .to_vec()
+}
+
+fn valid_cmra_data_shard() -> Vec<u8> {
+    CriticalMetadataRecoveryShard {
+        shard_index: 0,
+        shard_role: 0,
+        shard_payload_length: 16,
+        payload: [0x46; 16].to_vec(),
+        shard_crc32c: 0,
+    }
+    .to_bytes(16)
+    .expect("fixed CMRA shard seed builds")
+}
+
+fn valid_critical_recovery_locator() -> Vec<u8> {
+    CriticalRecoveryLocator {
+        cmra_offset: 4616,
+        cmra_length: CRITICAL_METADATA_RECOVERY_HEADER_LEN as u32 + 2 * (16 + 16),
+        volume_trailer_offset: 4488,
+        body_bytes_before_cmra: 4616,
+        archive_uuid_hint: uuid(),
+        session_id_hint: session(),
+        volume_index_hint: 0,
+        locator_sequence: 0,
+        cmra_shard_size: 16,
+        cmra_data_shard_count: 1,
+        cmra_parity_shard_count: 1,
+        cmra_image_length: valid_critical_metadata_image().len() as u32,
+        cmra_image_sha256: [0x45; 32],
+        locator_crc32c: 0,
     }
     .to_bytes()
     .to_vec()

@@ -15,8 +15,8 @@ cloud object storage, split volumes, and immediate single-file restores. It
 combines packing, fast compression, strong encryption, authenticated metadata,
 and recovery in one practical format.
 
-The implementation currently targets the v0.36 format specification:
-[specs/tzap-format-revisedv36.md](specs/tzap-format-revisedv36.md).
+The implementation currently targets the v0.41 format specification:
+[specs/tzap-format-revisedv41.md](specs/tzap-format-revisedv41.md).
 See the full command guide in
 [public-docs/tzap-cli-reference.md](public-docs/tzap-cli-reference.md).
 
@@ -184,6 +184,15 @@ tzap list --keyfile project.key project.tzap
 tzap extract --keyfile project.key -C restored project.tzap
 ```
 
+## Signed RootAuth workflow
+
+```sh
+tzap signing-keygen --secret-output root.signing.hex --public-output root.public.hex
+tzap create --keyfile project.key --signing-key root.signing.hex -o signed.tzap ./project
+tzap verify --keyfile project.key --trusted-public-key root.public.hex signed.tzap
+tzap verify --public-no-key --trusted-public-key root.public.hex signed.tzap
+```
+
 ## Multi-volume workflow (recoverable)
 
 ```sh
@@ -204,8 +213,8 @@ tzap extract --keyfile project.key --volume project.tzap.002 project.tzap.000 --
 - `tzap` does not overwrite existing files by default. Use `--overwrite` when restore should replace files.
 - Archive members are safe-checked before write; unsafe paths such as `../evil.txt` are rejected.
 - Use `--password-stdin` for non-interactive workflows and `--password` for interactive prompt mode.
-- Format and wire behavior align with the published v0.36 specification at
-  [specs/tzap-format-revisedv36.md](specs/tzap-format-revisedv36.md).
+- Format and wire behavior align with the published v0.41 specification at
+  [specs/tzap-format-revisedv41.md](specs/tzap-format-revisedv41.md).
 
 ## Exit codes
 
@@ -352,12 +361,14 @@ tzap create   [options] --output <output> <paths>...
 tzap extract  [options] <archive> [path]...
 tzap list     [options] <archive>
 tzap verify   [options] <archives>...
+tzap signing-keygen --secret-output <path> --public-output <path>
 ```
 
 Important `create` options:
 
 - `--keyfile <path>`: read a 32-byte raw key or 64-character hex key
 - `--password-stdin`: derive the archive key from a passphrase with Argon2id
+- `--signing-key <path>`: sign v41 RootAuth with an Ed25519 signing seed
 - `--volumes <n>`: write a striped multi-volume archive
 - `--volume-size <size>`: choose the number of volumes from a target size
 - `--volume-loss-tolerance <n>`: add enough parity for volume recovery
@@ -366,6 +377,13 @@ Important `create` options:
 - `--bootstrap-out <path>`: write a bootstrap sidecar
 - `--compression-level <n>`: choose the zstd compression level
 - `--chunk-size`, `--envelope-size`, `--block-size`: tune archive layout
+
+Important `verify` options:
+
+- `--trusted-public-key <path>`: require Ed25519 RootAuth verification
+- `--public-no-key`: verify signed public RootAuth commitments without the
+  archive key
+- `--json`: emit machine-readable verification status
 
 Stable diagnostics cover key validation, archive integrity, revision
 compatibility, path safety, bootstrap sidecars, and feature negotiation.
@@ -406,7 +424,7 @@ tar member groups -> zstd frames -> pack -> pad -> AEAD -> FEC -> stripe -> spli
 
 The format stores encrypted payload objects, encrypted indexes, authenticated
 headers and trailers, and enough metadata to support random access after the
-archive is opened. The v0.36 spec defines the wire structures, algorithm
+archive is opened. The v0.41 spec defines the wire structures, algorithm
 registry, integrity model, FEC layout, bootstrap behavior, and reader/writer
 requirements.
 
