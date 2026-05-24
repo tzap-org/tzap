@@ -1,0 +1,19 @@
+[package]
+name = "tzap-plugin-signing"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Signing profiles for tzap RootAuth"
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/tzap-plugin-signing"
+readme = "README.md"
+keywords = ["archive", "cryptography", "ed25519", "signing", "tzap"]
+categories = ["cryptography"]
+
+[dependencies]
+ed25519-dalek.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

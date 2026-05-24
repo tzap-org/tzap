@@ -1,31 +1,21 @@
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha512};
+use tzap_plugin_signing::ed25519_raw::{
+    authenticator_value as ed25519_raw_authenticator_value,
+    verify_root_auth as verify_ed25519_raw_root_auth, Ed25519RootAuthVerifierInput,
+};
 
 use crate::format::{FormatError, ROOT_AUTH_SPEC_ID};
 use crate::reader::RootAuthVerification;
 use crate::wire::RootAuthFooterV1;
 use crate::writer::RootAuthSigningRequest;
 
-pub const ED25519_AUTHENTICATOR_ID: u16 = 0x0002;
-pub const ED25519_AUTHENTICATOR_VALUE_LEN: u32 = 68;
+pub use tzap_plugin_signing::ed25519_raw::{
+    Ed25519RootAuthOutcome, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
+    ED25519_AUTHENTICATOR_VALUE_LEN,
+};
 
-const ED25519_SIG_SCHEME_PURE: u16 = 1;
 const ED25519_SIGNING_DOMAIN: &[u8] = b"tzap-sig-ed25519-v1\0";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ed25519VerificationMode {
-    KeyHoldingRootAuth,
-    PublicNoKey,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Ed25519RootAuthOutcome {
-    Invalid,
-    UnsupportedIdentity,
-    SelfSignedConsistent,
-    RootAuthContentVerified { key_id: [u8; 32] },
-    PublicDataBlockCommitmentVerified { key_id: [u8; 32] },
-}
 
 pub fn ed25519_signing_input(
     archive_uuid: &[u8; 16],
@@ -53,11 +43,7 @@ pub fn ed25519_authenticator_value(
         &request.session_id,
         &request.archive_root,
     );
-    let signature: Signature = signing_key.sign(&signing_input);
-    let mut out = [0u8; ED25519_AUTHENTICATOR_VALUE_LEN as usize];
-    out[0..2].copy_from_slice(&ED25519_SIG_SCHEME_PURE.to_le_bytes());
-    out[4..68].copy_from_slice(&signature.to_bytes());
-    out
+    ed25519_raw_authenticator_value(signing_key, &signing_input)
 }
 
 pub fn verify_ed25519_root_auth(
@@ -66,55 +52,19 @@ pub fn verify_ed25519_root_auth(
     trusted_public_key: Option<[u8; 32]>,
     mode: Ed25519VerificationMode,
 ) -> Result<Ed25519RootAuthOutcome, FormatError> {
-    if footer.authenticator_id != ED25519_AUTHENTICATOR_ID {
-        return Ok(Ed25519RootAuthOutcome::UnsupportedIdentity);
-    }
-    let Some(signature) = parse_ed25519_authenticator_value(&footer.authenticator_value)? else {
-        return Ok(Ed25519RootAuthOutcome::Invalid);
-    };
-
-    let (verifying_key, trusted) = match trusted_public_key {
-        Some(key_bytes) => {
-            if footer.signer_identity_type == 1 && footer.signer_identity_bytes != key_bytes {
-                return Ok(Ed25519RootAuthOutcome::Invalid);
-            }
-            let Ok(key) = VerifyingKey::from_bytes(&key_bytes) else {
-                return Ok(Ed25519RootAuthOutcome::Invalid);
-            };
-            (key, true)
-        }
-        None if footer.signer_identity_type == 1 && footer.signer_identity_bytes.len() == 32 => {
-            let mut key_bytes = [0u8; 32];
-            key_bytes.copy_from_slice(&footer.signer_identity_bytes);
-            let Ok(key) = VerifyingKey::from_bytes(&key_bytes) else {
-                return Ok(Ed25519RootAuthOutcome::Invalid);
-            };
-            (key, false)
-        }
-        _ => return Ok(Ed25519RootAuthOutcome::UnsupportedIdentity),
-    };
-
     let signing_input =
         ed25519_signing_input(&footer.archive_uuid, &footer.session_id, archive_root);
-    if verifying_key
-        .verify_strict(&signing_input, &signature)
-        .is_err()
-    {
-        return Ok(Ed25519RootAuthOutcome::Invalid);
-    }
-
-    if !trusted {
-        return Ok(Ed25519RootAuthOutcome::SelfSignedConsistent);
-    }
-    let key_id = verifying_key.to_bytes();
-    Ok(match mode {
-        Ed25519VerificationMode::KeyHoldingRootAuth => {
-            Ed25519RootAuthOutcome::RootAuthContentVerified { key_id }
-        }
-        Ed25519VerificationMode::PublicNoKey => {
-            Ed25519RootAuthOutcome::PublicDataBlockCommitmentVerified { key_id }
-        }
-    })
+    Ok(verify_ed25519_raw_root_auth(
+        Ed25519RootAuthVerifierInput {
+            signing_input: &signing_input,
+            authenticator_id: footer.authenticator_id,
+            signer_identity_type: footer.signer_identity_type,
+            signer_identity_bytes: &footer.signer_identity_bytes,
+            authenticator_value: &footer.authenticator_value,
+        },
+        trusted_public_key,
+        mode,
+    ))
 }
 
 pub fn verify_ed25519_after_root_auth(
@@ -128,21 +78,6 @@ pub fn verify_ed25519_after_root_auth(
         trusted_public_key,
         Ed25519VerificationMode::KeyHoldingRootAuth,
     )
-}
-
-fn parse_ed25519_authenticator_value(value: &[u8]) -> Result<Option<Signature>, FormatError> {
-    if value.len() != ED25519_AUTHENTICATOR_VALUE_LEN as usize {
-        return Ok(None);
-    }
-    let sig_scheme = u16::from_le_bytes([value[0], value[1]]);
-    let reserved = u16::from_le_bytes([value[2], value[3]]);
-    if sig_scheme != ED25519_SIG_SCHEME_PURE || reserved != 0 {
-        return Ok(None);
-    }
-    let Ok(signature) = Signature::from_slice(&value[4..68]) else {
-        return Ok(None);
-    };
-    Ok(Some(signature))
 }
 
 #[cfg(test)]

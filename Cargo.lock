@@ -1174,6 +1174,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tzap-core",
+ "tzap-plugin-signing",
 ]
 
 [[package]]
@@ -1196,11 +1197,20 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror",
+ "tzap-plugin-signing",
  "unicode-normalization",
  "uuid",
  "zeroize",
  "zstd",
  "zstd-safe",
+]
+
+[[package]]
+name = "tzap-plugin-signing"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "rand",
 ]
 
 [[package]]

@@ -15,16 +15,18 @@ use tzap_core::format::{
 };
 use tzap_core::metadata::normalize_lookup_file_path;
 use tzap_core::reader::ArchiveEntry;
-use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
+use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, RootAuthFooterV1, VolumeHeader};
 use tzap_core::{
-    ed25519_authenticator_value, open_archive, open_archive_volumes,
-    open_archive_with_bootstrap_sidecar, public_no_key_verify_volumes_with,
-    verify_ed25519_root_auth, write_archive, write_archive_with_dictionary,
+    ed25519_signing_input, open_archive, open_archive_volumes, open_archive_with_bootstrap_sidecar,
+    public_no_key_verify_volumes_with, write_archive, write_archive_with_dictionary,
     write_archive_with_dictionary_and_kdf, write_archive_with_dictionary_and_root_auth,
     write_archive_with_dictionary_kdf_and_root_auth, write_archive_with_kdf,
-    write_archive_with_root_auth, write_archive_with_root_auth_and_kdf, Ed25519RootAuthOutcome,
-    Ed25519VerificationMode, KdfParams, MasterKey, MetadataDiagnostic, OpenedArchive, RegularFile,
-    RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions, TarEntryKind, WriterOptions,
+    write_archive_with_root_auth, write_archive_with_root_auth_and_kdf, KdfParams, MasterKey,
+    MetadataDiagnostic, OpenedArchive, RegularFile, RootAuthSigningRequest, RootAuthVerification,
+    RootAuthWriterConfig, SafeExtractionOptions, TarEntryKind, WriterOptions,
+};
+use tzap_plugin_signing::ed25519_raw::{
+    self, Ed25519RootAuthOutcome, Ed25519RootAuthVerifierInput, Ed25519VerificationMode,
     ED25519_AUTHENTICATOR_ID, ED25519_AUTHENTICATOR_VALUE_LEN,
 };
 
@@ -663,7 +665,12 @@ fn run(cli: Cli) -> Result<()> {
                         options,
                         dictionary,
                         root_auth,
-                        |request| Ok(ed25519_authenticator_value(signing_key, request).to_vec()),
+                        |request| {
+                            Ok(ed25519_authenticator_value_for_request(
+                                signing_key,
+                                request,
+                            ))
+                        },
                     )
                 }
                 (Some(dictionary), kdf_params, Some(root_auth), Some(signing_key)) => {
@@ -674,7 +681,12 @@ fn run(cli: Cli) -> Result<()> {
                         dictionary,
                         kdf_params,
                         root_auth,
-                        |request| Ok(ed25519_authenticator_value(signing_key, request).to_vec()),
+                        |request| {
+                            Ok(ed25519_authenticator_value_for_request(
+                                signing_key,
+                                request,
+                            ))
+                        },
                     )
                 }
                 (None, KdfParams::Raw, Some(root_auth), Some(signing_key)) => {
@@ -683,7 +695,12 @@ fn run(cli: Cli) -> Result<()> {
                         &key.master_key,
                         options,
                         root_auth,
-                        |request| Ok(ed25519_authenticator_value(signing_key, request).to_vec()),
+                        |request| {
+                            Ok(ed25519_authenticator_value_for_request(
+                                signing_key,
+                                request,
+                            ))
+                        },
                     )
                 }
                 (None, kdf_params, Some(root_auth), Some(signing_key)) => {
@@ -693,7 +710,12 @@ fn run(cli: Cli) -> Result<()> {
                         options,
                         kdf_params,
                         root_auth,
-                        |request| Ok(ed25519_authenticator_value(signing_key, request).to_vec()),
+                        |request| {
+                            Ok(ed25519_authenticator_value_for_request(
+                                signing_key,
+                                request,
+                            ))
+                        },
                     )
                 }
                 (Some(dictionary), KdfParams::Raw, None, _) => write_archive_with_dictionary(
@@ -1763,18 +1785,15 @@ fn run_public_no_key_verify(
     };
     let borrowed = volume_bytes.iter().map(Vec::as_slice).collect::<Vec<_>>();
     let verification = match public_no_key_verify_volumes_with(&borrowed, |footer, archive_root| {
-        verify_ed25519_root_auth(
-            footer,
-            archive_root,
-            Some(public_key),
-            Ed25519VerificationMode::PublicNoKey,
-        )
-        .map(|outcome| {
-            matches!(
-                outcome,
-                Ed25519RootAuthOutcome::PublicDataBlockCommitmentVerified { .. }
-            )
-        })
+        Ok(matches!(
+            verify_ed25519_root_auth_footer(
+                footer,
+                archive_root,
+                public_key,
+                Ed25519VerificationMode::PublicNoKey,
+            ),
+            Ed25519RootAuthOutcome::PublicDataBlockCommitmentVerified { .. }
+        ))
     })
     .with_context(|| format!("failed to verify public RootAuth for {first}"))
     {
@@ -1854,20 +1873,50 @@ fn verify_opened_root_auth_ed25519(
     let public_key = load_ed25519_public_key(trusted_public_key)?;
     opened
         .verify_root_auth_with(|footer, archive_root| {
-            verify_ed25519_root_auth(
-                footer,
-                archive_root,
-                Some(public_key),
-                Ed25519VerificationMode::KeyHoldingRootAuth,
-            )
-            .map(|outcome| {
-                matches!(
-                    outcome,
-                    Ed25519RootAuthOutcome::RootAuthContentVerified { .. }
-                )
-            })
+            Ok(matches!(
+                verify_ed25519_root_auth_footer(
+                    footer,
+                    archive_root,
+                    public_key,
+                    Ed25519VerificationMode::KeyHoldingRootAuth,
+                ),
+                Ed25519RootAuthOutcome::RootAuthContentVerified { .. }
+            ))
         })
         .map_err(Into::into)
+}
+
+fn ed25519_authenticator_value_for_request(
+    signing_key: &SigningKey,
+    request: &RootAuthSigningRequest,
+) -> Vec<u8> {
+    let signing_input = ed25519_signing_input(
+        &request.archive_uuid,
+        &request.session_id,
+        &request.archive_root,
+    );
+    ed25519_raw::authenticator_value(signing_key, &signing_input).to_vec()
+}
+
+fn verify_ed25519_root_auth_footer(
+    footer: &RootAuthFooterV1,
+    archive_root: &[u8; 32],
+    trusted_public_key: [u8; 32],
+    mode: Ed25519VerificationMode,
+) -> Ed25519RootAuthOutcome {
+    let signing_input =
+        ed25519_signing_input(&footer.archive_uuid, &footer.session_id, archive_root);
+    ed25519_raw::verify_root_auth(
+        Ed25519RootAuthVerifierInput {
+            signing_input: &signing_input,
+            authenticator_id: footer.authenticator_id,
+            signer_identity_type: footer.signer_identity_type,
+            signer_identity_bytes: &footer.signer_identity_bytes,
+            authenticator_value: &footer.authenticator_value,
+        },
+        Some(trusted_public_key),
+        mode,
+    )
 }
 
 fn root_auth_json(root_auth: &RootAuthVerification, status: &str) -> serde_json::Value {

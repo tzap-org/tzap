@@ -434,6 +434,8 @@ requirements.
 crates/tzap-core   Format parsing, validation, crypto, compression, FEC, reader,
                    writer, metadata, and safe extraction primitives.
 crates/tzap-cli    Command-line interface for create, extract, list, and verify.
+crates/tzap-plugin-signing
+                   RootAuth signing profiles, including Ed25519 raw signing.
 specs/             tzap archive format specification.
 fuzz/              Parser fuzz targets, deterministic seeds, and fuzz smoke.
 ```

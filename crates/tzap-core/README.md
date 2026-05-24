@@ -35,6 +35,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 The crate provides the reference behavior for the v0.41 format. It is designed
 for archive creation, verification, metadata inspection, random-access file
 restore, sequential reading, multi-volume recovery, and bootstrap sidecar flows.
+RootAuth signing profiles live in `tzap-plugin-signing`; `tzap-core` computes
+the v41 signing input and keeps compatibility helpers for the Ed25519 raw
+profile.
 
 ## More Information
 

@@ -28,6 +28,7 @@ sha2.workspace = true
 subtle.workspace = true
 tar.workspace = true
 thiserror.workspace = true
+tzap-plugin-signing = { path = "../tzap-plugin-signing", version = "0.1.0" }
 unicode-normalization.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
