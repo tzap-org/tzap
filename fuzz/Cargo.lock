@@ -888,7 +888,7 @@ checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
 
 [[package]]
 name = "tzap-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "aes-gcm-siv",
@@ -896,7 +896,6 @@ dependencies = [
  "byteorder",
  "chacha20poly1305",
  "crc32c",
- "ed25519-dalek",
  "hex",
  "hkdf",
  "hmac",
@@ -917,6 +916,16 @@ name = "tzap-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "tzap-core",
+ "tzap-plugin-signing",
+]
+
+[[package]]
+name = "tzap-plugin-signing"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "sha2",
  "tzap-core",
 ]
 

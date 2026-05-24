@@ -11,13 +11,13 @@ use tzap_core::metadata::{
     DirectoryHintShardEntry, DirectoryHintTable, IndexRoot, IndexShard, MetadataLimits, ShardEntry,
 };
 use tzap_core::padding::depad_suffix_padding;
-use tzap_core::signing::{
-    verify_ed25519_root_auth, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
-};
 use tzap_core::wire::{
     BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage, CriticalMetadataRecoveryHeader,
     CriticalMetadataRecoveryShard, CriticalRecoveryLocator, CryptoHeader, CryptoHeaderFixed,
     ManifestFooter, RootAuthFooterV1, VolumeHeader, VolumeTrailer,
+};
+use tzap_plugin_signing::ed25519_raw::{
+    verify_root_auth_footer, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
 };
 
 const FUZZ_BLOCK_SIZES: [usize; 4] = [1, 16, 256, 4096];
@@ -48,7 +48,7 @@ pub fn parse_fixed_structures(data: &[u8]) {
             archive_root: [0; 32],
             footer_crc32c: 0,
         };
-        let _ = verify_ed25519_root_auth(
+        let _ = verify_root_auth_footer(
             &footer,
             &[0; 32],
             Some([1; 32]),
