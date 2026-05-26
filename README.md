@@ -401,8 +401,13 @@ use tzap_core::{
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = MasterKey::from_raw_key(&[0x42; 32])?;
     let files = [RegularFile::new("notes/readme.txt", b"hello from tzap")];
+    let options = WriterOptions {
+        stripe_width: 1,
+        volume_loss_tolerance: 0,
+        ..WriterOptions::default()
+    };
 
-    let written = write_archive(&files, &key, WriterOptions::default())?;
+    let written = write_archive(&files, &key, options)?;
     let opened = open_archive(&written.bytes, &key)?;
 
     assert_eq!(

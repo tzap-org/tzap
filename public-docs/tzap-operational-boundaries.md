@@ -225,11 +225,12 @@ What to do:
 
 ## Create outputs are archive files, not stdout
 
-The current core writer is an in-memory archive artifact builder:
-`write_archive` returns completed volume buffers, and the CLI then writes those
-buffers to explicit archive paths. The CLI does not expose archive stdout,
-append-only sink, multipart-upload sink, or pipe output modes for `tzap create`.
-`-o -` is rejected instead of being treated as an archive stdout sentinel.
+The convenience core writer APIs, such as `write_archive`, return completed
+volume buffers. The lower-level core writer also exposes an append-only sink API
+for re-openable sources, but the CLI currently writes completed outputs to
+explicit archive paths. The CLI does not expose archive stdout, multipart-upload
+sink, or pipe output modes for `tzap create`. `-o -` is rejected instead of
+being treated as an archive stdout sentinel.
 
 Example:
 

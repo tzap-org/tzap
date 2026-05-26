@@ -354,8 +354,8 @@ fn milestone11_public_docs_keep_boundaries_out_of_readme_marketing() {
     assert!(boundaries.contains("Create outputs are archive files, not stdout"));
     assert!(boundaries.contains("Archive paths, not archive stdin"));
     assert!(boundaries.contains("Sequential reader and provisional output"));
-    assert!(boundaries.contains("in-memory archive artifact builder"));
-    assert!(writer.contains("not a sink-based streaming writer"));
+    assert!(boundaries.contains("lower-level core writer also exposes an append-only sink API"));
+    assert!(writer.contains("sink writer when archive bytes should be delivered incrementally"));
     assert!(reader.contains("not a live provisional-output API"));
     assert!(cli.contains("--output - is not archive stdout"));
     assert!(cli.contains("--bootstrap-out - is not sidecar stdout"));
@@ -364,7 +364,7 @@ fn milestone11_public_docs_keep_boundaries_out_of_readme_marketing() {
         .contains("`--bootstrap-out`: sidecar output path for single-volume archives only"));
     assert!(reference.contains("`-` is not an archive stdin sentinel"));
     assert!(reference.contains("`-o -` is not archive stdout"));
-    assert!(reference.contains("No append-only sink or multipart-upload create"));
+    assert!(reference.contains("append-only sink or multipart-upload create mode is exposed"));
 
     let readme_lower = readme.to_lowercase();
     for phrase in [

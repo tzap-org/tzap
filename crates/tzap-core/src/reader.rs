@@ -32,6 +32,7 @@ use crate::tar_model::{
     parse_tar_member_group, restore_streaming_tar_member_group,
     stream_regular_tar_member_group_to_writer, validate_tar_stream_total_extraction_size,
     MetadataDiagnostic, OwnedTarMember, SafeExtractionOptions, TarEntryKind, TarMemberGroupReader,
+    TarStreamTotalExtractionSizeValidator,
 };
 use crate::wire::{
     BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage, CriticalMetadataRecoveryHeader,
@@ -5392,6 +5393,13 @@ fn sequential_extract_tar_stream_with_options(
     let mut pending = PendingSequentialEnvelope::default();
     let mut next_envelope_index = 0u64;
     let mut tar_stream = Vec::new();
+    let max_tar_stream_size = options.max_verify_tar_size;
+    let observed_archive_bytes = observed_archive_size([bytes.len() as u64])?;
+    let total_extraction_cap = total_extraction_size_cap(options, observed_archive_bytes);
+    let mut tar_stream_total_validator = TarStreamTotalExtractionSizeValidator::new(
+        parsed_crypto.fixed.max_path_length,
+        total_extraction_cap,
+    );
 
     while bytes.get(offset..offset + 4) == Some(b"TZBK") {
         let record = parse_sequential_block_or_erasure(
@@ -5431,6 +5439,8 @@ fn sequential_extract_tar_stream_with_options(
                         &volume_header,
                         &mut next_envelope_index,
                         &mut tar_stream,
+                        max_tar_stream_size,
+                        &mut tar_stream_total_validator,
                     )?;
                 }
                 let is_last_data = record.is_last_data();
@@ -5474,6 +5484,8 @@ fn sequential_extract_tar_stream_with_options(
                         &volume_header,
                         &mut next_envelope_index,
                         &mut tar_stream,
+                        max_tar_stream_size,
+                        &mut tar_stream_total_validator,
                     )?;
                 }
                 metadata_seen = true;
@@ -5491,6 +5503,8 @@ fn sequential_extract_tar_stream_with_options(
             &volume_header,
             &mut next_envelope_index,
             &mut tar_stream,
+            max_tar_stream_size,
+            &mut tar_stream_total_validator,
         )?;
     }
 
@@ -5505,11 +5519,10 @@ fn sequential_extract_tar_stream_with_options(
     )?;
     // This public helper is intentionally whole-buffer: decoded payload bytes
     // stay internal until terminal ManifestFooter and VolumeTrailer HMACs pass.
-    let observed_archive_bytes = observed_archive_size([bytes.len() as u64])?;
     validate_tar_stream_total_extraction_size(
         &tar_stream,
         parsed_crypto.fixed.max_path_length,
-        total_extraction_size_cap(options, observed_archive_bytes),
+        total_extraction_cap,
     )?;
     Ok(tar_stream)
 }
@@ -5543,6 +5556,8 @@ fn finalize_sequential_envelope(
     volume_header: &VolumeHeader,
     next_envelope_index: &mut u64,
     tar_stream: &mut Vec<u8>,
+    max_tar_stream_size: usize,
+    tar_stream_total_validator: &mut TarStreamTotalExtractionSizeValidator,
 ) -> Result<(), FormatError> {
     if !pending.saw_last_data {
         return Err(FormatError::InvalidArchive(
@@ -5585,7 +5600,13 @@ fn finalize_sequential_envelope(
         *next_envelope_index,
         &encrypted,
     )?;
-    decode_concatenated_zstd_frames(&plaintext, None, tar_stream)?;
+    decode_concatenated_zstd_frames_with_cap(
+        &plaintext,
+        None,
+        tar_stream,
+        max_tar_stream_size,
+        Some(tar_stream_total_validator),
+    )?;
     *next_envelope_index = next_envelope_index
         .checked_add(1)
         .ok_or(FormatError::InvalidArchive("envelope counter overflow"))?;
@@ -5593,10 +5614,12 @@ fn finalize_sequential_envelope(
     Ok(())
 }
 
-fn decode_concatenated_zstd_frames(
+fn decode_concatenated_zstd_frames_with_cap(
     plaintext: &[u8],
     dictionary: Option<&[u8]>,
     output: &mut Vec<u8>,
+    max_output_len: usize,
+    mut tar_stream_total_validator: Option<&mut TarStreamTotalExtractionSizeValidator>,
 ) -> Result<(), FormatError> {
     let mut cursor = 0usize;
     while cursor < plaintext.len() {
@@ -5607,23 +5630,65 @@ fn decode_concatenated_zstd_frames(
         }
         let end = checked_add(cursor, frame_len, "zstd frame")?;
         validate_exact_zstd_frame(&plaintext[cursor..end])?;
-        let decoded = if let Some(dictionary) = dictionary {
+        if let Some(dictionary) = dictionary {
             let mut decoder =
                 zstd::stream::Decoder::with_dictionary(&plaintext[cursor..end], dictionary)
                     .map_err(|_| FormatError::ZstdDecompressionFailure)?;
-            let mut decoded = Vec::new();
-            decoder
-                .read_to_end(&mut decoded)
-                .map_err(|_| FormatError::ZstdDecompressionFailure)?;
-            decoded
+            read_zstd_frame_to_capped_output(
+                &mut decoder,
+                output,
+                max_output_len,
+                tar_stream_total_validator
+                    .as_mut()
+                    .map(|validator| &mut **validator),
+            )?;
         } else {
-            zstd::stream::decode_all(&plaintext[cursor..end])
-                .map_err(|_| FormatError::ZstdDecompressionFailure)?
-        };
-        output.extend_from_slice(&decoded);
+            let mut decoder = zstd::stream::Decoder::new(&plaintext[cursor..end])
+                .map_err(|_| FormatError::ZstdDecompressionFailure)?;
+            read_zstd_frame_to_capped_output(
+                &mut decoder,
+                output,
+                max_output_len,
+                tar_stream_total_validator
+                    .as_mut()
+                    .map(|validator| &mut **validator),
+            )?;
+        }
         cursor = end;
     }
     Ok(())
+}
+
+fn read_zstd_frame_to_capped_output<R: Read>(
+    decoder: &mut R,
+    output: &mut Vec<u8>,
+    max_output_len: usize,
+    mut tar_stream_total_validator: Option<&mut TarStreamTotalExtractionSizeValidator>,
+) -> Result<(), FormatError> {
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = decoder
+            .read(&mut buf)
+            .map_err(|_| FormatError::ZstdDecompressionFailure)?;
+        if read == 0 {
+            return Ok(());
+        }
+        let next_len = output
+            .len()
+            .checked_add(read)
+            .ok_or(FormatError::ReaderUnsupported(
+                "sequential tar stream exceeds configured verification cap",
+            ))?;
+        if next_len > max_output_len {
+            return Err(FormatError::ReaderUnsupported(
+                "sequential tar stream exceeds configured verification cap",
+            ));
+        }
+        output.extend_from_slice(&buf[..read]);
+        if let Some(validator) = tar_stream_total_validator.as_mut() {
+            validator.observe(output)?;
+        }
+    }
 }
 
 fn load_archive_dictionary(
@@ -6036,7 +6101,7 @@ fn validate_envelope_frame_coverage(
 }
 
 fn validate_global_file_table_order(shards: &[IndexShard]) -> Result<(), FormatError> {
-    let mut previous_by_path = HashMap::<([u8; 8], Vec<u8>), u64>::new();
+    let mut previous = None::<([u8; 8], Vec<u8>, u64)>;
     for shard in shards {
         for (idx, file) in shard.files.iter().enumerate() {
             let path = shard
@@ -6049,12 +6114,8 @@ fn validate_global_file_table_order(shards: &[IndexShard]) -> Result<(), FormatE
                     "FileEntry tar member start is missing",
                 ))?;
             let key = (file.path_hash, path, start);
-            let path_key = (key.0, key.1.clone());
-            if let Some(previous_start) = previous_by_path.get(&path_key) {
-                let previous_key = (path_key.0, path_key.1.clone(), *previous_start);
-                validate_global_file_table_key_step(Some(&previous_key), &key)?;
-            }
-            previous_by_path.insert(path_key, key.2);
+            validate_global_file_table_key_step(previous.as_ref(), &key)?;
+            previous = Some(key);
         }
     }
     Ok(())
@@ -6065,8 +6126,7 @@ fn validate_global_file_table_key_step(
     current: &([u8; 8], Vec<u8>, u64),
 ) -> Result<(), FormatError> {
     if let Some(previous) = previous {
-        let same_path = previous.0 == current.0 && previous.1 == current.1;
-        if same_path && previous.2 >= current.2 {
+        if previous >= current {
             return Err(FormatError::InvalidArchive(
                 "global FileEntry rows are not sorted and unique",
             ));
@@ -6437,6 +6497,28 @@ mod tests {
             volume_loss_tolerance: 0,
             ..WriterOptions::default()
         }
+    }
+
+    #[test]
+    fn global_file_table_key_step_rejects_distinct_path_regression() {
+        let previous = ([1u8; 8], b"b.txt".to_vec(), 0);
+        let current = ([1u8; 8], b"a.txt".to_vec(), 0);
+
+        assert_eq!(
+            validate_global_file_table_key_step(Some(&previous), &current).unwrap_err(),
+            FormatError::InvalidArchive("global FileEntry rows are not sorted and unique")
+        );
+    }
+
+    #[test]
+    fn global_file_table_key_step_rejects_duplicate_full_key() {
+        let previous = ([1u8; 8], b"a.txt".to_vec(), 7);
+        let current = ([1u8; 8], b"a.txt".to_vec(), 7);
+
+        assert_eq!(
+            validate_global_file_table_key_step(Some(&previous), &current).unwrap_err(),
+            FormatError::InvalidArchive("global FileEntry rows are not sorted and unique")
+        );
     }
 
     fn small_block_recovery_options() -> WriterOptions {
@@ -7965,6 +8047,26 @@ mod tests {
     }
 
     #[test]
+    fn sequential_rejects_tar_stream_above_buffer_cap_during_decode() {
+        let archive = write_archive(
+            &[RegularFile::new("seq-buffer-cap.txt", b"payload")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut options = ReaderOptions::default();
+        options.max_verify_tar_size = 512;
+
+        assert_eq!(
+            sequential_extract_tar_stream_with_options(&archive.bytes, &master_key(), options)
+                .unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "sequential tar stream exceeds configured verification cap"
+            )
+        );
+    }
+
+    #[test]
     fn sequential_repairs_crc_failed_payload_data_when_parity_is_guaranteed() {
         let archive = write_archive(
             &[RegularFile::new("seq-erasure.txt", b"stream repair")],
@@ -8086,7 +8188,14 @@ mod tests {
         let mut output = Vec::new();
 
         assert_eq!(
-            decode_concatenated_zstd_frames(&skippable, None, &mut output).unwrap_err(),
+            decode_concatenated_zstd_frames_with_cap(
+                &skippable,
+                None,
+                &mut output,
+                usize::MAX,
+                None,
+            )
+            .unwrap_err(),
             FormatError::NotStandardZstdFrame
         );
         assert!(output.is_empty());
@@ -8661,10 +8770,10 @@ mod tests {
         let mut blocks = BTreeMap::new();
 
         let alpha = test_member(b"alpha.txt", b"alpha cross shard\n");
-        let zulu = test_member(b"zulu.txt", b"zulu cross shard\n");
-        let tar_stream = [alpha.as_slice(), zulu.as_slice()].concat();
+        let beta = test_member(b"beta.txt", b"beta cross shard\n");
+        let tar_stream = [alpha.as_slice(), beta.as_slice()].concat();
         let frame0_plaintext = compress_zstd_frame(&alpha, 1).unwrap();
-        let frame1_plaintext = compress_zstd_frame(&zulu, 1).unwrap();
+        let frame1_plaintext = compress_zstd_frame(&beta, 1).unwrap();
         let envelope_plaintext =
             [frame0_plaintext.as_slice(), frame1_plaintext.as_slice()].concat();
         let payload = encrypt_test_object(
@@ -8704,7 +8813,7 @@ mod tests {
             envelope_index: 0,
             offset_in_envelope: frame0_plaintext.len() as u32,
             compressed_size: frame1_plaintext.len() as u32,
-            decompressed_size: zulu.len() as u32,
+            decompressed_size: beta.len() as u32,
             flags: 0x0000_0003,
             tar_stream_offset: alpha.len() as u64,
         };
@@ -8722,11 +8831,11 @@ mod tests {
         );
         let (mut shard1_plaintext, first1, last1) = build_test_index_shard(
             &[TestFileMeta {
-                path: b"zulu.txt".to_vec(),
+                path: b"beta.txt".to_vec(),
                 frame_index: 1,
                 tar_stream_offset: alpha.len() as u64,
-                member_group_size: zulu.len() as u64,
-                file_data_size: b"zulu cross shard\n".len() as u64,
+                member_group_size: beta.len() as u64,
+                file_data_size: b"beta cross shard\n".len() as u64,
             }],
             &[frame1],
             std::slice::from_ref(&envelope),

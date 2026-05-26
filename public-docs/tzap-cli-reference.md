@@ -51,9 +51,9 @@ Notes:
   `unsupported-feature`.
 - Create writes archive files to explicit paths. `-o -` is not archive stdout;
   the current CLI rejects that sentinel with `unsupported-feature`.
-- The current core writer returns completed in-memory archive artifacts before
-  the CLI writes output paths. No append-only sink or multipart-upload create
-  mode is exposed.
+- The convenience core writer APIs return completed in-memory archive artifacts.
+  A lower-level core append-only sink API exists for re-openable sources, but no
+  append-only sink or multipart-upload create mode is exposed by the CLI.
 - Create emits regular-file tar member groups only. Long or non-ASCII archive
   paths use local path-specific PAX metadata; global PAX/GNU state and tar EOF
   zero blocks are not emitted into the encrypted tar stream.

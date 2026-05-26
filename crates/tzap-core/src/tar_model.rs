@@ -280,6 +280,126 @@ pub fn validate_tar_stream_total_extraction_size(
     Ok(())
 }
 
+pub(crate) struct TarStreamTotalExtractionSizeValidator {
+    cursor: usize,
+    total: u64,
+    max_path_length: u32,
+    cap: u64,
+}
+
+impl TarStreamTotalExtractionSizeValidator {
+    pub(crate) fn new(max_path_length: u32, cap: u64) -> Self {
+        Self {
+            cursor: 0,
+            total: 0,
+            max_path_length,
+            cap,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, stream: &[u8]) -> Result<(), FormatError> {
+        while self.cursor < stream.len() {
+            let Some(group_end) = try_tar_member_group_end(stream, self.cursor)? else {
+                return Ok(());
+            };
+            let member =
+                parse_tar_member_group(&stream[self.cursor..group_end], self.max_path_length)?;
+            if member.kind == TarEntryKind::Regular {
+                self.total = self.total.checked_add(member.logical_size).ok_or(
+                    FormatError::InvalidArchive("total extraction size overflow"),
+                )?;
+                if self.total > self.cap {
+                    return Err(FormatError::ReaderUnsupported(
+                        "total extraction size exceeds configured cap",
+                    ));
+                }
+            }
+            self.cursor = group_end;
+        }
+        Ok(())
+    }
+}
+
+fn try_tar_member_group_end(stream: &[u8], start: usize) -> Result<Option<usize>, FormatError> {
+    let mut cursor = start;
+    let mut metadata = LocalMetadata::default();
+
+    loop {
+        let Some(header) = try_slice(stream, cursor, TAR_BLOCK_LEN)? else {
+            return Ok(None);
+        };
+        if header.iter().all(|byte| *byte == 0) {
+            return Err(FormatError::InvalidArchive("tar member header is empty"));
+        }
+        verify_tar_checksum(header)?;
+        let typeflag = header[156];
+        let header_size = parse_tar_octal(&header[124..136])?;
+        let is_main = matches!(typeflag, 0 | b'0' | b'5' | b'2' | b'1');
+        let effective_size = if is_main {
+            metadata.pax_size.unwrap_or(header_size)
+        } else {
+            header_size
+        };
+        let payload_start = checked_add(cursor, TAR_BLOCK_LEN)?;
+        let payload_len = to_usize(effective_size)?;
+        let payload_end = checked_add(payload_start, payload_len)?;
+        let padded_end = checked_add(payload_end, padding_to_512(payload_len))?;
+        let Some(payload) = try_slice(stream, payload_start, payload_len)? else {
+            return Ok(None);
+        };
+        if padded_end > stream.len() {
+            return Ok(None);
+        }
+        if stream[payload_end..padded_end]
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(FormatError::InvalidArchive(
+                "tar member padding is non-zero",
+            ));
+        }
+
+        match typeflag {
+            b'x' => {
+                parse_pax_records(payload, &mut metadata)?;
+                cursor = padded_end;
+            }
+            b'L' | b'K' => {
+                cursor = padded_end;
+            }
+            b'g' => {
+                return Err(FormatError::InvalidArchive(
+                    "global PAX headers are not allowed",
+                ));
+            }
+            b'V' | b'M' | b'N' => {
+                return Err(FormatError::InvalidArchive(
+                    "global GNU headers are not allowed",
+                ));
+            }
+            b'S' => {
+                return Err(FormatError::ReaderUnsupported(
+                    "unsupported GNU sparse tar entry",
+                ));
+            }
+            0 | b'0' | b'5' | b'2' | b'1' => return Ok(Some(padded_end)),
+            _ => return Err(FormatError::ReaderUnsupported("unsupported tar entry type")),
+        }
+
+        if cursor >= stream.len() {
+            return Ok(None);
+        }
+    }
+}
+
+fn try_slice(stream: &[u8], offset: usize, len: usize) -> Result<Option<&[u8]>, FormatError> {
+    let end = checked_add(offset, len)?;
+    if end > stream.len() {
+        return Ok(None);
+    }
+    Ok(Some(&stream[offset..end]))
+}
+
 pub(crate) fn stream_regular_tar_member_group_to_writer<R, W>(
     reader: &mut R,
     expected_path: &[u8],

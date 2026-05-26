@@ -13,8 +13,9 @@ use crate::format::{
     AeadAlgo, ArchiveWriteError, BlockKind, CompressionAlgo, FecAlgo, FormatError, KdfAlgo,
     BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN, CRITICAL_RECOVERY_LOCATOR_LEN,
     CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_HEADER_FIXED_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION,
-    MANIFEST_FOOTER_LEN, READER_MAX_CMRA_PARITY_PCT, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN,
-    VOLUME_TRAILER_LEN,
+    MANIFEST_FOOTER_LEN, READER_MAX_CMRA_PARITY_PCT, READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN,
+    READER_MAX_ROOT_AUTH_FOOTER_LEN, READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN, VOLUME_FORMAT_REV,
+    VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, DirectoryHintEntry, DirectoryHintShardEntry,
@@ -229,10 +230,10 @@ impl ArchiveWriteSink for MemoryArchiveSink {
     }
 }
 
-/// Completed archive artifacts produced by the current in-memory writer API.
+/// Completed archive artifacts produced by the compatibility writer APIs.
 ///
-/// The public writer builds all volume bytes before returning this value. It is
-/// an in-memory archive artifact builder, not a sink-based streaming writer.
+/// APIs returning this value build all volume bytes before returning. Use the
+/// sink writer when archive bytes should be delivered incrementally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrittenArchive {
     pub bytes: Vec<u8>,
@@ -685,6 +686,9 @@ where
     O: ArchiveWriteSink,
 {
     validate_dictionary_inputs(files.is_empty(), dictionary)?;
+    if let Some(root_auth) = root_auth {
+        validate_root_auth_writer_config(root_auth)?;
+    }
     let mut requested_options = options;
     if requested_options.target_volume_size.is_some() {
         requested_options.stripe_width = requested_options
@@ -2548,7 +2552,34 @@ fn plan_writer_options(mut options: WriterOptions) -> Result<WriterOptions, Form
         options,
         "index_root_fec_parity_shards",
     )?;
+    validate_writer_options_match_reader_caps(options)?;
     Ok(options)
+}
+
+fn validate_writer_options_match_reader_caps(options: WriterOptions) -> Result<(), FormatError> {
+    CryptoHeaderFixed {
+        length: CRYPTO_HEADER_FIXED_LEN as u32,
+        compression_algo: CompressionAlgo::ZstdFramed,
+        aead_algo: options.aead_algo,
+        fec_algo: FecAlgo::ReedSolomonGF16,
+        kdf_algo: KdfAlgo::Raw,
+        chunk_size: options.chunk_size,
+        envelope_target_size: options.envelope_target_size,
+        block_size: options.block_size,
+        fec_data_shards: options.fec_data_shards,
+        fec_parity_shards: options.fec_parity_shards,
+        index_fec_data_shards: options.index_fec_data_shards,
+        index_fec_parity_shards: options.index_fec_parity_shards,
+        index_root_fec_data_shards: options.index_root_fec_data_shards,
+        index_root_fec_parity_shards: options.index_root_fec_parity_shards,
+        stripe_width: options.stripe_width,
+        volume_loss_tolerance: options.volume_loss_tolerance,
+        bit_rot_buffer_pct: options.bit_rot_buffer_pct,
+        has_dictionary: 0,
+        max_path_length: options.max_path_length,
+        expected_volume_size: options.target_volume_size.unwrap_or(0),
+    }
+    .validate_v36()
 }
 
 fn build_crypto_header(
@@ -3914,6 +3945,7 @@ fn root_auth_footer_wire_length(
     signer_identity_len: usize,
     authenticator_value_len: usize,
 ) -> Result<u32, FormatError> {
+    validate_root_auth_variable_lengths_for_writer(signer_identity_len, authenticator_value_len)?;
     let len = crate::format::ROOT_AUTH_FOOTER_FIXED_LEN
         .checked_add(signer_identity_len)
         .and_then(|value| value.checked_add(authenticator_value_len))
@@ -3921,7 +3953,43 @@ fn root_auth_footer_wire_length(
         .ok_or(FormatError::WriterUnsupported(
             "RootAuthFooterV1 length overflow",
         ))?;
+    if len > READER_MAX_ROOT_AUTH_FOOTER_LEN as usize {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "RootAuthFooterV1 length",
+            cap: READER_MAX_ROOT_AUTH_FOOTER_LEN as u64,
+            actual: len as u64,
+        });
+    }
     u32::try_from(len).map_err(|_| FormatError::WriterUnsupported("RootAuthFooterV1 length"))
+}
+
+fn validate_root_auth_writer_config(config: RootAuthWriterConfig<'_>) -> Result<(), FormatError> {
+    root_auth_footer_wire_length(
+        config.signer_identity.len(),
+        config.authenticator_value_length as usize,
+    )?;
+    Ok(())
+}
+
+fn validate_root_auth_variable_lengths_for_writer(
+    signer_identity_len: usize,
+    authenticator_value_len: usize,
+) -> Result<(), FormatError> {
+    if signer_identity_len > READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN as usize {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "RootAuthFooterV1 signer identity length",
+            cap: READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN as u64,
+            actual: signer_identity_len as u64,
+        });
+    }
+    if authenticator_value_len > READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN as usize {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "RootAuthFooterV1 authenticator value length",
+            cap: READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN as u64,
+            actual: authenticator_value_len as u64,
+        });
+    }
+    Ok(())
 }
 
 fn build_manifest_footer(
@@ -5289,6 +5357,107 @@ mod tests {
             })
             .unwrap_err(),
             FormatError::InvalidKdfParams("m_cost_kib requirement overflow")
+        );
+    }
+
+    #[test]
+    fn writer_options_reject_reader_resource_cap_excesses() {
+        assert_eq!(
+            plan_writer_options(WriterOptions {
+                stripe_width: crate::format::READER_MAX_STRIPE_WIDTH + 1,
+                volume_loss_tolerance: 0,
+                ..WriterOptions::default()
+            })
+            .unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "stripe_width",
+                cap: crate::format::READER_MAX_STRIPE_WIDTH as u64,
+                actual: crate::format::READER_MAX_STRIPE_WIDTH as u64 + 1,
+            }
+        );
+        assert_eq!(
+            plan_writer_options(WriterOptions {
+                block_size: crate::format::READER_MAX_BLOCK_SIZE + 2,
+                ..WriterOptions::default()
+            })
+            .unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "block_size",
+                cap: crate::format::READER_MAX_BLOCK_SIZE as u64,
+                actual: crate::format::READER_MAX_BLOCK_SIZE as u64 + 2,
+            }
+        );
+        assert_eq!(
+            plan_writer_options(WriterOptions {
+                chunk_size: crate::format::READER_MAX_CHUNK_SIZE + 1,
+                envelope_target_size: crate::format::READER_MAX_CHUNK_SIZE + 1,
+                ..WriterOptions::default()
+            })
+            .unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "chunk_size",
+                cap: crate::format::READER_MAX_CHUNK_SIZE as u64,
+                actual: crate::format::READER_MAX_CHUNK_SIZE as u64 + 1,
+            }
+        );
+        assert_eq!(
+            plan_writer_options(WriterOptions {
+                max_path_length: crate::format::READER_MAX_PATH_LENGTH + 1,
+                ..WriterOptions::default()
+            })
+            .unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "max_path_length",
+                cap: crate::format::READER_MAX_PATH_LENGTH as u64,
+                actual: crate::format::READER_MAX_PATH_LENGTH as u64 + 1,
+            }
+        );
+        assert_eq!(
+            plan_writer_options(WriterOptions {
+                bit_rot_buffer_pct: 0,
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                fec_data_shards: crate::format::READER_MAX_FEC_CLASS_SHARDS as u16 + 1,
+                ..WriterOptions::default()
+            })
+            .unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "fec_data_shards + fec_parity_shards",
+                cap: crate::format::READER_MAX_FEC_CLASS_SHARDS as u64,
+                actual: crate::format::READER_MAX_FEC_CLASS_SHARDS as u64 + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn root_auth_writer_config_rejects_reader_cap_excess_before_authenticator() {
+        let master_key = MasterKey::from_raw_key(&[7u8; 32]).unwrap();
+        let mut authenticator_called = false;
+        let err = write_archive_with_root_auth(
+            &[RegularFile::new("signed.txt", b"payload")],
+            &master_key,
+            single_volume_metadata_test_options(),
+            RootAuthWriterConfig {
+                authenticator_id: 1,
+                signer_identity_type: 1,
+                signer_identity: b"signer",
+                authenticator_value_length: READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN + 1,
+            },
+            |_| {
+                authenticator_called = true;
+                Ok(Vec::new())
+            },
+        )
+        .unwrap_err();
+
+        assert!(!authenticator_called);
+        assert_eq!(
+            err,
+            FormatError::ReaderResourceLimitExceeded {
+                field: "RootAuthFooterV1 authenticator value length",
+                cap: READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN as u64,
+                actual: READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN as u64 + 1,
+            }
         );
     }
 
