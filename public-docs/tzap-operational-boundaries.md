@@ -151,23 +151,31 @@ Operational shape:
   `public_physical_completeness_unverified`, and
   `public_recovery_margin_unchecked`.
 
-## Archive paths, not archive stdin
+## Archive stdin and file paths
 
-Archive inputs are opened from file paths. The current CLI does not expose `-`
-as archive stdin, and it does not expose a streaming non-seekable archive input
-mode. `--password-stdin` reads only the passphrase.
+For `verify`, `list`, and extract-all, `-` is archive stdin for the live
+non-seekable profile: single-volume archive streams with a raw `--keyfile`.
+Dictionary-compressed streams require a matching `--bootstrap` sidecar.
+`--password-stdin` reads passphrases for file-backed archives; it cannot share
+stdin with archive bytes.
 
 Example:
 
 ```sh
-tzap list --keyfile project.key -
-# exit 3: io, because "-" is treated as a literal file path
+cat archive.tzap | tzap verify --keyfile project.key -
+cat archive.tzap | tzap list --keyfile project.key -
+cat archive.tzap | tzap extract --keyfile project.key -C restored -
+cat dictionary.tzap | tzap verify --keyfile project.key --bootstrap dictionary.tzap.bootstrap -
 ```
 
-What to do:
+Unsupported stdin combinations:
 
-- Store the archive bytes in a file and pass that path to `tzap`.
-- Use `--bootstrap` only with a real single-volume archive path.
+- Selected-path extraction from `-` rejects with `unsupported-feature`.
+- `extract - --stdout` rejects with `unsupported-feature`.
+- Additional `--volume` inputs, passphrase modes, RootAuth external
+  verification, public no-key verification, and multi-volume recovery are
+  file-backed only.
+- A real file named `-` can still be addressed as `./-`.
 
 ## File-backed random access
 
@@ -189,17 +197,27 @@ Operational shape:
 
 ## Sequential reader and provisional output
 
-The core reader exposes a whole-buffer helper for dictionary-free
-single-volume non-seekable archive images. That helper returns decoded tar bytes
-only after the terminal ManifestFooter and VolumeTrailer authenticate. It is not
-a live stdout or filesystem extraction API, so callers do not receive
-provisional bytes.
+The core reader exposes live `Read` APIs for single-volume archive streams:
+`verify_non_seekable_stream`, `list_non_seekable_stream`,
+`extract_non_seekable_stream_to_dir`, and bootstrap-sidecar variants for
+dictionary streams. They authenticate payload envelopes as bytes arrive, retain
+bounded metadata and terminal-tail state, and return only after terminal
+metadata and index content conformance pass.
 
-The CLI does not expose archive stdin or live non-seekable extraction. `tzap
-extract --stdout` first opens and authenticates an archive from file paths, then
-writes one selected regular-file member to stdout. The default filesystem
-extractor also uses the opened authenticated archive; it does not stream
-unauthenticated non-seekable bytes into the destination directory.
+Live filesystem extraction stages output in a private directory under the
+destination parent. The final destination is committed only after terminal
+verification and metadata/content conformance succeed. On payload, metadata, or
+terminal failure, staged output is removed and final paths are not published.
+
+The older `sequential_extract_tar_stream` helper remains a whole-buffer
+compatibility API for dictionary-free single-volume non-seekable archive images.
+That helper returns decoded tar bytes only after the terminal ManifestFooter and
+VolumeTrailer authenticate. It is not a live stdout or filesystem extraction
+API, so callers do not receive provisional bytes.
+
+`tzap extract --stdout` remains file-backed only. It first opens and
+authenticates an archive from file paths, then writes one selected regular-file
+member to stdout.
 
 For opened file-backed archives, selected regular-file payloads are streamed
 from the selected payload envelopes to stdout or a destination file. The core
@@ -221,7 +239,8 @@ What to do:
 
 - Store archive bytes in a file before using the CLI.
 - Treat live provisional stdout or staged filesystem extraction from a
-  non-seekable archive stream as a future API, not current CLI behavior.
+  non-seekable archive stream as a future API, not current CLI behavior. The
+  current live core stream API is verify-only.
 
 ## Create outputs are archive files, not stdout
 

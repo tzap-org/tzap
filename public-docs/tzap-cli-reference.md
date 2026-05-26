@@ -66,6 +66,7 @@ Extract selected paths or all members:
 
 ```sh
 tzap extract --keyfile project.key -C restored project.tzap
+cat project.tzap | tzap extract --keyfile project.key -C restored -
 # Single file to stdout
 tzap extract --keyfile project.key --stdout project.tzap project/readme.txt
 ```
@@ -81,7 +82,10 @@ Useful flags:
 
 Notes:
 
-- Archive input comes from file paths. `-` is not an archive stdin sentinel.
+- `-` is archive stdin for staged extract-all of single-volume streams with
+  `--keyfile`. Dictionary-compressed streams require `--bootstrap`. It rejects
+  selected paths, `--stdout`, extra `--volume` inputs, and passphrase modes
+  because stdin is the archive byte stream.
 - Key-holding extract opens archive files through the core file-backed
   random-access reader. Selecting one path reads the authenticated terminal,
   index metadata, and the payload envelopes needed for that path; it does not
@@ -107,6 +111,7 @@ Inspect archive content paths:
 ```sh
 tzap list --keyfile project.key project.tzap
 printf '%s\n' "$TZAP_PASSPHRASE" | tzap list --password-stdin project.tzap
+cat project.tzap | tzap list --keyfile project.key -
 
 tzap list --keyfile project.key --long project.tzap
 tzap list --keyfile project.key --json project.tzap
@@ -121,10 +126,13 @@ Useful flags:
 
 Notes:
 
-- Archive input comes from file paths. `-` is not an archive stdin sentinel.
-- Default `list` output reads encrypted index entries and prints archive paths.
-  It does not decode payload envelopes for tar kind, mode, mtime, or metadata
-  diagnostics.
+- `-` is archive stdin for single-volume streams with `--keyfile`.
+  Dictionary-compressed streams require `--bootstrap`. Listing is emitted only
+  after EOF, terminal authentication, and metadata/content conformance checks
+  succeed.
+- For file-backed archives, default `list` output reads encrypted index entries
+  and prints archive paths. It does not decode payload envelopes for tar kind,
+  mode, mtime, or metadata diagnostics.
 - Key-holding list opens archive files through the core file-backed
   random-access reader. Default output reads terminal and index metadata rather
   than loading every payload block.
@@ -141,6 +149,8 @@ Notes:
 Validate archive integrity and recovery profile:
 
 ```sh
+tzap verify --keyfile project.key project.tzap
+cat project.tzap | tzap verify --keyfile project.key -
 tzap verify --keyfile project.key project.tzap project.tzap.001
 printf '%s\n' "$TZAP_PASSPHRASE" | tzap verify --password-stdin project.tzap
 
@@ -172,7 +182,10 @@ Notes:
   `public_recovery_margin_unchecked` on success.
 - Verification reports unsupported local tar metadata profiles to stderr as
   `tzap: degraded-metadata: ...` after the archive structure and content verify.
-- Archive input comes from file paths. `-` is not an archive stdin sentinel.
+- `-` is archive stdin for single-volume key-holding verification with
+  `--keyfile`. Dictionary-compressed streams require `--bootstrap`. Archive
+  stdin does not support `--password-stdin`, passphrase KDF discovery,
+  `--trusted-public-key`, `--public-no-key`, or multi-volume recovery.
 - `--bootstrap` is for single-volume open paths. Multi-volume open paths should
   pass volume files and omit the sidecar; combining multiple archive inputs
   with `--bootstrap` rejects before reading archive files with

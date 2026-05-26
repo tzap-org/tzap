@@ -352,7 +352,7 @@ fn milestone11_public_docs_keep_boundaries_out_of_readme_marketing() {
 
     assert!(boundaries.contains("Large regular-file input sets are supported"));
     assert!(boundaries.contains("Create outputs are archive files, not stdout"));
-    assert!(boundaries.contains("Archive paths, not archive stdin"));
+    assert!(boundaries.contains("Archive stdin and file paths"));
     assert!(boundaries.contains("Sequential reader and provisional output"));
     assert!(boundaries.contains("lower-level core writer also exposes an append-only sink API"));
     assert!(writer.contains("sink writer when archive bytes should be delivered incrementally"));
@@ -362,7 +362,7 @@ fn milestone11_public_docs_keep_boundaries_out_of_readme_marketing() {
 
     assert!(reference
         .contains("`--bootstrap-out`: sidecar output path for single-volume archives only"));
-    assert!(reference.contains("`-` is not an archive stdin sentinel"));
+    assert!(reference.contains("`-` is archive stdin"));
     assert!(reference.contains("`-o -` is not archive stdout"));
     assert!(reference.contains("append-only sink or multipart-upload create mode is exposed"));
 

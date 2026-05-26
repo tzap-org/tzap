@@ -88,6 +88,26 @@ pub(crate) struct StreamedTarMemberMetadata {
     pub diagnostics: Vec<MetadataDiagnostic>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TarStreamMemberSummary {
+    pub path: Vec<u8>,
+    pub kind: TarEntryKind,
+    pub link_target: Option<Vec<u8>>,
+    pub mode: u32,
+    pub mtime: u64,
+    pub logical_size: u64,
+    pub diagnostics: Vec<MetadataDiagnostic>,
+    pub group_start: u64,
+    pub group_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TarStreamSummary {
+    pub members: Vec<TarStreamMemberSummary>,
+    pub tar_total_size: u64,
+    pub total_extraction_size: u64,
+}
+
 pub(crate) trait TarMemberGroupReader {
     fn read_some_member_bytes(&mut self, buf: &mut [u8]) -> Result<usize, ExtractError>;
 
@@ -109,6 +129,62 @@ pub(crate) trait TarMemberGroupReader {
 trait TarMemberStreamHandler {
     fn on_member(&mut self, member: &StreamedTarMemberMetadata) -> Result<(), ExtractError>;
     fn write_regular_payload(&mut self, bytes: &[u8]) -> Result<(), ExtractError>;
+}
+
+pub(crate) trait TarStreamObserver {
+    fn on_member_start(&mut self, _member: &StreamedTarMemberMetadata) -> Result<(), FormatError> {
+        Ok(())
+    }
+
+    fn on_regular_payload(&mut self, _bytes: &[u8]) -> Result<(), FormatError> {
+        Ok(())
+    }
+
+    fn on_member_complete(
+        &mut self,
+        member: &StreamedTarMemberMetadata,
+    ) -> Result<Vec<MetadataDiagnostic>, FormatError> {
+        Ok(member.diagnostics.clone())
+    }
+}
+
+pub(crate) struct NoopTarStreamObserver;
+
+impl TarStreamObserver for NoopTarStreamObserver {}
+
+pub(crate) struct TarStreamFilesystemRestoreObserver<'a> {
+    handler: FilesystemRestoreHandler<'a>,
+}
+
+impl<'a> TarStreamFilesystemRestoreObserver<'a> {
+    pub(crate) fn new(root: &'a Path, options: SafeExtractionOptions) -> Self {
+        Self {
+            handler: FilesystemRestoreHandler::new(root, options),
+        }
+    }
+}
+
+impl TarStreamObserver for TarStreamFilesystemRestoreObserver<'_> {
+    fn on_member_start(&mut self, member: &StreamedTarMemberMetadata) -> Result<(), FormatError> {
+        self.handler
+            .on_member(member)
+            .map_err(format_error_from_extract_error)
+    }
+
+    fn on_regular_payload(&mut self, bytes: &[u8]) -> Result<(), FormatError> {
+        self.handler
+            .write_regular_payload(bytes)
+            .map_err(format_error_from_extract_error)
+    }
+
+    fn on_member_complete(
+        &mut self,
+        member: &StreamedTarMemberMetadata,
+    ) -> Result<Vec<MetadataDiagnostic>, FormatError> {
+        self.handler
+            .finish(member)
+            .map_err(format_error_from_extract_error)
+    }
 }
 
 #[derive(Default)]
@@ -318,6 +394,474 @@ impl TarStreamTotalExtractionSizeValidator {
         }
         Ok(())
     }
+}
+
+pub(crate) struct TarStreamSummaryValidator<O = NoopTarStreamObserver> {
+    state: StreamingTarState,
+    max_path_length: u32,
+    total_extraction_size: u64,
+    extraction_cap: u64,
+    max_metadata_payload_bytes: usize,
+    max_member_count: u64,
+    members: Vec<TarStreamMemberSummary>,
+    observer: O,
+}
+
+impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
+    pub(crate) fn with_observer(
+        max_path_length: u32,
+        extraction_cap: u64,
+        max_metadata_payload_bytes: usize,
+        max_member_count: u64,
+        observer: O,
+    ) -> Self {
+        Self {
+            state: StreamingTarState::new_member(0),
+            max_path_length,
+            total_extraction_size: 0,
+            extraction_cap,
+            max_metadata_payload_bytes,
+            max_member_count,
+            members: Vec::new(),
+            observer,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, mut input: &[u8]) -> Result<(), FormatError> {
+        while !input.is_empty() {
+            let state = std::mem::replace(&mut self.state, StreamingTarState::new_member(0));
+            let (consumed, next) = self.consume_state(state, input)?;
+            self.state = self.resolve_ready_state(next)?;
+            input = &input[consumed..];
+        }
+        Ok(())
+    }
+
+    fn consume_state(
+        &mut self,
+        state: StreamingTarState,
+        input: &[u8],
+    ) -> Result<(usize, StreamingTarState), FormatError> {
+        match state {
+            StreamingTarState::Header {
+                metadata,
+                group_start,
+                mut group_size,
+                mut header,
+            } => {
+                let needed = TAR_BLOCK_LEN - header.len();
+                let take = needed.min(input.len());
+                header.extend_from_slice(&input[..take]);
+                group_size = checked_u64_add(group_size, take as u64)?;
+                checked_u64_add(group_start, group_size)?;
+                let next = if header.len() == TAR_BLOCK_LEN {
+                    let mut header_bytes = [0u8; TAR_BLOCK_LEN];
+                    header_bytes.copy_from_slice(&header);
+                    self.state_after_header(metadata, group_start, group_size, header_bytes)?
+                } else {
+                    StreamingTarState::Header {
+                        metadata,
+                        group_start,
+                        group_size,
+                        header,
+                    }
+                };
+                Ok((take, next))
+            }
+            StreamingTarState::Payload {
+                metadata,
+                group_start,
+                mut group_size,
+                mut entry,
+                mut remaining,
+                padding_remaining,
+            } => {
+                let take = remaining.min(input.len() as u64) as usize;
+                if let Some(payload) = entry.metadata_payload_mut() {
+                    let next_len = checked_add(payload.len(), take)?;
+                    if next_len > self.max_metadata_payload_bytes {
+                        return Err(FormatError::ReaderUnsupported(
+                            "tar metadata payload exceeds configured streaming cap",
+                        ));
+                    }
+                    payload.extend_from_slice(&input[..take]);
+                } else if take > 0 && entry.is_regular_main() {
+                    self.observer.on_regular_payload(&input[..take])?;
+                }
+                remaining -= take as u64;
+                group_size = checked_u64_add(group_size, take as u64)?;
+                checked_u64_add(group_start, group_size)?;
+                let next = if remaining == 0 {
+                    StreamingTarState::Padding {
+                        metadata,
+                        group_start,
+                        group_size,
+                        entry,
+                        remaining: padding_remaining,
+                    }
+                } else {
+                    StreamingTarState::Payload {
+                        metadata,
+                        group_start,
+                        group_size,
+                        entry,
+                        remaining,
+                        padding_remaining,
+                    }
+                };
+                Ok((take, next))
+            }
+            StreamingTarState::Padding {
+                metadata,
+                group_start,
+                mut group_size,
+                entry,
+                mut remaining,
+            } => {
+                let take = remaining.min(input.len() as u64) as usize;
+                if input[..take].iter().any(|byte| *byte != 0) {
+                    return Err(FormatError::InvalidArchive(
+                        "tar member padding is non-zero",
+                    ));
+                }
+                remaining -= take as u64;
+                group_size = checked_u64_add(group_size, take as u64)?;
+                checked_u64_add(group_start, group_size)?;
+                let next = if remaining == 0 {
+                    self.finish_entry_parts(metadata, group_start, group_size, entry)?
+                } else {
+                    StreamingTarState::Padding {
+                        metadata,
+                        group_start,
+                        group_size,
+                        entry,
+                        remaining,
+                    }
+                };
+                Ok((take, next))
+            }
+        }
+    }
+
+    fn resolve_ready_state(
+        &mut self,
+        mut state: StreamingTarState,
+    ) -> Result<StreamingTarState, FormatError> {
+        loop {
+            state = match state {
+                StreamingTarState::Payload {
+                    metadata,
+                    group_start,
+                    group_size,
+                    entry,
+                    remaining: 0,
+                    padding_remaining,
+                } => StreamingTarState::Padding {
+                    metadata,
+                    group_start,
+                    group_size,
+                    entry,
+                    remaining: padding_remaining,
+                },
+                StreamingTarState::Padding {
+                    metadata,
+                    group_start,
+                    group_size,
+                    entry,
+                    remaining: 0,
+                } => self.finish_entry_parts(metadata, group_start, group_size, entry)?,
+                other => return Ok(other),
+            };
+        }
+    }
+
+    pub(crate) fn tar_total_size(&self) -> u64 {
+        match &self.state {
+            StreamingTarState::Header {
+                group_start,
+                group_size,
+                ..
+            }
+            | StreamingTarState::Payload {
+                group_start,
+                group_size,
+                ..
+            }
+            | StreamingTarState::Padding {
+                group_start,
+                group_size,
+                ..
+            } => group_start + group_size,
+        }
+    }
+
+    pub(crate) fn finish(self) -> Result<TarStreamSummary, FormatError> {
+        let tar_total_size = self.tar_total_size();
+        match self.state {
+            StreamingTarState::Header {
+                header, group_size, ..
+            } if header.is_empty() && group_size == 0 => Ok(TarStreamSummary {
+                members: self.members,
+                tar_total_size,
+                total_extraction_size: self.total_extraction_size,
+            }),
+            _ => Err(FormatError::InvalidArchive(
+                "tar stream ended inside member group",
+            )),
+        }
+    }
+
+    fn state_after_header(
+        &mut self,
+        mut metadata: LocalMetadata,
+        group_start: u64,
+        group_size: u64,
+        header: [u8; TAR_BLOCK_LEN],
+    ) -> Result<StreamingTarState, FormatError> {
+        if header.iter().all(|byte| *byte == 0) {
+            return Err(FormatError::InvalidArchive("tar member header is empty"));
+        }
+        verify_tar_checksum(&header)?;
+        let typeflag = header[156];
+        let header_size = parse_tar_octal(&header[124..136])?;
+        let is_main = matches!(typeflag, 0 | b'0' | b'5' | b'2' | b'1');
+        let effective_size = if is_main {
+            metadata.pax_size.unwrap_or(header_size)
+        } else {
+            header_size
+        };
+        let padding_remaining = padding_to_512_u64(effective_size);
+
+        let entry = match typeflag {
+            b'x' => PendingTarEntry::LocalPax {
+                payload: Vec::new(),
+            },
+            b'L' => PendingTarEntry::GnuLongName {
+                payload: Vec::new(),
+            },
+            b'K' => PendingTarEntry::GnuLongLink {
+                payload: Vec::new(),
+            },
+            b'g' => {
+                return Err(FormatError::InvalidArchive(
+                    "global PAX headers are not allowed",
+                ))
+            }
+            b'V' | b'M' | b'N' => {
+                return Err(FormatError::InvalidArchive(
+                    "global GNU headers are not allowed",
+                ))
+            }
+            b'S' => {
+                return Err(FormatError::ReaderUnsupported(
+                    "unsupported GNU sparse tar entry",
+                ))
+            }
+            0 | b'0' | b'5' | b'2' | b'1' => {
+                let kind = match typeflag {
+                    b'5' => TarEntryKind::Directory,
+                    b'2' => TarEntryKind::Symlink,
+                    b'1' => TarEntryKind::Hardlink,
+                    _ => TarEntryKind::Regular,
+                };
+                let mode = parse_tar_octal(&header[100..108])? as u32;
+                let mtime = parse_tar_octal(&header[136..148])?;
+                let path = canonical_main_path(&header, kind, &metadata, self.max_path_length)?;
+                let link_target =
+                    canonical_link_target(&header, kind, &path, &metadata, self.max_path_length)?;
+                if kind != TarEntryKind::Regular && effective_size != 0 {
+                    return Err(FormatError::InvalidArchive(
+                        "non-regular tar entry has non-zero payload size",
+                    ));
+                }
+                let logical_size = if kind == TarEntryKind::Regular {
+                    effective_size
+                } else {
+                    0
+                };
+                if kind == TarEntryKind::Regular {
+                    self.total_extraction_size =
+                        self.total_extraction_size.checked_add(logical_size).ok_or(
+                            FormatError::InvalidArchive("total extraction size overflow"),
+                        )?;
+                    if self.total_extraction_size > self.extraction_cap {
+                        return Err(FormatError::ReaderUnsupported(
+                            "total extraction size exceeds configured cap",
+                        ));
+                    }
+                }
+                let member = StreamedTarMemberMetadata {
+                    path,
+                    kind,
+                    link_target,
+                    mode,
+                    mtime,
+                    logical_size,
+                    diagnostics: std::mem::take(&mut metadata.diagnostics),
+                };
+                self.observer.on_member_start(&member)?;
+                PendingTarEntry::Main {
+                    member,
+                    group_start,
+                }
+            }
+            _ => return Err(FormatError::ReaderUnsupported("unsupported tar entry type")),
+        };
+
+        self.resolve_ready_state(StreamingTarState::Payload {
+            metadata,
+            group_start,
+            group_size,
+            entry,
+            remaining: effective_size,
+            padding_remaining,
+        })
+    }
+
+    fn finish_entry_parts(
+        &mut self,
+        mut metadata: LocalMetadata,
+        group_start: u64,
+        group_size: u64,
+        entry: PendingTarEntry,
+    ) -> Result<StreamingTarState, FormatError> {
+        match entry {
+            PendingTarEntry::LocalPax { payload } => {
+                parse_pax_records(&payload, &mut metadata)?;
+                Ok(StreamingTarState::Header {
+                    metadata,
+                    group_start,
+                    group_size,
+                    header: Vec::new(),
+                })
+            }
+            PendingTarEntry::GnuLongName { payload } => {
+                metadata.gnu_long_name = Some(trimmed_metadata_payload(&payload));
+                Ok(StreamingTarState::Header {
+                    metadata,
+                    group_start,
+                    group_size,
+                    header: Vec::new(),
+                })
+            }
+            PendingTarEntry::GnuLongLink { payload } => {
+                metadata.gnu_long_link = Some(trimmed_metadata_payload(&payload));
+                Ok(StreamingTarState::Header {
+                    metadata,
+                    group_start,
+                    group_size,
+                    header: Vec::new(),
+                })
+            }
+            PendingTarEntry::Main {
+                member,
+                group_start,
+            } => {
+                if self.members.len() as u64 >= self.max_member_count {
+                    return Err(FormatError::ReaderUnsupported(
+                        "tar member count exceeds configured streaming cap",
+                    ));
+                }
+                let diagnostics = self.observer.on_member_complete(&member)?;
+                self.members.push(TarStreamMemberSummary {
+                    path: member.path,
+                    kind: member.kind,
+                    link_target: member.link_target,
+                    mode: member.mode,
+                    mtime: member.mtime,
+                    logical_size: member.logical_size,
+                    diagnostics,
+                    group_start,
+                    group_size,
+                });
+                Ok(StreamingTarState::new_member(checked_u64_add(
+                    group_start,
+                    group_size,
+                )?))
+            }
+        }
+    }
+}
+
+enum StreamingTarState {
+    Header {
+        metadata: LocalMetadata,
+        group_start: u64,
+        group_size: u64,
+        header: Vec<u8>,
+    },
+    Payload {
+        metadata: LocalMetadata,
+        group_start: u64,
+        group_size: u64,
+        entry: PendingTarEntry,
+        remaining: u64,
+        padding_remaining: u64,
+    },
+    Padding {
+        metadata: LocalMetadata,
+        group_start: u64,
+        group_size: u64,
+        entry: PendingTarEntry,
+        remaining: u64,
+    },
+}
+
+impl StreamingTarState {
+    fn new_member(group_start: u64) -> Self {
+        Self::Header {
+            metadata: LocalMetadata::default(),
+            group_start,
+            group_size: 0,
+            header: Vec::new(),
+        }
+    }
+}
+
+enum PendingTarEntry {
+    LocalPax {
+        payload: Vec<u8>,
+    },
+    GnuLongName {
+        payload: Vec<u8>,
+    },
+    GnuLongLink {
+        payload: Vec<u8>,
+    },
+    Main {
+        member: StreamedTarMemberMetadata,
+        group_start: u64,
+    },
+}
+
+impl PendingTarEntry {
+    fn metadata_payload_mut(&mut self) -> Option<&mut Vec<u8>> {
+        match self {
+            Self::LocalPax { payload }
+            | Self::GnuLongName { payload }
+            | Self::GnuLongLink { payload } => Some(payload),
+            Self::Main { .. } => None,
+        }
+    }
+
+    fn is_regular_main(&self) -> bool {
+        matches!(
+            self,
+            Self::Main {
+                member: StreamedTarMemberMetadata {
+                    kind: TarEntryKind::Regular,
+                    ..
+                },
+                ..
+            }
+        )
+    }
+}
+
+fn checked_u64_add(lhs: u64, rhs: u64) -> Result<u64, FormatError> {
+    lhs.checked_add(rhs).ok_or(FormatError::InvalidArchive(
+        "tar member arithmetic overflow",
+    ))
 }
 
 fn try_tar_member_group_end(stream: &[u8], start: usize) -> Result<Option<usize>, FormatError> {
@@ -721,6 +1265,15 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
         file.write_all(bytes)
             .map_err(|_| FormatError::FilesystemExtractionFailed("failed to write regular file"))?;
         Ok(())
+    }
+}
+
+fn format_error_from_extract_error(error: ExtractError) -> FormatError {
+    match error {
+        ExtractError::Format(error) => error,
+        ExtractError::Output(_) => {
+            FormatError::FilesystemExtractionFailed("failed to write regular file")
+        }
     }
 }
 

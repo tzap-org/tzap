@@ -26,6 +26,7 @@ rand.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 tar.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 unicode-normalization.workspace = true
 uuid.workspace = true

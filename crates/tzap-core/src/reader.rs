@@ -23,6 +23,7 @@ use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, DirectoryHintShardEntry, DirectoryHintTable,
     EnvelopeEntry, FileEntry, FrameEntry, IndexRoot, IndexShard, MetadataLimits, ShardEntry,
 };
+use crate::non_seekable_reader::StreamedPayloadSummary;
 use crate::root_auth::{
     archive_root, critical_metadata_digest, data_block_merkle_root, fec_layout_digest,
     index_digest, root_auth_descriptor_digest, signer_identity_digest, ArchiveRootInputs,
@@ -194,6 +195,19 @@ struct ObjectExtent {
     data_block_count: u32,
     parity_block_count: u32,
     encrypted_size: u32,
+}
+
+pub(crate) struct StreamedArchiveOpenParts {
+    pub(crate) options: ReaderOptions,
+    pub(crate) observed_archive_bytes: u64,
+    pub(crate) subkeys: Subkeys,
+    pub(crate) blocks: BTreeMap<u64, BlockRecord>,
+    pub(crate) crypto_header_bytes: Vec<u8>,
+    pub(crate) volume_header: VolumeHeader,
+    pub(crate) crypto_header: CryptoHeaderFixed,
+    pub(crate) manifest_footer: ManifestFooter,
+    pub(crate) volume_trailer: VolumeTrailer,
+    pub(crate) root_auth_footer: Option<RootAuthFooterV1>,
 }
 
 #[derive(Clone, Copy)]
@@ -1432,6 +1446,251 @@ impl OpenedArchive {
             }
         }
         validate_file_extent_coverage_ranges(&file_extents, tar_len)?;
+        if !self.index_root.directory_hint_shards.is_empty() {
+            let hint_tables = self.load_all_directory_hint_tables()?;
+            validate_directory_hint_tables_against_expected(&hint_tables, &directory_hint_map)?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn from_streamed_parts(
+        parts: StreamedArchiveOpenParts,
+    ) -> Result<Self, FormatError> {
+        let limits = metadata_limits(&parts.crypto_header);
+        let index_root_plaintext = load_metadata_object_from_parts(
+            &parts.blocks,
+            &parts.subkeys,
+            &parts.volume_header,
+            &parts.crypto_header,
+            ObjectExtent {
+                first_block_index: parts.manifest_footer.index_root_first_block,
+                data_block_count: parts.manifest_footer.index_root_data_block_count,
+                parity_block_count: parts.manifest_footer.index_root_parity_block_count,
+                encrypted_size: parts.manifest_footer.index_root_encrypted_size,
+            },
+            BlockKind::IndexRootData,
+            BlockKind::IndexRootParity,
+            &parts.subkeys.index_root_key,
+            &parts.subkeys.index_nonce_seed,
+            b"idxroot",
+            0,
+            parts.crypto_header.index_root_fec_data_shards,
+            parts.crypto_header.index_root_fec_parity_shards,
+            parts.manifest_footer.index_root_decompressed_size,
+        )?;
+        let index_root = IndexRoot::parse(
+            &index_root_plaintext,
+            parts.crypto_header.has_dictionary != 0,
+            limits,
+        )?;
+        let payload_dictionary = load_archive_dictionary(
+            &parts.blocks,
+            &parts.subkeys,
+            &parts.volume_header,
+            &parts.crypto_header,
+            &index_root,
+        )?;
+
+        Ok(Self {
+            options: parts.options,
+            observed_archive_bytes: parts.observed_archive_bytes,
+            subkeys: parts.subkeys,
+            blocks: parts.blocks,
+            lazy_blocks: None,
+            crypto_header_bytes: parts.crypto_header_bytes,
+            volume_header: parts.volume_header,
+            crypto_header: parts.crypto_header,
+            manifest_footer: parts.manifest_footer,
+            volume_trailer: Some(parts.volume_trailer),
+            root_auth_footer: parts.root_auth_footer,
+            index_root,
+            payload_dictionary,
+        })
+    }
+
+    pub(crate) fn verify_streamed_payload_summary(
+        &self,
+        streamed: &StreamedPayloadSummary,
+    ) -> Result<(), FormatError> {
+        if self.index_root.header.file_count > DIRECTORY_HINT_REQUIRED_FILE_COUNT
+            && self.index_root.directory_hint_shards.is_empty()
+        {
+            return Err(FormatError::InvalidArchive(
+                "IndexRoot file_count requires directory hints",
+            ));
+        }
+        if streamed.tar.total_extraction_size
+            > total_extraction_size_cap(self.options, self.observed_archive_bytes)
+        {
+            return Err(FormatError::ReaderUnsupported(
+                "total extraction size exceeds configured cap",
+            ));
+        }
+
+        let shards = self.load_all_index_shards()?;
+        let mut file_count = 0u64;
+        let mut frames = BTreeMap::<u64, FrameEntry>::new();
+        let mut envelopes = BTreeMap::<u64, EnvelopeEntry>::new();
+
+        for shard in &shards {
+            file_count = file_count
+                .checked_add(shard.files.len() as u64)
+                .ok_or(FormatError::InvalidArchive("file count overflow"))?;
+            for frame in &shard.frames {
+                if let Some(existing) = frames.insert(frame.frame_index, frame.clone()) {
+                    if existing != *frame {
+                        return Err(FormatError::InvalidArchive(
+                            "duplicate FrameEntry rows do not match",
+                        ));
+                    }
+                }
+            }
+            for envelope in &shard.envelopes {
+                if let Some(existing) = envelopes.insert(envelope.envelope_index, envelope.clone())
+                {
+                    if existing != *envelope {
+                        return Err(FormatError::InvalidArchive(
+                            "duplicate EnvelopeEntry rows do not match",
+                        ));
+                    }
+                }
+            }
+        }
+        validate_global_file_table_order(&shards)?;
+
+        if file_count != self.index_root.header.file_count {
+            return Err(FormatError::InvalidArchive(
+                "IndexRoot file_count does not match decoded shards",
+            ));
+        }
+        verify_dense_keys(&frames, self.index_root.header.frame_count, "FrameEntry")?;
+        verify_dense_keys(
+            &envelopes,
+            self.index_root.header.envelope_count,
+            "EnvelopeEntry",
+        )?;
+        validate_envelope_frame_coverage(&frames, &envelopes)?;
+        self.validate_encrypted_object_block_ranges(&envelopes)?;
+
+        let metadata_payload_block_count = envelopes.values().try_fold(0u64, |sum, envelope| {
+            sum.checked_add(envelope.data_block_count as u64)
+                .ok_or(FormatError::InvalidArchive("payload block count overflow"))
+        })?;
+        if metadata_payload_block_count != self.index_root.header.payload_block_count {
+            return Err(FormatError::InvalidArchive(
+                "IndexRoot payload_block_count does not match envelopes",
+            ));
+        }
+        let streamed_payload_block_count =
+            streamed.envelopes.iter().try_fold(0u64, |sum, envelope| {
+                sum.checked_add(envelope.data_block_count as u64)
+                    .ok_or(FormatError::InvalidArchive("payload block count overflow"))
+            })?;
+        if streamed_payload_block_count != self.index_root.header.payload_block_count {
+            return Err(FormatError::InvalidArchive(
+                "streamed payload block count does not match IndexRoot",
+            ));
+        }
+
+        if streamed.tar.tar_total_size != self.index_root.header.tar_total_size {
+            return Err(FormatError::InvalidArchive(
+                "IndexRoot tar_total_size does not match streamed tar stream",
+            ));
+        }
+        if streamed.content_sha256 != self.index_root.header.content_sha256 {
+            return Err(FormatError::InvalidArchive(
+                "IndexRoot content_sha256 does not match streamed tar stream",
+            ));
+        }
+
+        let streamed_envelopes = streamed.envelope_map()?;
+        for envelope in envelopes.values() {
+            let actual = streamed_envelopes.get(&envelope.envelope_index).ok_or(
+                FormatError::InvalidArchive(
+                    "metadata references missing streamed payload envelope",
+                ),
+            )?;
+            if actual.first_block_index != envelope.first_block_index
+                || actual.data_block_count != envelope.data_block_count
+                || actual.parity_block_count != envelope.parity_block_count
+                || actual.encrypted_size != envelope.encrypted_size
+                || actual.plaintext_size != envelope.plaintext_size
+                || actual.first_frame_index != envelope.first_frame_index
+                || actual.frame_count != envelope.frame_count
+            {
+                return Err(FormatError::InvalidArchive(
+                    "EnvelopeEntry does not match streamed payload envelope",
+                ));
+            }
+        }
+
+        let streamed_frames = streamed.frame_map()?;
+        for frame in frames.values() {
+            let actual =
+                streamed_frames
+                    .get(&frame.frame_index)
+                    .ok_or(FormatError::InvalidArchive(
+                        "metadata references missing streamed payload frame",
+                    ))?;
+            if actual.envelope_index != frame.envelope_index
+                || actual.offset_in_envelope != frame.offset_in_envelope
+                || actual.compressed_size != frame.compressed_size
+                || actual.decompressed_size != frame.decompressed_size
+                || actual.tar_stream_offset != frame.tar_stream_offset
+                || streamed.frame_flags(actual)? != frame.flags
+            {
+                return Err(FormatError::InvalidArchive(
+                    "FrameEntry does not match streamed payload frame",
+                ));
+            }
+        }
+
+        let streamed_members = streamed.member_start_map()?;
+        if streamed.tar.members.len() as u64 != file_count {
+            return Err(FormatError::InvalidArchive(
+                "streamed tar member count does not match decoded shards",
+            ));
+        }
+        let mut file_extents = Vec::new();
+        let mut directory_hint_map = DirectoryHintMap::new();
+        for (shard_row_index, shard) in shards.iter().enumerate() {
+            let shard_row_index = u32::try_from(shard_row_index)
+                .map_err(|_| FormatError::InvalidArchive("shard row index overflow"))?;
+            for idx in 0..shard.files.len() {
+                let file = &shard.files[idx];
+                let start =
+                    shard
+                        .tar_member_group_start(idx)
+                        .ok_or(FormatError::InvalidArchive(
+                            "FileEntry tar member start is missing",
+                        ))?;
+                file_extents.push((start, file.tar_member_group_size));
+                let path = shard
+                    .file_path(idx)
+                    .ok_or(FormatError::InvalidArchive("FileEntry path is missing"))?;
+                let member = streamed_members
+                    .get(&start)
+                    .ok_or(FormatError::InvalidArchive(
+                        "FileEntry tar member start is missing from streamed tar",
+                    ))?;
+                if member.path != path
+                    || member.logical_size != file.file_data_size
+                    || member.group_size != file.tar_member_group_size
+                {
+                    return Err(FormatError::InvalidArchive(
+                        "FileEntry does not match streamed tar member",
+                    ));
+                }
+                add_expected_directory_hint_rows(
+                    &mut directory_hint_map,
+                    shard_row_index,
+                    path,
+                    member.kind,
+                );
+            }
+        }
+        validate_file_extent_coverage_ranges(&file_extents, streamed.tar.tar_total_size)?;
         if !self.index_root.directory_hint_shards.is_empty() {
             let hint_tables = self.load_all_directory_hint_tables()?;
             validate_directory_hint_tables_against_expected(&hint_tables, &directory_hint_map)?;
@@ -2759,7 +3018,7 @@ fn validate_seekable_supported_volume(
     Ok(())
 }
 
-fn validate_crypto_class_parity_exactness(
+pub(crate) fn validate_crypto_class_parity_exactness(
     crypto_header: &CryptoHeaderFixed,
 ) -> Result<(), FormatError> {
     let fec = required_object_parity(crypto_header.fec_data_shards as u64, crypto_header)?;
@@ -2823,7 +3082,10 @@ fn validate_volume_set_member_metadata(
     Ok(())
 }
 
-fn manifest_bootstrap_fields_match(left: &ManifestFooter, right: &ManifestFooter) -> bool {
+pub(crate) fn manifest_bootstrap_fields_match(
+    left: &ManifestFooter,
+    right: &ManifestFooter,
+) -> bool {
     left.archive_uuid == right.archive_uuid
         && left.session_id == right.session_id
         && left.is_authoritative == right.is_authoritative
@@ -2882,6 +3144,12 @@ struct V41Terminal {
     root_auth_footer_bytes: Option<Vec<u8>>,
     root_auth_footer: Option<RootAuthFooterV1>,
     volume_trailer: VolumeTrailer,
+}
+
+pub(crate) struct SequentialTerminalMaterial {
+    pub(crate) manifest_footer: ManifestFooter,
+    pub(crate) volume_trailer: VolumeTrailer,
+    pub(crate) root_auth_footer: Option<RootAuthFooterV1>,
 }
 
 #[derive(Debug)]
@@ -4506,7 +4774,7 @@ fn cmra_serialized_length(tuple: CmraDecoderTuple) -> Result<u64, FormatError> {
         .ok_or(FormatError::InvalidArchive("CMRA length overflow"))
 }
 
-fn max_critical_recovery_scan(options: ReaderOptions) -> Result<usize, FormatError> {
+fn cmra_worst_case_cap() -> Result<u64, FormatError> {
     let cap = critical_image_cap()?;
     let mut worst = 0u64;
     let mut shard_size = 512u64;
@@ -4529,6 +4797,27 @@ fn max_critical_recovery_scan(options: ReaderOptions) -> Result<usize, FormatErr
         worst = worst.max(cmra_serialized_length(tuple)?);
         shard_size += 2;
     }
+    Ok(worst)
+}
+
+pub(crate) fn v41_terminal_tail_cap() -> Result<usize, FormatError> {
+    let total = [
+        MANIFEST_FOOTER_LEN as u64,
+        READER_MAX_ROOT_AUTH_FOOTER_LEN as u64,
+        VOLUME_TRAILER_LEN as u64,
+        cmra_worst_case_cap()?,
+        LOCATOR_PAIR_LEN as u64,
+    ]
+    .into_iter()
+    .try_fold(0u64, |sum, value| {
+        sum.checked_add(value)
+            .ok_or(FormatError::InvalidArchive("terminal tail cap overflow"))
+    })?;
+    usize::try_from(total).map_err(|_| FormatError::InvalidArchive("terminal tail cap overflow"))
+}
+
+fn max_critical_recovery_scan(options: ReaderOptions) -> Result<usize, FormatError> {
+    let worst = cmra_worst_case_cap()?;
     let total = options
         .max_trailing_garbage_scan
         .try_into()
@@ -4565,6 +4854,11 @@ struct ParsedBootstrapSidecar {
     dictionary_records_section: Option<(u64, u64)>,
 }
 
+pub(crate) struct NonSeekableBootstrapMaterial {
+    pub(crate) manifest_footer: ManifestFooter,
+    pub(crate) payload_dictionary: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BootstrapSidecarUse {
     SeekableAssist,
@@ -4591,6 +4885,93 @@ impl ParsedBootstrapSidecar {
         }
         Ok(())
     }
+}
+
+pub(crate) fn parse_non_seekable_bootstrap_material(
+    bootstrap_sidecar: &[u8],
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+    subkeys: &Subkeys,
+) -> Result<NonSeekableBootstrapMaterial, FormatError> {
+    validate_bootstrap_single_volume_input(volume_header, crypto_header)?;
+    let sidecar =
+        parse_bootstrap_sidecar(bootstrap_sidecar, volume_header, crypto_header, subkeys)?;
+    sidecar.require_sections_for(BootstrapSidecarUse::NonSeekableRandomAccess, crypto_header)?;
+    let manifest_footer = sidecar
+        .manifest_footer
+        .clone()
+        .ok_or(FormatError::ReaderUnsupported(
+            "non-seekable bootstrap sidecar requires ManifestFooter and IndexRoot sections",
+        ))?;
+
+    let mut blocks = BTreeMap::new();
+    let (offset, length) =
+        sidecar
+            .index_root_records_section
+            .ok_or(FormatError::ReaderUnsupported(
+                "non-seekable bootstrap sidecar requires ManifestFooter and IndexRoot sections",
+            ))?;
+    let index_root_records = parse_sidecar_block_records(
+        bootstrap_sidecar,
+        offset,
+        length,
+        crypto_header.block_size as usize,
+        index_root_extent_from_manifest(&manifest_footer),
+        BlockKind::IndexRootData,
+        BlockKind::IndexRootParity,
+        "IndexRoot",
+    )?;
+    insert_sidecar_records(&mut blocks, index_root_records)?;
+
+    let limits = metadata_limits(crypto_header);
+    let index_root_plaintext = load_metadata_object_from_parts(
+        &blocks,
+        subkeys,
+        volume_header,
+        crypto_header,
+        index_root_extent_from_manifest(&manifest_footer),
+        BlockKind::IndexRootData,
+        BlockKind::IndexRootParity,
+        &subkeys.index_root_key,
+        &subkeys.index_nonce_seed,
+        b"idxroot",
+        0,
+        crypto_header.index_root_fec_data_shards,
+        crypto_header.index_root_fec_parity_shards,
+        manifest_footer.index_root_decompressed_size,
+    )?;
+    let index_root = IndexRoot::parse(
+        &index_root_plaintext,
+        crypto_header.has_dictionary != 0,
+        limits,
+    )?;
+
+    if crypto_header.has_dictionary != 0 {
+        let (offset, length) =
+            sidecar
+                .dictionary_records_section
+                .ok_or(FormatError::ReaderUnsupported(
+                    "dictionary bootstrap required",
+                ))?;
+        let dictionary_records = parse_sidecar_block_records(
+            bootstrap_sidecar,
+            offset,
+            length,
+            crypto_header.block_size as usize,
+            dictionary_extent_from_index_root(&index_root)?,
+            BlockKind::DictionaryData,
+            BlockKind::DictionaryParity,
+            "dictionary",
+        )?;
+        insert_sidecar_records(&mut blocks, dictionary_records)?;
+    }
+    let payload_dictionary =
+        load_archive_dictionary(&blocks, subkeys, volume_header, crypto_header, &index_root)?;
+
+    Ok(NonSeekableBootstrapMaterial {
+        manifest_footer,
+        payload_dictionary,
+    })
 }
 
 fn parse_bootstrap_sidecar(
@@ -5122,7 +5503,7 @@ fn parse_public_block_observation(
     Ok(blocks)
 }
 
-fn block_record_error_is_recoverable_erasure(error: &FormatError) -> bool {
+pub(crate) fn block_record_error_is_recoverable_erasure(error: &FormatError) -> bool {
     matches!(
         error,
         FormatError::BadCrc {
@@ -5204,7 +5585,7 @@ fn parse_stream_block_prefix(
     Ok((blocks, offset, observed_block_count))
 }
 
-fn expected_stream_block_index(
+pub(crate) fn expected_stream_block_index(
     volume_header: &VolumeHeader,
     observed_block_count: u64,
 ) -> Result<u64, FormatError> {
@@ -5276,6 +5657,64 @@ fn parse_terminal_material(
         terminal.volume_trailer,
         terminal.root_auth_footer,
     ))
+}
+
+pub(crate) fn parse_terminal_material_read_at(
+    reader: &dyn ArchiveReadAt,
+    input_len: u64,
+    manifest_offset: u64,
+    observed_block_count: u64,
+    subkeys: &Subkeys,
+    volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
+) -> Result<SequentialTerminalMaterial, FormatError> {
+    let mut candidates = Vec::new();
+    if input_len >= CRITICAL_RECOVERY_LOCATOR_LEN as u64 {
+        collect_v41_locator_candidate_read_at(
+            reader,
+            input_len - CRITICAL_RECOVERY_LOCATOR_LEN as u64,
+            0,
+            subkeys,
+            volume_header,
+            crypto_header,
+            &mut candidates,
+        );
+    }
+    if input_len >= LOCATOR_PAIR_LEN as u64 {
+        collect_v41_locator_candidate_read_at(
+            reader,
+            input_len - LOCATOR_PAIR_LEN as u64,
+            1,
+            subkeys,
+            volume_header,
+            crypto_header,
+            &mut candidates,
+        );
+    }
+
+    let candidate = choose_v41_terminal_candidate(candidates)?;
+    if !terminal_candidate_reaches_eof(&candidate, to_usize(input_len, "terminal EOF")?)? {
+        return Err(FormatError::InvalidArchive(
+            "sequential terminal does not end at EOF",
+        ));
+    }
+    let terminal = candidate.terminal;
+    if terminal.image.manifest_footer_offset != manifest_offset {
+        return Err(FormatError::InvalidArchive(
+            "VolumeTrailer ManifestFooter offset does not match observed stream offset",
+        ));
+    }
+    if terminal.volume_trailer.block_count != observed_block_count {
+        return Err(FormatError::InvalidArchive(
+            "VolumeTrailer block_count does not match observed stream",
+        ));
+    }
+    let manifest_footer = ManifestFooter::parse(&terminal.manifest_footer_bytes)?;
+    Ok(SequentialTerminalMaterial {
+        manifest_footer,
+        volume_trailer: terminal.volume_trailer,
+        root_auth_footer: terminal.root_auth_footer,
+    })
 }
 
 fn terminal_candidate_reaches_eof(
@@ -5934,7 +6373,7 @@ fn validate_object_extent(
     Ok(())
 }
 
-fn required_object_parity(
+pub(crate) fn required_object_parity(
     data_block_count: u64,
     crypto_header: &CryptoHeaderFixed,
 ) -> Result<u32, FormatError> {
@@ -6301,7 +6740,9 @@ fn validate_non_overlapping_object_ranges(ranges: &mut [(u64, u64)]) -> Result<(
     Ok(())
 }
 
-fn observed_archive_size(sizes: impl IntoIterator<Item = u64>) -> Result<u64, FormatError> {
+pub(crate) fn observed_archive_size(
+    sizes: impl IntoIterator<Item = u64>,
+) -> Result<u64, FormatError> {
     sizes.into_iter().try_fold(0u64, |sum, size| {
         sum.checked_add(size).ok_or(FormatError::InvalidArchive(
             "observed archive size overflow",
@@ -6309,7 +6750,10 @@ fn observed_archive_size(sizes: impl IntoIterator<Item = u64>) -> Result<u64, Fo
     })
 }
 
-fn total_extraction_size_cap(options: ReaderOptions, observed_archive_bytes: u64) -> u64 {
+pub(crate) fn total_extraction_size_cap(
+    options: ReaderOptions,
+    observed_archive_bytes: u64,
+) -> u64 {
     options
         .max_total_extraction_size
         .min(observed_archive_bytes.saturating_mul(10))
@@ -6387,6 +6831,8 @@ fn to_usize(value: u64, structure: &'static str) -> Result<usize, FormatError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::compression::compress_zstd_frame;
     use crate::crypto::{compute_hmac, encrypt_padded_aead_object};
@@ -6398,6 +6844,11 @@ mod tests {
     use crate::metadata::{
         DirectoryHintEntry, DirectoryHintTableHeader, IndexRootHeader, IndexShardHeader,
         ENVELOPE_ENTRY_LEN, FILE_ENTRY_LEN, FRAME_ENTRY_LEN, INDEX_SHARD_HEADER_LEN,
+    };
+    use crate::non_seekable_reader::{
+        extract_non_seekable_stream_to_dir, list_non_seekable_stream, verify_non_seekable_stream,
+        verify_non_seekable_stream_with_bootstrap_sidecar, verify_non_seekable_stream_with_options,
+        NonSeekableReaderOptions, SequentialRootAuthStatus,
     };
     use crate::writer::{
         write_archive, write_archive_with_dictionary, write_archive_with_root_auth, RegularFile,
@@ -6496,6 +6947,35 @@ mod tests {
             stripe_width: 1,
             volume_loss_tolerance: 0,
             ..WriterOptions::default()
+        }
+    }
+
+    struct ChunkedReader {
+        bytes: Vec<u8>,
+        cursor: usize,
+        max_chunk: usize,
+    }
+
+    impl ChunkedReader {
+        fn new(bytes: Vec<u8>, max_chunk: usize) -> Self {
+            Self {
+                bytes,
+                cursor: 0,
+                max_chunk,
+            }
+        }
+    }
+
+    impl std::io::Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.cursor >= self.bytes.len() {
+                return Ok(0);
+            }
+            let available = self.bytes.len() - self.cursor;
+            let len = available.min(buf.len()).min(self.max_chunk);
+            buf[..len].copy_from_slice(&self.bytes[self.cursor..self.cursor + len]);
+            self.cursor += len;
+            Ok(len)
         }
     }
 
@@ -8199,6 +8679,380 @@ mod tests {
             FormatError::NotStandardZstdFrame
         );
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn live_non_seekable_verify_stream_accepts_single_volume_archive() {
+        let archive = write_archive(
+            &[RegularFile::new("live.txt", b"stream verify")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+
+        let report =
+            verify_non_seekable_stream(std::io::Cursor::new(archive.bytes), &master_key()).unwrap();
+
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.total_volumes, 1);
+        assert_eq!(report.root_auth, SequentialRootAuthStatus::Absent);
+        assert!(report.payload_block_count > 0);
+    }
+
+    #[test]
+    fn live_non_seekable_verify_stream_accepts_tiny_read_chunks() {
+        let archive = write_archive(
+            &[RegularFile::new("tiny-chunks.txt", b"one byte at a time")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+
+        let report =
+            verify_non_seekable_stream(ChunkedReader::new(archive.bytes, 1), &master_key())
+                .unwrap();
+
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.tar_total_size % 512, 0);
+    }
+
+    #[test]
+    fn live_non_seekable_verify_stream_accepts_empty_archive() {
+        let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
+
+        let report =
+            verify_non_seekable_stream(std::io::Cursor::new(archive.bytes), &master_key()).unwrap();
+
+        assert_eq!(report.file_count, 0);
+        assert_eq!(report.payload_block_count, 0);
+        assert_eq!(report.tar_total_size, 0);
+    }
+
+    #[test]
+    fn live_non_seekable_verify_rejects_dictionary_archive_without_bootstrap() {
+        let archive = write_archive_with_dictionary(
+            &[RegularFile::new(
+                "live-dict.txt",
+                b"common words common words dictionary payload",
+            )],
+            &master_key(),
+            single_stream_options(),
+            b"common words dictionary",
+        )
+        .unwrap();
+
+        assert_eq!(
+            verify_non_seekable_stream(std::io::Cursor::new(archive.bytes), &master_key())
+                .unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "dictionary bootstrap required for non-seekable sequential verification"
+            )
+        );
+    }
+
+    #[test]
+    fn live_non_seekable_verify_accepts_dictionary_archive_with_bootstrap() {
+        let archive = write_archive_with_dictionary(
+            &[RegularFile::new(
+                "live-dict-sidecar.txt",
+                b"common words common words dictionary payload",
+            )],
+            &master_key(),
+            single_stream_options(),
+            b"common words dictionary",
+        )
+        .unwrap();
+
+        let report = verify_non_seekable_stream_with_bootstrap_sidecar(
+            std::io::Cursor::new(archive.bytes),
+            &archive.bootstrap_sidecar,
+            &master_key(),
+            NonSeekableReaderOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.total_volumes, 1);
+    }
+
+    #[test]
+    fn live_non_seekable_verify_rejects_terminal_tail_above_cap() {
+        let archive = write_archive(
+            &[RegularFile::new("tail-cap.txt", b"payload")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let options = NonSeekableReaderOptions {
+            max_terminal_tail_size: 8,
+            ..NonSeekableReaderOptions::default()
+        };
+
+        assert_eq!(
+            verify_non_seekable_stream_with_options(
+                std::io::Cursor::new(archive.bytes),
+                &master_key(),
+                options
+            )
+            .unwrap_err(),
+            FormatError::ReaderUnsupported("terminal tail exceeds configured cap")
+        );
+    }
+
+    #[test]
+    fn live_non_seekable_verify_rejects_metadata_above_retention_cap() {
+        let archive = write_archive(
+            &[RegularFile::new("metadata-cap.txt", b"payload")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let options = NonSeekableReaderOptions {
+            max_retained_metadata_bytes: 1,
+            ..NonSeekableReaderOptions::default()
+        };
+
+        assert_eq!(
+            verify_non_seekable_stream_with_options(
+                std::io::Cursor::new(archive.bytes),
+                &master_key(),
+                options
+            )
+            .unwrap_err(),
+            FormatError::ReaderUnsupported("retained metadata exceeds configured streaming cap")
+        );
+    }
+
+    #[test]
+    fn live_non_seekable_verify_repairs_crc_failed_metadata_block() {
+        let archive = write_archive(
+            &[RegularFile::new("metadata-erasure.txt", b"payload")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut corrupted = archive.bytes;
+        let slot = first_block_record_slot_with_kind(&corrupted, BlockKind::IndexRootData).unwrap();
+        corrupt_block_record_payload_at_slot(&mut corrupted, slot);
+
+        let report =
+            verify_non_seekable_stream(std::io::Cursor::new(corrupted), &master_key()).unwrap();
+
+        assert_eq!(report.file_count, 1);
+    }
+
+    #[test]
+    fn live_non_seekable_verify_rejects_member_count_above_cap() {
+        let archive = write_archive(
+            &[RegularFile::new("member-cap.txt", b"payload")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let options = NonSeekableReaderOptions {
+            max_streamed_member_count: 0,
+            ..NonSeekableReaderOptions::default()
+        };
+
+        assert_eq!(
+            verify_non_seekable_stream_with_options(
+                std::io::Cursor::new(archive.bytes),
+                &master_key(),
+                options
+            )
+            .unwrap_err(),
+            FormatError::ReaderUnsupported("tar member count exceeds configured streaming cap")
+        );
+    }
+
+    #[test]
+    fn live_non_seekable_verify_rejects_total_extraction_cap_during_decode() {
+        let archive = write_archive(
+            &[RegularFile::new("live-total-cap.txt", b"payload")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut options = NonSeekableReaderOptions::default();
+        options.reader.max_total_extraction_size = 3;
+
+        assert_eq!(
+            verify_non_seekable_stream_with_options(
+                std::io::Cursor::new(archive.bytes),
+                &master_key(),
+                options
+            )
+            .unwrap_err(),
+            FormatError::ReaderUnsupported("total extraction size exceeds configured cap")
+        );
+    }
+
+    #[test]
+    fn live_non_seekable_verify_reports_root_auth_wire_only() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("signed-live.txt", b"root-auth stream")],
+            &master_key(),
+            single_stream_options(),
+            test_root_auth_config(),
+            |request| Ok(test_root_auth_value(request)),
+        )
+        .unwrap();
+
+        let report =
+            verify_non_seekable_stream(std::io::Cursor::new(archive.bytes), &master_key()).unwrap();
+
+        assert_eq!(report.root_auth, SequentialRootAuthStatus::WireValidOnly);
+    }
+
+    #[test]
+    fn live_non_seekable_extract_stream_commits_after_terminal_verify() {
+        let archive = write_archive(
+            &[
+                RegularFile::new("alpha.txt", b"alpha"),
+                RegularFile::new("nested/beta.txt", b"beta"),
+            ],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+
+        let report = extract_non_seekable_stream_to_dir(
+            std::io::Cursor::new(archive.bytes),
+            &master_key(),
+            &out,
+            NonSeekableReaderOptions::default(),
+            SafeExtractionOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.verification.file_count, 2);
+        assert_eq!(report.extracted_member_count, 2);
+        assert_eq!(fs::read(out.join("alpha.txt")).unwrap(), b"alpha");
+        assert_eq!(fs::read(out.join("nested/beta.txt")).unwrap(), b"beta");
+    }
+
+    #[test]
+    fn live_non_seekable_extract_stream_accepts_tiny_read_chunks() {
+        let archive = write_archive(
+            &[RegularFile::new("tiny-extract.txt", b"chunked extraction")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+
+        extract_non_seekable_stream_to_dir(
+            ChunkedReader::new(archive.bytes, 1),
+            &master_key(),
+            &out,
+            NonSeekableReaderOptions::default(),
+            SafeExtractionOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(out.join("tiny-extract.txt")).unwrap(),
+            b"chunked extraction"
+        );
+    }
+
+    #[test]
+    fn live_non_seekable_extract_stream_terminal_failure_leaves_no_final_output() {
+        let archive = write_archive(
+            &[RegularFile::new("late-fail.txt", b"must remain staged")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let mut corrupted = archive.bytes;
+        corrupt_v41_terminal_recovery(&mut corrupted);
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+
+        match extract_non_seekable_stream_to_dir(
+            std::io::Cursor::new(corrupted),
+            &master_key(),
+            &out,
+            NonSeekableReaderOptions::default(),
+            SafeExtractionOptions::default(),
+        )
+        .unwrap_err()
+        {
+            ExtractError::Format(err) => assert_eq!(
+                err,
+                FormatError::InvalidArchive("no valid v41 CMRA candidate found")
+            ),
+            ExtractError::Output(err) => panic!("unexpected output error: {err}"),
+        }
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn live_non_seekable_extract_stream_existing_destination_obeys_overwrite_policy() {
+        let archive = write_archive(
+            &[RegularFile::new("same.txt", b"new")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        fs::write(out.join("same.txt"), b"old").unwrap();
+
+        match extract_non_seekable_stream_to_dir(
+            std::io::Cursor::new(archive.bytes.clone()),
+            &master_key(),
+            &out,
+            NonSeekableReaderOptions::default(),
+            SafeExtractionOptions::default(),
+        )
+        .unwrap_err()
+        {
+            ExtractError::Format(err) => assert_eq!(err, FormatError::UnsafeOverwrite),
+            ExtractError::Output(err) => panic!("unexpected output error: {err}"),
+        }
+        assert_eq!(fs::read(out.join("same.txt")).unwrap(), b"old");
+
+        extract_non_seekable_stream_to_dir(
+            std::io::Cursor::new(archive.bytes),
+            &master_key(),
+            &out,
+            NonSeekableReaderOptions::default(),
+            SafeExtractionOptions {
+                overwrite_existing: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(out.join("same.txt")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn live_non_seekable_list_stream_matches_seekable_final_view() {
+        let archive = write_archive(
+            &[
+                RegularFile::new("a.txt", b"a"),
+                RegularFile::new("b.txt", b"bb"),
+            ],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let seekable = open_archive(&archive.bytes, &master_key()).unwrap();
+        let expected = seekable.list_files().unwrap();
+
+        let report = list_non_seekable_stream(
+            std::io::Cursor::new(archive.bytes),
+            &master_key(),
+            NonSeekableReaderOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.verification.file_count, 2);
+        assert_eq!(report.entries, expected);
     }
 
     #[test]

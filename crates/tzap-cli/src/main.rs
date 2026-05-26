@@ -16,13 +16,17 @@ use tzap_core::format::{
 use tzap_core::reader::{ArchiveEntry, ArchiveIndexEntry};
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
 use tzap_core::{
+    extract_non_seekable_stream_to_dir, extract_non_seekable_stream_to_dir_with_bootstrap_sidecar,
+    list_non_seekable_stream, list_non_seekable_stream_with_bootstrap_sidecar,
     open_seekable_archive, open_seekable_archive_volumes,
-    open_seekable_archive_with_bootstrap_sidecar, public_no_key_verify_volumes_with, write_archive,
-    write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
+    open_seekable_archive_with_bootstrap_sidecar, public_no_key_verify_volumes_with,
+    verify_non_seekable_stream_with_bootstrap_sidecar, verify_non_seekable_stream_with_options,
+    write_archive, write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
     write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
     write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
-    ExtractError, KdfParams, MasterKey, MetadataDiagnostic, OpenedArchive, RegularFile,
-    RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions, TarEntryKind, WriterOptions,
+    ExtractError, KdfParams, MasterKey, MetadataDiagnostic, NonSeekableReaderOptions,
+    OpenedArchive, RegularFile, RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions,
+    TarEntryKind, WriterOptions,
 };
 use tzap_plugin_signing::ed25519_raw::{
     self, Ed25519RootAuthOutcome, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
@@ -794,6 +798,60 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             reject_multi_volume_bootstrap(1 + volumes.len(), bootstrap.as_deref())?;
             reject_stdout_extract_shape(stdout, paths.len())?;
+            if archive == "-" {
+                reject_archive_stdin_open_options(
+                    &paths,
+                    stdout,
+                    bootstrap.as_deref(),
+                    &volumes,
+                    password_stdin,
+                    password,
+                    keyfile.as_deref(),
+                )?;
+                if dry_run {
+                    eprintln!("extract dry-run summary:");
+                    eprintln!("  input: archive stdin");
+                    eprintln!("  destination: {}", directory);
+                    eprintln!("  mode: staged non-seekable extract-all");
+                    return Ok(());
+                }
+                let master_key =
+                    load_archive_stdin_key(keyfile.as_deref(), password_stdin, password)?;
+                let options = SafeExtractionOptions {
+                    overwrite_existing: overwrite,
+                };
+                let bootstrap_bytes = read_optional_bootstrap_sidecar(bootstrap.as_deref())?;
+                let stdin = io::stdin();
+                let report = if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+                    extract_non_seekable_stream_to_dir_with_bootstrap_sidecar(
+                        stdin.lock(),
+                        bootstrap_bytes,
+                        &master_key,
+                        Path::new(&directory),
+                        NonSeekableReaderOptions::default(),
+                        options,
+                    )
+                } else {
+                    extract_non_seekable_stream_to_dir(
+                        stdin.lock(),
+                        &master_key,
+                        Path::new(&directory),
+                        NonSeekableReaderOptions::default(),
+                        options,
+                    )
+                }
+                .context("failed to extract non-seekable archive stream")?;
+                emit_success_summary(
+                    quiet,
+                    &format!(
+                        "extracted {} member(s), {} degraded metadata items to {} using staged non-seekable stream extraction",
+                        report.extracted_member_count,
+                        report.degraded_metadata_count,
+                        directory
+                    ),
+                )?;
+                return Ok(());
+            }
             let volume_files = open_volume_inputs(&archive, &volumes)?;
             let master_key = load_open_key(keyfile.as_deref(), password_stdin, password, &archive)?;
             let opened =
@@ -877,6 +935,88 @@ fn run(cli: Cli) -> Result<()> {
             json,
         } => {
             reject_multi_volume_bootstrap(1 + volumes.len(), bootstrap.as_deref())?;
+            if archive == "-" {
+                reject_archive_stdin_list_options(
+                    bootstrap.as_deref(),
+                    &volumes,
+                    password_stdin,
+                    password,
+                    keyfile.as_deref(),
+                )?;
+                let master_key =
+                    load_archive_stdin_key(keyfile.as_deref(), password_stdin, password)?;
+                let bootstrap_bytes = read_optional_bootstrap_sidecar(bootstrap.as_deref())?;
+                let stdin = io::stdin();
+                let report = if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+                    list_non_seekable_stream_with_bootstrap_sidecar(
+                        stdin.lock(),
+                        bootstrap_bytes,
+                        &master_key,
+                        NonSeekableReaderOptions::default(),
+                    )
+                } else {
+                    list_non_seekable_stream(
+                        stdin.lock(),
+                        &master_key,
+                        NonSeekableReaderOptions::default(),
+                    )
+                }
+                .context("failed to list non-seekable archive stream")?;
+                emit_entry_metadata_diagnostics(quiet, &report.entries)?;
+                if json {
+                    let files = report
+                        .entries
+                        .iter()
+                        .map(|entry| {
+                            let kind = match entry.kind {
+                                TarEntryKind::Regular => "file",
+                                TarEntryKind::Directory => "directory",
+                                TarEntryKind::Symlink => "symlink",
+                                TarEntryKind::Hardlink => "hardlink",
+                            };
+                            json!({
+                                "path": &entry.path,
+                                "kind": kind,
+                                "size": entry.file_data_size,
+                                "mode": entry.mode,
+                                "mtime": entry.mtime,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json!({
+                            "streaming_mode": "non-seekable",
+                            "verification": {
+                                "file_count": report.verification.file_count,
+                                "tar_total_size": report.verification.tar_total_size,
+                            },
+                            "files": files,
+                        }))
+                        .context("failed to encode list output as JSON")?
+                    );
+                    return Ok(());
+                }
+                if long {
+                    for entry in report.entries {
+                        let kind = match entry.kind {
+                            TarEntryKind::Regular => "file",
+                            TarEntryKind::Directory => "directory",
+                            TarEntryKind::Symlink => "symlink",
+                            TarEntryKind::Hardlink => "hardlink",
+                        };
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}",
+                            entry.file_data_size, kind, entry.mode, entry.mtime, entry.path
+                        );
+                    }
+                    return Ok(());
+                }
+                for entry in report.entries {
+                    println!("{}", entry.path);
+                }
+                return Ok(());
+            }
             let volume_files = open_volume_inputs(&archive, &volumes)?;
             let master_key = load_open_key(keyfile.as_deref(), password_stdin, password, &archive)?;
             let opened =
@@ -946,6 +1086,105 @@ fn run(cli: Cli) -> Result<()> {
                 .first()
                 .ok_or_else(|| anyhow!("at least one archive volume is required"))?;
             let archive_paths = archives.to_vec();
+            if archives.iter().any(|path| path == "-") {
+                if json && archives.len() != 1 {
+                    let err = anyhow!(FormatError::ReaderUnsupported(
+                        "archive stdin must be the only archive input",
+                    ));
+                    emit_verify_json_error(&archive_paths, None, None, &err)?;
+                    return Err(err);
+                }
+                if first != "-" || archives.len() != 1 {
+                    return Err(anyhow!(FormatError::ReaderUnsupported(
+                        "archive stdin must be the only archive input",
+                    )));
+                }
+                if public_no_key {
+                    let err = anyhow!(FormatError::ReaderUnsupported(
+                        "public no-key verification is not supported for archive stdin",
+                    ));
+                    if json {
+                        emit_verify_json_error(&archive_paths, None, None, &err)?;
+                    }
+                    return Err(err);
+                }
+                if trusted_public_key.is_some() {
+                    let err = anyhow!(FormatError::ReaderUnsupported(
+                        "RootAuth external verification is not supported for archive stdin",
+                    ));
+                    if json {
+                        emit_verify_json_error(&archive_paths, None, None, &err)?;
+                    }
+                    return Err(err);
+                }
+                let master_key =
+                    match load_archive_stdin_key(keyfile.as_deref(), password_stdin, password) {
+                        Ok(master_key) => master_key,
+                        Err(err) => {
+                            if json {
+                                emit_verify_json_error(&archive_paths, None, None, &err)?;
+                            }
+                            return Err(err);
+                        }
+                    };
+                let bootstrap_bytes = match read_optional_bootstrap_sidecar(bootstrap.as_deref()) {
+                    Ok(bootstrap_bytes) => bootstrap_bytes,
+                    Err(err) => {
+                        if json {
+                            emit_verify_json_error(&archive_paths, None, None, &err)?;
+                        }
+                        return Err(err);
+                    }
+                };
+                let stdin = io::stdin();
+                let result = if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+                    verify_non_seekable_stream_with_bootstrap_sidecar(
+                        stdin.lock(),
+                        bootstrap_bytes,
+                        &master_key,
+                        NonSeekableReaderOptions::default(),
+                    )
+                } else {
+                    verify_non_seekable_stream_with_options(
+                        stdin.lock(),
+                        &master_key,
+                        NonSeekableReaderOptions::default(),
+                    )
+                }
+                .context("failed to verify non-seekable archive stream");
+                let report = match result {
+                    Ok(report) => report,
+                    Err(err) => {
+                        if json {
+                            emit_verify_json_error(&archive_paths, None, None, &err)?;
+                        }
+                        return Err(err);
+                    }
+                };
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json!({
+                            "ok": true,
+                            "archives": archive_paths,
+                            "verification_mode": "key-holding-non-seekable-stream",
+                            "volume_count": report.total_volumes,
+                            "file_count": report.file_count,
+                            "tar_total_size": report.tar_total_size,
+                        }))
+                        .context("failed to encode verify output as JSON")?
+                    );
+                    return Ok(());
+                }
+                emit_success_stdout(
+                    quiet,
+                    &format!(
+                        "-: OK non-seekable stream ({} volume(s), {} file(s))",
+                        report.total_volumes, report.file_count
+                    ),
+                )?;
+                return Ok(());
+            }
             if public_no_key {
                 return run_public_no_key_verify(
                     &archive_paths,
@@ -1670,6 +1909,77 @@ fn reject_stdout_extract_shape(stdout: bool, path_count: usize) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn reject_archive_stdin_open_options(
+    paths: &[String],
+    stdout: bool,
+    _bootstrap: Option<&str>,
+    volumes: &[String],
+    password_stdin: bool,
+    password: bool,
+    keyfile: Option<&str>,
+) -> Result<()> {
+    if !volumes.is_empty() {
+        return Err(anyhow!(FormatError::ReaderUnsupported(
+            "archive stdin must be the only archive input",
+        )));
+    }
+    if stdout {
+        return Err(anyhow!(FormatError::ReaderUnsupported(
+            "--stdout is not supported for archive stdin extraction",
+        )));
+    }
+    if !paths.is_empty() {
+        return Err(anyhow!(FormatError::ReaderUnsupported(
+            "selected-path extraction is not supported for archive stdin",
+        )));
+    }
+    reject_archive_stdin_key_options(password_stdin, password, keyfile)
+}
+
+fn reject_archive_stdin_list_options(
+    _bootstrap: Option<&str>,
+    volumes: &[String],
+    password_stdin: bool,
+    password: bool,
+    keyfile: Option<&str>,
+) -> Result<()> {
+    if !volumes.is_empty() {
+        return Err(anyhow!(FormatError::ReaderUnsupported(
+            "archive stdin must be the only archive input",
+        )));
+    }
+    reject_archive_stdin_key_options(password_stdin, password, keyfile)
+}
+
+fn reject_archive_stdin_key_options(
+    password_stdin: bool,
+    password: bool,
+    keyfile: Option<&str>,
+) -> Result<()> {
+    if password_stdin || password || keyfile.is_none() {
+        return Err(anyhow!(FormatError::ReaderUnsupported(
+            "archive stdin currently supports raw --keyfile only",
+        )));
+    }
+    Ok(())
+}
+
+fn load_archive_stdin_key(
+    keyfile: Option<&str>,
+    password_stdin: bool,
+    password: bool,
+) -> Result<MasterKey> {
+    reject_archive_stdin_key_options(password_stdin, password, keyfile)?;
+    load_raw_master_key(keyfile)
+}
+
+fn read_optional_bootstrap_sidecar(path: Option<&str>) -> Result<Option<Vec<u8>>> {
+    path.map(|path| {
+        fs::read(path).with_context(|| format!("failed to read bootstrap sidecar {path}"))
+    })
+    .transpose()
 }
 
 fn open_inputs_maybe_bootstrap(

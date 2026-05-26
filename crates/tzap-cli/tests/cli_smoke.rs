@@ -613,7 +613,7 @@ fn create_dash_boundary_archive(temp: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
 }
 
 #[test]
-fn cli_list_treats_dash_as_literal_archive_path_not_stdin() {
+fn cli_list_reads_dash_as_archive_stdin() {
     let temp = tempdir().unwrap();
     let (keyfile, _archive, archive_bytes) = create_dash_boundary_archive(temp.path());
 
@@ -623,29 +623,42 @@ fn cli_list_treats_dash_as_literal_archive_path_not_stdin() {
         .args(["list", "--keyfile", keyfile.to_str().unwrap(), "-"])
         .write_stdin(archive_bytes)
         .assert()
-        .code(3)
-        .stderr(predicate::str::contains("io-error"))
-        .stderr(predicate::str::contains("failed to read archive -"));
+        .success()
+        .stdout(predicate::str::contains("hello.txt\n"));
 }
 
 #[test]
-fn cli_extract_treats_dash_as_literal_archive_path_not_stdin() {
+fn cli_extract_reads_dash_as_archive_stdin() {
     let temp = tempdir().unwrap();
     let (keyfile, _archive, archive_bytes) = create_dash_boundary_archive(temp.path());
+    let output = temp.path().join("out");
 
     Command::cargo_bin("tzap")
         .unwrap()
         .current_dir(temp.path())
-        .args(["extract", "--keyfile", keyfile.to_str().unwrap(), "-"])
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            "-",
+        ])
         .write_stdin(archive_bytes)
         .assert()
-        .code(3)
-        .stderr(predicate::str::contains("io-error"))
-        .stderr(predicate::str::contains("failed to read archive -"));
+        .success()
+        .stderr(predicate::str::contains(
+            "staged non-seekable stream extraction",
+        ));
+
+    assert_eq!(
+        fs::read(output.join("hello.txt")).unwrap(),
+        b"hello from dash archive\n"
+    );
 }
 
 #[test]
-fn cli_verify_treats_dash_as_literal_archive_path_not_stdin() {
+fn cli_verify_reads_dash_as_archive_stdin() {
     let temp = tempdir().unwrap();
     let (keyfile, _archive, archive_bytes) = create_dash_boundary_archive(temp.path());
 
@@ -655,13 +668,95 @@ fn cli_verify_treats_dash_as_literal_archive_path_not_stdin() {
         .args(["verify", "--keyfile", keyfile.to_str().unwrap(), "-"])
         .write_stdin(archive_bytes)
         .assert()
-        .code(3)
-        .stderr(predicate::str::contains("io-error"))
-        .stderr(predicate::str::contains("failed to read archive -"));
+        .success()
+        .stdout(predicate::str::contains("OK non-seekable stream"));
 }
 
 #[test]
-fn cli_commands_read_real_file_named_dash_as_archive_path() {
+fn cli_archive_stdin_uses_bootstrap_sidecar_for_dictionary_archive() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let dictionary = temp.path().join("dictionary.bin");
+    let input = temp.path().join("dict.txt");
+    let archive = temp.path().join("dict.tzap");
+    let bootstrap = temp.path().join("dict.tzap.bootstrap");
+    let output = temp.path().join("out");
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&dictionary, b"common words dictionary").unwrap();
+    fs::write(&input, b"common words common words dictionary payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--dictionary",
+            dictionary.to_str().unwrap(),
+            "--bootstrap-out",
+            bootstrap.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let archive_bytes = fs::read(&archive).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap",
+            bootstrap.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(archive_bytes.clone())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK non-seekable stream"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap",
+            bootstrap.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(archive_bytes.clone())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dict.txt\n"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--bootstrap",
+            bootstrap.to_str().unwrap(),
+            "--directory",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(archive_bytes)
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(output.join("dict.txt")).unwrap(),
+        b"common words common words dictionary payload\n"
+    );
+}
+
+#[test]
+fn cli_commands_read_real_file_named_dash_with_explicit_relative_path() {
     let temp = tempdir().unwrap();
     let (keyfile, archive, _archive_bytes) = create_dash_boundary_archive(temp.path());
     let dash_archive = temp.path().join("-");
@@ -671,7 +766,7 @@ fn cli_commands_read_real_file_named_dash_as_archive_path() {
     Command::cargo_bin("tzap")
         .unwrap()
         .current_dir(temp.path())
-        .args(["list", "--keyfile", keyfile.to_str().unwrap(), "-"])
+        .args(["list", "--keyfile", keyfile.to_str().unwrap(), "./-"])
         .assert()
         .success()
         .stdout(predicate::str::contains("hello.txt\n"));
@@ -679,7 +774,7 @@ fn cli_commands_read_real_file_named_dash_as_archive_path() {
     Command::cargo_bin("tzap")
         .unwrap()
         .current_dir(temp.path())
-        .args(["verify", "--keyfile", keyfile.to_str().unwrap(), "-"])
+        .args(["verify", "--keyfile", keyfile.to_str().unwrap(), "./-"])
         .assert()
         .success()
         .stdout(predicate::str::contains("OK"));
@@ -693,7 +788,7 @@ fn cli_commands_read_real_file_named_dash_as_archive_path() {
             keyfile.to_str().unwrap(),
             "--directory",
             output.to_str().unwrap(),
-            "-",
+            "./-",
             "hello.txt",
         ])
         .assert()

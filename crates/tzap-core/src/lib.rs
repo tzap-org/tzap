@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod fec;
 pub mod format;
 pub mod metadata;
+pub mod non_seekable_reader;
 pub mod padding;
 pub mod reader;
 pub mod root_auth;
@@ -19,6 +20,13 @@ pub use crypto::{HmacDomain, KdfParams, MasterKey, Subkeys};
 pub use format::{
     AeadAlgo, ArchiveWriteError, CompressionAlgo, ExtractError, FecAlgo, FormatError, KdfAlgo,
     FORMAT_VERSION, VOLUME_FORMAT_REV,
+};
+pub use non_seekable_reader::{
+    extract_non_seekable_stream_to_dir, extract_non_seekable_stream_to_dir_with_bootstrap_sidecar,
+    list_non_seekable_stream, list_non_seekable_stream_with_bootstrap_sidecar,
+    verify_non_seekable_stream, verify_non_seekable_stream_with_bootstrap_sidecar,
+    verify_non_seekable_stream_with_options, NonSeekableReaderOptions, SequentialExtractReport,
+    SequentialListReport, SequentialRootAuthStatus, SequentialVerifyReport,
 };
 pub use reader::{
     open_archive, open_archive_volumes, open_archive_with_bootstrap_sidecar,
