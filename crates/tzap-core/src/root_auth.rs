@@ -199,28 +199,43 @@ pub fn fec_layout_digest(rows: &[FecLayoutObjectRow]) -> Result<[u8; 32], Format
 
 pub fn data_block_merkle_root(leaves: &[DataBlockMerkleLeaf]) -> [u8; 32] {
     if leaves.is_empty() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(EMPTY_MERKLE_DOMAIN);
-        bytes.extend_from_slice(DATA_BLOCK_MERKLE_DOMAIN);
-        return sha256_bytes(&bytes);
+        return empty_data_block_merkle_root();
     }
 
-    let mut level = leaves
+    let leaf_hashes = leaves
         .iter()
         .map(|leaf| {
-            let mut payload = Vec::with_capacity(10 + leaf.payload.len());
-            push_u64(&mut payload, leaf.block_index);
-            payload.push(leaf.kind as u8);
-            payload.push(leaf.flags);
-            payload.extend_from_slice(&leaf.payload);
-
-            let mut bytes = Vec::new();
-            bytes.push(0x00);
-            bytes.extend_from_slice(DATA_BLOCK_MERKLE_DOMAIN);
-            bytes.extend_from_slice(&payload);
-            sha256_bytes(&bytes)
+            data_block_merkle_leaf_hash(leaf.block_index, leaf.kind, leaf.flags, &leaf.payload)
         })
         .collect::<Vec<_>>();
+    data_block_merkle_root_from_leaf_hashes(&leaf_hashes)
+}
+
+pub fn data_block_merkle_leaf_hash(
+    block_index: u64,
+    kind: BlockKind,
+    flags: u8,
+    payload: &[u8],
+) -> [u8; 32] {
+    let mut leaf_payload = Vec::with_capacity(10 + payload.len());
+    push_u64(&mut leaf_payload, block_index);
+    leaf_payload.push(kind as u8);
+    leaf_payload.push(flags);
+    leaf_payload.extend_from_slice(payload);
+
+    let mut bytes = Vec::new();
+    bytes.push(0x00);
+    bytes.extend_from_slice(DATA_BLOCK_MERKLE_DOMAIN);
+    bytes.extend_from_slice(&leaf_payload);
+    sha256_bytes(&bytes)
+}
+
+pub fn data_block_merkle_root_from_leaf_hashes(leaf_hashes: &[[u8; 32]]) -> [u8; 32] {
+    if leaf_hashes.is_empty() {
+        return empty_data_block_merkle_root();
+    }
+
+    let mut level = leaf_hashes.to_vec();
 
     while level.len() > 1 {
         let mut next = Vec::with_capacity(level.len().div_ceil(2));
@@ -241,6 +256,13 @@ pub fn data_block_merkle_root(leaves: &[DataBlockMerkleLeaf]) -> [u8; 32] {
         level = next;
     }
     level[0]
+}
+
+fn empty_data_block_merkle_root() -> [u8; 32] {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(EMPTY_MERKLE_DOMAIN);
+    bytes.extend_from_slice(DATA_BLOCK_MERKLE_DOMAIN);
+    sha256_bytes(&bytes)
 }
 
 pub fn archive_root(inputs: ArchiveRootInputs) -> [u8; 32] {

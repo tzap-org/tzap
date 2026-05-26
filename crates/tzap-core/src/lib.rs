@@ -17,8 +17,8 @@ pub mod writer;
 
 pub use crypto::{HmacDomain, KdfParams, MasterKey, Subkeys};
 pub use format::{
-    AeadAlgo, CompressionAlgo, ExtractError, FecAlgo, FormatError, KdfAlgo, FORMAT_VERSION,
-    VOLUME_FORMAT_REV,
+    AeadAlgo, ArchiveWriteError, CompressionAlgo, ExtractError, FecAlgo, FormatError, KdfAlgo,
+    FORMAT_VERSION, VOLUME_FORMAT_REV,
 };
 pub use reader::{
     open_archive, open_archive_volumes, open_archive_with_bootstrap_sidecar,
@@ -30,8 +30,10 @@ pub use reader::{
 };
 pub use tar_model::{MetadataDiagnostic, SafeExtractionOptions, TarEntryKind};
 pub use writer::{
-    write_archive, write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
-    write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
-    write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
-    write_empty_archive, RegularFile, RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions,
+    write_archive, write_archive_sources_to_sink, write_archive_with_dictionary,
+    write_archive_with_dictionary_and_kdf, write_archive_with_dictionary_and_root_auth,
+    write_archive_with_dictionary_kdf_and_root_auth, write_archive_with_kdf,
+    write_archive_with_root_auth, write_archive_with_root_auth_and_kdf, write_empty_archive,
+    ArchiveWriteSink, MemoryArchiveSink, RegularFile, RegularFileSource, RootAuthSigningRequest,
+    RootAuthWriterConfig, WriterOptions, WrittenArchiveSummary,
 };

@@ -37,6 +37,15 @@ pub enum ExtractError {
     #[error("extraction output write failed")]
     Output(#[source] std::io::Error),
 }
+
+#[derive(Debug, Error)]
+pub enum ArchiveWriteError {
+    #[error(transparent)]
+    Format(#[from] FormatError),
+
+    #[error("archive I/O failed")]
+    Io(#[source] std::io::Error),
+}
 pub const READER_MAX_ARGON2ID_T_COST: u32 = 100;
 pub const READER_MAX_ARGON2ID_PARALLELISM: u32 = 64;
 pub const READER_MAX_CRYPTO_HEADER_LEN: u32 = 64 * 1024;
