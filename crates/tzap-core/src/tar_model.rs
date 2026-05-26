@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use crate::format::FormatError;
+use crate::format::{ExtractError, FormatError};
 use crate::metadata::validate_file_path_bytes;
 
 const TAR_BLOCK_LEN: usize = 512;
@@ -75,6 +75,40 @@ impl Default for SafeExtractionOptions {
             overwrite_existing: false,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamedTarMemberMetadata {
+    pub path: Vec<u8>,
+    pub kind: TarEntryKind,
+    pub link_target: Option<Vec<u8>>,
+    pub mode: u32,
+    pub mtime: u64,
+    pub logical_size: u64,
+    pub diagnostics: Vec<MetadataDiagnostic>,
+}
+
+pub(crate) trait TarMemberGroupReader {
+    fn read_some_member_bytes(&mut self, buf: &mut [u8]) -> Result<usize, ExtractError>;
+
+    fn read_exact_member_bytes(&mut self, mut buf: &mut [u8]) -> Result<(), ExtractError> {
+        while !buf.is_empty() {
+            let read = self.read_some_member_bytes(buf)?;
+            if read == 0 {
+                return Err(
+                    FormatError::InvalidArchive("tar member group exceeds frame range").into(),
+                );
+            }
+            let (_, rest) = buf.split_at_mut(read);
+            buf = rest;
+        }
+        Ok(())
+    }
+}
+
+trait TarMemberStreamHandler {
+    fn on_member(&mut self, member: &StreamedTarMemberMetadata) -> Result<(), ExtractError>;
+    fn write_regular_payload(&mut self, bytes: &[u8]) -> Result<(), ExtractError>;
 }
 
 #[derive(Default)]
@@ -246,6 +280,396 @@ pub fn validate_tar_stream_total_extraction_size(
     Ok(())
 }
 
+pub(crate) fn stream_regular_tar_member_group_to_writer<R, W>(
+    reader: &mut R,
+    expected_path: &[u8],
+    expected_file_data_size: u64,
+    group_len: u64,
+    max_path_length: u32,
+    writer: &mut W,
+) -> Result<Vec<MetadataDiagnostic>, ExtractError>
+where
+    R: TarMemberGroupReader,
+    W: Write,
+{
+    let mut handler = RegularWriterHandler { writer };
+    let member = stream_tar_member_group(
+        reader,
+        expected_path,
+        expected_file_data_size,
+        group_len,
+        max_path_length,
+        &mut handler,
+    )?;
+    Ok(member.diagnostics)
+}
+
+pub(crate) fn restore_streaming_tar_member_group<R>(
+    root: &Path,
+    expected_path: &[u8],
+    expected_file_data_size: u64,
+    group_len: u64,
+    max_path_length: u32,
+    options: SafeExtractionOptions,
+    reader: &mut R,
+) -> Result<Vec<MetadataDiagnostic>, ExtractError>
+where
+    R: TarMemberGroupReader,
+{
+    let mut handler = FilesystemRestoreHandler::new(root, options);
+    let member = stream_tar_member_group(
+        reader,
+        expected_path,
+        expected_file_data_size,
+        group_len,
+        max_path_length,
+        &mut handler,
+    )?;
+    handler.finish(&member)
+}
+
+fn stream_tar_member_group<R, H>(
+    reader: &mut R,
+    expected_path: &[u8],
+    expected_file_data_size: u64,
+    group_len: u64,
+    max_path_length: u32,
+    handler: &mut H,
+) -> Result<StreamedTarMemberMetadata, ExtractError>
+where
+    R: TarMemberGroupReader,
+    H: TarMemberStreamHandler,
+{
+    if group_len < TAR_BLOCK_LEN as u64 || group_len % TAR_BLOCK_LEN as u64 != 0 {
+        return Err(FormatError::InvalidArchive("tar member group is not block aligned").into());
+    }
+
+    let mut remaining = group_len;
+    let mut metadata = LocalMetadata::default();
+
+    loop {
+        let mut header = [0u8; TAR_BLOCK_LEN];
+        read_member_bytes(reader, &mut header, &mut remaining)?;
+        if header.iter().all(|byte| *byte == 0) {
+            return Err(FormatError::InvalidArchive("tar member header is empty").into());
+        }
+        verify_tar_checksum(&header)?;
+
+        let typeflag = header[156];
+        let header_size = parse_tar_octal(&header[124..136])?;
+        let is_main = matches!(typeflag, 0 | b'0' | b'5' | b'2' | b'1');
+        let effective_size = if is_main {
+            metadata.pax_size.unwrap_or(header_size)
+        } else {
+            header_size
+        };
+        let padding_len = padding_to_512_u64(effective_size);
+        let entry_payload_len =
+            effective_size
+                .checked_add(padding_len)
+                .ok_or(FormatError::InvalidArchive(
+                    "tar member arithmetic overflow",
+                ))?;
+        if entry_payload_len > remaining {
+            return Err(FormatError::InvalidArchive("tar member payload exceeds group").into());
+        }
+
+        match typeflag {
+            b'x' => {
+                let payload = read_member_vec(reader, effective_size, &mut remaining)?;
+                parse_pax_records(&payload, &mut metadata)?;
+                read_zero_padding(reader, padding_len, &mut remaining)?;
+            }
+            b'g' => {
+                return Err(
+                    FormatError::InvalidArchive("global PAX headers are not allowed").into(),
+                );
+            }
+            b'V' | b'M' | b'N' => {
+                return Err(
+                    FormatError::InvalidArchive("global GNU headers are not allowed").into(),
+                );
+            }
+            b'L' => {
+                let payload = read_member_vec(reader, effective_size, &mut remaining)?;
+                metadata.gnu_long_name = Some(trimmed_metadata_payload(&payload));
+                read_zero_padding(reader, padding_len, &mut remaining)?;
+            }
+            b'K' => {
+                let payload = read_member_vec(reader, effective_size, &mut remaining)?;
+                metadata.gnu_long_link = Some(trimmed_metadata_payload(&payload));
+                read_zero_padding(reader, padding_len, &mut remaining)?;
+            }
+            b'S' => {
+                return Err(
+                    FormatError::ReaderUnsupported("unsupported GNU sparse tar entry").into(),
+                );
+            }
+            0 | b'0' | b'5' | b'2' | b'1' => {
+                let kind = match typeflag {
+                    b'5' => TarEntryKind::Directory,
+                    b'2' => TarEntryKind::Symlink,
+                    b'1' => TarEntryKind::Hardlink,
+                    _ => TarEntryKind::Regular,
+                };
+                let mode = parse_tar_octal(&header[100..108])? as u32;
+                let mtime = parse_tar_octal(&header[136..148])?;
+                let path = canonical_main_path(&header, kind, &metadata, max_path_length)?;
+                let link_target =
+                    canonical_link_target(&header, kind, &path, &metadata, max_path_length)?;
+                if kind != TarEntryKind::Regular && effective_size != 0 {
+                    return Err(FormatError::InvalidArchive(
+                        "non-regular tar entry has non-zero payload size",
+                    )
+                    .into());
+                }
+                let logical_size = if kind == TarEntryKind::Regular {
+                    effective_size
+                } else {
+                    0
+                };
+                let member = StreamedTarMemberMetadata {
+                    path,
+                    kind,
+                    link_target,
+                    mode,
+                    mtime,
+                    logical_size,
+                    diagnostics: std::mem::take(&mut metadata.diagnostics),
+                };
+                if member.path != expected_path {
+                    return Err(FormatError::InvalidArchive(
+                        "tar member path does not match FileEntry path",
+                    )
+                    .into());
+                }
+                if member.logical_size != expected_file_data_size {
+                    return Err(FormatError::InvalidArchive(
+                        "tar member size does not match FileEntry file_data_size",
+                    )
+                    .into());
+                }
+                handler.on_member(&member)?;
+                if member.kind == TarEntryKind::Regular {
+                    stream_regular_payload(reader, effective_size, &mut remaining, handler)?;
+                }
+                read_zero_padding(reader, padding_len, &mut remaining)?;
+                if remaining != 0 {
+                    return Err(FormatError::InvalidArchive(
+                        "tar member group has bytes after main entry",
+                    )
+                    .into());
+                }
+                return Ok(member);
+            }
+            _ => {
+                return Err(FormatError::ReaderUnsupported("unsupported tar entry type").into());
+            }
+        }
+
+        if remaining == 0 {
+            return Err(FormatError::InvalidArchive(
+                "tar member group has metadata records but no main entry",
+            )
+            .into());
+        }
+    }
+}
+
+struct RegularWriterHandler<'a, W> {
+    writer: &'a mut W,
+}
+
+impl<W: Write> TarMemberStreamHandler for RegularWriterHandler<'_, W> {
+    fn on_member(&mut self, member: &StreamedTarMemberMetadata) -> Result<(), ExtractError> {
+        if member.kind != TarEntryKind::Regular {
+            return Err(FormatError::ReaderUnsupported(
+                "extract_file_to_writer returns only regular file payloads",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn write_regular_payload(&mut self, bytes: &[u8]) -> Result<(), ExtractError> {
+        self.writer.write_all(bytes).map_err(ExtractError::Output)
+    }
+}
+
+struct FilesystemRestoreHandler<'a> {
+    root: &'a Path,
+    options: SafeExtractionOptions,
+    destination: Option<PathBuf>,
+    temp_path: Option<PathBuf>,
+    file: Option<fs::File>,
+}
+
+impl<'a> FilesystemRestoreHandler<'a> {
+    fn new(root: &'a Path, options: SafeExtractionOptions) -> Self {
+        Self {
+            root,
+            options,
+            destination: None,
+            temp_path: None,
+            file: None,
+        }
+    }
+
+    fn finish(
+        &mut self,
+        member: &StreamedTarMemberMetadata,
+    ) -> Result<Vec<MetadataDiagnostic>, ExtractError> {
+        let mut diagnostics = member.diagnostics.clone();
+        if member.kind != TarEntryKind::Regular {
+            return Ok(diagnostics);
+        }
+
+        let mut file = self.file.take().ok_or(FormatError::InvalidArchive(
+            "regular file output is missing",
+        ))?;
+        file.flush()
+            .map_err(|_| FormatError::FilesystemExtractionFailed("failed to write regular file"))?;
+        apply_restored_regular_file_metadata_parts(
+            &file,
+            member.mode,
+            member.mtime,
+            &mut diagnostics,
+        );
+        drop(file);
+
+        let destination = self.destination.take().ok_or(FormatError::InvalidArchive(
+            "regular file destination is missing",
+        ))?;
+        let temp_path = self.temp_path.take().ok_or(FormatError::InvalidArchive(
+            "regular file temp path is missing",
+        ))?;
+        if self.options.overwrite_existing && destination.exists() {
+            fs::remove_file(&destination).map_err(|_| {
+                FormatError::FilesystemExtractionFailed("failed to remove old file")
+            })?;
+        }
+        fs::rename(&temp_path, &destination).map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to create regular file")
+        })?;
+        Ok(diagnostics)
+    }
+}
+
+impl Drop for FilesystemRestoreHandler<'_> {
+    fn drop(&mut self) {
+        if let Some(path) = self.temp_path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
+    fn on_member(&mut self, member: &StreamedTarMemberMetadata) -> Result<(), ExtractError> {
+        let destination = prepare_destination(self.root, &member.path, member.kind, self.options)?;
+        match member.kind {
+            TarEntryKind::Regular => {
+                let (temp_path, file) = create_temp_regular_file(&destination)?;
+                self.destination = Some(destination);
+                self.temp_path = Some(temp_path);
+                self.file = Some(file);
+            }
+            TarEntryKind::Directory => create_directory(&destination)?,
+            TarEntryKind::Symlink => {
+                let target = member
+                    .link_target
+                    .as_deref()
+                    .ok_or(FormatError::InvalidArchive("symlink target is missing"))?;
+                validate_symlink_target(&member.path, target)?;
+                create_symlink(&destination, target, self.options)?;
+            }
+            TarEntryKind::Hardlink => {
+                let target = member
+                    .link_target
+                    .as_deref()
+                    .ok_or(FormatError::InvalidArchive("hardlink target is missing"))?;
+                let target_path = existing_safe_regular_path(self.root, target)?;
+                create_hardlink(&destination, &target_path, self.options)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_regular_payload(&mut self, bytes: &[u8]) -> Result<(), ExtractError> {
+        let file = self.file.as_mut().ok_or(FormatError::InvalidArchive(
+            "regular file output is missing",
+        ))?;
+        file.write_all(bytes)
+            .map_err(|_| FormatError::FilesystemExtractionFailed("failed to write regular file"))?;
+        Ok(())
+    }
+}
+
+fn read_member_bytes<R: TarMemberGroupReader>(
+    reader: &mut R,
+    buf: &mut [u8],
+    remaining: &mut u64,
+) -> Result<(), ExtractError> {
+    if buf.len() as u64 > *remaining {
+        return Err(FormatError::InvalidArchive("tar member payload exceeds group").into());
+    }
+    reader.read_exact_member_bytes(buf)?;
+    *remaining -= buf.len() as u64;
+    Ok(())
+}
+
+fn read_member_vec<R: TarMemberGroupReader>(
+    reader: &mut R,
+    len: u64,
+    remaining: &mut u64,
+) -> Result<Vec<u8>, ExtractError> {
+    let mut out = vec![0u8; to_usize(len)?];
+    read_member_bytes(reader, &mut out, remaining)?;
+    Ok(out)
+}
+
+fn read_zero_padding<R: TarMemberGroupReader>(
+    reader: &mut R,
+    len: u64,
+    remaining: &mut u64,
+) -> Result<(), ExtractError> {
+    let mut pending = len;
+    let mut buf = [0u8; 8192];
+    while pending > 0 {
+        let chunk_len = pending.min(buf.len() as u64) as usize;
+        read_member_bytes(reader, &mut buf[..chunk_len], remaining)?;
+        if buf[..chunk_len].iter().any(|byte| *byte != 0) {
+            return Err(FormatError::InvalidArchive("tar member padding is non-zero").into());
+        }
+        pending -= chunk_len as u64;
+    }
+    Ok(())
+}
+
+fn stream_regular_payload<R, H>(
+    reader: &mut R,
+    len: u64,
+    remaining: &mut u64,
+    handler: &mut H,
+) -> Result<(), ExtractError>
+where
+    R: TarMemberGroupReader,
+    H: TarMemberStreamHandler,
+{
+    let mut pending = len;
+    let mut buf = [0u8; 64 * 1024];
+    while pending > 0 {
+        let chunk_len = pending.min(buf.len() as u64).min(*remaining) as usize;
+        let read = reader.read_some_member_bytes(&mut buf[..chunk_len])?;
+        if read == 0 {
+            return Err(FormatError::InvalidArchive("tar member group exceeds frame range").into());
+        }
+        *remaining -= read as u64;
+        pending -= read as u64;
+        handler.write_regular_payload(&buf[..read])?;
+    }
+    Ok(())
+}
+
 fn tar_member_group_end(stream: &[u8], start: usize) -> Result<usize, FormatError> {
     let mut cursor = start;
     let mut metadata = LocalMetadata::default();
@@ -356,8 +780,17 @@ fn apply_restored_regular_file_metadata(
     member: &OwnedTarMember,
     diagnostics: &mut Vec<MetadataDiagnostic>,
 ) {
-    apply_regular_file_mtime(file, member.mtime, diagnostics);
-    apply_regular_file_mode(file, member.mode, diagnostics);
+    apply_restored_regular_file_metadata_parts(file, member.mode, member.mtime, diagnostics);
+}
+
+fn apply_restored_regular_file_metadata_parts(
+    file: &fs::File,
+    mode: u32,
+    mtime: u64,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) {
+    apply_regular_file_mtime(file, mtime, diagnostics);
+    apply_regular_file_mode(file, mode, diagnostics);
 }
 
 #[cfg(unix)]
@@ -688,6 +1121,27 @@ fn write_regular_file(
     Ok(file)
 }
 
+fn create_temp_regular_file(destination: &Path) -> Result<(PathBuf, fs::File), FormatError> {
+    let pid = std::process::id();
+    for attempt in 0..1000u32 {
+        let mut candidate = destination.as_os_str().to_os_string();
+        candidate.push(format!(".tzap-tmp-{pid}-{attempt}"));
+        let path = PathBuf::from(candidate);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => {
+                return Err(FormatError::FilesystemExtractionFailed(
+                    "failed to create regular file",
+                ));
+            }
+        }
+    }
+    Err(FormatError::FilesystemExtractionFailed(
+        "failed to create regular file",
+    ))
+}
+
 fn create_directory(destination: &Path) -> Result<(), FormatError> {
     match fs::create_dir(destination) {
         Ok(()) => Ok(()),
@@ -844,6 +1298,15 @@ fn padding_to_512(len: usize) -> usize {
         0
     } else {
         TAR_BLOCK_LEN - remainder
+    }
+}
+
+fn padding_to_512_u64(len: u64) -> u64 {
+    let remainder = len % TAR_BLOCK_LEN as u64;
+    if remainder == 0 {
+        0
+    } else {
+        TAR_BLOCK_LEN as u64 - remainder
     }
 }
 

@@ -21,8 +21,8 @@ use tzap_core::{
     write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
     write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
     write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
-    KdfParams, MasterKey, MetadataDiagnostic, OpenedArchive, RegularFile, RootAuthVerification,
-    RootAuthWriterConfig, SafeExtractionOptions, TarEntryKind, WriterOptions,
+    ExtractError, KdfParams, MasterKey, MetadataDiagnostic, OpenedArchive, RegularFile,
+    RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions, TarEntryKind, WriterOptions,
 };
 use tzap_plugin_signing::ed25519_raw::{
     self, Ed25519RootAuthOutcome, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
@@ -809,14 +809,19 @@ fn run(cli: Cli) -> Result<()> {
             }
             if stdout {
                 let path = requested_entries[0].path.as_str();
-                let member = opened
-                    .extract_member(path)?
-                    .ok_or_else(|| anyhow!("path not found in archive: {path}"))?;
-                if member.kind != TarEntryKind::Regular {
-                    bail!("--stdout supports regular file members only");
-                }
-                emit_member_metadata_diagnostics(quiet, path, &member.diagnostics)?;
-                io::stdout().write_all(&member.data)?;
+                let mut stdout = io::stdout().lock();
+                let diagnostics = match opened.extract_file_to_writer(path, &mut stdout) {
+                    Ok(Some(diagnostics)) => diagnostics,
+                    Ok(None) => bail!("path not found in archive: {path}"),
+                    Err(ExtractError::Format(FormatError::ReaderUnsupported(message)))
+                        if message.contains("regular file") =>
+                    {
+                        bail!("--stdout supports regular file members only");
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+                stdout.flush()?;
+                emit_member_metadata_diagnostics(quiet, path, &diagnostics)?;
                 return Ok(());
             }
 

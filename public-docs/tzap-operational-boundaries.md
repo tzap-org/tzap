@@ -201,6 +201,12 @@ writes one selected regular-file member to stdout. The default filesystem
 extractor also uses the opened authenticated archive; it does not stream
 unauthenticated non-seekable bytes into the destination directory.
 
+For opened file-backed archives, selected regular-file payloads are streamed
+from the selected payload envelopes to stdout or a destination file. The core
+keeps extraction memory bounded by the current envelope plaintext, current
+decompressed frame, and small tar metadata buffers; it still reads/decrypts
+whole payload envelopes because envelopes are the authenticated AEAD/FEC object.
+
 Examples:
 
 ```sh

@@ -86,6 +86,9 @@ Notes:
   random-access reader. Selecting one path reads the authenticated terminal,
   index metadata, and the payload envelopes needed for that path; it does not
   load the whole archive into memory first.
+- Selected regular-file payloads stream from the needed envelopes to stdout or
+  the destination file with memory bounded by the current envelope, current
+  frame, and small tar metadata buffers.
 - `--stdout` writes one selected regular-file member after the archive has been
   opened and authenticated from file paths; it is not live non-seekable archive
   streaming.

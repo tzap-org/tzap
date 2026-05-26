@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -12,7 +12,7 @@ use crate::compression::{
 use crate::crypto::{decrypt_padded_aead_object, verify_hmac, HmacDomain, MasterKey, Subkeys};
 use crate::fec::repair_data_gf16;
 use crate::format::{
-    BlockKind, FormatError, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN,
+    BlockKind, ExtractError, FormatError, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN,
     CRITICAL_METADATA_IMAGE_FIXED_LEN, CRITICAL_METADATA_RECOVERY_HEADER_LEN,
     CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN, CRITICAL_RECOVERY_LOCATOR_LEN,
     CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, IMAGE_CRC_LEN, LOCATOR_PAIR_LEN, MANIFEST_FOOTER_LEN,
@@ -29,8 +29,9 @@ use crate::root_auth::{
     CriticalMetadataDigestInputs, DataBlockMerkleLeaf, FecLayoutObjectRow,
 };
 use crate::tar_model::{
-    parse_tar_member_group, restore_tar_member, validate_tar_stream_total_extraction_size,
-    MetadataDiagnostic, OwnedTarMember, SafeExtractionOptions, TarEntryKind,
+    parse_tar_member_group, restore_streaming_tar_member_group,
+    stream_regular_tar_member_group_to_writer, validate_tar_stream_total_extraction_size,
+    MetadataDiagnostic, OwnedTarMember, SafeExtractionOptions, TarEntryKind, TarMemberGroupReader,
 };
 use crate::wire::{
     BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage, CriticalMetadataRecoveryHeader,
@@ -206,6 +207,18 @@ struct LocatedIndexFile {
     shard: IndexShard,
     file_index: usize,
     start: u64,
+}
+
+struct DecodedTarMemberGroupReader<'a> {
+    archive: &'a OpenedArchive,
+    shard: &'a IndexShard,
+    file: &'a FileEntry,
+    next_frame_offset: u64,
+    cached_envelope_index: Option<u64>,
+    cached_envelope_plaintext: Vec<u8>,
+    current_frame: Vec<u8>,
+    current_frame_offset: usize,
+    remaining_group_bytes: u64,
 }
 
 struct SeekableVolumeSource {
@@ -1231,6 +1244,24 @@ impl OpenedArchive {
             .transpose()
     }
 
+    /// Stream regular-file payload bytes for `path` into `writer`.
+    ///
+    /// This keeps extraction memory bounded by the selected payload envelope,
+    /// one decompressed frame, and small tar metadata buffers. It returns the
+    /// same metadata diagnostics as [`Self::extract_file_with_diagnostics`].
+    pub fn extract_file_to_writer<W: Write>(
+        &self,
+        path: &str,
+        writer: &mut W,
+    ) -> Result<Option<Vec<MetadataDiagnostic>>, ExtractError> {
+        let normalized = normalize_lookup_file_path(path, self.crypto_header.max_path_length)?;
+        self.locate_index_file(&normalized)?
+            .map(|located| {
+                self.stream_loaded_file_to_writer(&located.shard, located.file_index, writer)
+            })
+            .transpose()
+    }
+
     pub fn extract_member(
         &self,
         path: &str,
@@ -1247,8 +1278,11 @@ impl OpenedArchive {
         root: &std::path::Path,
         options: SafeExtractionOptions,
     ) -> Result<Option<Vec<MetadataDiagnostic>>, FormatError> {
-        self.extract_owned_tar_member(path)?
-            .map(|member| restore_tar_member(root, &member, options))
+        let normalized = normalize_lookup_file_path(path, self.crypto_header.max_path_length)?;
+        self.locate_index_file(&normalized)?
+            .map(|located| {
+                self.stream_loaded_file_to_path(&located.shard, located.file_index, root, options)
+            })
             .transpose()
     }
 
@@ -1549,13 +1583,6 @@ impl OpenedArchive {
         Ok(plaintext)
     }
 
-    fn extract_owned_tar_member(&self, path: &str) -> Result<Option<OwnedTarMember>, FormatError> {
-        let normalized = normalize_lookup_file_path(path, self.crypto_header.max_path_length)?;
-        self.locate_index_file(&normalized)?
-            .map(|located| self.extract_loaded_owned_tar_member(&located.shard, located.file_index))
-            .transpose()
-    }
-
     fn locate_index_file(
         &self,
         normalized: &[u8],
@@ -1622,6 +1649,59 @@ impl OpenedArchive {
         file_index: usize,
     ) -> Result<OwnedTarMember, FormatError> {
         self.decode_loaded_owned_tar_member(shard, file_index, true)
+    }
+
+    fn stream_loaded_file_to_writer<W: Write>(
+        &self,
+        shard: &IndexShard,
+        file_index: usize,
+        writer: &mut W,
+    ) -> Result<Vec<MetadataDiagnostic>, ExtractError> {
+        let file = shard
+            .files
+            .get(file_index)
+            .ok_or(FormatError::InvalidArchive("FileEntry index out of bounds"))?;
+        self.validate_total_extraction_size(file.file_data_size)?;
+        let expected_path = shard
+            .file_path(file_index)
+            .ok_or(FormatError::InvalidArchive("FileEntry path is missing"))?;
+        let mut reader = DecodedTarMemberGroupReader::new(self, shard, file);
+        stream_regular_tar_member_group_to_writer(
+            &mut reader,
+            expected_path,
+            file.file_data_size,
+            file.tar_member_group_size,
+            self.crypto_header.max_path_length,
+            writer,
+        )
+    }
+
+    fn stream_loaded_file_to_path(
+        &self,
+        shard: &IndexShard,
+        file_index: usize,
+        root: &std::path::Path,
+        options: SafeExtractionOptions,
+    ) -> Result<Vec<MetadataDiagnostic>, FormatError> {
+        let file = shard
+            .files
+            .get(file_index)
+            .ok_or(FormatError::InvalidArchive("FileEntry index out of bounds"))?;
+        self.validate_total_extraction_size(file.file_data_size)?;
+        let expected_path = shard
+            .file_path(file_index)
+            .ok_or(FormatError::InvalidArchive("FileEntry path is missing"))?;
+        let mut reader = DecodedTarMemberGroupReader::new(self, shard, file);
+        restore_streaming_tar_member_group(
+            root,
+            expected_path,
+            file.file_data_size,
+            file.tar_member_group_size,
+            self.crypto_header.max_path_length,
+            options,
+            &mut reader,
+        )
+        .map_err(format_error_from_extract_error)
     }
 
     fn decode_loaded_owned_tar_member(
@@ -2022,6 +2102,125 @@ impl OpenedArchive {
             )?);
         }
         validate_non_overlapping_object_ranges(&mut ranges)
+    }
+}
+
+impl<'a> DecodedTarMemberGroupReader<'a> {
+    fn new(archive: &'a OpenedArchive, shard: &'a IndexShard, file: &'a FileEntry) -> Self {
+        Self {
+            archive,
+            shard,
+            file,
+            next_frame_offset: 0,
+            cached_envelope_index: None,
+            cached_envelope_plaintext: Vec::new(),
+            current_frame: Vec::new(),
+            current_frame_offset: 0,
+            remaining_group_bytes: file.tar_member_group_size,
+        }
+    }
+
+    fn ensure_frame_available(&mut self) -> Result<(), ExtractError> {
+        while self.current_frame_offset >= self.current_frame.len() {
+            if self.next_frame_offset >= self.file.frame_count as u64 {
+                return Err(
+                    FormatError::InvalidArchive("tar member group exceeds frame range").into(),
+                );
+            }
+            let frame_index = self
+                .file
+                .first_frame_index
+                .checked_add(self.next_frame_offset)
+                .ok_or(FormatError::InvalidArchive(
+                    "FileEntry frame range overflow",
+                ))?;
+            let frame = frame_by_index(self.shard, frame_index)?;
+            let envelope = envelope_by_index(self.shard, frame.envelope_index)?;
+            if self.cached_envelope_index != Some(envelope.envelope_index) {
+                self.cached_envelope_plaintext = self.archive.load_payload_envelope(envelope)?;
+                self.cached_envelope_index = Some(envelope.envelope_index);
+            }
+            let compressed = slice(
+                &self.cached_envelope_plaintext,
+                frame.offset_in_envelope as usize,
+                frame.compressed_size as usize,
+                "FrameEntry",
+            )?;
+            let decoded = self
+                .archive
+                .decompress_payload_frame(compressed, frame.decompressed_size)?;
+            let offset = if self.next_frame_offset == 0 {
+                self.file.offset_in_first_frame_plaintext as usize
+            } else {
+                0
+            };
+            if offset > decoded.len() {
+                return Err(FormatError::InvalidArchive(
+                    "offset in first frame is outside the first referenced frame",
+                )
+                .into());
+            }
+            self.next_frame_offset += 1;
+            self.current_frame = decoded;
+            self.current_frame_offset = offset;
+        }
+        Ok(())
+    }
+}
+
+impl TarMemberGroupReader for DecodedTarMemberGroupReader<'_> {
+    fn read_some_member_bytes(&mut self, buf: &mut [u8]) -> Result<usize, ExtractError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining_group_bytes == 0 {
+            return Ok(0);
+        }
+        self.ensure_frame_available()?;
+        let available = self.current_frame.len() - self.current_frame_offset;
+        let len = available
+            .min(buf.len())
+            .min(to_usize(self.remaining_group_bytes, "FileEntry")?);
+        if len == 0 {
+            return Err(FormatError::InvalidArchive("tar member group exceeds frame range").into());
+        }
+        buf[..len].copy_from_slice(
+            &self.current_frame[self.current_frame_offset..self.current_frame_offset + len],
+        );
+        self.current_frame_offset += len;
+        self.remaining_group_bytes -= len as u64;
+        Ok(len)
+    }
+}
+
+fn frame_by_index<'a>(
+    shard: &'a IndexShard,
+    frame_index: u64,
+) -> Result<&'a FrameEntry, FormatError> {
+    shard
+        .frames
+        .binary_search_by_key(&frame_index, |entry| entry.frame_index)
+        .map(|idx| &shard.frames[idx])
+        .map_err(|_| FormatError::InvalidArchive("FileEntry references missing FrameEntry"))
+}
+
+fn envelope_by_index<'a>(
+    shard: &'a IndexShard,
+    envelope_index: u64,
+) -> Result<&'a EnvelopeEntry, FormatError> {
+    shard
+        .envelopes
+        .binary_search_by_key(&envelope_index, |entry| entry.envelope_index)
+        .map(|idx| &shard.envelopes[idx])
+        .map_err(|_| FormatError::InvalidArchive("FrameEntry references missing EnvelopeEntry"))
+}
+
+fn format_error_from_extract_error(err: ExtractError) -> FormatError {
+    match err {
+        ExtractError::Format(err) => err,
+        ExtractError::Output(_) => {
+            FormatError::FilesystemExtractionFailed("failed to write regular file")
+        }
     }
 }
 
@@ -7077,6 +7276,212 @@ mod tests {
             opened.extract_file("broken.bin").unwrap_err(),
             FormatError::InvalidArchive("denied test read")
         );
+    }
+
+    #[test]
+    fn extract_file_to_writer_streams_before_reading_later_envelopes() {
+        struct FailOnFirstWrite;
+
+        impl std::io::Write for FailOnFirstWrite {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "sink stopped",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let payload = pseudo_random_bytes(128 * 1024);
+        let options = WriterOptions {
+            block_size: 4096,
+            chunk_size: 4096,
+            envelope_target_size: 8192,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            fec_data_shards: 4,
+            fec_parity_shards: 0,
+            index_fec_data_shards: 4,
+            index_fec_parity_shards: 0,
+            index_root_fec_data_shards: 4,
+            index_root_fec_parity_shards: 0,
+            ..WriterOptions::default()
+        };
+        let archive = write_archive(
+            &[RegularFile::new("large.bin", &payload)],
+            &master_key(),
+            options,
+        )
+        .unwrap();
+        let eager = open_archive(&archive.bytes, &master_key()).unwrap();
+        let envelopes = envelope_entries_for_path(&eager, "large.bin");
+        let first_envelope = envelopes
+            .first()
+            .expect("large fixture should have at least one envelope")
+            .envelope_index;
+        let later_envelope_blocks = envelopes
+            .iter()
+            .filter(|entry| entry.envelope_index != first_envelope)
+            .flat_map(|entry| {
+                let block_count = entry.data_block_count as u64 + entry.parity_block_count as u64;
+                entry.first_block_index..entry.first_block_index + block_count
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !later_envelope_blocks.is_empty(),
+            "fixture must span more than one payload envelope"
+        );
+        let denied_ranges = block_record_slots(&archive.bytes)
+            .into_iter()
+            .filter_map(|(offset, len, record)| {
+                later_envelope_blocks
+                    .contains(&record.block_index)
+                    .then_some((offset as u64, (offset + len) as u64))
+            })
+            .collect::<Vec<_>>();
+        assert!(!denied_ranges.is_empty());
+
+        let reader = CountingReadAt::new(archive.bytes, denied_ranges.clone());
+        let opened = open_seekable_archive(reader.clone(), &master_key()).unwrap();
+        let mut writer = FailOnFirstWrite;
+
+        let err = opened
+            .extract_file_to_writer("large.bin", &mut writer)
+            .unwrap_err();
+        assert_eq!(err.to_string(), "extraction output write failed");
+        for (read_start, read_end) in reader.reads() {
+            assert!(
+                denied_ranges
+                    .iter()
+                    .all(|(start, end)| !ranges_overlap(read_start, read_end, *start, *end)),
+                "streaming writer read a later payload envelope before surfacing writer failure"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_file_to_writer_writes_bounded_chunks() {
+        struct ChunkRecorder {
+            total: usize,
+            max_write: usize,
+            writes: usize,
+        }
+
+        impl std::io::Write for ChunkRecorder {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.total += buf.len();
+                self.max_write = self.max_write.max(buf.len());
+                self.writes += 1;
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let payload = pseudo_random_bytes(128 * 1024);
+        let options = WriterOptions {
+            block_size: 4096,
+            chunk_size: 4096,
+            envelope_target_size: 8192,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            fec_data_shards: 4,
+            fec_parity_shards: 0,
+            index_fec_data_shards: 4,
+            index_fec_parity_shards: 0,
+            index_root_fec_data_shards: 4,
+            index_root_fec_parity_shards: 0,
+            ..WriterOptions::default()
+        };
+        let archive = write_archive(
+            &[RegularFile::new("large.bin", &payload)],
+            &master_key(),
+            options,
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let mut writer = ChunkRecorder {
+            total: 0,
+            max_write: 0,
+            writes: 0,
+        };
+
+        opened
+            .extract_file_to_writer("large.bin", &mut writer)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(writer.total, payload.len());
+        assert!(writer.writes > 1);
+        assert!(
+            writer.max_write <= options.chunk_size as usize,
+            "writer saw a {} byte chunk, larger than the {} byte frame target",
+            writer.max_write,
+            options.chunk_size
+        );
+    }
+
+    #[test]
+    fn streaming_filesystem_extract_does_not_publish_partial_file_on_late_payload_error() {
+        let payload = pseudo_random_bytes(128 * 1024);
+        let options = WriterOptions {
+            block_size: 4096,
+            chunk_size: 4096,
+            envelope_target_size: 8192,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            fec_data_shards: 4,
+            fec_parity_shards: 0,
+            index_fec_data_shards: 4,
+            index_fec_parity_shards: 0,
+            index_root_fec_data_shards: 4,
+            index_root_fec_parity_shards: 0,
+            ..WriterOptions::default()
+        };
+        let archive = write_archive(
+            &[RegularFile::new("large.bin", &payload)],
+            &master_key(),
+            options,
+        )
+        .unwrap();
+        let eager = open_archive(&archive.bytes, &master_key()).unwrap();
+        let envelopes = envelope_entries_for_path(&eager, "large.bin");
+        let last_envelope = envelopes
+            .last()
+            .expect("large fixture should have at least one envelope");
+        assert_ne!(
+            envelopes.first().unwrap().envelope_index,
+            last_envelope.envelope_index,
+            "fixture must span more than one payload envelope"
+        );
+        let corrupt_slot = block_record_slots(&archive.bytes)
+            .into_iter()
+            .enumerate()
+            .find_map(|(slot, (_, _, record))| {
+                (record.block_index == last_envelope.first_block_index).then_some(slot)
+            })
+            .unwrap();
+        let mut corrupted = archive.bytes;
+        corrupt_block_record_payload_at_slot(&mut corrupted, corrupt_slot);
+        let opened = open_seekable_archive(corrupted, &master_key()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        assert!(matches!(
+            opened
+                .extract_file_to("large.bin", tmp.path(), SafeExtractionOptions::default())
+                .unwrap_err(),
+            FormatError::AeadFailure | FormatError::FecTooFewAvailableShards
+        ));
+        assert!(!tmp.path().join("large.bin").exists());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 
     #[test]

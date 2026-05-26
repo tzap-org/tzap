@@ -28,6 +28,15 @@ pub const CRYPTO_EXTENSION_MAX_VALUE_LEN: u32 = 256;
 pub const MASTER_KEY_LEN: usize = 32;
 pub const SUBKEY_LEN: usize = 32;
 pub const READER_MAX_ARGON2ID_M_COST_KIB: u32 = 4 * 1024 * 1024;
+
+#[derive(Debug, Error)]
+pub enum ExtractError {
+    #[error(transparent)]
+    Format(#[from] FormatError),
+
+    #[error("extraction output write failed")]
+    Output(#[source] std::io::Error),
+}
 pub const READER_MAX_ARGON2ID_T_COST: u32 = 100;
 pub const READER_MAX_ARGON2ID_PARALLELISM: u32 = 64;
 pub const READER_MAX_CRYPTO_HEADER_LEN: u32 = 64 * 1024;

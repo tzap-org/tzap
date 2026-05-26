@@ -17,7 +17,8 @@ pub mod writer;
 
 pub use crypto::{HmacDomain, KdfParams, MasterKey, Subkeys};
 pub use format::{
-    AeadAlgo, CompressionAlgo, FecAlgo, FormatError, KdfAlgo, FORMAT_VERSION, VOLUME_FORMAT_REV,
+    AeadAlgo, CompressionAlgo, ExtractError, FecAlgo, FormatError, KdfAlgo, FORMAT_VERSION,
+    VOLUME_FORMAT_REV,
 };
 pub use reader::{
     open_archive, open_archive_volumes, open_archive_with_bootstrap_sidecar,
