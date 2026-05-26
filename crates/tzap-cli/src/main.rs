@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
-use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -13,17 +13,16 @@ use tzap_core::format::{
     FormatError, CRYPTO_HEADER_FIXED_LEN, READER_MAX_ARGON2ID_M_COST_KIB,
     READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST, VOLUME_HEADER_LEN,
 };
-use tzap_core::metadata::normalize_lookup_file_path;
-use tzap_core::reader::ArchiveEntry;
+use tzap_core::reader::{ArchiveEntry, ArchiveIndexEntry};
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
 use tzap_core::{
-    open_archive, open_archive_volumes, open_archive_with_bootstrap_sidecar,
-    public_no_key_verify_volumes_with, write_archive, write_archive_with_dictionary,
-    write_archive_with_dictionary_and_kdf, write_archive_with_dictionary_and_root_auth,
-    write_archive_with_dictionary_kdf_and_root_auth, write_archive_with_kdf,
-    write_archive_with_root_auth, write_archive_with_root_auth_and_kdf, KdfParams, MasterKey,
-    MetadataDiagnostic, OpenedArchive, RegularFile, RootAuthVerification, RootAuthWriterConfig,
-    SafeExtractionOptions, TarEntryKind, WriterOptions,
+    open_seekable_archive, open_seekable_archive_volumes,
+    open_seekable_archive_with_bootstrap_sidecar, public_no_key_verify_volumes_with, write_archive,
+    write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
+    write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
+    write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
+    KdfParams, MasterKey, MetadataDiagnostic, OpenedArchive, RegularFile, RootAuthVerification,
+    RootAuthWriterConfig, SafeExtractionOptions, TarEntryKind, WriterOptions,
 };
 use tzap_plugin_signing::ed25519_raw::{
     self, Ed25519RootAuthOutcome, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
@@ -795,19 +794,13 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             reject_multi_volume_bootstrap(1 + volumes.len(), bootstrap.as_deref())?;
             reject_stdout_extract_shape(stdout, paths.len())?;
-            let volume_bytes = read_volume_inputs(&archive, &volumes)?;
-            let master_key = load_open_key(
-                keyfile.as_deref(),
-                password_stdin,
-                password,
-                &volume_bytes[0],
-            )?;
+            let volume_files = open_volume_inputs(&archive, &volumes)?;
+            let master_key = load_open_key(keyfile.as_deref(), password_stdin, password, &archive)?;
             let opened =
-                open_inputs_maybe_bootstrap(&volume_bytes, &master_key, bootstrap.as_deref())
+                open_inputs_maybe_bootstrap(volume_files, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {archive}"))?;
-            let all_entries = opened.list_files()?;
-            let (requested_paths, missing_paths) =
-                resolve_extract_paths(&all_entries, &paths, opened.crypto_header.max_path_length)?;
+            let (requested_entries, missing_paths) =
+                resolve_extract_index_entries(&opened, &paths)?;
             if !missing_paths.is_empty() {
                 for missing in missing_paths {
                     eprintln!("missing archive path: {missing}");
@@ -815,7 +808,7 @@ fn run(cli: Cli) -> Result<()> {
                 return Err(anyhow!("missing requested archive paths"));
             }
             if stdout {
-                let path = requested_paths[0].as_str();
+                let path = requested_entries[0].path.as_str();
                 let member = opened
                     .extract_member(path)?
                     .ok_or_else(|| anyhow!("path not found in archive: {path}"))?;
@@ -828,20 +821,11 @@ fn run(cli: Cli) -> Result<()> {
             }
 
             if dry_run {
-                emit_entry_metadata_diagnostics_for_paths(quiet, &all_entries, &requested_paths)?;
                 eprintln!("extract dry-run summary:");
                 eprintln!("  destination: {}", directory);
                 eprintln!("  archive members:");
-                for path in &requested_paths {
-                    if let Some(size) = all_entries
-                        .iter()
-                        .find(|entry| entry.path == *path)
-                        .map(|entry| entry.file_data_size)
-                    {
-                        eprintln!("    {path} ({size} bytes)");
-                    } else {
-                        eprintln!("    {path}");
-                    }
+                for entry in &requested_entries {
+                    eprintln!("    {} ({} bytes)", entry.path, entry.file_data_size);
                 }
                 return Ok(());
             }
@@ -855,7 +839,8 @@ fn run(cli: Cli) -> Result<()> {
             let options = SafeExtractionOptions {
                 overwrite_existing: overwrite,
             };
-            for path in requested_paths {
+            for entry in requested_entries {
+                let path = entry.path;
                 let diagnostics = opened
                     .extract_file_to(&path, &root, options)?
                     .ok_or_else(|| anyhow!("path not found in archive: {path}"))?;
@@ -887,46 +872,41 @@ fn run(cli: Cli) -> Result<()> {
             json,
         } => {
             reject_multi_volume_bootstrap(1 + volumes.len(), bootstrap.as_deref())?;
-            let volume_bytes = read_volume_inputs(&archive, &volumes)?;
-            let master_key = load_open_key(
-                keyfile.as_deref(),
-                password_stdin,
-                password,
-                &volume_bytes[0],
-            )?;
+            let volume_files = open_volume_inputs(&archive, &volumes)?;
+            let master_key = load_open_key(keyfile.as_deref(), password_stdin, password, &archive)?;
             let opened =
-                open_inputs_maybe_bootstrap(&volume_bytes, &master_key, bootstrap.as_deref())
+                open_inputs_maybe_bootstrap(volume_files, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {archive}"))?;
-            let entries = opened.list_files()?;
-            emit_entry_metadata_diagnostics(quiet, &entries)?;
-            if json {
-                let files = entries
-                    .iter()
-                    .map(|entry| {
-                        let kind = match entry.kind {
-                            TarEntryKind::Regular => "file",
-                            TarEntryKind::Directory => "directory",
-                            TarEntryKind::Symlink => "symlink",
-                            TarEntryKind::Hardlink => "hardlink",
-                        };
-                        json!({
-                            "path": &entry.path,
-                            "kind": kind,
-                            "size": entry.file_data_size,
-                            "mode": entry.mode,
-                            "mtime": entry.mtime,
+            if json || long {
+                let entries = opened.list_files()?;
+                emit_entry_metadata_diagnostics(quiet, &entries)?;
+                if json {
+                    let files = entries
+                        .iter()
+                        .map(|entry| {
+                            let kind = match entry.kind {
+                                TarEntryKind::Regular => "file",
+                                TarEntryKind::Directory => "directory",
+                                TarEntryKind::Symlink => "symlink",
+                                TarEntryKind::Hardlink => "hardlink",
+                            };
+                            json!({
+                                "path": &entry.path,
+                                "kind": kind,
+                                "size": entry.file_data_size,
+                                "mode": entry.mode,
+                                "mtime": entry.mtime,
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>();
-                println!(
-                    "{}",
-                    serde_json::to_string(&json!({ "files": files }))
-                        .context("failed to encode list output as JSON")?
-                );
-                Ok(())
-            } else {
-                for entry in entries {
-                    if long {
+                        .collect::<Vec<_>>();
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json!({ "files": files }))
+                            .context("failed to encode list output as JSON")?
+                    );
+                    Ok(())
+                } else {
+                    for entry in entries {
                         let kind = match entry.kind {
                             TarEntryKind::Regular => "file",
                             TarEntryKind::Directory => "directory",
@@ -937,9 +917,12 @@ fn run(cli: Cli) -> Result<()> {
                             "{}\t{}\t{}\t{}\t{}",
                             entry.file_data_size, kind, entry.mode, entry.mtime, entry.path
                         );
-                    } else {
-                        println!("{}", entry.path);
                     }
+                    Ok(())
+                }
+            } else {
+                for entry in opened.list_index_entries()? {
+                    println!("{}", entry.path);
                 }
                 Ok(())
             }
@@ -984,8 +967,8 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 return Err(err);
             }
-            let volume_bytes = match read_volume_inputs(first, &archives[1..]) {
-                Ok(volume_bytes) => volume_bytes,
+            let volume_files = match open_volume_inputs(first, &archives[1..]) {
+                Ok(volume_files) => volume_files,
                 Err(err) => {
                     if json {
                         emit_verify_json_error(&archive_paths, None, None, &err)?;
@@ -993,22 +976,18 @@ fn run(cli: Cli) -> Result<()> {
                     return Err(err);
                 }
             };
-            let master_key = match load_open_key(
-                keyfile.as_deref(),
-                password_stdin,
-                password,
-                &volume_bytes[0],
-            ) {
-                Ok(master_key) => master_key,
-                Err(err) => {
-                    if json {
-                        emit_verify_json_error(&archive_paths, None, None, &err)?;
+            let master_key =
+                match load_open_key(keyfile.as_deref(), password_stdin, password, first) {
+                    Ok(master_key) => master_key,
+                    Err(err) => {
+                        if json {
+                            emit_verify_json_error(&archive_paths, None, None, &err)?;
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
-                }
-            };
+                };
             let opened =
-                match open_inputs_maybe_bootstrap(&volume_bytes, &master_key, bootstrap.as_deref())
+                match open_inputs_maybe_bootstrap(volume_files, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {first}"))
                 {
                     Ok(opened) => opened,
@@ -1194,6 +1173,7 @@ fn metadata_diagnostic_lines_for_entries(entries: &[ArchiveEntry]) -> Vec<String
         .collect()
 }
 
+#[cfg(test)]
 fn metadata_diagnostic_lines_for_paths(entries: &[ArchiveEntry], paths: &[String]) -> Vec<String> {
     paths
         .iter()
@@ -1212,20 +1192,6 @@ fn emit_entry_metadata_diagnostics(quiet: bool, entries: &[ArchiveEntry]) -> io:
         return Ok(());
     }
     for line in metadata_diagnostic_lines_for_entries(entries) {
-        eprintln!("{line}");
-    }
-    Ok(())
-}
-
-fn emit_entry_metadata_diagnostics_for_paths(
-    quiet: bool,
-    entries: &[ArchiveEntry],
-    paths: &[String],
-) -> io::Result<()> {
-    if quiet {
-        return Ok(());
-    }
-    for line in metadata_diagnostic_lines_for_paths(entries, paths) {
         eprintln!("{line}");
     }
     Ok(())
@@ -1374,32 +1340,20 @@ fn collect_one_input_spec(
     Ok(())
 }
 
-fn resolve_extract_paths(
-    all_entries: &[ArchiveEntry],
+fn resolve_extract_index_entries(
+    opened: &OpenedArchive,
     requested: &[String],
-    max_path_length: u32,
-) -> Result<(Vec<String>, Vec<String>)> {
+) -> Result<(Vec<ArchiveIndexEntry>, Vec<String>)> {
     if requested.is_empty() {
-        return Ok((
-            all_entries.iter().map(|entry| entry.path.clone()).collect(),
-            Vec::new(),
-        ));
+        return Ok((opened.list_index_entries()?, Vec::new()));
     }
 
-    let available = all_entries
-        .iter()
-        .map(|entry| entry.path.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
     let mut resolved = Vec::with_capacity(requested.len());
     let mut missing = Vec::new();
     for path in requested {
-        let normalized = normalize_lookup_file_path(path, max_path_length)?;
-        let normalized =
-            String::from_utf8(normalized).map_err(|_| anyhow!(FormatError::UnsafeArchivePath))?;
-        if available.contains(normalized.as_str()) {
-            resolved.push(normalized);
-        } else {
-            missing.push(path.clone());
+        match opened.lookup_index_entry(path)? {
+            Some(entry) => resolved.push(entry),
+            None => missing.push(path.clone()),
         }
     }
     Ok((resolved, missing))
@@ -1685,6 +1639,16 @@ fn read_volume_inputs(primary: &str, additional: &[String]) -> Result<Vec<Vec<u8
         .collect()
 }
 
+fn open_volume_inputs(primary: &str, additional: &[String]) -> Result<Vec<File>> {
+    let mut paths = Vec::with_capacity(additional.len() + 1);
+    paths.push(primary.to_owned());
+    paths.extend(additional.iter().cloned());
+    paths
+        .into_iter()
+        .map(|path| File::open(&path).with_context(|| format!("failed to read archive {path}")))
+        .collect()
+}
+
 fn reject_multi_volume_bootstrap(volume_count: usize, bootstrap: Option<&str>) -> Result<()> {
     if volume_count > 1 && bootstrap.is_some() {
         return Err(anyhow!(FormatError::ReaderUnsupported(
@@ -1704,22 +1668,25 @@ fn reject_stdout_extract_shape(stdout: bool, path_count: usize) -> Result<()> {
 }
 
 fn open_inputs_maybe_bootstrap(
-    volume_bytes: &[Vec<u8>],
+    volume_files: Vec<File>,
     master_key: &MasterKey,
     bootstrap: Option<&str>,
 ) -> Result<OpenedArchive> {
-    if volume_bytes.len() > 1 {
-        reject_multi_volume_bootstrap(volume_bytes.len(), bootstrap)?;
-        let borrowed = volume_bytes.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        return open_archive_volumes(&borrowed, master_key).map_err(Into::into);
+    if volume_files.len() > 1 {
+        reject_multi_volume_bootstrap(volume_files.len(), bootstrap)?;
+        return open_seekable_archive_volumes(volume_files, master_key).map_err(Into::into);
     }
+    let volume_file = volume_files
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("at least one archive volume is required"))?;
     if let Some(path) = bootstrap {
         let sidecar =
             fs::read(path).with_context(|| format!("failed to read bootstrap sidecar {path}"))?;
-        open_archive_with_bootstrap_sidecar(&volume_bytes[0], &sidecar, master_key)
+        open_seekable_archive_with_bootstrap_sidecar(volume_file, &sidecar, master_key)
             .map_err(Into::into)
     } else {
-        open_archive(&volume_bytes[0], master_key).map_err(Into::into)
+        open_seekable_archive(volume_file, master_key).map_err(Into::into)
     }
 }
 
@@ -2023,16 +1990,16 @@ fn load_open_key(
     keyfile: Option<&str>,
     password_stdin: bool,
     password: bool,
-    first_volume: &[u8],
+    first_volume_path: &str,
 ) -> Result<MasterKey> {
     if password_stdin {
         let passphrase = read_passphrase_stdin()?;
-        let kdf_params = read_kdf_params_from_volume(first_volume)?;
+        let kdf_params = read_kdf_params_from_volume_path(first_volume_path)?;
         return derive_key_from_passphrase(&kdf_params, &passphrase);
     }
     if password {
         let passphrase = read_passphrase_interactive_open()?;
-        let kdf_params = read_kdf_params_from_volume(first_volume)?;
+        let kdf_params = read_kdf_params_from_volume_path(first_volume_path)?;
         return derive_key_from_passphrase(&kdf_params, &passphrase);
     }
     load_raw_master_key(keyfile)
@@ -2185,6 +2152,7 @@ fn read_passphrase_stdin_fallback() -> Result<String> {
     Ok(passphrase)
 }
 
+#[cfg(test)]
 fn read_kdf_params_from_volume(bytes: &[u8]) -> Result<KdfParams> {
     let header_bytes = bytes.get(..VOLUME_HEADER_LEN).ok_or_else(|| {
         anyhow!(FormatError::InvalidArchive(
@@ -2202,6 +2170,30 @@ fn read_kdf_params_from_volume(bytes: &[u8]) -> Result<KdfParams> {
             "volume is too short for CryptoHeader"
         ))
     })?;
+    read_kdf_params_from_headers(header_bytes, crypto_header_bytes)
+}
+
+fn read_kdf_params_from_volume_path(path: &str) -> Result<KdfParams> {
+    let mut file = File::open(path).with_context(|| format!("failed to open archive {path}"))?;
+    let mut header_bytes = vec![0u8; VOLUME_HEADER_LEN];
+    file.read_exact(&mut header_bytes)
+        .with_context(|| format!("failed to read VolumeHeader from {path}"))?;
+    let volume_header = VolumeHeader::parse(&header_bytes)?;
+    let offset = volume_header.crypto_header_offset as u64;
+    let length = volume_header.crypto_header_length as usize;
+    file.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("failed to seek to CryptoHeader in {path}"))?;
+    let mut crypto_header_bytes = vec![0u8; length];
+    file.read_exact(&mut crypto_header_bytes)
+        .with_context(|| format!("failed to read CryptoHeader from {path}"))?;
+    read_kdf_params_from_headers(&header_bytes, &crypto_header_bytes)
+}
+
+fn read_kdf_params_from_headers(
+    header_bytes: &[u8],
+    crypto_header_bytes: &[u8],
+) -> Result<KdfParams> {
+    let volume_header = VolumeHeader::parse(header_bytes)?;
     let fixed_bytes = crypto_header_bytes
         .get(..CRYPTO_HEADER_FIXED_LEN)
         .ok_or_else(|| {

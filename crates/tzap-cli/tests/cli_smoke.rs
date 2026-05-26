@@ -3709,6 +3709,59 @@ fn cli_list_one_file_archive_with_keyfile() {
 }
 
 #[test]
+fn cli_default_list_uses_index_entries_not_payload_metadata() {
+    let temp = tempdir().unwrap();
+    let input = temp.path().join("payload.txt");
+    let archive = temp.path().join("payload.tzap");
+    let keyfile = temp.path().join("key.hex");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let mut bytes = fs::read(&archive).unwrap();
+    corrupt_first_record_of_kind(&mut bytes, BlockKind::PayloadData);
+    fs::write(&archive, bytes).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::eq("payload.txt\n"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--long",
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("corrupt-payload"));
+}
+
+#[test]
 fn cli_list_with_long_output_includes_kind_mode_mtime() {
     let temp = tempdir().unwrap();
     let input = temp.path().join("payload.bin");
@@ -4993,7 +5046,7 @@ fn cli_extract_corrupt_archive_reports_corruption() {
             "--keyfile",
             keyfile.to_str().unwrap(),
             archive.to_str().unwrap(),
-            "payload.txt",
+            "hello.txt",
         ])
         .assert()
         .code(11)

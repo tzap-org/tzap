@@ -22,6 +22,8 @@ tzap-core = "0.1.1"
 - zstd compression and dictionary support
 - multi-volume layout and FEC recovery
 - bootstrap sidecar parsing and verification
+- index-only path and size listing
+- file-backed `ArchiveReadAt` opening for lazy random-access extraction
 - safe extraction and tar metadata normalization
 - RootAuth writer request, footer, and verifier callback surfaces
 
@@ -29,8 +31,9 @@ tzap-core = "0.1.1"
 
 ```rust
 use tzap_core::{
-    open_archive, write_archive, MasterKey, RegularFile, WriterOptions,
+    open_archive, open_seekable_archive, write_archive, MasterKey, RegularFile, WriterOptions,
 };
+use std::fs::File;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = MasterKey::from_raw_key(&[0x42; 32])?;
@@ -43,6 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         opened.extract_file("notes/readme.txt")?,
         Some(b"hello from tzap".to_vec())
     );
+
+    std::fs::write("notes.tzap", &written.bytes)?;
+    let opened_from_file = open_seekable_archive(File::open("notes.tzap")?, &key)?;
+    assert_eq!(opened_from_file.list_index_entries()?.len(), 1);
 
     Ok(())
 }

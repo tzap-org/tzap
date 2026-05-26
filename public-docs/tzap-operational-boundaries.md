@@ -169,6 +169,24 @@ What to do:
 - Store the archive bytes in a file and pass that path to `tzap`.
 - Use `--bootstrap` only with a real single-volume archive path.
 
+## File-backed random access
+
+Key-holding `list`, `extract`, and `verify` open archive paths through the core
+file-backed `ArchiveReadAt` reader. Opening authenticates the fixed headers and
+terminal metadata, then reads index objects through positional reads. It does
+not copy the whole archive into memory before an operation starts.
+
+Operational shape:
+
+- Default `tzap list` reads terminal and encrypted index metadata only.
+- `tzap extract archive.tzap path/in/archive` reads the selected member's index
+  metadata and payload envelopes. Unselected payload envelopes are not read as
+  part of that targeted extraction.
+- `tzap verify` is intentionally a full archive walk: it reads all relevant
+  payload and metadata blocks to validate integrity.
+- Public no-key verification still needs a complete volume set and validates
+  public RootAuth data-block commitments rather than providing keyed extraction.
+
 ## Sequential reader and provisional output
 
 The core reader exposes a whole-buffer helper for dictionary-free
@@ -277,8 +295,8 @@ nanosecond timestamp, or global tar-state restoration. Mode or mtime application
 failures are reported as degraded metadata diagnostics.
 
 Unsupported local metadata is reported as degraded metadata instead of looking
-fully successful. `tzap list`, `tzap verify`, and `tzap extract` write
-diagnostics such as:
+fully successful. `tzap list --long`, `tzap list --json`, `tzap verify`, and
+payload-reading `tzap extract` operations write diagnostics such as:
 
 ```text
 tzap: degraded-metadata: path/in/archive: gnu-sparse: unsupported sparse-file PAX metadata was ignored
@@ -291,9 +309,11 @@ through degraded metadata diagnostics. The global `--quiet` flag suppresses
 success summaries where applicable; it is not a best-effort metadata-warning
 mode.
 
-Library callers that only need bytes may use `extract_file`, which is explicitly
-payload-only. Callers that surface metadata fidelity should use `list_files`,
-`extract_member`, `extract_file_with_diagnostics`, or `extract_file_to`.
+Library callers that only need index paths and payload sizes may use
+`list_index_entries` or `lookup_index_entry`. Library callers that only need
+bytes may use `extract_file`, which is explicitly payload-only. Callers that
+surface metadata fidelity should use `list_files`, `extract_member`,
+`extract_file_with_diagnostics`, or `extract_file_to`.
 
 ## Cloud directory-prefix optimization
 

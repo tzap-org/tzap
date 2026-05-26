@@ -21,9 +21,11 @@ pub use format::{
 };
 pub use reader::{
     open_archive, open_archive_volumes, open_archive_with_bootstrap_sidecar,
-    open_non_seekable_archive, public_no_key_verify_archive_with,
-    public_no_key_verify_volumes_with, sequential_extract_tar_stream, ArchiveEntry, OpenedArchive,
-    PublicNoKeyVerification, ReaderOptions, RootAuthVerification,
+    open_non_seekable_archive, open_seekable_archive, open_seekable_archive_volumes,
+    open_seekable_archive_with_bootstrap_sidecar, public_no_key_verify_archive_with,
+    public_no_key_verify_volumes_with, sequential_extract_tar_stream, ArchiveEntry,
+    ArchiveIndexEntry, ArchiveReadAt, OpenedArchive, PublicNoKeyVerification, ReaderOptions,
+    RootAuthVerification,
 };
 pub use tar_model::{MetadataDiagnostic, SafeExtractionOptions, TarEntryKind};
 pub use writer::{

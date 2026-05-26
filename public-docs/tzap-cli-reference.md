@@ -82,6 +82,10 @@ Useful flags:
 Notes:
 
 - Archive input comes from file paths. `-` is not an archive stdin sentinel.
+- Key-holding extract opens archive files through the core file-backed
+  random-access reader. Selecting one path reads the authenticated terminal,
+  index metadata, and the payload envelopes needed for that path; it does not
+  load the whole archive into memory first.
 - `--stdout` writes one selected regular-file member after the archive has been
   opened and authenticated from file paths; it is not live non-seekable archive
   streaming.
@@ -115,6 +119,12 @@ Useful flags:
 Notes:
 
 - Archive input comes from file paths. `-` is not an archive stdin sentinel.
+- Default `list` output reads encrypted index entries and prints archive paths.
+  It does not decode payload envelopes for tar kind, mode, mtime, or metadata
+  diagnostics.
+- Key-holding list opens archive files through the core file-backed
+  random-access reader. Default output reads terminal and index metadata rather
+  than loading every payload block.
 - `--bootstrap` is for single-volume open paths. Multi-volume open paths should
   pass volume files and omit the sidecar; combining multiple archive inputs
   with `--bootstrap` rejects before reading archive files with
@@ -149,6 +159,9 @@ Notes:
 - Key-holding verification uses `--keyfile`, `--password`, or
   `--password-stdin`. Add `--trusted-public-key` to require RootAuth content
   verification after ordinary archive integrity verification.
+- Key-holding verification opens archive files through the core file-backed
+  random-access reader, then intentionally walks the payload and metadata needed
+  to validate the full archive.
 - Public no-key verification requires `--public-no-key --trusted-public-key`.
   It does not use archive key material or bootstrap sidecars, and reports the
   public v41 diagnostics `public_data_block_commitment_verified`,
