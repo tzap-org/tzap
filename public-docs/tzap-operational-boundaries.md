@@ -290,22 +290,30 @@ tzap create --keyfile project.key -o - ./project
 
 ## Streaming create stdin modes
 
-The CLI reserves the future streaming-create shapes now:
+The CLI supports single-volume tar stdin create:
 
 ```sh
 tar cf - ./project | tzap create --tar-stdin --keyfile project.key -o project.tzap -
+```
+
+Use a file-backed archive path with `-o`; `-o -` is not archive stdout. The
+file-backed path is also much faster for later selected-file workflows because
+seekable readers can use random access.
+
+The CLI reserves the raw stdin create shapes for future support:
+
+```sh
 producer | tzap create --raw-stdin --stdin-name data/export.bin --keyfile project.key -o export.tzap -
 cat disk.img | tzap create --raw-stdin --stdin-name disk.img --stdin-size 8G --volumes 4 --keyfile project.key -o disk.tzap -
 producer | tzap create --raw-stdin --stdin-name data/export.bin --spool-stdin --volumes 4 --keyfile project.key -o export.tzap -
 ```
 
-Until CLI streaming-create integration lands, those accepted-looking shapes exit
-with `16 unsupported-feature`.
+Those accepted-looking raw stdin shapes exit with `16 unsupported-feature`.
 
 The following combinations are rejected before stdin payload bytes, keyfiles,
 dictionaries, or ordinary input paths are read:
 
-- `--password-stdin` with `--tar-stdin` or `--raw-stdin`
+- `--password` or `--password-stdin` with `--tar-stdin` or `--raw-stdin`
 - `--dictionary` with `--tar-stdin` or `--raw-stdin`
 - `--volume-size` with stdin create modes
 - ordinary input paths mixed with stdin create modes; use exactly one input

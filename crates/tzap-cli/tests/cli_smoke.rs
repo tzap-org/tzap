@@ -50,6 +50,58 @@ fn numbered_volume_path(output_base: &Path, index: usize) -> PathBuf {
     ))
 }
 
+fn tar_stream(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (path, data) in entries {
+        out.extend_from_slice(&tar_header(path.as_bytes(), b'0', data.len() as u64));
+        out.extend_from_slice(data);
+        out.resize(out.len() + padding_to_512(data.len()), 0);
+    }
+    out.extend_from_slice(&[0u8; 1024]);
+    out
+}
+
+fn tar_header(path: &[u8], kind: u8, size: u64) -> [u8; 512] {
+    let mut header = [0u8; 512];
+    header[..path.len()].copy_from_slice(path);
+    write_tar_octal(&mut header[100..108], 0o644);
+    write_tar_octal(&mut header[108..116], 0);
+    write_tar_octal(&mut header[116..124], 0);
+    write_tar_octal(&mut header[124..136], size);
+    write_tar_octal(&mut header[136..148], 0);
+    header[148..156].fill(b' ');
+    header[156] = kind;
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    let checksum = header.iter().map(|byte| *byte as u64).sum::<u64>();
+    write_tar_checksum(&mut header[148..156], checksum);
+    header
+}
+
+fn write_tar_octal(field: &mut [u8], value: u64) {
+    let digits = format!("{value:o}");
+    field.fill(0);
+    let start = field.len() - 1 - digits.len();
+    field[..start].fill(b'0');
+    field[start..start + digits.len()].copy_from_slice(digits.as_bytes());
+}
+
+fn write_tar_checksum(field: &mut [u8], value: u64) {
+    let digits = format!("{value:06o}");
+    field[0..6].copy_from_slice(digits.as_bytes());
+    field[6] = 0;
+    field[7] = b' ';
+}
+
+fn padding_to_512(len: usize) -> usize {
+    let remainder = len % 512;
+    if remainder == 0 {
+        0
+    } else {
+        512 - remainder
+    }
+}
+
 fn payload_data_record_locations(volume_index: usize, volume: &[u8]) -> Vec<PayloadRecordLocation> {
     let volume_header = VolumeHeader::parse(&volume[..VOLUME_HEADER_LEN]).unwrap();
     let crypto_start = volume_header.crypto_header_offset as usize;
@@ -309,7 +361,7 @@ fn cli_create_help_includes_examples_and_flags() {
     assert!(stdout.contains("--block-size <SIZE>"));
     assert!(stdout.contains("--force"));
     assert!(stdout.contains("--dry-run"));
-    assert!(!stdout.contains("tar cf -"));
+    assert!(stdout.contains("tar cf -"));
     assert!(!stdout.contains("producer | tzap create --raw-stdin"));
 }
 
@@ -541,6 +593,23 @@ fn cli_create_stdin_modes_reject_incompatible_stdin_consumers() {
         .stderr(predicate::str::contains(
             "--password-stdin cannot be used when stdin carries archive payload bytes",
         ));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--tar-stdin",
+            "--password",
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(tar_stream(&[("payload.txt", b"payload".as_slice())]))
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains(
+            "--password cannot be used when stdin carries archive payload bytes",
+        ));
 }
 
 #[test]
@@ -592,6 +661,25 @@ fn cli_create_stdin_modes_reject_volume_size_and_stdout_output() {
         .code(16)
         .stderr(predicate::str::contains(
             "--volume-size is not supported with stdin create modes",
+        ));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--tar-stdin",
+            "--volumes",
+            "2",
+            "--keyfile",
+            "missing-key.hex",
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains(
+            "--volumes > 1 is not supported with stdin create modes",
         ));
 
     Command::cargo_bin("tzap")
@@ -766,12 +854,166 @@ fn cli_create_raw_stdin_spool_rejects_known_size() {
 }
 
 #[test]
-fn cli_create_stdin_modes_accept_shape_but_return_core_blocker() {
+fn cli_create_tar_stdin_round_trips_list_verify_and_extract() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let output = temp.path().join("stdin.tzap");
+    let extract_dir = temp.path().join("extract");
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--tar-stdin",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(tar_stream(&[
+            ("alpha.txt", b"alpha payload".as_slice()),
+            ("dir/beta.txt", b"beta payload".as_slice()),
+        ]))
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("created 2 file(s)"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alpha.txt"))
+        .stdout(predicate::str::contains("dir/beta.txt"));
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(extract_dir.join("dir/beta.txt")).unwrap(),
+        b"beta payload"
+    );
+}
+
+#[test]
+fn cli_create_tar_stdin_signed_archive_verifies_public_root_auth() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let signing_secret = temp.path().join("root.signing.hex");
+    let signing_public = temp.path().join("root.public.hex");
+    let output = temp.path().join("signed-stdin.tzap");
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "signing-keygen",
+            "--secret-output",
+            signing_secret.to_str().unwrap(),
+            "--public-output",
+            signing_public.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--tar-stdin",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--signing-key",
+            signing_secret.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(tar_stream(&[("signed.txt", b"signed payload".as_slice())]))
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("root auth: ed25519 signed"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--public-no-key",
+            "--trusted-public-key",
+            signing_public.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "public_data_block_commitment_verified",
+        ));
+}
+
+#[test]
+fn cli_create_tar_stdin_late_reject_removes_output_path() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let output = temp.path().join("late-error.tzap");
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    let mut input = tar_stream(&[("ok.txt", b"ok".as_slice())]);
+    input.truncate(input.len() - 1024);
+    input.extend_from_slice(&tar_header(b"link", b'2', 0));
+    input.extend_from_slice(&[0u8; 1024]);
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--tar-stdin",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(input)
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains(
+            "streaming tar stdin supports regular files and directory entries only",
+        ));
+
+    assert!(!output.exists());
+}
+
+#[test]
+fn cli_create_raw_stdin_modes_accept_shape_but_return_core_blocker() {
     let temp = tempdir().unwrap();
     let output = temp.path().join("stdin.tzap");
 
     for args in [
-        vec!["--tar-stdin"],
         vec!["--raw-stdin", "--stdin-name", "data.bin"],
         vec![
             "--raw-stdin",
@@ -779,17 +1021,8 @@ fn cli_create_stdin_modes_accept_shape_but_return_core_blocker() {
             "data.bin",
             "--stdin-size",
             "4K",
-            "--volumes",
-            "2",
         ],
-        vec![
-            "--raw-stdin",
-            "--stdin-name",
-            "data.bin",
-            "--spool-stdin",
-            "--volumes",
-            "2",
-        ],
+        vec!["--raw-stdin", "--stdin-name", "data.bin", "--spool-stdin"],
     ] {
         let mut command_args = vec!["create"];
         command_args.extend(args);
@@ -807,7 +1040,7 @@ fn cli_create_stdin_modes_accept_shape_but_return_core_blocker() {
             .assert()
             .code(16)
             .stderr(predicate::str::contains(
-                "streaming create from stdin is not implemented",
+                "raw stdin streaming create is not implemented",
             ));
     }
 }

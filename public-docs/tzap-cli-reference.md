@@ -30,8 +30,10 @@ tzap create --keyfile project.key --signing-cert signer.pem --signing-private-ke
 # Multi-volume recovery settings
 tzap create --keyfile project.key --volumes 3 --volume-loss-tolerance 1 -o backup.tzap ./project
 
-# Future streaming-create shapes; currently reject with unsupported-feature
+# Single-volume tar stream from stdin
 tar cf - ./project | tzap create --tar-stdin --keyfile project.key -o project.tzap -
+
+# Future raw stdin shapes; currently reject with unsupported-feature
 producer | tzap create --raw-stdin --stdin-name data/export.bin --keyfile project.key -o export.tzap -
 ```
 
@@ -49,7 +51,7 @@ Useful flags:
 - `--signing-private-key`: private key for `--signing-cert`
 - `--signing-chain`: optional PEM or DER intermediate certificate chain
 - `--bootstrap-out`: sidecar output path for single-volume archives only
-- `--tar-stdin`: future create mode where input path `-` is a tar stream
+- `--tar-stdin`: create a single-volume archive from a tar stream at input path `-`
 - `--raw-stdin`: future create mode where input path `-` is one raw member
 - `--stdin-name`: archive member path for `--raw-stdin`
 - `--stdin-size`: known byte size for raw stdin
@@ -64,13 +66,19 @@ Notes:
   `unsupported-feature`.
 - Create writes archive files to explicit paths. `-o -` is not archive stdout;
   the current CLI rejects that sentinel with `unsupported-feature`.
-- Streaming-create flags are present for future tar/raw stdin support, but the
-  current CLI public surface still returns `unsupported-feature` for
-  accepted-looking stdin create shapes. Incompatible combinations reject before
-  stdin, keyfiles, dictionaries, or ordinary input paths are read.
+- `--tar-stdin` requires exactly one input path, `-`, and writes to a
+  file-backed archive path. `-o -` is not supported; using a normal output file
+  is also much faster for later selected-file workflows because readers can use
+  random access.
+- `--tar-stdin` rejects `--password`, `--password-stdin`, `--dictionary`,
+  `--volumes > 1`, and `--volume-size` before reading payload stdin.
+- Raw stdin create flags are present for future support, but the current CLI
+  public surface still returns `unsupported-feature` for accepted-looking raw
+  stdin create shapes.
 - The convenience core writer APIs return completed in-memory archive artifacts.
-  A lower-level core append-only sink API exists for re-openable sources, but no
-  append-only sink or multipart-upload create mode is exposed by the CLI.
+  The `--tar-stdin` CLI path uses the core sink writer and publishes the output
+  file only after terminal metadata and optional RootAuth signing finish.
+- No append-only sink or multipart-upload create mode is exposed by the CLI.
 - Create emits regular-file tar member groups only. Long or non-ASCII archive
   paths use local path-specific PAX metadata; global PAX/GNU state and tar EOF
   zero blocks are not emitted into the encrypted tar stream.

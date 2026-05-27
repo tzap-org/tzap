@@ -26,9 +26,10 @@ use tzap_core::{
     write_archive, write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
     write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
     write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
+    write_tar_stream_archive_to_sink_with_kdf_and_root_auth, ArchiveWriteError, ArchiveWriteSink,
     ExtractError, KdfParams, MasterKey, MetadataDiagnostic, NonSeekableReaderOptions,
     OpenedArchive, RegularFile, RootAuthSigningRequest, RootAuthVerification, RootAuthWriterConfig,
-    SafeExtractionOptions, TarEntryKind, WriterOptions,
+    SafeExtractionOptions, StreamingTarWriterSummary, TarEntryKind, WriterOptions,
 };
 use tzap_plugin_signing::ed25519_raw::{
     self, Ed25519RootAuthOutcome, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
@@ -79,7 +80,7 @@ enum Command {
     #[command(
         about = "Create a new archive",
         long_about = "Create a new archive from files and directories.\n\nThe command writes one output path for single-volume archives, or a base path plus `.000`, `.001`, ... suffixes for multi-volume archives.",
-        after_help = "Examples:\n  tzap create --keyfile key.hex -o backup.tzap file.txt\n  tzap create --password -o backup.tzap file.txt\n  tzap create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8192 -o backup.tzap file.txt\n  tzap create --keyfile key.hex --signing-key root.signing.hex -o backup.tzap file.txt\n  tzap create --keyfile key.hex --signing-cert signer.pem --signing-private-key signer.key -o backup.tzap file.txt\n  tzap create --keyfile key.hex -o backup.tzap --volumes 3 dir/\n  tzap create --keyfile key.hex --volume-size 64M --volume-loss-tolerance 1 -o backup.tzap dir/\n  tzap create --keyfile key.hex --bootstrap-out backup.tzap.bootstrap file.txt",
+        after_help = "Examples:\n  tzap create --keyfile key.hex -o backup.tzap file.txt\n  tzap create --password -o backup.tzap file.txt\n  tzap create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8192 -o backup.tzap file.txt\n  tar cf - ./dir | tzap create --tar-stdin --keyfile key.hex -o backup.tzap -\n  tzap create --keyfile key.hex --signing-key root.signing.hex -o backup.tzap file.txt\n  tzap create --keyfile key.hex --signing-cert signer.pem --signing-private-key signer.key -o backup.tzap file.txt\n  tzap create --keyfile key.hex -o backup.tzap --volumes 3 dir/\n  tzap create --keyfile key.hex --volume-size 64M --volume-loss-tolerance 1 -o backup.tzap dir/\n  tzap create --keyfile key.hex --bootstrap-out backup.tzap.bootstrap file.txt",
         group(
             ArgGroup::new("create-key-source")
                 .required(true)
@@ -231,13 +232,13 @@ enum Command {
 
         #[arg(
             long = "tar-stdin",
-            help = "Treat PATH '-' as a tar stream read from stdin (streaming writer pending)."
+            help = "Treat PATH '-' as a tar stream read from stdin."
         )]
         tar_stdin: bool,
 
         #[arg(
             long = "raw-stdin",
-            help = "Treat PATH '-' as one raw stdin member named by --stdin-name (streaming writer pending)."
+            help = "Treat PATH '-' as one raw stdin member named by --stdin-name (future streaming writer)."
         )]
         raw_stdin: bool,
 
@@ -673,15 +674,11 @@ fn run(cli: Cli) -> Result<()> {
                 spool_stdin,
                 paths: &paths,
                 password_stdin,
+                password,
                 has_dictionary: dictionary.is_some(),
+                volumes,
                 volume_size: volume_size.as_deref(),
             })?;
-            if stdin_mode.is_some() {
-                return Err(FormatError::WriterUnsupported(
-                    "streaming create from stdin is not implemented in this CLI/core version",
-                )
-                .into());
-            }
 
             ensure_create_output_paths_can_be_written(
                 &output,
@@ -691,6 +688,99 @@ fn run(cli: Cli) -> Result<()> {
                 force,
             )?;
             validate_create_writer_options(&options)?;
+            if let Some(stdin_mode) = stdin_mode {
+                if dry_run {
+                    eprintln!("create dry-run summary:");
+                    eprintln!("  files: streaming stdin");
+                    eprintln!("  input bytes: unknown until stdin is consumed");
+                    eprintln!(
+                        "  key mode: {}",
+                        create_key_mode_label(keyfile.as_deref(), password_stdin, password)
+                    );
+                    eprintln!(
+                        "  root auth: {}",
+                        create_root_auth_mode_label(
+                            signing_key.as_deref(),
+                            signing_cert.as_deref()
+                        )
+                    );
+                    eprintln!(
+                        "  volume mode: {}",
+                        describe_planned_volume_mode(volumes, volume_size.as_deref())
+                    );
+                    eprintln!("  planned archive paths:");
+                    for path in create_dry_run_output_paths(&output, volumes, volume_size.is_some())
+                    {
+                        eprintln!("    {path}");
+                    }
+                    if let Some(bootstrap_path) = bootstrap_out.as_ref() {
+                        eprintln!("  bootstrap: {}", bootstrap_path);
+                    }
+                    return Ok(());
+                }
+
+                if !matches!(stdin_mode, CreateStdinMode::Tar) {
+                    return Err(FormatError::WriterUnsupported(
+                        "raw stdin streaming create is not implemented in this CLI/core version",
+                    )
+                    .into());
+                }
+
+                let key = load_create_key(
+                    keyfile.as_deref(),
+                    password_stdin,
+                    password,
+                    argon2_t_cost,
+                    argon2_m_cost_kib,
+                    argon2_parallelism,
+                )?;
+                let root_auth_profile = load_create_root_auth_profile(
+                    signing_key.as_deref(),
+                    signing_cert.as_deref(),
+                    signing_private_key.as_deref(),
+                    &signing_chain,
+                )?;
+                let root_auth = root_auth_profile
+                    .as_ref()
+                    .map(CreateRootAuthProfile::root_auth_writer_config)
+                    .transpose()?;
+                let (summary, bootstrap_sidecar) = write_tar_stdin_archive_output(
+                    &output,
+                    &key,
+                    options,
+                    root_auth,
+                    root_auth_profile.as_ref(),
+                )?;
+                if let Some(path) = bootstrap_out.as_deref() {
+                    if bootstrap_sidecar.is_empty() {
+                        return Err(FormatError::WriterUnsupported(
+                            "bootstrap output is unavailable for this archive shape",
+                        )
+                        .into());
+                    }
+                    write_bootstrap_output(path, &bootstrap_sidecar, force)?;
+                }
+                let summary_text = format!(
+                    "created {} file(s), {} tar bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
+                    summary.input_member_count,
+                    summary.input_tar_bytes,
+                    summary.archive.archive_bytes,
+                    summary.archive.volume_count,
+                    volume_loss_tolerance,
+                    bit_rot_buffer_pct
+                );
+                emit_success_summary(quiet, &summary_text)?;
+                if let Some(profile) = root_auth_profile.as_ref() {
+                    emit_success_summary(
+                        quiet,
+                        &format!("  root auth: {} signed", profile.label()),
+                    )?;
+                }
+                if let Some(path) = bootstrap_out.as_ref() {
+                    emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
+                }
+                return Ok(());
+            }
             let input_specs = collect_input_specs(&paths)?;
             let bootstrap_output = bootstrap_out.clone();
 
@@ -1613,7 +1703,9 @@ struct CreateStdinArgs<'a> {
     spool_stdin: bool,
     paths: &'a [String],
     password_stdin: bool,
+    password: bool,
     has_dictionary: bool,
+    volumes: Option<u32>,
     volume_size: Option<&'a str>,
 }
 
@@ -1773,6 +1865,131 @@ fn write_archive_outputs(output: &str, volumes: &[Vec<u8>]) -> Result<()> {
     Ok(())
 }
 
+struct SingleVolumeFileSink<'a> {
+    file: &'a mut File,
+    bootstrap_sidecar: Vec<u8>,
+}
+
+impl ArchiveWriteSink for SingleVolumeFileSink<'_> {
+    fn begin_archive(&mut self, volume_count: usize) -> std::result::Result<(), ArchiveWriteError> {
+        if volume_count != 1 {
+            return Err(
+                FormatError::WriterUnsupported("tar stdin create is single-volume only").into(),
+            );
+        }
+        self.file.set_len(0).map_err(ArchiveWriteError::Io)?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(ArchiveWriteError::Io)?;
+        self.bootstrap_sidecar.clear();
+        Ok(())
+    }
+
+    fn write_volume(
+        &mut self,
+        volume_index: usize,
+        bytes: &[u8],
+    ) -> std::result::Result<(), ArchiveWriteError> {
+        if volume_index != 0 {
+            return Err(FormatError::WriterInvariant(
+                "tar stdin file sink received a non-zero volume",
+            )
+            .into());
+        }
+        self.file.write_all(bytes).map_err(ArchiveWriteError::Io)
+    }
+
+    fn write_bootstrap_sidecar(
+        &mut self,
+        bytes: &[u8],
+    ) -> std::result::Result<(), ArchiveWriteError> {
+        self.bootstrap_sidecar.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+fn write_tar_stdin_archive_output(
+    output: &str,
+    key: &CreateKey,
+    options: WriterOptions,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    root_auth_profile: Option<&CreateRootAuthProfile>,
+) -> Result<(StreamingTarWriterSummary, Vec<u8>)> {
+    let stdin = io::stdin();
+    let mut stdin_lock = stdin.lock();
+    if let (Some(profile), Some(root_auth)) = (root_auth_profile, root_auth) {
+        let mut authenticator =
+            |request: &RootAuthSigningRequest| root_auth_authenticator_value(profile, request);
+        return write_tar_stdin_archive_output_from_reader(
+            output,
+            &mut stdin_lock,
+            key,
+            options,
+            Some(root_auth),
+            Some(&mut authenticator),
+        );
+    }
+    write_tar_stdin_archive_output_from_reader(output, &mut stdin_lock, key, options, None, None)
+}
+
+fn write_tar_stdin_archive_output_from_reader<R: Read>(
+    output: &str,
+    reader: &mut R,
+    key: &CreateKey,
+    options: WriterOptions,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
+) -> Result<(StreamingTarWriterSummary, Vec<u8>)> {
+    let output_path = Path::new(output);
+    let parent = output_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .prefix(".tzap-create-")
+        .suffix(".partial")
+        .tempfile_in(parent)
+        .with_context(|| {
+            format!(
+                "failed to create temporary archive output in {}",
+                parent.display()
+            )
+        })?;
+    let (summary, bootstrap_sidecar) = {
+        let mut sink = SingleVolumeFileSink {
+            file: temp.as_file_mut(),
+            bootstrap_sidecar: Vec::new(),
+        };
+        let summary = write_tar_stream_archive_to_sink_with_kdf_and_root_auth(
+            reader,
+            &key.master_key,
+            options,
+            &key.kdf_params,
+            root_auth,
+            authenticator,
+            &mut sink,
+        )?;
+        (summary, sink.bootstrap_sidecar)
+    };
+    temp.as_file_mut()
+        .flush()
+        .with_context(|| format!("failed to flush temporary archive for {output}"))?;
+    temp.as_file_mut()
+        .sync_all()
+        .with_context(|| format!("failed to sync temporary archive for {output}"))?;
+    temp.persist(output_path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to publish archive {output}"))?;
+    Ok((summary, bootstrap_sidecar))
+}
+
+fn write_bootstrap_output(path: &str, bytes: &[u8], force: bool) -> Result<()> {
+    if !force {
+        check_output_path_free("bootstrap output", Path::new(path))?;
+    }
+    fs::write(path, bytes).with_context(|| format!("failed to write bootstrap sidecar {path}"))
+}
+
 fn reject_create_stdout_sentinels(output: &str, bootstrap_out: Option<&str>) -> Result<()> {
     if output == "-" {
         return Err(anyhow!(FormatError::WriterUnsupported(
@@ -1833,9 +2050,19 @@ fn validate_create_stdin_mode(args: CreateStdinArgs<'_>) -> Result<Option<Create
             "--password-stdin cannot be used when stdin carries archive payload bytes",
         )));
     }
+    if args.password {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--password cannot be used when stdin carries archive payload bytes",
+        )));
+    }
     if args.has_dictionary {
         return Err(anyhow!(FormatError::WriterUnsupported(
             "--dictionary is not supported with stdin create modes",
+        )));
+    }
+    if matches!(args.volumes, Some(volumes) if volumes > 1) {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--volumes > 1 is not supported with stdin create modes",
         )));
     }
     if args.volume_size.is_some() {
@@ -3095,30 +3322,40 @@ fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 action: "check command arguments",
             };
         }
+        if let Some(write_error) = cause.downcast_ref::<ArchiveWriteError>() {
+            return match write_error {
+                ArchiveWriteError::Format(format) => classify_format_error(format),
+                ArchiveWriteError::Io(io_error) => classify_io_error(io_error),
+            };
+        }
         if let Some(format) = cause.downcast_ref::<FormatError>() {
             return classify_format_error(format);
         }
         if let Some(io_error) = cause.downcast_ref::<io::Error>() {
-            return match io_error.kind() {
-                io::ErrorKind::PermissionDenied
-                | io::ErrorKind::NotFound
-                | io::ErrorKind::AlreadyExists => Diagnostic {
-                    label: "io-error",
-                    exit_code: EXIT_IO,
-                    action: "check file paths and permissions",
-                },
-                _ => Diagnostic {
-                    label: "io-error",
-                    exit_code: EXIT_IO,
-                    action: "check filesystem state",
-                },
-            };
+            return classify_io_error(io_error);
         }
     }
     Diagnostic {
         label: "error",
         exit_code: EXIT_GENERIC,
         action: "",
+    }
+}
+
+fn classify_io_error(err: &io::Error) -> Diagnostic {
+    match err.kind() {
+        io::ErrorKind::PermissionDenied
+        | io::ErrorKind::NotFound
+        | io::ErrorKind::AlreadyExists => Diagnostic {
+            label: "io-error",
+            exit_code: EXIT_IO,
+            action: "check file paths and permissions",
+        },
+        _ => Diagnostic {
+            label: "io-error",
+            exit_code: EXIT_IO,
+            action: "check filesystem state",
+        },
     }
 }
 
@@ -3259,10 +3496,102 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
 mod tests {
     use super::*;
 
+    use std::io::Cursor;
+
     use tzap_core::format::MASTER_KEY_LEN;
 
     fn test_master_key() -> MasterKey {
         MasterKey::from_raw_key(&[0x42; MASTER_KEY_LEN]).unwrap()
+    }
+
+    fn test_tar_stream(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (path, data) in entries {
+            out.extend_from_slice(&test_tar_header(path.as_bytes(), b'0', data.len() as u64));
+            out.extend_from_slice(data);
+            out.resize(out.len() + test_tar_padding(data.len()), 0);
+        }
+        out.extend_from_slice(&[0u8; 1024]);
+        out
+    }
+
+    fn test_tar_header(path: &[u8], kind: u8, size: u64) -> [u8; 512] {
+        let mut header = [0u8; 512];
+        header[..path.len()].copy_from_slice(path);
+        test_tar_octal(&mut header[100..108], 0o644);
+        test_tar_octal(&mut header[108..116], 0);
+        test_tar_octal(&mut header[116..124], 0);
+        test_tar_octal(&mut header[124..136], size);
+        test_tar_octal(&mut header[136..148], 0);
+        header[148..156].fill(b' ');
+        header[156] = kind;
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let checksum = header.iter().map(|byte| *byte as u64).sum::<u64>();
+        test_tar_checksum(&mut header[148..156], checksum);
+        header
+    }
+
+    fn test_tar_octal(field: &mut [u8], value: u64) {
+        let digits = format!("{value:o}");
+        field.fill(0);
+        let start = field.len() - 1 - digits.len();
+        field[..start].fill(b'0');
+        field[start..start + digits.len()].copy_from_slice(digits.as_bytes());
+    }
+
+    fn test_tar_checksum(field: &mut [u8], value: u64) {
+        let digits = format!("{value:06o}");
+        field[0..6].copy_from_slice(digits.as_bytes());
+        field[6] = 0;
+        field[7] = b' ';
+    }
+
+    fn test_tar_padding(len: usize) -> usize {
+        let remainder = len % 512;
+        if remainder == 0 {
+            0
+        } else {
+            512 - remainder
+        }
+    }
+
+    #[test]
+    fn tar_stdin_signer_failure_removes_temporary_archive_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("failed.tzap");
+        let key = CreateKey {
+            master_key: test_master_key(),
+            kdf_params: KdfParams::Raw,
+        };
+        let root_auth = RootAuthWriterConfig {
+            authenticator_id: 0x9001,
+            signer_identity_type: 0x9002,
+            signer_identity: b"test signer",
+            authenticator_value_length: 64,
+        };
+        let mut authenticator = |_request: &RootAuthSigningRequest| {
+            Err(FormatError::WriterUnsupported("test signer failed"))
+        };
+        let mut input = Cursor::new(test_tar_stream(&[("signed.txt", b"signed")]));
+
+        let error = write_tar_stdin_archive_output_from_reader(
+            output.to_str().unwrap(),
+            &mut input,
+            &key,
+            WriterOptions {
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+            Some(root_auth),
+            Some(&mut authenticator),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("test signer failed"));
+        assert!(!output.exists());
     }
 
     #[test]

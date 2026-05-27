@@ -20,7 +20,6 @@ pub mod writer;
 mod raw_stream_profile;
 #[allow(dead_code)]
 mod streaming_volume_distributor;
-#[allow(dead_code)]
 mod streaming_writer;
 
 pub use crypto::{HmacDomain, KdfParams, MasterKey, Subkeys};
@@ -42,6 +41,10 @@ pub use reader::{
     public_no_key_verify_volumes_with, sequential_extract_tar_stream, ArchiveEntry,
     ArchiveIndexEntry, ArchiveReadAt, OpenedArchive, PublicNoKeyVerification, ReaderOptions,
     RootAuthVerification,
+};
+pub use streaming_writer::{
+    write_tar_stream_archive, write_tar_stream_archive_to_sink,
+    write_tar_stream_archive_to_sink_with_kdf_and_root_auth, StreamingTarWriterSummary,
 };
 pub use tar_model::{MetadataDiagnostic, SafeExtractionOptions, TarEntryKind};
 pub use writer::{
