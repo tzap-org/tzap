@@ -129,6 +129,12 @@ tzap create \
   ./project
 
 tzap create \
+  --insecure-zero-key \
+  --signing-key root.signing.hex \
+  -o public.tzap \
+  ./project
+
+tzap create \
   --keyfile project.key \
   --signing-cert signer.pem \
   --signing-private-key signer.key \
@@ -154,8 +160,8 @@ tzap verify \
 
 Operational shape:
 
-- `--signing-key` may be combined with raw-key, passphrase, dictionary, and
-  normal volume options.
+- `--signing-key` may be combined with raw-key, passphrase,
+  `--insecure-zero-key`, dictionary, and normal volume options.
 - `--signing-cert` uses the leaf certificate as signer identity and stores the
   RootAuth signature plus optional `--signing-chain` intermediates in the
   authenticator value.
@@ -168,7 +174,7 @@ Operational shape:
   signer-claimed signing time.
 - Public no-key verification is requested with
   `--public-no-key --trusted-public-key`. It does not use `--keyfile`,
-  `--password`, `--password-stdin`, or `--bootstrap`.
+  `--password`, `--password-stdin`, `--insecure-zero-key`, or `--bootstrap`.
 - X.509 RootAuth signing time is a signer-claimed timestamp embedded in the
   authenticator and used for certificate validity checks. It is not a trusted
   timestamp token, transparency log proof, notarization receipt, or revocation
@@ -178,13 +184,51 @@ Operational shape:
   `public_physical_completeness_unverified`, and
   `public_recovery_margin_unchecked`.
 
+## Explicit no-secret convenience archives
+
+`--insecure-zero-key` is an explicit no-secret mode for workflows that want a
+convenience archive without managing archive key material. It uses raw-key mode
+with a 32-byte all-zero master key, stores `KdfParams::Raw`, and does not run
+Argon2.
+
+Example:
+
+```text
+tzap create \
+  --insecure-zero-key \
+  --signing-key root.signing.hex \
+  -o public.tzap \
+  ./project
+
+tzap verify \
+  --insecure-zero-key \
+  --trusted-public-key root.public.hex \
+  public.tzap
+
+tzap verify \
+  --public-no-key \
+  --trusted-public-key root.public.hex \
+  public.tzap
+```
+
+Operational shape:
+
+- `--insecure-zero-key` provides no confidentiality. Anyone can reconstruct the
+  archive key.
+- RootAuth signing can still authenticate archive integrity and signer
+  provenance for zero-key archives.
+- Readers must pass `--insecure-zero-key` explicitly on `list`, `extract`, and
+  key-holding `verify`; there is no silent no-key fallback.
+- `--public-no-key` remains separate and rejects `--insecure-zero-key` because
+  it verifies public RootAuth commitments without opening archive contents.
+
 ## Archive stdin and file paths
 
 For `verify`, `list`, and extract-all, `-` is archive stdin for the live
-non-seekable profile: single-volume archive streams with a raw `--keyfile`.
-Dictionary-compressed streams require a matching `--bootstrap` sidecar.
-`--password-stdin` reads passphrases for file-backed archives; it cannot share
-stdin with archive bytes.
+non-seekable profile: single-volume archive streams with a raw `--keyfile` or
+`--insecure-zero-key`. Dictionary-compressed streams require a matching
+`--bootstrap` sidecar. `--password-stdin` reads passphrases for file-backed
+archives; it cannot share stdin with archive bytes.
 
 Example:
 
@@ -192,6 +236,7 @@ Example:
 cat archive.tzap | tzap verify --keyfile project.key -
 cat archive.tzap | tzap list --keyfile project.key -
 cat archive.tzap | tzap extract --keyfile project.key -C restored -
+cat public.tzap | tzap verify --insecure-zero-key -
 cat dictionary.tzap | tzap verify --keyfile project.key --bootstrap dictionary.tzap.bootstrap -
 ```
 
@@ -265,8 +310,8 @@ tzap verify --keyfile project.key -
 What to do:
 
 - Use `tzap verify --keyfile project.key -`, `tzap list --keyfile project.key
-  -`, or `tzap extract --keyfile project.key -C restored -` for live
-  single-volume archive streams.
+  -`, `tzap extract --keyfile project.key -C restored -`, or the same commands
+  with `--insecure-zero-key` for live single-volume archive streams.
 - Provide `--bootstrap <path>` for dictionary-compressed archive streams.
 - Store archive bytes in files when you need selected-path extraction,
   `--stdout`, passphrase KDF discovery, public no-key verification,

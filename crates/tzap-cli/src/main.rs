@@ -59,13 +59,14 @@ const DEFAULT_ARGON2_T_COST: u32 = 3;
 const DEFAULT_ARGON2_M_COST_KIB: u32 = 262_144;
 const DEFAULT_ARGON2_PARALLELISM: u32 = 4;
 const DEFAULT_ARGON2_SALT_LEN: usize = 16;
+const INSECURE_ZERO_KEY: [u8; 32] = [0; 32];
 
 #[derive(Debug, Parser)]
 #[command(name = "tzap")]
 #[command(version)]
 #[command(about = "Create, list, verify, and extract v41 archives")]
 #[command(
-    long_about = "Create, list, verify, and extract v41 archives.\n\nUsage is centered on an explicit key source per command: either `--keyfile` for raw-key archives, `--password` for interactive prompt, or `--password-stdin` for scripted passphrase input. The `verify --public-no-key` mode verifies signed public RootAuth commitments without the archive key.\n\nSize suffixes accepted by size flags:\n  0-9 (bytes), K/KB/KiB, M/MB/MiB, G/GB/GiB.\n\nMulti-volume output naming for this CLI:\n  - one volume: --output writes exactly that path\n  - multiple volumes: --output writes --output.000, --output.001, ...\n\nExit codes:\n  2  usage / argument error\n  3  I/O failure (missing file, permission denied, etc.)\n  10 wrong key\n  11 archive corruption or integrity mismatch\n  12 unsupported archive revision / format version\n  13 unsafe extraction attempt\n  14 missing required bootstrap metadata\n  16 unsupported feature in this CLI/core version\n  1  generic failure\n\nSubcommands:\n  create   Build a new archive\n  extract  Extract files from an archive\n  list     List archive contents\n  verify   Validate archive integrity\n  keygen   Generate a random raw keyfile\n  signing-keygen Generate an Ed25519 RootAuth signing keypair"
+    long_about = "Create, list, verify, and extract v41 archives.\n\nUsage is centered on an explicit key source per command: either `--keyfile` for raw-key archives, `--password` for interactive prompt, `--password-stdin` for scripted passphrase input, or `--insecure-zero-key` for explicit no-secret convenience archives. The `verify --public-no-key` mode verifies signed public RootAuth commitments without the archive key.\n\nSize suffixes accepted by size flags:\n  0-9 (bytes), K/KB/KiB, M/MB/MiB, G/GB/GiB.\n\nMulti-volume output naming for this CLI:\n  - one volume: --output writes exactly that path\n  - multiple volumes: --output writes --output.000, --output.001, ...\n\nExit codes:\n  2  usage / argument error\n  3  I/O failure (missing file, permission denied, etc.)\n  10 wrong key\n  11 archive corruption or integrity mismatch\n  12 unsupported archive revision / format version\n  13 unsafe extraction attempt\n  14 missing required bootstrap metadata\n  16 unsupported feature in this CLI/core version\n  1  generic failure\n\nSubcommands:\n  create   Build a new archive\n  extract  Extract files from an archive\n  list     List archive contents\n  verify   Validate archive integrity\n  keygen   Generate a random raw keyfile\n  signing-keygen Generate an Ed25519 RootAuth signing keypair"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -87,7 +88,7 @@ enum Command {
         group(
             ArgGroup::new("create-key-source")
                 .required(true)
-                .args(["password_stdin", "password", "keyfile"])
+                .args(["password_stdin", "password", "keyfile", "insecure_zero_key"])
         )
     )]
     Create {
@@ -135,6 +136,7 @@ enum Command {
             long = "password-stdin",
             conflicts_with = "keyfile",
             conflicts_with = "password",
+            conflicts_with = "insecure_zero_key",
             value_name = "STDIN",
             help = "Read passphrase from stdin; one trailing LF or CRLF is stripped."
         )]
@@ -144,6 +146,7 @@ enum Command {
             long = "password",
             conflicts_with = "keyfile",
             conflicts_with = "password_stdin",
+            conflicts_with = "insecure_zero_key",
             help = "Read passphrase from an interactive prompt."
         )]
         password: bool,
@@ -151,9 +154,16 @@ enum Command {
         #[arg(
             long = "keyfile",
             value_name = "KEYFILE",
+            conflicts_with = "insecure_zero_key",
             help = "Use a raw key from KEYFILE."
         )]
         keyfile: Option<String>,
+
+        #[arg(
+            long = "insecure-zero-key",
+            help = "Use an all-zero raw key. This provides no secrecy and is for explicit convenience archives."
+        )]
+        insecure_zero_key: bool,
 
         #[arg(
             long = "force",
@@ -317,7 +327,7 @@ enum Command {
         group(
             ArgGroup::new("open-key-source")
                 .required(true)
-                .args(["password_stdin", "password", "keyfile"])
+                .args(["password_stdin", "password", "keyfile", "insecure_zero_key"])
         )
     )]
     Extract {
@@ -362,6 +372,7 @@ enum Command {
             long = "password-stdin",
             conflicts_with = "keyfile",
             conflicts_with = "password",
+            conflicts_with = "insecure_zero_key",
             value_name = "STDIN",
             help = "Read passphrase from stdin; one trailing LF or CRLF is stripped."
         )]
@@ -371,6 +382,7 @@ enum Command {
             long = "password",
             conflicts_with = "keyfile",
             conflicts_with = "password_stdin",
+            conflicts_with = "insecure_zero_key",
             help = "Read passphrase from an interactive prompt."
         )]
         password: bool,
@@ -378,9 +390,16 @@ enum Command {
         #[arg(
             long = "keyfile",
             value_name = "KEYFILE",
+            conflicts_with = "insecure_zero_key",
             help = "Use a raw key from KEYFILE."
         )]
         keyfile: Option<String>,
+
+        #[arg(
+            long = "insecure-zero-key",
+            help = "Use an all-zero raw key. This provides no secrecy and is for explicit convenience archives."
+        )]
+        insecure_zero_key: bool,
 
         #[arg(
             long = "bootstrap",
@@ -399,7 +418,7 @@ enum Command {
         group(
             ArgGroup::new("open-key-source")
                 .required(true)
-                .args(["password_stdin", "password", "keyfile"])
+                .args(["password_stdin", "password", "keyfile", "insecure_zero_key"])
         )
     )]
     List {
@@ -410,6 +429,7 @@ enum Command {
             long = "password-stdin",
             conflicts_with = "keyfile",
             conflicts_with = "password",
+            conflicts_with = "insecure_zero_key",
             value_name = "STDIN",
             help = "Read passphrase from stdin; one trailing LF or CRLF is stripped."
         )]
@@ -419,6 +439,7 @@ enum Command {
             long = "password",
             conflicts_with = "keyfile",
             conflicts_with = "password_stdin",
+            conflicts_with = "insecure_zero_key",
             help = "Read passphrase from an interactive prompt."
         )]
         password: bool,
@@ -426,9 +447,16 @@ enum Command {
         #[arg(
             long = "keyfile",
             value_name = "KEYFILE",
+            conflicts_with = "insecure_zero_key",
             help = "Use a raw key from KEYFILE."
         )]
         keyfile: Option<String>,
+
+        #[arg(
+            long = "insecure-zero-key",
+            help = "Use an all-zero raw key. This provides no secrecy and is for explicit convenience archives."
+        )]
+        insecure_zero_key: bool,
 
         #[arg(
             long = "bootstrap",
@@ -456,7 +484,7 @@ enum Command {
     },
     #[command(
         about = "Verify archive integrity",
-        long_about = "Verify archive signatures and checksum integrity. No payload changes are made.\n\nBy default verify is key-holding and requires --keyfile, --password, or --password-stdin. With --public-no-key, verify uses the v41 public RootAuth profile and does not require the archive key.",
+        long_about = "Verify archive signatures and checksum integrity. No payload changes are made.\n\nBy default verify is key-holding and requires --keyfile, --password, --password-stdin, or --insecure-zero-key. With --public-no-key, verify uses the v41 public RootAuth profile and does not require the archive key.",
         after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex backup.tzap backup.tzap.001\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives, the first positional argument is the primary archive.\nAdditional positionals are optional extra volumes."
     )]
     Verify {
@@ -471,6 +499,7 @@ enum Command {
             long = "password-stdin",
             conflicts_with = "keyfile",
             conflicts_with = "password",
+            conflicts_with = "insecure_zero_key",
             value_name = "STDIN",
             help = "Read passphrase from stdin; one trailing LF or CRLF is stripped."
         )]
@@ -480,6 +509,7 @@ enum Command {
             long = "password",
             conflicts_with = "keyfile",
             conflicts_with = "password_stdin",
+            conflicts_with = "insecure_zero_key",
             help = "Read passphrase from an interactive prompt."
         )]
         password: bool,
@@ -487,9 +517,16 @@ enum Command {
         #[arg(
             long = "keyfile",
             value_name = "KEYFILE",
+            conflicts_with = "insecure_zero_key",
             help = "Use a raw key from KEYFILE."
         )]
         keyfile: Option<String>,
+
+        #[arg(
+            long = "insecure-zero-key",
+            help = "Use an all-zero raw key. This provides no secrecy and is for explicit convenience archives."
+        )]
+        insecure_zero_key: bool,
 
         #[arg(
             long = "trusted-public-key",
@@ -626,6 +663,7 @@ fn run(cli: Cli) -> Result<()> {
             password_stdin,
             password,
             keyfile,
+            insecure_zero_key,
             force,
             dry_run,
             argon2_t_cost,
@@ -699,7 +737,12 @@ fn run(cli: Cli) -> Result<()> {
                     eprintln!("  input bytes: unknown until stdin is consumed");
                     eprintln!(
                         "  key mode: {}",
-                        create_key_mode_label(keyfile.as_deref(), password_stdin, password)
+                        create_key_mode_label(
+                            keyfile.as_deref(),
+                            password_stdin,
+                            password,
+                            insecure_zero_key
+                        )
                     );
                     eprintln!(
                         "  root auth: {}",
@@ -734,6 +777,7 @@ fn run(cli: Cli) -> Result<()> {
                     keyfile.as_deref(),
                     password_stdin,
                     password,
+                    insecure_zero_key,
                     argon2_t_cost,
                     argon2_m_cost_kib,
                     argon2_parallelism,
@@ -856,7 +900,12 @@ fn run(cli: Cli) -> Result<()> {
                 );
                 eprintln!(
                     "  key mode: {}",
-                    create_key_mode_label(keyfile.as_deref(), password_stdin, password)
+                    create_key_mode_label(
+                        keyfile.as_deref(),
+                        password_stdin,
+                        password,
+                        insecure_zero_key
+                    )
                 );
                 eprintln!(
                     "  root auth: {}",
@@ -880,6 +929,7 @@ fn run(cli: Cli) -> Result<()> {
                 keyfile.as_deref(),
                 password_stdin,
                 password,
+                insecure_zero_key,
                 argon2_t_cost,
                 argon2_m_cost_kib,
                 argon2_parallelism,
@@ -1028,6 +1078,7 @@ fn run(cli: Cli) -> Result<()> {
             password_stdin,
             password,
             keyfile,
+            insecure_zero_key,
             bootstrap,
             volumes,
         } => {
@@ -1042,6 +1093,7 @@ fn run(cli: Cli) -> Result<()> {
                     password_stdin,
                     password,
                     keyfile.as_deref(),
+                    insecure_zero_key,
                 )?;
                 if dry_run {
                     eprintln!("extract dry-run summary:");
@@ -1050,8 +1102,12 @@ fn run(cli: Cli) -> Result<()> {
                     eprintln!("  mode: staged non-seekable extract-all");
                     return Ok(());
                 }
-                let master_key =
-                    load_archive_stdin_key(keyfile.as_deref(), password_stdin, password)?;
+                let master_key = load_archive_stdin_key(
+                    keyfile.as_deref(),
+                    password_stdin,
+                    password,
+                    insecure_zero_key,
+                )?;
                 let options = SafeExtractionOptions {
                     overwrite_existing: overwrite,
                 };
@@ -1088,7 +1144,13 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             let volume_files = open_volume_inputs(&archive, &volumes)?;
-            let master_key = load_open_key(keyfile.as_deref(), password_stdin, password, &archive)?;
+            let master_key = load_open_key(
+                keyfile.as_deref(),
+                password_stdin,
+                password,
+                insecure_zero_key,
+                &archive,
+            )?;
             let opened =
                 open_inputs_maybe_bootstrap(volume_files, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {archive}"))?;
@@ -1164,6 +1226,7 @@ fn run(cli: Cli) -> Result<()> {
             password_stdin,
             password,
             keyfile,
+            insecure_zero_key,
             bootstrap,
             volumes,
             long,
@@ -1177,9 +1240,14 @@ fn run(cli: Cli) -> Result<()> {
                     password_stdin,
                     password,
                     keyfile.as_deref(),
+                    insecure_zero_key,
                 )?;
-                let master_key =
-                    load_archive_stdin_key(keyfile.as_deref(), password_stdin, password)?;
+                let master_key = load_archive_stdin_key(
+                    keyfile.as_deref(),
+                    password_stdin,
+                    password,
+                    insecure_zero_key,
+                )?;
                 let bootstrap_bytes = read_optional_bootstrap_sidecar(bootstrap.as_deref())?;
                 let stdin = io::stdin();
                 let report = if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
@@ -1253,7 +1321,13 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             let volume_files = open_volume_inputs(&archive, &volumes)?;
-            let master_key = load_open_key(keyfile.as_deref(), password_stdin, password, &archive)?;
+            let master_key = load_open_key(
+                keyfile.as_deref(),
+                password_stdin,
+                password,
+                insecure_zero_key,
+                &archive,
+            )?;
             let opened =
                 open_inputs_maybe_bootstrap(volume_files, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {archive}"))?;
@@ -1312,6 +1386,7 @@ fn run(cli: Cli) -> Result<()> {
             password_stdin,
             password,
             keyfile,
+            insecure_zero_key,
             trusted_public_key,
             trusted_ca_cert,
             trusted_system_roots,
@@ -1357,16 +1432,20 @@ fn run(cli: Cli) -> Result<()> {
                     }
                     return Err(err);
                 }
-                let master_key =
-                    match load_archive_stdin_key(keyfile.as_deref(), password_stdin, password) {
-                        Ok(master_key) => master_key,
-                        Err(err) => {
-                            if json {
-                                emit_verify_json_error(&archive_paths, None, None, &err)?;
-                            }
-                            return Err(err);
+                let master_key = match load_archive_stdin_key(
+                    keyfile.as_deref(),
+                    password_stdin,
+                    password,
+                    insecure_zero_key,
+                ) {
+                    Ok(master_key) => master_key,
+                    Err(err) => {
+                        if json {
+                            emit_verify_json_error(&archive_paths, None, None, &err)?;
                         }
-                    };
+                        return Err(err);
+                    }
+                };
                 let bootstrap_bytes = match read_optional_bootstrap_sidecar(bootstrap.as_deref()) {
                     Ok(bootstrap_bytes) => bootstrap_bytes,
                     Err(err) => {
@@ -1434,14 +1513,18 @@ fn run(cli: Cli) -> Result<()> {
                     password_stdin,
                     password,
                     keyfile.as_deref(),
+                    insecure_zero_key,
                     bootstrap.as_deref(),
                     quiet,
                     json,
                 );
             }
-            if let Err(err) =
-                validate_verify_key_holding_key_source(keyfile.as_deref(), password_stdin, password)
-            {
+            if let Err(err) = validate_verify_key_holding_key_source(
+                keyfile.as_deref(),
+                password_stdin,
+                password,
+                insecure_zero_key,
+            ) {
                 if json {
                     emit_verify_json_error(&archive_paths, None, None, &err)?;
                 }
@@ -1462,16 +1545,21 @@ fn run(cli: Cli) -> Result<()> {
                     return Err(err);
                 }
             };
-            let master_key =
-                match load_open_key(keyfile.as_deref(), password_stdin, password, first) {
-                    Ok(master_key) => master_key,
-                    Err(err) => {
-                        if json {
-                            emit_verify_json_error(&archive_paths, None, None, &err)?;
-                        }
-                        return Err(err);
+            let master_key = match load_open_key(
+                keyfile.as_deref(),
+                password_stdin,
+                password,
+                insecure_zero_key,
+                first,
+            ) {
+                Ok(master_key) => master_key,
+                Err(err) => {
+                    if json {
+                        emit_verify_json_error(&archive_paths, None, None, &err)?;
                     }
-                };
+                    return Err(err);
+                }
+            };
             let opened =
                 match open_inputs_maybe_bootstrap(volume_files, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {first}"))
@@ -2492,7 +2580,12 @@ fn describe_planned_volume_mode(volumes: Option<u32>, volume_size: Option<&str>)
     format!("single volume")
 }
 
-fn create_key_mode_label(keyfile: Option<&str>, password_stdin: bool, password: bool) -> String {
+fn create_key_mode_label(
+    keyfile: Option<&str>,
+    password_stdin: bool,
+    password: bool,
+    insecure_zero_key: bool,
+) -> String {
     if password_stdin {
         return "password-stdin".to_string();
     }
@@ -2501,6 +2594,9 @@ fn create_key_mode_label(keyfile: Option<&str>, password_stdin: bool, password: 
     }
     if keyfile.is_some() {
         return "keyfile".to_string();
+    }
+    if insecure_zero_key {
+        return "insecure-zero-key".to_string();
     }
     "unknown".to_string()
 }
@@ -2598,6 +2694,7 @@ fn reject_archive_stdin_open_options(
     password_stdin: bool,
     password: bool,
     keyfile: Option<&str>,
+    insecure_zero_key: bool,
 ) -> Result<()> {
     if !volumes.is_empty() {
         return Err(anyhow!(FormatError::ReaderUnsupported(
@@ -2614,7 +2711,7 @@ fn reject_archive_stdin_open_options(
             "selected-path extraction is not supported for archive stdin",
         )));
     }
-    reject_archive_stdin_key_options(password_stdin, password, keyfile)
+    reject_archive_stdin_key_options(password_stdin, password, keyfile, insecure_zero_key)
 }
 
 fn reject_archive_stdin_list_options(
@@ -2623,23 +2720,31 @@ fn reject_archive_stdin_list_options(
     password_stdin: bool,
     password: bool,
     keyfile: Option<&str>,
+    insecure_zero_key: bool,
 ) -> Result<()> {
     if !volumes.is_empty() {
         return Err(anyhow!(FormatError::ReaderUnsupported(
             "archive stdin must be the only archive input",
         )));
     }
-    reject_archive_stdin_key_options(password_stdin, password, keyfile)
+    reject_archive_stdin_key_options(password_stdin, password, keyfile, insecure_zero_key)
 }
 
 fn reject_archive_stdin_key_options(
     password_stdin: bool,
     password: bool,
     keyfile: Option<&str>,
+    insecure_zero_key: bool,
 ) -> Result<()> {
-    if password_stdin || password || keyfile.is_none() {
+    if password_stdin || password {
         return Err(anyhow!(FormatError::ReaderUnsupported(
-            "archive stdin currently supports raw --keyfile only",
+            "archive stdin currently supports raw --keyfile or --insecure-zero-key only",
+        )));
+    }
+    let raw_key_count = usize::from(keyfile.is_some()) + usize::from(insecure_zero_key);
+    if raw_key_count != 1 {
+        return Err(anyhow!(FormatError::ReaderUnsupported(
+            "archive stdin currently supports raw --keyfile or --insecure-zero-key only",
         )));
     }
     Ok(())
@@ -2649,8 +2754,12 @@ fn load_archive_stdin_key(
     keyfile: Option<&str>,
     password_stdin: bool,
     password: bool,
+    insecure_zero_key: bool,
 ) -> Result<MasterKey> {
-    reject_archive_stdin_key_options(password_stdin, password, keyfile)?;
+    reject_archive_stdin_key_options(password_stdin, password, keyfile, insecure_zero_key)?;
+    if insecure_zero_key {
+        return insecure_zero_master_key();
+    }
     load_raw_master_key(keyfile)
 }
 
@@ -2688,12 +2797,15 @@ fn validate_verify_key_holding_key_source(
     keyfile: Option<&str>,
     password_stdin: bool,
     password: bool,
+    insecure_zero_key: bool,
 ) -> Result<()> {
-    let count =
-        usize::from(keyfile.is_some()) + usize::from(password_stdin) + usize::from(password);
+    let count = usize::from(keyfile.is_some())
+        + usize::from(password_stdin)
+        + usize::from(password)
+        + usize::from(insecure_zero_key);
     if count != 1 {
         return Err(UsageError(
-            "verify requires exactly one key source: --keyfile, --password, or --password-stdin; use --public-no-key for public verification",
+            "verify requires exactly one key source: --keyfile, --password, --password-stdin, or --insecure-zero-key; use --public-no-key for public verification",
         )
         .into());
     }
@@ -2708,6 +2820,7 @@ fn run_public_no_key_verify(
     password_stdin: bool,
     password: bool,
     keyfile: Option<&str>,
+    insecure_zero_key: bool,
     bootstrap: Option<&str>,
     quiet: bool,
     json: bool,
@@ -2719,6 +2832,7 @@ fn run_public_no_key_verify(
         password_stdin,
         password,
         keyfile,
+        insecure_zero_key,
         bootstrap,
     ) {
         if json {
@@ -2816,6 +2930,7 @@ fn validate_public_no_key_inputs(
     password_stdin: bool,
     password: bool,
     keyfile: Option<&str>,
+    insecure_zero_key: bool,
     bootstrap: Option<&str>,
 ) -> Result<()> {
     if trusted_public_key.is_none() {
@@ -2827,9 +2942,9 @@ fn validate_public_no_key_inputs(
         )
         .into());
     }
-    if password_stdin || password || keyfile.is_some() {
+    if password_stdin || password || keyfile.is_some() || insecure_zero_key {
         return Err(UsageError(
-            "--public-no-key cannot be combined with --keyfile, --password, or --password-stdin",
+            "--public-no-key cannot be combined with --keyfile, --password, --password-stdin, or --insecure-zero-key",
         )
         .into());
     }
@@ -3176,6 +3291,7 @@ fn load_create_key(
     keyfile: Option<&str>,
     password_stdin: bool,
     password: bool,
+    insecure_zero_key: bool,
     t_cost: u32,
     m_cost_kib: u32,
     parallelism: u32,
@@ -3214,6 +3330,12 @@ fn load_create_key(
             kdf_params,
         });
     }
+    if insecure_zero_key {
+        return Ok(CreateKey {
+            master_key: insecure_zero_master_key()?,
+            kdf_params: KdfParams::Raw,
+        });
+    }
     Ok(CreateKey {
         master_key: load_raw_master_key(keyfile)?,
         kdf_params: KdfParams::Raw,
@@ -3224,6 +3346,7 @@ fn load_open_key(
     keyfile: Option<&str>,
     password_stdin: bool,
     password: bool,
+    insecure_zero_key: bool,
     first_volume_path: &str,
 ) -> Result<MasterKey> {
     if password_stdin {
@@ -3236,7 +3359,14 @@ fn load_open_key(
         let kdf_params = read_kdf_params_from_volume_path(first_volume_path)?;
         return derive_key_from_passphrase(&kdf_params, &passphrase);
     }
+    if insecure_zero_key {
+        return insecure_zero_master_key();
+    }
     load_raw_master_key(keyfile)
+}
+
+fn insecure_zero_master_key() -> Result<MasterKey> {
+    MasterKey::from_raw_key(&INSECURE_ZERO_KEY).map_err(Into::into)
 }
 
 fn derive_key_from_passphrase(kdf_params: &KdfParams, passphrase: &str) -> Result<MasterKey> {
@@ -3290,7 +3420,9 @@ fn validate_argon2_params(t_cost: u32, m_cost_kib: u32, parallelism: u32) -> Res
 
 fn load_raw_master_key(keyfile: Option<&str>) -> Result<MasterKey> {
     let keyfile = keyfile.ok_or_else(|| {
-        anyhow!("no key source provided; use --password-stdin, --password, or --keyfile PATH")
+        anyhow!(
+            "no key source provided; use --password-stdin, --password, --keyfile PATH, or --insecure-zero-key"
+        )
     })?;
     let bytes = fs::read(keyfile).with_context(|| format!("failed to read keyfile {keyfile}"))?;
     if bytes.len() == 32 {

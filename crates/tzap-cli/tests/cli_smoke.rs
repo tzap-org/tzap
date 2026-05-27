@@ -341,6 +341,7 @@ fn cli_create_help_includes_examples_and_flags() {
     assert!(stdout.contains("--password"));
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
+    assert!(stdout.contains("--insecure-zero-key"));
     assert!(stdout.contains("--argon2-t-cost <COUNT>"));
     assert!(stdout.contains("--argon2-m-cost-kib <KIB>"));
     assert!(stdout.contains("--argon2-parallelism <COUNT>"));
@@ -388,6 +389,7 @@ fn cli_extract_help_includes_examples_and_flags() {
     assert!(stdout.contains("--volume"));
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
+    assert!(stdout.contains("--insecure-zero-key"));
 }
 
 #[test]
@@ -407,6 +409,7 @@ fn cli_list_help_includes_examples_and_flags() {
     assert!(stdout.contains("--password"));
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
+    assert!(stdout.contains("--insecure-zero-key"));
     assert!(stdout.contains("--bootstrap"));
     assert!(stdout.contains("--volume"));
     assert!(stdout.contains("--long"));
@@ -430,6 +433,7 @@ fn cli_verify_help_includes_examples_and_flags() {
     assert!(stdout.contains("--password"));
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
+    assert!(stdout.contains("--insecure-zero-key"));
     assert!(stdout.contains("--trusted-public-key <FILE>"));
     assert!(stdout.contains("--trusted-ca-cert <FILE>"));
     assert!(stdout.contains("--trusted-system-roots"));
@@ -571,6 +575,52 @@ fn cli_create_rejects_password_source_conflicts() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn cli_insecure_zero_key_rejects_mixed_key_sources_and_public_no_key() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let output = temp.path().join("sample.tzap");
+    let input = temp.path().join("hello.txt");
+    let public_key = temp.path().join("root.public.hex");
+    let missing_archive = temp.path().join("missing.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"hello from tzap\n").unwrap();
+    fs::write(&public_key, "00".repeat(32)).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--insecure-zero-key",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--public-no-key",
+            "--insecure-zero-key",
+            "--trusted-public-key",
+            public_key.to_str().unwrap(),
+            missing_archive.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--public-no-key cannot be combined",
+        ))
+        .stderr(predicate::str::contains("--insecure-zero-key"));
 }
 
 #[test]
@@ -2001,7 +2051,8 @@ fn cli_verify_requires_key_source_before_running() {
         .args(["verify", archive.to_str().unwrap()])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("exactly one key source"));
+        .stderr(predicate::str::contains("exactly one key source"))
+        .stderr(predicate::str::contains("--insecure-zero-key"));
 }
 
 #[test]
@@ -2562,6 +2613,98 @@ fn cli_create_signed_archive_and_verify_root_auth_profiles() {
         .unwrap()
         .iter()
         .any(|entry| entry == "public_recovery_margin_unchecked"));
+}
+
+#[test]
+fn cli_insecure_zero_key_signed_archive_round_trips_and_publicly_verifies() {
+    let temp = tempdir().unwrap();
+    let signing_secret = temp.path().join("root.signing.hex");
+    let signing_public = temp.path().join("root.public.hex");
+    let input = temp.path().join("public.txt");
+    let archive = temp.path().join("public.tzap");
+    let output = temp.path().join("out");
+    let payload = b"public convenience payload\n";
+
+    fs::write(&input, payload).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "signing-keygen",
+            "--secret-output",
+            signing_secret.to_str().unwrap(),
+            "--public-output",
+            signing_public.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--insecure-zero-key",
+            "--signing-key",
+            signing_secret.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("root auth: ed25519 signed"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["list", "--insecure-zero-key", archive.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("public.txt"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--insecure-zero-key",
+            "--trusted-public-key",
+            signing_public.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("OK (1 volume(s), 1 file(s))")
+                .and(predicate::str::contains("root-auth: OK ed25519")),
+        );
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--public-no-key",
+            "--trusted-public-key",
+            signing_public.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "public_data_block_commitment_verified",
+        ));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--insecure-zero-key",
+            "-C",
+            output.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(output.join("public.txt")).unwrap(), payload);
 }
 
 #[test]
