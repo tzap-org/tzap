@@ -43,8 +43,9 @@ pub use reader::{
     RootAuthVerification,
 };
 pub use streaming_writer::{
-    write_tar_stream_archive, write_tar_stream_archive_to_sink,
-    write_tar_stream_archive_to_sink_with_kdf_and_root_auth, StreamingTarWriterSummary,
+    write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth, write_tar_stream_archive,
+    write_tar_stream_archive_to_sink, write_tar_stream_archive_to_sink_with_kdf_and_root_auth,
+    StreamingRawWriterSummary, StreamingTarWriterSummary,
 };
 pub use tar_model::{MetadataDiagnostic, SafeExtractionOptions, TarEntryKind};
 pub use writer::{

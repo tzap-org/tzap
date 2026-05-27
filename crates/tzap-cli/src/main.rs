@@ -26,10 +26,12 @@ use tzap_core::{
     write_archive, write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
     write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
     write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
+    write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
     write_tar_stream_archive_to_sink_with_kdf_and_root_auth, ArchiveWriteError, ArchiveWriteSink,
     ExtractError, KdfParams, MasterKey, MetadataDiagnostic, NonSeekableReaderOptions,
     OpenedArchive, RegularFile, RootAuthSigningRequest, RootAuthVerification, RootAuthWriterConfig,
-    SafeExtractionOptions, StreamingTarWriterSummary, TarEntryKind, WriterOptions,
+    SafeExtractionOptions, StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind,
+    WriterOptions,
 };
 use tzap_plugin_signing::ed25519_raw::{
     self, Ed25519RootAuthOutcome, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
@@ -41,6 +43,7 @@ use tzap_plugin_signing::x509_chain::{
 
 #[allow(dead_code)]
 mod plaintext_spool;
+use plaintext_spool::{spool_unknown_size_raw_stdin, ExplicitPlaintextSpool};
 
 const EXIT_USAGE: u8 = 2;
 const EXIT_IO: u8 = 3;
@@ -238,7 +241,7 @@ enum Command {
 
         #[arg(
             long = "raw-stdin",
-            help = "Treat PATH '-' as one raw stdin member named by --stdin-name (future streaming writer)."
+            help = "Treat PATH '-' as one raw stdin member named by --stdin-name."
         )]
         raw_stdin: bool,
 
@@ -258,7 +261,7 @@ enum Command {
 
         #[arg(
             long = "spool-stdin",
-            help = "Allow future plaintext spool mode for unknown-size raw stdin."
+            help = "Spool unknown-size raw stdin to a restrictive temporary file before archiving."
         )]
         spool_stdin: bool,
 
@@ -719,9 +722,9 @@ fn run(cli: Cli) -> Result<()> {
                     return Ok(());
                 }
 
-                if !matches!(stdin_mode, CreateStdinMode::Tar) {
+                if matches!(stdin_mode, CreateStdinMode::RawUnknownSize) {
                     return Err(FormatError::WriterUnsupported(
-                        "raw stdin streaming create is not implemented in this CLI/core version",
+                        "unknown-size raw stdin without --spool-stdin requires the future raw_stream_v1 profile",
                     )
                     .into());
                 }
@@ -744,13 +747,81 @@ fn run(cli: Cli) -> Result<()> {
                     .as_ref()
                     .map(CreateRootAuthProfile::root_auth_writer_config)
                     .transpose()?;
-                let (summary, bootstrap_sidecar) = write_tar_stdin_archive_output(
-                    &output,
-                    &key,
-                    options,
-                    root_auth,
-                    root_auth_profile.as_ref(),
-                )?;
+                let (bootstrap_sidecar, summary_text) = match stdin_mode {
+                    CreateStdinMode::Tar => {
+                        let (summary, bootstrap_sidecar) = write_tar_stdin_archive_output(
+                            &output,
+                            &key,
+                            options,
+                            root_auth,
+                            root_auth_profile.as_ref(),
+                        )?;
+                        let summary_text = format!(
+                            "created {} file(s), {} tar bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
+                            summary.input_member_count,
+                            summary.input_tar_bytes,
+                            summary.archive.archive_bytes,
+                            summary.archive.volume_count,
+                            volume_loss_tolerance,
+                            bit_rot_buffer_pct
+                        );
+                        (bootstrap_sidecar, summary_text)
+                    }
+                    CreateStdinMode::RawKnownSize => {
+                        let stdin_size =
+                            parse_size(stdin_size.as_deref().expect("validated stdin-size"))?;
+                        let (summary, bootstrap_sidecar) = write_raw_stdin_archive_output(
+                            &output,
+                            io::stdin().lock(),
+                            stdin_name.as_deref().expect("validated stdin-name"),
+                            stdin_size,
+                            &key,
+                            options,
+                            root_auth,
+                            root_auth_profile.as_ref(),
+                        )?;
+                        let summary_text = format!(
+                            "created 1 file(s), {} raw bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
+                            summary.input_bytes,
+                            summary.archive.archive_bytes,
+                            summary.archive.volume_count,
+                            volume_loss_tolerance,
+                            bit_rot_buffer_pct
+                        );
+                        (bootstrap_sidecar, summary_text)
+                    }
+                    CreateStdinMode::RawSpool => {
+                        let stdin = io::stdin();
+                        let mut stdin_lock = stdin.lock();
+                        let spool = spool_unknown_size_raw_stdin(
+                            &mut stdin_lock,
+                            u64::MAX,
+                            ExplicitPlaintextSpool::acknowledge_plaintext_spool(),
+                        )?;
+                        let spool_source = spool.known_size_source();
+                        let spool_reader = spool.reopen()?;
+                        let (summary, bootstrap_sidecar) = write_raw_stdin_archive_output(
+                            &output,
+                            spool_reader,
+                            stdin_name.as_deref().expect("validated stdin-name"),
+                            spool_source.size(),
+                            &key,
+                            options,
+                            root_auth,
+                            root_auth_profile.as_ref(),
+                        )?;
+                        let summary_text = format!(
+                            "created 1 file(s), {} spooled raw bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
+                            summary.input_bytes,
+                            summary.archive.archive_bytes,
+                            summary.archive.volume_count,
+                            volume_loss_tolerance,
+                            bit_rot_buffer_pct
+                        );
+                        (bootstrap_sidecar, summary_text)
+                    }
+                    CreateStdinMode::RawUnknownSize => unreachable!("rejected before key loading"),
+                };
                 if let Some(path) = bootstrap_out.as_deref() {
                     if bootstrap_sidecar.is_empty() {
                         return Err(FormatError::WriterUnsupported(
@@ -760,15 +831,6 @@ fn run(cli: Cli) -> Result<()> {
                     }
                     write_bootstrap_output(path, &bootstrap_sidecar, force)?;
                 }
-                let summary_text = format!(
-                    "created {} file(s), {} tar bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
-                    summary.input_member_count,
-                    summary.input_tar_bytes,
-                    summary.archive.archive_bytes,
-                    summary.archive.volume_count,
-                    volume_loss_tolerance,
-                    bit_rot_buffer_pct
-                );
                 emit_success_summary(quiet, &summary_text)?;
                 if let Some(profile) = root_auth_profile.as_ref() {
                     emit_success_summary(
@@ -1874,7 +1936,7 @@ impl ArchiveWriteSink for SingleVolumeFileSink<'_> {
     fn begin_archive(&mut self, volume_count: usize) -> std::result::Result<(), ArchiveWriteError> {
         if volume_count != 1 {
             return Err(
-                FormatError::WriterUnsupported("tar stdin create is single-volume only").into(),
+                FormatError::WriterUnsupported("stdin create is single-volume only").into(),
             );
         }
         self.file.set_len(0).map_err(ArchiveWriteError::Io)?;
@@ -1891,10 +1953,9 @@ impl ArchiveWriteSink for SingleVolumeFileSink<'_> {
         bytes: &[u8],
     ) -> std::result::Result<(), ArchiveWriteError> {
         if volume_index != 0 {
-            return Err(FormatError::WriterInvariant(
-                "tar stdin file sink received a non-zero volume",
-            )
-            .into());
+            return Err(
+                FormatError::WriterInvariant("stdin file sink received a non-zero volume").into(),
+            );
         }
         self.file.write_all(bytes).map_err(ArchiveWriteError::Io)
     }
@@ -1940,6 +2001,87 @@ fn write_tar_stdin_archive_output_from_reader<R: Read>(
     root_auth: Option<RootAuthWriterConfig<'_>>,
     authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
 ) -> Result<(StreamingTarWriterSummary, Vec<u8>)> {
+    write_stdin_archive_output_with_sink(output, |sink| {
+        write_tar_stream_archive_to_sink_with_kdf_and_root_auth(
+            reader,
+            &key.master_key,
+            options,
+            &key.kdf_params,
+            root_auth,
+            authenticator,
+            sink,
+        )
+    })
+}
+
+fn write_raw_stdin_archive_output<R: Read>(
+    output: &str,
+    mut reader: R,
+    archive_path: &str,
+    input_size: u64,
+    key: &CreateKey,
+    options: WriterOptions,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    root_auth_profile: Option<&CreateRootAuthProfile>,
+) -> Result<(StreamingRawWriterSummary, Vec<u8>)> {
+    if let (Some(profile), Some(root_auth)) = (root_auth_profile, root_auth) {
+        let mut authenticator =
+            |request: &RootAuthSigningRequest| root_auth_authenticator_value(profile, request);
+        return write_raw_stdin_archive_output_from_reader(
+            output,
+            &mut reader,
+            archive_path,
+            input_size,
+            key,
+            options,
+            Some(root_auth),
+            Some(&mut authenticator),
+        );
+    }
+    write_raw_stdin_archive_output_from_reader(
+        output,
+        &mut reader,
+        archive_path,
+        input_size,
+        key,
+        options,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_raw_stdin_archive_output_from_reader<R: Read>(
+    output: &str,
+    reader: &mut R,
+    archive_path: &str,
+    input_size: u64,
+    key: &CreateKey,
+    options: WriterOptions,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
+) -> Result<(StreamingRawWriterSummary, Vec<u8>)> {
+    write_stdin_archive_output_with_sink(output, |sink| {
+        write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth(
+            reader,
+            archive_path,
+            input_size,
+            &key.master_key,
+            options,
+            &key.kdf_params,
+            root_auth,
+            authenticator,
+            sink,
+        )
+    })
+}
+
+fn write_stdin_archive_output_with_sink<T>(
+    output: &str,
+    write_archive: impl FnOnce(
+        &mut SingleVolumeFileSink<'_>,
+    ) -> std::result::Result<T, ArchiveWriteError>,
+) -> Result<(T, Vec<u8>)> {
     let output_path = Path::new(output);
     let parent = output_path
         .parent()
@@ -1960,15 +2102,7 @@ fn write_tar_stdin_archive_output_from_reader<R: Read>(
             file: temp.as_file_mut(),
             bootstrap_sidecar: Vec::new(),
         };
-        let summary = write_tar_stream_archive_to_sink_with_kdf_and_root_auth(
-            reader,
-            &key.master_key,
-            options,
-            &key.kdf_params,
-            root_auth,
-            authenticator,
-            &mut sink,
-        )?;
+        let summary = write_archive(&mut sink)?;
         (summary, sink.bootstrap_sidecar)
     };
     temp.as_file_mut()

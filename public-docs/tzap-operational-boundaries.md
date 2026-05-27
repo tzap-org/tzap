@@ -290,40 +290,53 @@ tzap create --keyfile project.key -o - ./project
 
 ## Streaming create stdin modes
 
-The CLI supports single-volume tar stdin create:
+The CLI supports single-volume tar stdin create and single-volume raw stdin
+create:
 
 ```sh
 tar cf - ./project | tzap create --tar-stdin --keyfile project.key -o project.tzap -
+cat disk.img | tzap create --raw-stdin --stdin-name disk.img --stdin-size "$(stat -c%s disk.img)" --keyfile project.key -o disk.tzap -
+producer | tzap create --raw-stdin --stdin-name data/export.bin --spool-stdin --keyfile project.key -o export.tzap -
 ```
 
 Use a file-backed archive path with `-o`; `-o -` is not archive stdout. The
 file-backed path is also much faster for later selected-file workflows because
 seekable readers can use random access.
 
-The CLI reserves the raw stdin create shapes for future support:
+Known-size raw stdin (`--stdin-size`) is consumed once and archived as one
+regular-file member in the standard tar-member v41 profile. Short stdin or
+extra bytes after the declared size reject the create and remove the temporary
+archive output.
+
+Unknown-size raw stdin is supported only with explicit `--spool-stdin`. That
+mode writes plaintext stdin to a restrictive temporary file, then archives that
+file as a regular tar-member v41 member. The spool is removed after the command
+finishes, but the plaintext exists on local disk while the command is running.
+
+The no-spool unknown-size raw profile remains reserved for future support:
 
 ```sh
 producer | tzap create --raw-stdin --stdin-name data/export.bin --keyfile project.key -o export.tzap -
-cat disk.img | tzap create --raw-stdin --stdin-name disk.img --stdin-size 8G --volumes 4 --keyfile project.key -o disk.tzap -
-producer | tzap create --raw-stdin --stdin-name data/export.bin --spool-stdin --volumes 4 --keyfile project.key -o export.tzap -
 ```
 
-Those accepted-looking raw stdin shapes exit with `16 unsupported-feature`.
+That accepted-looking no-spool raw stdin shape exits with
+`16 unsupported-feature` until `raw_stream_v1` lands. Multi-volume stdin create
+also remains unsupported for now.
 
 The following combinations are rejected before stdin payload bytes, keyfiles,
 dictionaries, or ordinary input paths are read:
 
 - `--password` or `--password-stdin` with `--tar-stdin` or `--raw-stdin`
 - `--dictionary` with `--tar-stdin` or `--raw-stdin`
+- `--volumes > 1` with stdin create modes
 - `--volume-size` with stdin create modes
 - ordinary input paths mixed with stdin create modes; use exactly one input
   path, `-`
 - `-o -`; create output must remain a path-backed archive file
 
 Raw stdin stores one archive member and therefore requires `--stdin-name PATH`.
-`--stdin-size SIZE` declares a known raw stdin length for future fixed-volume
-streaming. `--spool-stdin` is reserved for a future plaintext spool path and is
-valid only with unknown-size `--raw-stdin`.
+`--stdin-size SIZE` declares a known raw stdin length. `--spool-stdin` is valid
+only with unknown-size `--raw-stdin`; combining it with `--stdin-size` rejects.
 
 Sidecar output is also file-path based:
 

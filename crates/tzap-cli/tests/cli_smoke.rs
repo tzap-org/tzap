@@ -1009,40 +1009,253 @@ fn cli_create_tar_stdin_late_reject_removes_output_path() {
 }
 
 #[test]
-fn cli_create_raw_stdin_modes_accept_shape_but_return_core_blocker() {
+fn cli_create_raw_stdin_known_size_round_trips_list_verify_and_extract() {
     let temp = tempdir().unwrap();
-    let output = temp.path().join("stdin.tzap");
+    let keyfile = temp.path().join("key.hex");
+    let output = temp.path().join("raw-known.tzap");
+    let extract_dir = temp.path().join("extract");
+    let payload = b"raw bytes\nfrom stdin\0".to_vec();
+    let size = payload.len().to_string();
+    fs::write(&keyfile, KEY_HEX).unwrap();
 
-    for args in [
-        vec!["--raw-stdin", "--stdin-name", "data.bin"],
-        vec![
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "raw/data.bin",
+            "--stdin-size",
+            size.as_str(),
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(payload.clone())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("created 1 file(s)"))
+        .stderr(predicate::str::contains("raw bytes in"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("raw/data.bin"));
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(extract_dir.join("raw/data.bin")).unwrap(), payload);
+}
+
+#[test]
+fn cli_create_raw_stdin_known_size_signed_archive_verifies_public_root_auth() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let signing_secret = temp.path().join("root.signing.hex");
+    let signing_public = temp.path().join("root.public.hex");
+    let output = temp.path().join("raw-signed.tzap");
+    let payload = b"signed raw stdin payload".to_vec();
+    let size = payload.len().to_string();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "signing-keygen",
+            "--secret-output",
+            signing_secret.to_str().unwrap(),
+            "--public-output",
+            signing_public.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "raw/signed.bin",
+            "--stdin-size",
+            size.as_str(),
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--signing-key",
+            signing_secret.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("root auth: ed25519 signed"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--public-no-key",
+            "--trusted-public-key",
+            signing_public.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "public_data_block_commitment_verified",
+        ));
+}
+
+#[test]
+fn cli_create_raw_stdin_spool_round_trips() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let output = temp.path().join("raw-spool.tzap");
+    let extract_dir = temp.path().join("extract");
+    let payload = b"unknown size raw bytes".to_vec();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "spooled.bin",
+            "--spool-stdin",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(payload.clone())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("spooled raw bytes in"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(extract_dir.join("spooled.bin")).unwrap(), payload);
+}
+
+#[test]
+fn cli_create_raw_stdin_known_size_mismatch_removes_output_path() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let short_output = temp.path().join("short.tzap");
+    let long_output = temp.path().join("long.tzap");
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
             "--raw-stdin",
             "--stdin-name",
             "data.bin",
             "--stdin-size",
-            "4K",
-        ],
-        vec!["--raw-stdin", "--stdin-name", "data.bin", "--spool-stdin"],
-    ] {
-        let mut command_args = vec!["create"];
-        command_args.extend(args);
-        command_args.extend([
+            "8",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            short_output.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(b"short".as_slice())
+        .assert()
+        .code(3);
+    assert!(!short_output.exists());
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "data.bin",
+            "--stdin-size",
+            "3",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            long_output.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(b"toolong".as_slice())
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains(
+            "raw stdin exceeds declared --stdin-size",
+        ));
+    assert!(!long_output.exists());
+}
+
+#[test]
+fn cli_create_raw_stdin_unknown_no_spool_returns_profile_blocker() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("stdin.tzap");
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "data.bin",
             "--keyfile",
             "missing-key.hex",
             "-o",
             output.to_str().unwrap(),
             "-",
-        ]);
-
-        Command::cargo_bin("tzap")
-            .unwrap()
-            .args(command_args)
-            .assert()
-            .code(16)
-            .stderr(predicate::str::contains(
-                "raw stdin streaming create is not implemented",
-            ));
-    }
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains(
+            "unknown-size raw stdin without --spool-stdin requires the future raw_stream_v1 profile",
+        ));
 }
 
 #[test]

@@ -2,7 +2,9 @@ use std::io::{self, ErrorKind, Read};
 
 use crate::crypto::{KdfParams, MasterKey};
 use crate::format::{ArchiveWriteError, FormatError};
-use crate::metadata::{validate_directory_path_bytes, validate_file_path_bytes};
+use crate::metadata::{
+    normalize_lookup_file_path, validate_directory_path_bytes, validate_file_path_bytes,
+};
 use crate::writer::{
     write_single_pass_archive_to_sink, ArchiveWriteSink, MemoryArchiveSink, RootAuthSigningRequest,
     RootAuthWriterConfig, StreamingRegularMember, WriterOptions, WrittenArchive,
@@ -17,6 +19,12 @@ pub struct StreamingTarWriterSummary {
     pub archive: WrittenArchiveSummary,
     pub input_member_count: u64,
     pub input_tar_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingRawWriterSummary {
+    pub archive: WrittenArchiveSummary,
+    pub input_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -98,6 +106,61 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth<R, O>(
+    mut reader: R,
+    archive_path: &str,
+    input_size: u64,
+    master_key: &MasterKey,
+    options: WriterOptions,
+    kdf_params: &KdfParams,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
+    sink: &mut O,
+) -> Result<StreamingRawWriterSummary, ArchiveWriteError>
+where
+    R: Read,
+    O: ArchiveWriteSink,
+{
+    validate_streaming_tar_writer_options(options)?;
+    let archive_path = normalize_lookup_file_path(archive_path, options.max_path_length)?;
+    let archive = write_single_pass_archive_to_sink(
+        master_key,
+        options,
+        kdf_params,
+        root_auth,
+        authenticator,
+        sink,
+        |writer| {
+            let mut payload = SizedRawPayloadReader {
+                reader: &mut reader,
+                remaining: input_size,
+            };
+            writer.write_regular_member_from_reader(
+                StreamingRegularMember {
+                    archive_path,
+                    file_data_size: input_size,
+                    mode: 0o644,
+                    mtime: 0,
+                },
+                &mut payload,
+            )?;
+            if payload.remaining != 0 {
+                return Err(FormatError::WriterInvariant(
+                    "raw stdin payload was not fully consumed",
+                )
+                .into());
+            }
+            reject_trailing_raw_stdin_bytes(&mut reader)?;
+            Ok(())
+        },
+    )?;
+    Ok(StreamingRawWriterSummary {
+        archive,
+        input_bytes: input_size,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn write_tar_stream_archive_to_sink_with_kdf_and_root_auth<R, O>(
     mut reader: R,
     master_key: &MasterKey,
@@ -174,6 +237,46 @@ fn validate_streaming_tar_writer_options(options: WriterOptions) -> Result<(), F
         ));
     }
     Ok(())
+}
+
+struct SizedRawPayloadReader<'a, R: Read> {
+    reader: &'a mut R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for SizedRawPayloadReader<'_, R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() || self.remaining == 0 {
+            return Ok(0);
+        }
+        let max_read = out
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        match self.reader.read(&mut out[..max_read]) {
+            Ok(read) => {
+                self.remaining -= read as u64;
+                Ok(read)
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => self.read(out),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn reject_trailing_raw_stdin_bytes<R: Read>(reader: &mut R) -> Result<(), ArchiveWriteError> {
+    let mut extra = [0u8; 1];
+    loop {
+        match reader.read(&mut extra) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                return Err(
+                    FormatError::InvalidArchive("raw stdin exceeds declared --stdin-size").into(),
+                )
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(ArchiveWriteError::Io(error)),
+        }
+    }
 }
 
 fn stream_tar_stdin_regulars<R, F>(
@@ -871,6 +974,78 @@ mod tests {
             opened.extract_file("dir/beta.txt").unwrap(),
             Some(b"beta payload".to_vec())
         );
+    }
+
+    #[test]
+    fn sized_raw_stdin_round_trips_as_regular_tar_member_archive() {
+        let input = b"raw bytes from stdin";
+        let mut sink = MemoryArchiveSink::default();
+
+        let summary = write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth(
+            input.as_slice(),
+            "raw/data.bin",
+            input.len() as u64,
+            &master_key(),
+            options(),
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(summary.input_bytes, input.len() as u64);
+        let opened = open_archive(&sink.volumes[0], &master_key()).unwrap();
+        opened.verify().unwrap();
+        assert_eq!(
+            opened.extract_file("raw/data.bin").unwrap(),
+            Some(input.to_vec())
+        );
+    }
+
+    #[test]
+    fn sized_raw_stdin_rejects_short_input() {
+        let mut sink = MemoryArchiveSink::default();
+
+        let error = write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth(
+            b"short".as_slice(),
+            "raw/data.bin",
+            6,
+            &master_key(),
+            options(),
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ArchiveWriteError::Io(_)));
+    }
+
+    #[test]
+    fn sized_raw_stdin_rejects_trailing_input() {
+        let mut sink = MemoryArchiveSink::default();
+
+        let error = write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth(
+            b"toolong".as_slice(),
+            "raw/data.bin",
+            3,
+            &master_key(),
+            options(),
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArchiveWriteError::Format(FormatError::InvalidArchive(
+                "raw stdin exceeds declared --stdin-size"
+            ))
+        ));
     }
 
     #[test]

@@ -33,8 +33,11 @@ tzap create --keyfile project.key --volumes 3 --volume-loss-tolerance 1 -o backu
 # Single-volume tar stream from stdin
 tar cf - ./project | tzap create --tar-stdin --keyfile project.key -o project.tzap -
 
-# Future raw stdin shapes; currently reject with unsupported-feature
-producer | tzap create --raw-stdin --stdin-name data/export.bin --keyfile project.key -o export.tzap -
+# Single-volume raw stream from stdin with a known size
+cat disk.img | tzap create --raw-stdin --stdin-name disk.img --stdin-size "$(stat -c%s disk.img)" --keyfile project.key -o disk.tzap -
+
+# Explicit plaintext spool for unknown-size raw stdin
+producer | tzap create --raw-stdin --stdin-name data/export.bin --spool-stdin --keyfile project.key -o export.tzap -
 ```
 
 Useful flags:
@@ -52,10 +55,10 @@ Useful flags:
 - `--signing-chain`: optional PEM or DER intermediate certificate chain
 - `--bootstrap-out`: sidecar output path for single-volume archives only
 - `--tar-stdin`: create a single-volume archive from a tar stream at input path `-`
-- `--raw-stdin`: future create mode where input path `-` is one raw member
+- `--raw-stdin`: create from one raw stdin member at input path `-`
 - `--stdin-name`: archive member path for `--raw-stdin`
-- `--stdin-size`: known byte size for raw stdin
-- `--spool-stdin`: future plaintext spool mode for unknown-size raw stdin
+- `--stdin-size`: known byte size for single-pass raw stdin
+- `--spool-stdin`: explicit plaintext spool mode for unknown-size raw stdin
 - `--compression-level`, `--chunk-size`, `--envelope-size`, `--block-size`
 - `--dry-run`: print planned actions without writing bytes
 - `--force`: allow overwrite of outputs and bootstrap
@@ -72,12 +75,18 @@ Notes:
   random access.
 - `--tar-stdin` rejects `--password`, `--password-stdin`, `--dictionary`,
   `--volumes > 1`, and `--volume-size` before reading payload stdin.
-- Raw stdin create flags are present for future support, but the current CLI
-  public surface still returns `unsupported-feature` for accepted-looking raw
-  stdin create shapes.
+- `--raw-stdin --stdin-size SIZE` streams exactly `SIZE` bytes into one
+  regular-file member in the standard tar-member v41 profile. Short or
+  overlong stdin is rejected and the temporary archive is not published.
+- `--raw-stdin --spool-stdin` writes stdin to an explicit plaintext temporary
+  spool first, then archives it as the same tar-member v41 profile. Use it only
+  when the plaintext spool tradeoff is acceptable.
+- `--raw-stdin` without `--stdin-size` or `--spool-stdin` is reserved for the
+  future no-spool `raw_stream_v1` profile and exits with `unsupported-feature`.
 - The convenience core writer APIs return completed in-memory archive artifacts.
-  The `--tar-stdin` CLI path uses the core sink writer and publishes the output
-  file only after terminal metadata and optional RootAuth signing finish.
+  The `--tar-stdin` and single-volume raw stdin CLI paths use the core sink
+  writer and publish the output file only after terminal metadata and optional
+  RootAuth signing finish.
 - No append-only sink or multipart-upload create mode is exposed by the CLI.
 - Create emits regular-file tar member groups only. Long or non-ASCII archive
   paths use local path-specific PAX metadata; global PAX/GNU state and tar EOF
