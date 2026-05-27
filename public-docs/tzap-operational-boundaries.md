@@ -291,10 +291,10 @@ tzap create --keyfile project.key -o - ./project
 
 ## Streaming create stdin modes
 
-The CLI supports tar stdin create and known-size raw stdin create with either
-one output file or a fixed `--volumes N` output set. Unknown-size raw stdin is
-supported only through the explicit plaintext spool path, and that spool path is
-single-volume in this CLI:
+The CLI supports tar stdin create, known-size raw stdin create, and explicit
+spooled raw stdin create with either one output file or a fixed `--volumes N`
+output set. Unknown-size raw stdin is supported only through the explicit
+plaintext spool path:
 
 ```sh
 tar cf - ./project | tzap create --tar-stdin --keyfile project.key -o project.tzap -
@@ -302,6 +302,7 @@ tar cf - ./project | tzap create --tar-stdin --volumes 3 --keyfile project.key -
 cat disk.img | tzap create --raw-stdin --stdin-name disk.img --stdin-size "$(stat -c%s disk.img)" --keyfile project.key -o disk.tzap -
 cat disk.img | tzap create --raw-stdin --stdin-name disk.img --stdin-size "$(stat -c%s disk.img)" --volumes 3 --keyfile project.key -o disk.tzap -
 producer | tzap create --raw-stdin --stdin-name data/export.bin --spool-stdin --keyfile project.key -o export.tzap -
+producer | tzap create --raw-stdin --stdin-name data/export.bin --spool-stdin --volumes 3 --keyfile project.key -o export.tzap -
 ```
 
 Use a file-backed archive path with `-o`; `-o -` is not archive stdout. The
@@ -316,9 +317,14 @@ archive output or volume set.
 
 Unknown-size raw stdin is supported only with explicit `--spool-stdin`. That
 mode writes plaintext stdin to a restrictive temporary file, then archives that
-file as a regular tar-member v41 member. The spool is removed after the command
-finishes, but the plaintext exists on local disk while the command is running.
-The current CLI does not combine `--spool-stdin` with `--volumes > 1`.
+file as a regular tar-member v41 member. With `--volumes N`, tzap waits for EOF,
+uses the file-backed spool size as the known raw member size, and stripes the
+member across the fixed output volume set. The spool is removed after normal
+success or normal failure, but the plaintext exists on local disk while the
+command is running. The current CLI has no `--max-spool-size` flag, so the OS
+temp directory must be able to hold the full raw stream. A hard kill, process
+abort, or host crash can leave the plaintext temp file behind in the OS temp
+directory.
 
 The no-spool unknown-size raw profile remains reserved for future support:
 
@@ -336,8 +342,7 @@ dictionaries, or ordinary input paths are read:
 
 - `--password` or `--password-stdin` with `--tar-stdin` or `--raw-stdin`
 - `--dictionary` with `--tar-stdin` or `--raw-stdin`
-- `--volumes > 1` with `--raw-stdin --spool-stdin` or no-size/no-spool
-  `--raw-stdin`
+- `--volumes > 1` with no-size/no-spool `--raw-stdin`
 - `--volume-size` with stdin create modes
 - `--volume-loss-tolerance > 0` with stdin create modes
 - ordinary input paths mixed with stdin create modes; use exactly one input

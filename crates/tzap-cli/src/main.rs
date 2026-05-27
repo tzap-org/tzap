@@ -799,13 +799,13 @@ fn run(cli: Cli) -> Result<()> {
                             u64::MAX,
                             ExplicitPlaintextSpool::acknowledge_plaintext_spool(),
                         )?;
-                        let spool_source = spool.known_size_source();
+                        let known_size_source = spool.known_size_source();
                         let spool_reader = spool.reopen()?;
                         let (summary, bootstrap_sidecar) = write_raw_stdin_archive_output(
                             &output,
                             spool_reader,
                             stdin_name.as_deref().expect("validated stdin-name"),
-                            spool_source.size(),
+                            known_size_source.size(),
                             &key,
                             options,
                             root_auth,
@@ -2251,10 +2251,13 @@ fn validate_create_stdin_mode(args: CreateStdinArgs<'_>) -> Result<Option<Create
         )));
     }
     if matches!(args.volumes, Some(volumes) if volumes > 1)
-        && !matches!(mode, CreateStdinMode::Tar | CreateStdinMode::RawKnownSize)
+        && !matches!(
+            mode,
+            CreateStdinMode::Tar | CreateStdinMode::RawKnownSize | CreateStdinMode::RawSpool
+        )
     {
         return Err(anyhow!(FormatError::WriterUnsupported(
-            "--volumes > 1 is supported only with --tar-stdin or known-size --raw-stdin",
+            "--volumes > 1 is supported only with --tar-stdin, known-size --raw-stdin, or --raw-stdin --spool-stdin",
         )));
     }
 
@@ -3779,6 +3782,71 @@ mod tests {
 
         assert!(error.to_string().contains("test signer failed"));
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn raw_spool_multi_volume_signer_failure_removes_temporary_archive_outputs_and_spool() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("failed-raw-spool.tzap");
+        let volume_0 = create_output_paths(output.to_str().unwrap(), 3)[0].clone();
+        let volume_1 = create_output_paths(output.to_str().unwrap(), 3)[1].clone();
+        let volume_2 = create_output_paths(output.to_str().unwrap(), 3)[2].clone();
+        let key = CreateKey {
+            master_key: test_master_key(),
+            kdf_params: KdfParams::Raw,
+        };
+        let root_auth = RootAuthWriterConfig {
+            authenticator_id: 0x9001,
+            signer_identity_type: 0x9002,
+            signer_identity: b"test signer",
+            authenticator_value_length: 64,
+        };
+        let mut authenticator = |_request: &RootAuthSigningRequest| {
+            Err(FormatError::WriterUnsupported("test signer failed"))
+        };
+        let payload = (0..150_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let spool_path;
+
+        {
+            let spool = crate::plaintext_spool::spool_unknown_size_raw_stdin_in(
+                Cursor::new(payload),
+                temp.path(),
+                u64::MAX,
+                ExplicitPlaintextSpool::acknowledge_plaintext_spool(),
+            )
+            .unwrap();
+            let known_size_source = spool.known_size_source();
+            spool_path = known_size_source.path().to_path_buf();
+            let mut spool_reader = spool.reopen().unwrap();
+
+            let error = write_raw_stdin_archive_output_from_reader(
+                output.to_str().unwrap(),
+                &mut spool_reader,
+                "raw/spooled.bin",
+                known_size_source.size(),
+                &key,
+                WriterOptions {
+                    stripe_width: 3,
+                    volume_loss_tolerance: 0,
+                    bit_rot_buffer_pct: 0,
+                    ..WriterOptions::default()
+                },
+                Some(root_auth),
+                Some(&mut authenticator),
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("test signer failed"));
+            assert!(spool_path.exists());
+        }
+
+        assert!(!spool_path.exists());
+        assert!(!output.exists());
+        assert!(!volume_0.exists());
+        assert!(!volume_1.exists());
+        assert!(!volume_2.exists());
     }
 
     #[test]

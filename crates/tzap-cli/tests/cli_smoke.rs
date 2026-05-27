@@ -691,7 +691,6 @@ fn cli_create_stdin_modes_reject_unsupported_multi_volume_shapes() {
             "--raw-stdin",
             "--stdin-name",
             "data.bin",
-            "--spool-stdin",
             "--volumes",
             "2",
             "--keyfile",
@@ -703,7 +702,7 @@ fn cli_create_stdin_modes_reject_unsupported_multi_volume_shapes() {
         .assert()
         .code(16)
         .stderr(predicate::str::contains(
-            "--volumes > 1 is supported only with --tar-stdin or known-size --raw-stdin",
+            "--volumes > 1 is supported only with --tar-stdin, known-size --raw-stdin, or --raw-stdin --spool-stdin",
         ));
 
     Command::cargo_bin("tzap")
@@ -1565,6 +1564,231 @@ fn cli_create_raw_stdin_spool_round_trips() {
         .success();
 
     assert_eq!(fs::read(extract_dir.join("spooled.bin")).unwrap(), payload);
+}
+
+#[test]
+fn cli_create_raw_stdin_spool_multi_volume_round_trips_list_verify_and_extract() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let output_base = temp.path().join("raw-spool-mv.tzap");
+    let extract_dir = temp.path().join("extract");
+    let volume_0 = numbered_volume_path(&output_base, 0);
+    let volume_1 = numbered_volume_path(&output_base, 1);
+    let volume_2 = numbered_volume_path(&output_base, 2);
+    let payload = (0..150_000)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "raw/spooled.bin",
+            "--spool-stdin",
+            "--volumes",
+            "3",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output_base.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(payload.clone())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("spooled raw bytes in"))
+        .stderr(predicate::str::contains("3 volume(s)"));
+
+    assert!(volume_0.exists());
+    assert!(volume_1.exists());
+    assert!(volume_2.exists());
+    assert!(!output_base.exists());
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+            volume_1.to_str().unwrap(),
+            volume_2.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+            "--volume",
+            volume_1.to_str().unwrap(),
+            "--volume",
+            volume_2.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("raw/spooled.bin"));
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+            "--volume",
+            volume_1.to_str().unwrap(),
+            "--volume",
+            volume_2.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(extract_dir.join("raw/spooled.bin")).unwrap(),
+        payload
+    );
+}
+
+#[test]
+fn cli_create_raw_stdin_spool_multi_volume_empty_input_round_trips() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let output_base = temp.path().join("raw-spool-empty-mv.tzap");
+    let extract_dir = temp.path().join("extract");
+    let volume_0 = numbered_volume_path(&output_base, 0);
+    let volume_1 = numbered_volume_path(&output_base, 1);
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "empty.bin",
+            "--spool-stdin",
+            "--volumes",
+            "2",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output_base.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(Vec::<u8>::new())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("0 spooled raw bytes in"))
+        .stderr(predicate::str::contains("2 volume(s)"));
+
+    assert!(volume_0.exists());
+    assert!(volume_1.exists());
+    assert!(!output_base.exists());
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+            "--volume",
+            volume_1.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("empty.bin"));
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+            "--volume",
+            volume_1.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(extract_dir.join("empty.bin")).unwrap(), b"");
+}
+
+#[test]
+fn cli_create_raw_stdin_spool_multi_volume_signed_archive_verifies_public_root_auth() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let signing_secret = temp.path().join("root.signing.hex");
+    let signing_public = temp.path().join("root.public.hex");
+    let output_base = temp.path().join("raw-spool-signed-mv.tzap");
+    let volume_0 = numbered_volume_path(&output_base, 0);
+    let volume_1 = numbered_volume_path(&output_base, 1);
+    let payload = (0..150_000)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "signing-keygen",
+            "--secret-output",
+            signing_secret.to_str().unwrap(),
+            "--public-output",
+            signing_public.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "raw/spooled-signed.bin",
+            "--spool-stdin",
+            "--volumes",
+            "2",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--signing-key",
+            signing_secret.to_str().unwrap(),
+            "-o",
+            output_base.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("root auth: ed25519 signed"))
+        .stderr(predicate::str::contains("2 volume(s)"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--public-no-key",
+            "--trusted-public-key",
+            signing_public.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+            volume_1.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "public_data_block_commitment_verified",
+        ));
 }
 
 #[test]

@@ -40,6 +40,7 @@ cat disk.img | tzap create --raw-stdin --stdin-name disk.img --stdin-size "$(sta
 
 # Explicit plaintext spool for unknown-size raw stdin
 producer | tzap create --raw-stdin --stdin-name data/export.bin --spool-stdin --keyfile project.key -o export.tzap -
+producer | tzap create --raw-stdin --stdin-name data/export.bin --spool-stdin --volumes 3 --keyfile project.key -o export.tzap -
 ```
 
 Useful flags:
@@ -83,9 +84,16 @@ Notes:
   for fixed-count multi-volume output. Short or overlong stdin is rejected and
   the temporary archive path or volume set is not published.
 - `--raw-stdin --spool-stdin` writes stdin to an explicit plaintext temporary
-  spool first, then archives it as the same tar-member v41 profile. It remains
-  single-volume in this CLI. Use it only when the plaintext spool tradeoff is
-  acceptable.
+  spool first, then archives it as the same tar-member v41 profile. Add
+  `--volumes N` for fixed-count multi-volume output. After EOF the spool gives
+  tzap a file-backed raw source with a known size, while `-o` still writes a
+  normal file-backed archive path or volume set. That output shape is faster
+  for later selected-file workflows because readers can use random access. The
+  spool is plaintext, owner-only on Unix, and removed on normal success or
+  normal error. The current CLI does not expose `--max-spool-size`, so the OS
+  temp directory must be able to hold the full raw stream. A hard kill or host
+  crash can leave the temp file behind in the OS temp directory. Use it only
+  when the plaintext spool tradeoff is acceptable.
 - `--raw-stdin` without `--stdin-size` or `--spool-stdin` is reserved for the
   future no-spool `raw_stream_v1` profile and exits with `unsupported-feature`.
 - The convenience core writer APIs return completed in-memory archive artifacts.
