@@ -7,3 +7,4 @@
 #![forbid(unsafe_code)]
 
 pub mod ed25519_raw;
+pub mod x509_chain;

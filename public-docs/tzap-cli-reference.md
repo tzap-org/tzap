@@ -25,6 +25,7 @@ tzap create --keyfile project.key -o backup.tzap ./project
 
 # Signed RootAuth archive
 tzap create --keyfile project.key --signing-key root.signing.hex -o backup.tzap ./project
+tzap create --keyfile project.key --signing-cert signer.pem --signing-private-key signer.key -o backup.tzap ./project
 
 # Multi-volume recovery settings
 tzap create --keyfile project.key --volumes 3 --volume-loss-tolerance 1 -o backup.tzap ./project
@@ -44,6 +45,9 @@ Useful flags:
 - `--argon2-*`: passphrase derivation tuning
 - `--dictionary`: optional zstd dictionary
 - `--signing-key`: Ed25519 signing seed for v41 RootAuth
+- `--signing-cert`: X.509 leaf certificate for RootAuth
+- `--signing-private-key`: private key for `--signing-cert`
+- `--signing-chain`: optional PEM or DER intermediate certificate chain
 - `--bootstrap-out`: sidecar output path for single-volume archives only
 - `--tar-stdin`: future create mode where input path `-` is a tar stream
 - `--raw-stdin`: future create mode where input path `-` is one raw member
@@ -173,6 +177,7 @@ printf '%s\n' "$TZAP_PASSPHRASE" | tzap verify --password-stdin project.tzap
 
 tzap verify --json --keyfile project.key backup.tzap.000 backup.tzap.001 backup.tzap.002
 tzap verify --keyfile project.key --trusted-public-key root.public.hex backup.tzap
+tzap verify --keyfile project.key --trusted-ca-cert root-ca.pem backup.tzap
 tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap
 ```
 
@@ -181,6 +186,8 @@ Useful flags:
 - `--json`: machine-readable status output
 - `--quiet`: suppress success summary
 - `--trusted-public-key`: verify Ed25519 RootAuth with a trusted public key
+- `--trusted-ca-cert`: verify X.509 RootAuth with a trusted CA certificate
+- `--trusted-system-roots`: allow OpenSSL default trust roots for X.509 RootAuth
 - `--public-no-key`: verify public v41 RootAuth commitments without the archive key
 - `--bootstrap`: bootstrap sidecar path
 
@@ -188,7 +195,8 @@ Notes:
 
 - Key-holding verification uses `--keyfile`, `--password`, or
   `--password-stdin`. Add `--trusted-public-key` to require RootAuth content
-  verification after ordinary archive integrity verification.
+  verification after ordinary archive integrity verification for Ed25519, or add
+  `--trusted-ca-cert` / `--trusted-system-roots` for X.509 RootAuth.
 - Key-holding verification opens archive files through the core file-backed
   random-access reader, then intentionally walks the payload and metadata needed
   to validate the full archive.
@@ -202,7 +210,8 @@ Notes:
 - `-` is archive stdin for single-volume key-holding verification with
   `--keyfile`. Dictionary-compressed streams require `--bootstrap`. Archive
   stdin does not support `--password-stdin`, passphrase KDF discovery,
-  `--trusted-public-key`, `--public-no-key`, or multi-volume recovery.
+  RootAuth external verification flags, `--public-no-key`, or multi-volume
+  recovery.
 - `--bootstrap` is for single-volume open paths. Multi-volume open paths should
   pass volume files and omit the sidecar; combining multiple archive inputs
   with `--bootstrap` rejects before reading archive files with

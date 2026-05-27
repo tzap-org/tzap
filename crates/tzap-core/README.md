@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 footer, and verification callback surfaces, so signing profiles compose cleanly
 through companion crates.
 
-For Ed25519 RootAuth signing, pair this crate with
+For Ed25519 or X.509 RootAuth signing, pair this crate with
 [`tzap-plugin-signing`](https://crates.io/crates/tzap-plugin-signing). The core
 crate recomputes archive roots and gates when a plugin verifier may claim full
 RootAuth or public no-key verification.

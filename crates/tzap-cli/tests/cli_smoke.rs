@@ -3,6 +3,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use openssl::asn1::Asn1Time;
+use openssl::bn::{BigNum, MsbOption};
+use openssl::hash::MessageDigest;
+use openssl::pkey::{PKey, PKeyRef, Private};
+use openssl::rsa::Rsa;
+use openssl::x509::extension::{BasicConstraints, KeyUsage};
+use openssl::x509::{X509NameBuilder, X509Ref, X509};
 use predicates::prelude::*;
 use serde_json::Value;
 use tempfile::tempdir;
@@ -287,6 +294,9 @@ fn cli_create_help_includes_examples_and_flags() {
     assert!(stdout.contains("--argon2-parallelism <COUNT>"));
     assert!(stdout.contains("--dictionary <FILE>"));
     assert!(stdout.contains("--signing-key <FILE>"));
+    assert!(stdout.contains("--signing-cert <FILE>"));
+    assert!(stdout.contains("--signing-private-key <FILE>"));
+    assert!(stdout.contains("--signing-chain <FILE>"));
     assert!(stdout.contains("--bootstrap-out <FILE>"));
     assert!(stdout.contains("--tar-stdin"));
     assert!(stdout.contains("--raw-stdin"));
@@ -369,6 +379,8 @@ fn cli_verify_help_includes_examples_and_flags() {
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
     assert!(stdout.contains("--trusted-public-key <FILE>"));
+    assert!(stdout.contains("--trusted-ca-cert <FILE>"));
+    assert!(stdout.contains("--trusted-system-roots"));
     assert!(stdout.contains("--public-no-key"));
     assert!(stdout.contains("--bootstrap"));
     assert!(stdout.contains("--json"));
@@ -1426,6 +1438,97 @@ fn cli_create_signed_archive_and_verify_root_auth_profiles() {
         .unwrap()
         .iter()
         .any(|entry| entry == "public_recovery_margin_unchecked"));
+}
+
+#[test]
+fn cli_create_x509_signed_archive_and_verify_certificate_details() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let root_ca = temp.path().join("root-ca.pem");
+    let signer_cert = temp.path().join("signer.pem");
+    let signer_key = temp.path().join("signer.key");
+    let input = temp.path().join("signed.txt");
+    let archive = temp.path().join("signed-x509.tzap");
+
+    let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+    let (leaf_cert, leaf_key) = test_leaf_cert(
+        "Acme Release Signing",
+        root_cert.as_ref(),
+        root_key.as_ref(),
+    );
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&root_ca, root_cert.to_pem().unwrap()).unwrap();
+    fs::write(&signer_cert, leaf_cert.to_pem().unwrap()).unwrap();
+    fs::write(&signer_key, leaf_key.private_key_to_pem_pkcs8().unwrap()).unwrap();
+    fs::write(&input, b"x509 signed payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--signing-cert",
+            signer_cert.to_str().unwrap(),
+            "--signing-private-key",
+            signer_key.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("root auth: x509 signed"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--trusted-ca-cert",
+            root_ca.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("root-auth: OK x509")
+                .and(predicate::str::contains(
+                    "root-auth signer: CN=Acme Release Signing",
+                ))
+                .and(predicate::str::contains(
+                    "root-auth issuer: CN=Acme Test Root CA",
+                ))
+                .and(predicate::str::contains("root-auth signed-at:")),
+        );
+
+    let output = Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--json",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--trusted-ca-cert",
+            root_ca.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["root_auth"]["authenticator"], "x509");
+    assert_eq!(value["root_auth"]["subject"], "CN=Acme Release Signing");
+    assert_eq!(value["root_auth"]["issuer"], "CN=Acme Test Root CA");
+    assert_eq!(value["root_auth"]["time_source"], "signer_claimed");
+    assert_eq!(
+        value["root_auth"]["trust_anchor_subject"],
+        "CN=Acme Test Root CA"
+    );
 }
 
 #[test]
@@ -5885,4 +5988,77 @@ fn cli_extract_preserves_crlf_payload_bytes() {
         .success();
 
     assert_eq!(fs::read(output.join("payload.txt")).unwrap(), expected);
+}
+
+fn test_ca_cert(cn: &str) -> (X509, PKey<Private>) {
+    let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+    let mut name = X509NameBuilder::new().unwrap();
+    name.append_entry_by_text("CN", cn).unwrap();
+    let name = name.build();
+    let mut builder = X509::builder().unwrap();
+    builder.set_version(2).unwrap();
+    builder.set_serial_number(&random_serial_number()).unwrap();
+    builder.set_subject_name(&name).unwrap();
+    builder.set_issuer_name(&name).unwrap();
+    builder.set_pubkey(&key).unwrap();
+    builder
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    builder
+        .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+        .unwrap();
+    builder
+        .append_extension(BasicConstraints::new().critical().ca().build().unwrap())
+        .unwrap();
+    builder
+        .append_extension(
+            KeyUsage::new()
+                .critical()
+                .key_cert_sign()
+                .crl_sign()
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+    builder.sign(&key, MessageDigest::sha256()).unwrap();
+    (builder.build(), key)
+}
+
+fn test_leaf_cert(cn: &str, ca_cert: &X509Ref, ca_key: &PKeyRef<Private>) -> (X509, PKey<Private>) {
+    let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+    let mut name = X509NameBuilder::new().unwrap();
+    name.append_entry_by_text("CN", cn).unwrap();
+    let name = name.build();
+    let mut builder = X509::builder().unwrap();
+    builder.set_version(2).unwrap();
+    builder.set_serial_number(&random_serial_number()).unwrap();
+    builder.set_subject_name(&name).unwrap();
+    builder.set_issuer_name(ca_cert.subject_name()).unwrap();
+    builder.set_pubkey(&key).unwrap();
+    builder
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    builder
+        .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+        .unwrap();
+    builder
+        .append_extension(BasicConstraints::new().build().unwrap())
+        .unwrap();
+    builder
+        .append_extension(
+            KeyUsage::new()
+                .critical()
+                .digital_signature()
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+    builder.sign(ca_key, MessageDigest::sha256()).unwrap();
+    (builder.build(), key)
+}
+
+fn random_serial_number() -> openssl::asn1::Asn1Integer {
+    let mut serial = BigNum::new().unwrap();
+    serial.rand(159, MsbOption::MAYBE_ZERO, false).unwrap();
+    serial.to_asn1_integer().unwrap()
 }

@@ -4,11 +4,12 @@
 the companion crate for applications that want signed v41 RootAuth archives on
 top of the standalone `tzap-core` archive foundation.
 
-The first profile is `ed25519_raw`, which implements the v41 optional Ed25519
-RootAuth authenticator (`authenticator_id = 0x0002`). The crate signs and
-verifies the domain-separated v41 signing input from `tzap-core` request and
-footer types. Core provides archive-root recomputation and verification gates;
-this crate provides the signing profile logic.
+The `ed25519_raw` profile implements the v41 optional Ed25519 RootAuth
+authenticator (`authenticator_id = 0x0002`). The `x509_chain` profile adds an
+OpenSSL-backed certificate verifier (`authenticator_id = 0x0003`) for leaf
+certificates, optional intermediate chains, and trusted CA roots. Core provides
+archive-root recomputation and verification gates; this crate provides the
+signing profile logic.
 
 ## Install
 
@@ -26,12 +27,12 @@ RootAuth workflows and public no-key verification.
 
 ```text
 tzap-core              archive format, RootAuth material, verifier gates
-tzap-plugin-signing    Ed25519 profile and future signing profiles
+tzap-plugin-signing    Ed25519 and X.509 RootAuth profiles
 tzap CLI               composes core plus signing plugin
 ```
 
-Future certificate profiles can live in this crate as additional modules while
-keeping core independent.
+Certificate profiles live in this crate as additional modules while keeping core
+independent.
 
 ## Example
 
@@ -67,6 +68,17 @@ The `ed25519_raw` module provides:
 - distinct outcome types for profile data quality, reserved identity classes,
   self-signed consistency, key-holding RootAuth verification, and public no-key
   commitment verification
+
+## X.509 Chain Profile
+
+The `x509_chain` module provides:
+
+- `X509_AUTHENTICATOR_ID = 0x0003`
+- `X509_SIGNER_IDENTITY_TYPE_DER_CERT = 2`
+- `X509RootAuthSigner` for core writer callbacks
+- `verify_root_auth_footer` for core verifier callbacks
+- reports with signer subject, issuer, serial number, certificate SHA-256,
+  signer-claimed signing time, verified chain subjects, and trust anchor subject
 
 ## More Information
 

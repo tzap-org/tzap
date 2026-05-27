@@ -3,12 +3,14 @@ use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use rand::RngCore;
 use serde_json::json;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tzap_core::format::{
     FormatError, CRYPTO_HEADER_FIXED_LEN, READER_MAX_ARGON2ID_M_COST_KIB,
     READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST, VOLUME_HEADER_LEN,
@@ -25,12 +27,15 @@ use tzap_core::{
     write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
     write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
     ExtractError, KdfParams, MasterKey, MetadataDiagnostic, NonSeekableReaderOptions,
-    OpenedArchive, RegularFile, RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions,
-    TarEntryKind, WriterOptions,
+    OpenedArchive, RegularFile, RootAuthSigningRequest, RootAuthVerification, RootAuthWriterConfig,
+    SafeExtractionOptions, TarEntryKind, WriterOptions,
 };
 use tzap_plugin_signing::ed25519_raw::{
     self, Ed25519RootAuthOutcome, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
     ED25519_AUTHENTICATOR_VALUE_LEN,
+};
+use tzap_plugin_signing::x509_chain::{
+    self, X509RootAuthReport, X509RootAuthSigner, X509_AUTHENTICATOR_ID,
 };
 
 #[allow(dead_code)]
@@ -74,7 +79,7 @@ enum Command {
     #[command(
         about = "Create a new archive",
         long_about = "Create a new archive from files and directories.\n\nThe command writes one output path for single-volume archives, or a base path plus `.000`, `.001`, ... suffixes for multi-volume archives.",
-        after_help = "Examples:\n  tzap create --keyfile key.hex -o backup.tzap file.txt\n  tzap create --password -o backup.tzap file.txt\n  tzap create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8192 -o backup.tzap file.txt\n  tzap create --keyfile key.hex --signing-key root.signing.hex -o backup.tzap file.txt\n  tzap create --keyfile key.hex -o backup.tzap --volumes 3 dir/\n  tzap create --keyfile key.hex --volume-size 64M --volume-loss-tolerance 1 -o backup.tzap dir/\n  tzap create --keyfile key.hex --bootstrap-out backup.tzap.bootstrap file.txt",
+        after_help = "Examples:\n  tzap create --keyfile key.hex -o backup.tzap file.txt\n  tzap create --password -o backup.tzap file.txt\n  tzap create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8192 -o backup.tzap file.txt\n  tzap create --keyfile key.hex --signing-key root.signing.hex -o backup.tzap file.txt\n  tzap create --keyfile key.hex --signing-cert signer.pem --signing-private-key signer.key -o backup.tzap file.txt\n  tzap create --keyfile key.hex -o backup.tzap --volumes 3 dir/\n  tzap create --keyfile key.hex --volume-size 64M --volume-loss-tolerance 1 -o backup.tzap dir/\n  tzap create --keyfile key.hex --bootstrap-out backup.tzap.bootstrap file.txt",
         group(
             ArgGroup::new("create-key-source")
                 .required(true)
@@ -186,9 +191,36 @@ enum Command {
         #[arg(
             long = "signing-key",
             value_name = "FILE",
+            conflicts_with = "signing_cert",
             help = "Sign RootAuth with an Ed25519 signing key seed from FILE."
         )]
         signing_key: Option<String>,
+
+        #[arg(
+            long = "signing-cert",
+            value_name = "FILE",
+            conflicts_with = "signing_key",
+            requires = "signing_private_key",
+            help = "Sign RootAuth with an X.509 leaf certificate from FILE."
+        )]
+        signing_cert: Option<String>,
+
+        #[arg(
+            long = "signing-private-key",
+            value_name = "FILE",
+            conflicts_with = "signing_key",
+            requires = "signing_cert",
+            help = "Private key for --signing-cert."
+        )]
+        signing_private_key: Option<String>,
+
+        #[arg(
+            long = "signing-chain",
+            value_name = "FILE",
+            requires = "signing_cert",
+            help = "PEM or DER intermediate certificate chain for --signing-cert."
+        )]
+        signing_chain: Vec<String>,
 
         #[arg(
             long = "bootstrap-out",
@@ -421,7 +453,7 @@ enum Command {
     #[command(
         about = "Verify archive integrity",
         long_about = "Verify archive signatures and checksum integrity. No payload changes are made.\n\nBy default verify is key-holding and requires --keyfile, --password, or --password-stdin. With --public-no-key, verify uses the v41 public RootAuth profile and does not require the archive key.",
-        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex backup.tzap backup.tzap.001\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives, the first positional argument is the primary archive.\nAdditional positionals are optional extra volumes."
+        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex backup.tzap backup.tzap.001\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives, the first positional argument is the primary archive.\nAdditional positionals are optional extra volumes."
     )]
     Verify {
         #[arg(
@@ -461,6 +493,21 @@ enum Command {
             help = "Verify Ed25519 RootAuth with trusted public key FILE."
         )]
         trusted_public_key: Option<String>,
+
+        #[arg(
+            long = "trusted-ca-cert",
+            value_name = "FILE",
+            conflicts_with = "public_no_key",
+            help = "Verify X.509 RootAuth with trusted CA certificate FILE."
+        )]
+        trusted_ca_cert: Vec<String>,
+
+        #[arg(
+            long = "trusted-system-roots",
+            conflicts_with = "public_no_key",
+            help = "Allow X.509 RootAuth verification with OpenSSL default trust roots."
+        )]
+        trusted_system_roots: bool,
 
         #[arg(
             long = "public-no-key",
@@ -582,6 +629,9 @@ fn run(cli: Cli) -> Result<()> {
             argon2_parallelism,
             dictionary,
             signing_key,
+            signing_cert,
+            signing_private_key,
+            signing_chain,
             bootstrap_out,
             tar_stdin,
             raw_stdin,
@@ -657,7 +707,7 @@ fn run(cli: Cli) -> Result<()> {
                 );
                 eprintln!(
                     "  root auth: {}",
-                    create_root_auth_mode_label(signing_key.as_deref())
+                    create_root_auth_mode_label(signing_key.as_deref(), signing_cert.as_deref())
                 );
                 eprintln!(
                     "  volume mode: {}",
@@ -697,43 +747,33 @@ fn run(cli: Cli) -> Result<()> {
                     fs::read(path).with_context(|| format!("failed to read dictionary {path}"))
                 })
                 .transpose()?;
-            let signing_key = signing_key
-                .as_deref()
-                .map(load_ed25519_signing_key)
+            let root_auth_profile = load_create_root_auth_profile(
+                signing_key.as_deref(),
+                signing_cert.as_deref(),
+                signing_private_key.as_deref(),
+                &signing_chain,
+            )?;
+            let root_auth = root_auth_profile
+                .as_ref()
+                .map(CreateRootAuthProfile::root_auth_writer_config)
                 .transpose()?;
-            let signer_identity = signing_key
-                .as_ref()
-                .map(|key| key.verifying_key().to_bytes());
-            let root_auth = signer_identity
-                .as_ref()
-                .map(|identity| RootAuthWriterConfig {
-                    authenticator_id: ED25519_AUTHENTICATOR_ID,
-                    signer_identity_type: 1,
-                    signer_identity: identity,
-                    authenticator_value_length: ED25519_AUTHENTICATOR_VALUE_LEN,
-                });
             let archive = match (
                 &dictionary_bytes,
                 &key.kdf_params,
                 root_auth,
-                signing_key.as_ref(),
+                root_auth_profile.as_ref(),
             ) {
-                (Some(dictionary), KdfParams::Raw, Some(root_auth), Some(signing_key)) => {
+                (Some(dictionary), KdfParams::Raw, Some(root_auth), Some(profile)) => {
                     write_archive_with_dictionary_and_root_auth(
                         &regular_files,
                         &key.master_key,
                         options,
                         dictionary,
                         root_auth,
-                        |request| {
-                            Ok(
-                                ed25519_raw::authenticator_value_for_request(signing_key, request)
-                                    .to_vec(),
-                            )
-                        },
+                        |request| root_auth_authenticator_value(profile, request),
                     )
                 }
-                (Some(dictionary), kdf_params, Some(root_auth), Some(signing_key)) => {
+                (Some(dictionary), kdf_params, Some(root_auth), Some(profile)) => {
                     write_archive_with_dictionary_kdf_and_root_auth(
                         &regular_files,
                         &key.master_key,
@@ -741,41 +781,26 @@ fn run(cli: Cli) -> Result<()> {
                         dictionary,
                         kdf_params,
                         root_auth,
-                        |request| {
-                            Ok(
-                                ed25519_raw::authenticator_value_for_request(signing_key, request)
-                                    .to_vec(),
-                            )
-                        },
+                        |request| root_auth_authenticator_value(profile, request),
                     )
                 }
-                (None, KdfParams::Raw, Some(root_auth), Some(signing_key)) => {
+                (None, KdfParams::Raw, Some(root_auth), Some(profile)) => {
                     write_archive_with_root_auth(
                         &regular_files,
                         &key.master_key,
                         options,
                         root_auth,
-                        |request| {
-                            Ok(
-                                ed25519_raw::authenticator_value_for_request(signing_key, request)
-                                    .to_vec(),
-                            )
-                        },
+                        |request| root_auth_authenticator_value(profile, request),
                     )
                 }
-                (None, kdf_params, Some(root_auth), Some(signing_key)) => {
+                (None, kdf_params, Some(root_auth), Some(profile)) => {
                     write_archive_with_root_auth_and_kdf(
                         &regular_files,
                         &key.master_key,
                         options,
                         kdf_params,
                         root_auth,
-                        |request| {
-                            Ok(
-                                ed25519_raw::authenticator_value_for_request(signing_key, request)
-                                    .to_vec(),
-                            )
-                        },
+                        |request| root_auth_authenticator_value(profile, request),
                     )
                 }
                 (Some(dictionary), KdfParams::Raw, None, _) => write_archive_with_dictionary(
@@ -797,7 +822,7 @@ fn run(cli: Cli) -> Result<()> {
                 (None, kdf_params, None, _) => {
                     write_archive_with_kdf(&regular_files, &key.master_key, options, kdf_params)
                 }
-                (_, _, Some(_), None) => unreachable!("root auth requires signing key"),
+                (_, _, Some(_), None) => unreachable!("root auth requires signing profile"),
             }
             .context("failed to create archive")?;
 
@@ -832,8 +857,8 @@ fn run(cli: Cli) -> Result<()> {
                 bit_rot_buffer_pct
             );
             emit_success_summary(quiet, &summary)?;
-            if root_auth.is_some() {
-                emit_success_summary(quiet, "  root auth: ed25519 signed")?;
+            if let Some(profile) = root_auth_profile.as_ref() {
+                emit_success_summary(quiet, &format!("  root auth: {} signed", profile.label()))?;
             }
             if let Some(path) = bootstrap_output {
                 emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
@@ -1135,6 +1160,8 @@ fn run(cli: Cli) -> Result<()> {
             password,
             keyfile,
             trusted_public_key,
+            trusted_ca_cert,
+            trusted_system_roots,
             public_no_key,
             bootstrap,
             json,
@@ -1165,7 +1192,10 @@ fn run(cli: Cli) -> Result<()> {
                     }
                     return Err(err);
                 }
-                if trusted_public_key.is_some() {
+                if trusted_public_key.is_some()
+                    || !trusted_ca_cert.is_empty()
+                    || trusted_system_roots
+                {
                     let err = anyhow!(FormatError::ReaderUnsupported(
                         "RootAuth external verification is not supported for archive stdin",
                     ));
@@ -1246,6 +1276,8 @@ fn run(cli: Cli) -> Result<()> {
                 return run_public_no_key_verify(
                     &archive_paths,
                     trusted_public_key.as_deref(),
+                    &trusted_ca_cert,
+                    trusted_system_roots,
                     password_stdin,
                     password,
                     keyfile.as_deref(),
@@ -1306,24 +1338,26 @@ fn run(cli: Cli) -> Result<()> {
             let file_count = opened.index_root.header.file_count;
             match result {
                 Ok(()) => {
-                    let root_auth = match trusted_public_key.as_deref() {
-                        Some(path) => match verify_opened_root_auth_ed25519(&opened, path)
-                            .with_context(|| format!("failed to verify RootAuth for {first}"))
-                        {
-                            Ok(root_auth) => Some(root_auth),
-                            Err(err) => {
-                                if json {
-                                    emit_verify_json_error(
-                                        &archive_paths,
-                                        Some(volume_count as u64),
-                                        Some(file_count),
-                                        &err,
-                                    )?;
-                                }
-                                return Err(err);
+                    let root_auth = match verify_opened_root_auth(
+                        &opened,
+                        trusted_public_key.as_deref(),
+                        &trusted_ca_cert,
+                        trusted_system_roots,
+                    )
+                    .with_context(|| format!("failed to verify RootAuth for {first}"))
+                    {
+                        Ok(root_auth) => root_auth,
+                        Err(err) => {
+                            if json {
+                                emit_verify_json_error(
+                                    &archive_paths,
+                                    Some(volume_count as u64),
+                                    Some(file_count),
+                                    &err,
+                                )?;
                             }
-                        },
-                        None => None,
+                            return Err(err);
+                        }
                     };
                     let entries = opened.list_files()?;
                     emit_entry_metadata_diagnostics(quiet, &entries)?;
@@ -1354,13 +1388,7 @@ fn run(cli: Cli) -> Result<()> {
                         ),
                     )?;
                     if let Some(root_auth) = &root_auth {
-                        emit_success_stdout(
-                            quiet,
-                            &format!(
-                                "root-auth: OK ed25519 {}",
-                                encode_hex(&root_auth.archive_root)
-                            ),
-                        )?;
+                        emit_root_auth_stdout(quiet, root_auth)?;
                     }
                     Ok(())
                 }
@@ -1548,6 +1576,24 @@ struct InputSpec {
 struct CreateKey {
     master_key: MasterKey,
     kdf_params: KdfParams,
+}
+
+#[derive(Debug)]
+enum CreateRootAuthProfile {
+    Ed25519 {
+        signing_key: SigningKey,
+        signer_identity: [u8; 32],
+    },
+    X509(X509RootAuthSigner),
+}
+
+#[derive(Debug)]
+enum VerifiedRootAuth {
+    Ed25519(RootAuthVerification),
+    X509 {
+        verification: RootAuthVerification,
+        report: X509RootAuthReport,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2042,11 +2088,51 @@ fn create_key_mode_label(keyfile: Option<&str>, password_stdin: bool, password: 
     "unknown".to_string()
 }
 
-fn create_root_auth_mode_label(signing_key: Option<&str>) -> String {
+fn create_root_auth_mode_label(signing_key: Option<&str>, signing_cert: Option<&str>) -> String {
     if signing_key.is_some() {
         return "ed25519".to_string();
     }
+    if signing_cert.is_some() {
+        return "x509".to_string();
+    }
     "unsigned".to_string()
+}
+
+impl CreateRootAuthProfile {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Ed25519 { .. } => "ed25519",
+            Self::X509(_) => "x509",
+        }
+    }
+
+    fn root_auth_writer_config(&self) -> Result<RootAuthWriterConfig<'_>> {
+        match self {
+            Self::Ed25519 {
+                signer_identity, ..
+            } => Ok(RootAuthWriterConfig {
+                authenticator_id: ED25519_AUTHENTICATOR_ID,
+                signer_identity_type: 1,
+                signer_identity,
+                authenticator_value_length: ED25519_AUTHENTICATOR_VALUE_LEN,
+            }),
+            Self::X509(signer) => signer.root_auth_writer_config().map_err(Into::into),
+        }
+    }
+}
+
+fn root_auth_authenticator_value(
+    profile: &CreateRootAuthProfile,
+    request: &RootAuthSigningRequest,
+) -> Result<Vec<u8>, FormatError> {
+    match profile {
+        CreateRootAuthProfile::Ed25519 { signing_key, .. } => {
+            Ok(ed25519_raw::authenticator_value_for_request(signing_key, request).to_vec())
+        }
+        CreateRootAuthProfile::X509(signer) => signer
+            .authenticator_value_for_request(request)
+            .map_err(|_| FormatError::WriterUnsupported("X.509 RootAuth signing failed")),
+    }
 }
 
 fn read_volume_inputs(primary: &str, additional: &[String]) -> Result<Vec<Vec<u8>>> {
@@ -2200,6 +2286,8 @@ fn validate_verify_key_holding_key_source(
 fn run_public_no_key_verify(
     archive_paths: &[String],
     trusted_public_key: Option<&str>,
+    trusted_ca_cert: &[String],
+    trusted_system_roots: bool,
     password_stdin: bool,
     password: bool,
     keyfile: Option<&str>,
@@ -2209,6 +2297,8 @@ fn run_public_no_key_verify(
 ) -> Result<()> {
     if let Err(err) = validate_public_no_key_inputs(
         trusted_public_key,
+        trusted_ca_cert,
+        trusted_system_roots,
         password_stdin,
         password,
         keyfile,
@@ -2304,6 +2394,8 @@ fn run_public_no_key_verify(
 
 fn validate_public_no_key_inputs(
     trusted_public_key: Option<&str>,
+    trusted_ca_cert: &[String],
+    trusted_system_roots: bool,
     password_stdin: bool,
     password: bool,
     keyfile: Option<&str>,
@@ -2311,6 +2403,12 @@ fn validate_public_no_key_inputs(
 ) -> Result<()> {
     if trusted_public_key.is_none() {
         return Err(UsageError("--public-no-key requires --trusted-public-key FILE").into());
+    }
+    if !trusted_ca_cert.is_empty() || trusted_system_roots {
+        return Err(UsageError(
+            "--public-no-key supports Ed25519 RootAuth only; use --trusted-public-key",
+        )
+        .into());
     }
     if password_stdin || password || keyfile.is_some() {
         return Err(UsageError(
@@ -2344,20 +2442,184 @@ fn verify_opened_root_auth_ed25519(
         .map_err(Into::into)
 }
 
-fn root_auth_json(root_auth: &RootAuthVerification, status: &str) -> serde_json::Value {
-    let mut payload = json!({
-        "status": status,
-        "authenticator": "ed25519",
-        "archive_root": encode_hex(&root_auth.archive_root),
-        "authenticator_id": root_auth.authenticator_id,
-        "signer_identity_type": root_auth.signer_identity_type,
-        "signer_identity": encode_hex(&root_auth.signer_identity_bytes),
-        "total_data_block_count": root_auth.total_data_block_count,
-    });
-    if root_auth.signer_identity_type == 1 && root_auth.signer_identity_bytes.len() == 32 {
-        payload["key_id"] = json!(encode_hex(&root_auth.signer_identity_bytes));
+fn verify_opened_root_auth(
+    opened: &OpenedArchive,
+    trusted_public_key: Option<&str>,
+    trusted_ca_cert: &[String],
+    trusted_system_roots: bool,
+) -> Result<Option<VerifiedRootAuth>> {
+    let wants_ed25519 = trusted_public_key.is_some();
+    let wants_x509 = !trusted_ca_cert.is_empty() || trusted_system_roots;
+    if !wants_ed25519 && !wants_x509 {
+        return Ok(None);
     }
-    payload
+    if wants_ed25519 && wants_x509 {
+        return Err(
+            UsageError("use either --trusted-public-key or X.509 trust options, not both").into(),
+        );
+    }
+    let footer = opened
+        .root_auth_footer
+        .as_ref()
+        .ok_or(FormatError::InvalidArchive("missing RootAuthFooter"))?;
+    match footer.authenticator_id {
+        ED25519_AUTHENTICATOR_ID if wants_ed25519 => {
+            let public_key = trusted_public_key.expect("checked Ed25519 trust request");
+            Ok(Some(VerifiedRootAuth::Ed25519(
+                verify_opened_root_auth_ed25519(opened, public_key)?,
+            )))
+        }
+        X509_AUTHENTICATOR_ID if wants_x509 => {
+            let trusted_roots_der = load_x509_certificate_files(trusted_ca_cert)?;
+            Ok(Some(verify_opened_root_auth_x509(
+                opened,
+                &trusted_roots_der,
+                trusted_system_roots,
+            )?))
+        }
+        ED25519_AUTHENTICATOR_ID => {
+            Err(UsageError("Ed25519 RootAuth requires --trusted-public-key FILE").into())
+        }
+        X509_AUTHENTICATOR_ID => Err(UsageError(
+            "X.509 RootAuth requires --trusted-ca-cert FILE or --trusted-system-roots",
+        )
+        .into()),
+        _ => Err(FormatError::ReaderUnsupported("unsupported RootAuth authenticator id").into()),
+    }
+}
+
+fn verify_opened_root_auth_x509(
+    opened: &OpenedArchive,
+    trusted_roots_der: &[Vec<u8>],
+    trusted_system_roots: bool,
+) -> Result<VerifiedRootAuth> {
+    let mut report = None;
+    let mut x509_error = None;
+    let verification = opened
+        .verify_root_auth_with(|footer, archive_root| {
+            match x509_chain::verify_root_auth_footer(
+                footer,
+                archive_root,
+                trusted_roots_der,
+                trusted_system_roots,
+            ) {
+                Ok(value) => {
+                    report = Some(value);
+                    Ok(true)
+                }
+                Err(err) => {
+                    x509_error = Some(err.to_string());
+                    Ok(false)
+                }
+            }
+        })
+        .map_err(|err| {
+            if let Some(detail) = x509_error {
+                anyhow!("{err}: {detail}")
+            } else {
+                anyhow!(err)
+            }
+        })?;
+    let report = report.ok_or(FormatError::InvalidArchive(
+        "missing X.509 RootAuth verification report",
+    ))?;
+    Ok(VerifiedRootAuth::X509 {
+        verification,
+        report,
+    })
+}
+
+fn root_auth_json(root_auth: &VerifiedRootAuth, status: &str) -> serde_json::Value {
+    match root_auth {
+        VerifiedRootAuth::Ed25519(root_auth) => {
+            let mut payload = json!({
+                "status": status,
+                "authenticator": "ed25519",
+                "archive_root": encode_hex(&root_auth.archive_root),
+                "authenticator_id": root_auth.authenticator_id,
+                "signer_identity_type": root_auth.signer_identity_type,
+                "signer_identity": encode_hex(&root_auth.signer_identity_bytes),
+                "total_data_block_count": root_auth.total_data_block_count,
+            });
+            if root_auth.signer_identity_type == 1 && root_auth.signer_identity_bytes.len() == 32 {
+                payload["key_id"] = json!(encode_hex(&root_auth.signer_identity_bytes));
+            }
+            payload
+        }
+        VerifiedRootAuth::X509 {
+            verification,
+            report,
+        } => json!({
+            "status": status,
+            "authenticator": "x509",
+            "archive_root": encode_hex(&verification.archive_root),
+            "authenticator_id": verification.authenticator_id,
+            "signer_identity_type": verification.signer_identity_type,
+            "signer_identity": encode_hex(&verification.signer_identity_bytes),
+            "total_data_block_count": verification.total_data_block_count,
+            "subject": &report.subject,
+            "issuer": &report.issuer,
+            "serial_number": &report.serial_number_hex,
+            "certificate_sha256": encode_hex(&report.certificate_sha256),
+            "signed_at_unix_seconds": report.signed_at_unix_seconds,
+            "signed_at": format_unix_timestamp(report.signed_at_unix_seconds),
+            "time_source": "signer_claimed",
+            "verified_chain_subjects": &report.verified_chain_subjects,
+            "trust_anchor_subject": &report.trust_anchor_subject,
+        }),
+    }
+}
+
+fn emit_root_auth_stdout(quiet: bool, root_auth: &VerifiedRootAuth) -> io::Result<()> {
+    match root_auth {
+        VerifiedRootAuth::Ed25519(verification) => emit_success_stdout(
+            quiet,
+            &format!(
+                "root-auth: OK ed25519 {}",
+                encode_hex(&verification.archive_root)
+            ),
+        ),
+        VerifiedRootAuth::X509 {
+            verification,
+            report,
+        } => {
+            emit_success_stdout(
+                quiet,
+                &format!(
+                    "root-auth: OK x509 {}",
+                    encode_hex(&verification.archive_root)
+                ),
+            )?;
+            emit_success_stdout(quiet, &format!("root-auth signer: {}", report.subject))?;
+            emit_success_stdout(quiet, &format!("root-auth issuer: {}", report.issuer))?;
+            if let Some(trust_anchor) = &report.trust_anchor_subject {
+                emit_success_stdout(quiet, &format!("root-auth trust-anchor: {trust_anchor}"))?;
+            }
+            emit_success_stdout(
+                quiet,
+                &format!(
+                    "root-auth signed-at: {} (signer-claimed)",
+                    format_unix_timestamp(report.signed_at_unix_seconds)
+                ),
+            )?;
+            emit_success_stdout(
+                quiet,
+                &format!(
+                    "root-auth certificate-sha256: {}",
+                    encode_hex(&report.certificate_sha256)
+                ),
+            )
+        }
+    }
+}
+
+fn format_unix_timestamp(unix_seconds: i64) -> String {
+    match OffsetDateTime::from_unix_timestamp(unix_seconds) {
+        Ok(date_time) => date_time
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| unix_seconds.to_string()),
+        Err(_) => unix_seconds.to_string(),
+    }
 }
 
 fn public_no_key_success_diagnostics() -> [&'static str; 3] {
@@ -2396,8 +2658,72 @@ fn load_ed25519_signing_key(path: &str) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&seed))
 }
 
+fn load_create_root_auth_profile(
+    signing_key: Option<&str>,
+    signing_cert: Option<&str>,
+    signing_private_key: Option<&str>,
+    signing_chain: &[String],
+) -> Result<Option<CreateRootAuthProfile>> {
+    match (signing_key, signing_cert, signing_private_key) {
+        (Some(path), None, None) => {
+            let signing_key = load_ed25519_signing_key(path)?;
+            let signer_identity = signing_key.verifying_key().to_bytes();
+            Ok(Some(CreateRootAuthProfile::Ed25519 {
+                signing_key,
+                signer_identity,
+            }))
+        }
+        (None, Some(cert_path), Some(private_key_path)) => {
+            let cert = fs::read(cert_path)
+                .with_context(|| format!("failed to read signing certificate {cert_path}"))?;
+            let private_key = fs::read(private_key_path).with_context(|| {
+                format!("failed to read signing private key {private_key_path}")
+            })?;
+            let chain_der = load_x509_certificate_files(signing_chain)?;
+            let signer = X509RootAuthSigner::from_pem_or_der(
+                &cert,
+                &private_key,
+                chain_der,
+                current_unix_seconds()?,
+            )
+            .with_context(|| format!("failed to load X.509 signing profile from {cert_path}"))?;
+            Ok(Some(CreateRootAuthProfile::X509(signer)))
+        }
+        (None, None, None) => {
+            if !signing_chain.is_empty() {
+                return Err(UsageError("--signing-chain requires --signing-cert").into());
+            }
+            Ok(None)
+        }
+        _ => Err(UsageError(
+            "create requires either --signing-key or --signing-cert with --signing-private-key",
+        )
+        .into()),
+    }
+}
+
 fn load_ed25519_public_key(path: &str) -> Result<[u8; 32]> {
     load_32_byte_key_file("Ed25519 public key", path)
+}
+
+fn load_x509_certificate_files(paths: &[String]) -> Result<Vec<Vec<u8>>> {
+    let mut certificates = Vec::new();
+    for path in paths {
+        let bytes = fs::read(path).with_context(|| format!("failed to read certificate {path}"))?;
+        certificates.extend(
+            x509_chain::certificates_der_from_pem_or_der(&bytes)
+                .with_context(|| format!("failed to parse certificate {path}"))?,
+        );
+    }
+    Ok(certificates)
+}
+
+fn current_unix_seconds() -> Result<i64> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    i64::try_from(seconds).context("current Unix timestamp exceeds i64")
 }
 
 fn load_32_byte_key_file(label: &'static str, path: &str) -> Result<[u8; 32]> {

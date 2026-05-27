@@ -45,11 +45,13 @@ tzap signing-keygen --secret-output root.signing.hex --public-output root.public
 tzap create --keyfile project.key --signing-key root.signing.hex -o signed.tzap ./project
 tzap verify --keyfile project.key --trusted-public-key root.public.hex signed.tzap
 tzap verify --public-no-key --trusted-public-key root.public.hex signed.tzap
+tzap create --keyfile project.key --signing-cert signer.pem --signing-private-key signer.key -o signed-x509.tzap ./project
+tzap verify --keyfile project.key --trusted-ca-cert root-ca.pem signed-x509.tzap
 ```
 
-The CLI composes `tzap-core` with `tzap-plugin-signing` for Ed25519 RootAuth
-signing. Library users can choose `tzap-core` for archive workflows or compose
-it with `tzap-plugin-signing` for signed RootAuth workflows.
+The CLI composes `tzap-core` with `tzap-plugin-signing` for Ed25519 and X.509
+RootAuth signing. Library users can choose `tzap-core` for archive workflows or
+compose it with `tzap-plugin-signing` for signed RootAuth workflows.
 
 Extract files safely into a destination directory:
 

@@ -895,7 +895,7 @@ struct VolumeTrailer {
     closed_at_ns:             i64,
 
     root_auth_footer_offset:  u64,       // 0 when absent
-    root_auth_footer_length:  u32,       // 0 when absent, max 64 KiB
+    root_auth_footer_length:  u32,       // 0 when absent, max 160 KiB
     root_auth_flags:          u32,       // bit 0: RootAuthFooterV1 present
     _reserved_v38:            u32,       // MUST be zero
     trailer_hmac:             [u8; 32],  // HMAC-SHA-256(mac_key,
@@ -1312,7 +1312,7 @@ value as `master_key` and still runs the same HKDF subkey schedule.
 | `max_entries_per_directory_hint_shard` | 1,000,000 |
 | `max_hash_collision_shard_scan` | 16 adjacent shards per direction |
 | `max_trailing_garbage_scan` | 1 MiB |
-| `RootAuthFooterV1 byte length` | 64 KiB |
+| `RootAuthFooterV1 byte length` | 160 KiB |
 | `active_cmra_parity_pct_cap` | 100 |
 | `max_critical_recovery_scan` | derived in §30.6 |
 | Bootstrap sidecar file size | derived cap below |
@@ -5386,7 +5386,7 @@ The 20 reserved bytes are assigned in v41:
 
 ```rust
 root_auth_footer_offset:     u64,  // 0 when absent
-root_auth_footer_length:     u32,  // 0 when absent, max 64 KiB
+root_auth_footer_length:     u32,  // 0 when absent, max 160 KiB
 root_auth_flags:             u32,  // bit 0: RootAuthFooterV1 present
 _reserved_v38:               u32,  // MUST be zero
 ```
@@ -5928,7 +5928,7 @@ IMAGE_CRC_LEN             = 4
 LOCATOR_PAIR_LEN          = 256
 
 active_crypto_header_cap  = reader's active CryptoHeader cap, default 64 KiB
-active_root_auth_cap      = reader's active RootAuthFooterV1 cap, default 64 KiB
+active_root_auth_cap      = reader's active RootAuthFooterV1 cap, default 160 KiB
 active_cmra_parity_pct_cap = reader's active CMRA parity cap, default 100
 effective_cmra_pre_hmac_parity_pct_cap =
     max(active_cmra_parity_pct_cap, 100)

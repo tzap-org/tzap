@@ -110,8 +110,10 @@ What to do:
 ## Root-authenticated v41 archives
 
 The core library and CLI can create and verify root-authenticated v41 archives
-with the Ed25519 helper profile. CLI signing uses a 32-byte Ed25519 signing seed
-and writes the derived 32-byte public key through `signing-keygen`.
+with the Ed25519 helper profile or an X.509 certificate profile. CLI Ed25519
+signing uses a 32-byte signing seed and writes the derived 32-byte public key
+through `signing-keygen`. CLI X.509 signing uses a leaf certificate plus its
+private key, and verification uses supplied CA roots or OpenSSL default roots.
 
 Example CLI flow:
 
@@ -126,6 +128,14 @@ tzap create \
   -o archive.tzap \
   ./project
 
+tzap create \
+  --keyfile project.key \
+  --signing-cert signer.pem \
+  --signing-private-key signer.key \
+  --signing-chain intermediate.pem \
+  -o archive-x509.tzap \
+  ./project
+
 tzap verify \
   --keyfile project.key \
   --trusted-public-key root.public.hex \
@@ -135,17 +145,34 @@ tzap verify \
   --public-no-key \
   --trusted-public-key root.public.hex \
   archive.tzap
+
+tzap verify \
+  --keyfile project.key \
+  --trusted-ca-cert root-ca.pem \
+  archive-x509.tzap
 ```
 
 Operational shape:
 
 - `--signing-key` may be combined with raw-key, passphrase, dictionary, and
   normal volume options.
+- `--signing-cert` uses the leaf certificate as signer identity and stores the
+  RootAuth signature plus optional `--signing-chain` intermediates in the
+  authenticator value.
 - Key-holding RootAuth verification is requested by adding
   `--trusted-public-key` to ordinary `tzap verify`.
+- X.509 RootAuth verification is requested by adding `--trusted-ca-cert` and/or
+  `--trusted-system-roots` to ordinary `tzap verify`.
+- X.509 verification reports the certificate subject, issuer, serial number,
+  certificate SHA-256, verified chain subjects, trust anchor subject, and the
+  signer-claimed signing time.
 - Public no-key verification is requested with
   `--public-no-key --trusted-public-key`. It does not use `--keyfile`,
   `--password`, `--password-stdin`, or `--bootstrap`.
+- X.509 RootAuth signing time is a signer-claimed timestamp embedded in the
+  authenticator and used for certificate validity checks. It is not a trusted
+  timestamp token, transparency log proof, notarization receipt, or revocation
+  proof.
 - Successful public no-key verification reports
   `public_data_block_commitment_verified`,
   `public_physical_completeness_unverified`, and
