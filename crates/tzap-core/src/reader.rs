@@ -11259,8 +11259,11 @@ mod tests {
             Some(b"trailer scan boundaries".to_vec())
         );
 
-        let mut beyond_scan = within_scan;
-        beyond_scan.resize(beyond_scan.len() + 300_000, 0xAA);
+        let mut beyond_scan = archive.bytes.clone();
+        beyond_scan.resize(
+            beyond_scan.len() + max_critical_recovery_scan(options).unwrap() + 1,
+            0xAA,
+        );
         assert_eq!(
             OpenedArchive::open_with_options(&beyond_scan, &master_key(), options).unwrap_err(),
             FormatError::InvalidArchive("no valid v41 CMRA candidate found")

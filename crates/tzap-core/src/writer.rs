@@ -5462,6 +5462,42 @@ mod tests {
     }
 
     #[test]
+    fn root_auth_writer_accepts_128_kib_authenticator_value() {
+        let master_key = MasterKey::from_raw_key(&[8u8; 32]).unwrap();
+        let authenticator_value = vec![0x5a; READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN as usize];
+        let expected_value = authenticator_value.clone();
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("signed.txt", b"payload")],
+            &master_key,
+            single_volume_metadata_test_options(),
+            RootAuthWriterConfig {
+                authenticator_id: 0xcafe,
+                signer_identity_type: 1,
+                signer_identity: b"certificate-profile-signer",
+                authenticator_value_length: READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN,
+            },
+            |_| Ok(authenticator_value.clone()),
+        )
+        .unwrap();
+
+        let opened = open_archive(&archive.bytes, &master_key).unwrap();
+        let footer = opened.root_auth_footer.as_ref().unwrap();
+        assert_eq!(footer.authenticator_id, 0xcafe);
+        assert_eq!(
+            footer.authenticator_value.as_slice(),
+            expected_value.as_slice()
+        );
+
+        let verification = opened
+            .verify_root_auth_with(|footer, _| {
+                Ok(footer.authenticator_id == 0xcafe
+                    && footer.authenticator_value.as_slice() == expected_value.as_slice())
+            })
+            .unwrap();
+        assert_eq!(verification.authenticator_id, 0xcafe);
+    }
+
+    #[test]
     fn streaming_writer_sink_round_trips_archive() {
         let files = [
             RegularFile::new("alpha.txt", b"alpha"),

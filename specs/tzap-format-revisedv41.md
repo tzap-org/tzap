@@ -6172,9 +6172,9 @@ immediately after `authenticator_value`. It is CRC32C over all fixed fields,
 
 Length rules:
 
-- `footer_length <= 65536`.
-- `signer_identity_length <= 4096`.
-- `authenticator_value_length <= 8192` unless a future core registry raises it.
+- `footer_length <= 163840`.
+- `signer_identity_length <= 16384`.
+- `authenticator_value_length <= 131072`.
 - `footer_length` MUST equal fixed fields plus identity bytes plus
   authenticator bytes plus `footer_crc32c`.
 - `footer_length` MUST equal the exact number of serialized
