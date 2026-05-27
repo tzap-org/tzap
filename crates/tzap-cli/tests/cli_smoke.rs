@@ -668,6 +668,30 @@ fn cli_create_stdin_modes_reject_volume_size_and_stdout_output() {
         .args([
             "create",
             "--tar-stdin",
+            "--keyfile",
+            "missing-key.hex",
+            "-o",
+            "-",
+            "-",
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains("--output - is not archive stdout"));
+}
+
+#[test]
+fn cli_create_stdin_modes_reject_unsupported_multi_volume_shapes() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("stdin.tzap");
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "data.bin",
+            "--spool-stdin",
             "--volumes",
             "2",
             "--keyfile",
@@ -679,7 +703,7 @@ fn cli_create_stdin_modes_reject_volume_size_and_stdout_output() {
         .assert()
         .code(16)
         .stderr(predicate::str::contains(
-            "--volumes > 1 is not supported with stdin create modes",
+            "--volumes > 1 is supported only with --tar-stdin or known-size --raw-stdin",
         ));
 
     Command::cargo_bin("tzap")
@@ -687,15 +711,21 @@ fn cli_create_stdin_modes_reject_volume_size_and_stdout_output() {
         .args([
             "create",
             "--tar-stdin",
+            "--volumes",
+            "2",
+            "--volume-loss-tolerance",
+            "1",
             "--keyfile",
             "missing-key.hex",
             "-o",
-            "-",
+            output.to_str().unwrap(),
             "-",
         ])
         .assert()
         .code(16)
-        .stderr(predicate::str::contains("--output - is not archive stdout"));
+        .stderr(predicate::str::contains(
+            "--volume-loss-tolerance > 0 is not supported with stdin create modes",
+        ));
 }
 
 #[test]
@@ -922,6 +952,161 @@ fn cli_create_tar_stdin_round_trips_list_verify_and_extract() {
 }
 
 #[test]
+fn cli_create_tar_stdin_multi_volume_round_trips_list_verify_and_extract() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let output_base = temp.path().join("tar-stdin-mv.tzap");
+    let extract_dir = temp.path().join("extract");
+    let volume_0 = numbered_volume_path(&output_base, 0);
+    let volume_1 = numbered_volume_path(&output_base, 1);
+    let volume_2 = numbered_volume_path(&output_base, 2);
+    let payload = (0..150_000)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--tar-stdin",
+            "--volumes",
+            "3",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output_base.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(tar_stream(&[
+            ("alpha.txt", b"alpha payload".as_slice()),
+            ("dir/beta.bin", payload.as_slice()),
+        ]))
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("created 2 file(s)"))
+        .stderr(predicate::str::contains("3 volume(s)"));
+
+    assert!(volume_0.exists());
+    assert!(volume_1.exists());
+    assert!(volume_2.exists());
+    assert!(!output_base.exists());
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+            volume_1.to_str().unwrap(),
+            volume_2.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+            "--volume",
+            volume_1.to_str().unwrap(),
+            "--volume",
+            volume_2.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alpha.txt"))
+        .stdout(predicate::str::contains("dir/beta.bin"));
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+            "--volume",
+            volume_1.to_str().unwrap(),
+            "--volume",
+            volume_2.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(extract_dir.join("dir/beta.bin")).unwrap(), payload);
+}
+
+#[test]
+fn cli_create_tar_stdin_multi_volume_signed_archive_verifies_public_root_auth() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let signing_secret = temp.path().join("root.signing.hex");
+    let signing_public = temp.path().join("root.public.hex");
+    let output_base = temp.path().join("signed-tar-stdin-mv.tzap");
+    let volume_0 = numbered_volume_path(&output_base, 0);
+    let volume_1 = numbered_volume_path(&output_base, 1);
+    let volume_2 = numbered_volume_path(&output_base, 2);
+    let payload = (0..150_000)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "signing-keygen",
+            "--secret-output",
+            signing_secret.to_str().unwrap(),
+            "--public-output",
+            signing_public.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--tar-stdin",
+            "--volumes",
+            "3",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--signing-key",
+            signing_secret.to_str().unwrap(),
+            "-o",
+            output_base.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(tar_stream(&[("signed/beta.bin", payload.as_slice())]))
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("root auth: ed25519 signed"))
+        .stderr(predicate::str::contains("3 volume(s)"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--public-no-key",
+            "--trusted-public-key",
+            signing_public.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+            volume_1.to_str().unwrap(),
+            volume_2.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "public_data_block_commitment_verified",
+        ));
+}
+
+#[test]
 fn cli_create_tar_stdin_signed_archive_verifies_public_root_auth() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
@@ -1009,6 +1194,46 @@ fn cli_create_tar_stdin_late_reject_removes_output_path() {
 }
 
 #[test]
+fn cli_create_tar_stdin_multi_volume_late_reject_removes_output_paths() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let output_base = temp.path().join("late-error-mv.tzap");
+    let volume_0 = numbered_volume_path(&output_base, 0);
+    let volume_1 = numbered_volume_path(&output_base, 1);
+    let volume_2 = numbered_volume_path(&output_base, 2);
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    let mut input = tar_stream(&[("ok.txt", b"ok".as_slice())]);
+    input.truncate(input.len() - 1024);
+    input.extend_from_slice(&tar_header(b"link", b'2', 0));
+    input.extend_from_slice(&[0u8; 1024]);
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--tar-stdin",
+            "--volumes",
+            "3",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output_base.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(input)
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains(
+            "streaming tar stdin supports regular files and directory entries only",
+        ));
+
+    assert!(!output_base.exists());
+    assert!(!volume_0.exists());
+    assert!(!volume_1.exists());
+    assert!(!volume_2.exists());
+}
+
+#[test]
 fn cli_create_raw_stdin_known_size_round_trips_list_verify_and_extract() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
@@ -1074,6 +1299,167 @@ fn cli_create_raw_stdin_known_size_round_trips_list_verify_and_extract() {
         .success();
 
     assert_eq!(fs::read(extract_dir.join("raw/data.bin")).unwrap(), payload);
+}
+
+#[test]
+fn cli_create_raw_stdin_known_size_multi_volume_round_trips_list_verify_and_extract() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let output_base = temp.path().join("raw-known-mv.tzap");
+    let extract_dir = temp.path().join("extract");
+    let volume_0 = numbered_volume_path(&output_base, 0);
+    let volume_1 = numbered_volume_path(&output_base, 1);
+    let volume_2 = numbered_volume_path(&output_base, 2);
+    let payload = (0..150_000)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let size = payload.len().to_string();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "raw/data.bin",
+            "--stdin-size",
+            size.as_str(),
+            "--volumes",
+            "3",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            output_base.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(payload.clone())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("created 1 file(s)"))
+        .stderr(predicate::str::contains("3 volume(s)"));
+
+    assert!(volume_0.exists());
+    assert!(volume_1.exists());
+    assert!(volume_2.exists());
+    assert!(!output_base.exists());
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+            volume_1.to_str().unwrap(),
+            volume_2.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+            "--volume",
+            volume_1.to_str().unwrap(),
+            "--volume",
+            volume_2.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("raw/data.bin"));
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+            "--volume",
+            volume_1.to_str().unwrap(),
+            "--volume",
+            volume_2.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(extract_dir.join("raw/data.bin")).unwrap(), payload);
+}
+
+#[test]
+fn cli_create_raw_stdin_known_size_multi_volume_signed_archive_verifies_public_root_auth() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let signing_secret = temp.path().join("root.signing.hex");
+    let signing_public = temp.path().join("root.public.hex");
+    let output_base = temp.path().join("raw-signed-mv.tzap");
+    let volume_0 = numbered_volume_path(&output_base, 0);
+    let volume_1 = numbered_volume_path(&output_base, 1);
+    let volume_2 = numbered_volume_path(&output_base, 2);
+    let payload = (0..150_000)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let size = payload.len().to_string();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "signing-keygen",
+            "--secret-output",
+            signing_secret.to_str().unwrap(),
+            "--public-output",
+            signing_public.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "raw/signed.bin",
+            "--stdin-size",
+            size.as_str(),
+            "--volumes",
+            "3",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--signing-key",
+            signing_secret.to_str().unwrap(),
+            "-o",
+            output_base.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("root auth: ed25519 signed"))
+        .stderr(predicate::str::contains("3 volume(s)"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--public-no-key",
+            "--trusted-public-key",
+            signing_public.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+            volume_1.to_str().unwrap(),
+            volume_2.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "public_data_block_commitment_verified",
+        ));
 }
 
 #[test]
@@ -1231,6 +1617,74 @@ fn cli_create_raw_stdin_known_size_mismatch_removes_output_path() {
             "raw stdin exceeds declared --stdin-size",
         ));
     assert!(!long_output.exists());
+}
+
+#[test]
+fn cli_create_raw_stdin_known_size_multi_volume_mismatch_removes_output_paths() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let short_output = temp.path().join("short-mv.tzap");
+    let long_output = temp.path().join("long-mv.tzap");
+    let short_volumes = [
+        numbered_volume_path(&short_output, 0),
+        numbered_volume_path(&short_output, 1),
+        numbered_volume_path(&short_output, 2),
+    ];
+    let long_volumes = [
+        numbered_volume_path(&long_output, 0),
+        numbered_volume_path(&long_output, 1),
+        numbered_volume_path(&long_output, 2),
+    ];
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "data.bin",
+            "--stdin-size",
+            "8",
+            "--volumes",
+            "3",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            short_output.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(b"short".as_slice())
+        .assert()
+        .code(3);
+    assert!(!short_output.exists());
+    assert!(short_volumes.iter().all(|path| !path.exists()));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "data.bin",
+            "--stdin-size",
+            "3",
+            "--volumes",
+            "3",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            long_output.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(b"toolong".as_slice())
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains(
+            "raw stdin exceeds declared --stdin-size",
+        ));
+    assert!(!long_output.exists());
+    assert!(long_volumes.iter().all(|path| !path.exists()));
 }
 
 #[test]

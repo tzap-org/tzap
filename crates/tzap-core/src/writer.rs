@@ -1152,22 +1152,8 @@ where
         &session_id,
         kdf_params,
     )?;
-    let volume_header = VolumeHeader {
-        format_version: FORMAT_VERSION,
-        volume_format_rev: VOLUME_FORMAT_REV,
-        volume_index: 0,
-        stripe_width: options.stripe_width,
-        archive_uuid,
-        session_id,
-        crypto_header_offset: VOLUME_HEADER_LEN as u32,
-        crypto_header_length: u32_len(crypto_header.len(), "CryptoHeader")?,
-        header_crc32c: 0,
-    };
-    let volume_header_bytes = volume_header.to_bytes();
-    let crypto_header_len = crypto_header.len();
-    sink.begin_archive(1)?;
-    sink.write_volume(0, &volume_header_bytes)?;
-    sink.write_volume(0, &crypto_header)?;
+    let emission_state =
+        begin_writer_emission_state(sink, options, &crypto_header, archive_uuid, session_id)?;
 
     let mut writer = StreamingArchiveWriter {
         sink,
@@ -1187,39 +1173,71 @@ where
             envelope_index: 0,
             plaintext: Vec::new(),
         },
-        emission_state: WriterEmissionState {
-            volume_headers: vec![volume_header_bytes],
-            bytes_written: vec![checked_u64_add(
-                VOLUME_HEADER_LEN as u64,
-                crypto_header_len as u64,
-                "volume header",
-            )?],
-            record_counts: vec![0],
-            data_leaf_hashes: Vec::new(),
-            next_block_index: 0,
-        },
+        emission_state,
     };
     drive_members(&mut writer)?;
     writer.finish(master_key, kdf_params, root_auth, authenticator)
 }
 
 fn validate_single_pass_writer_options(options: WriterOptions) -> Result<(), FormatError> {
-    if options.stripe_width != 1 {
-        return Err(FormatError::WriterUnsupported(
-            "streaming tar stdin is single-volume only",
-        ));
-    }
     if options.volume_loss_tolerance != 0 {
         return Err(FormatError::WriterUnsupported(
-            "streaming tar stdin cannot tolerate volume loss",
+            "streaming create cannot tolerate volume loss",
         ));
     }
     if options.target_volume_size.is_some() {
         return Err(FormatError::WriterUnsupported(
-            "streaming tar stdin does not support target volume sizing",
+            "streaming create does not support target volume sizing",
         ));
     }
     Ok(())
+}
+
+fn begin_writer_emission_state<O: ArchiveWriteSink>(
+    sink: &mut O,
+    options: WriterOptions,
+    crypto_header: &[u8],
+    archive_uuid: [u8; 16],
+    session_id: [u8; 16],
+) -> Result<WriterEmissionState, ArchiveWriteError> {
+    let volume_count = usize::try_from(options.stripe_width)
+        .map_err(|_| FormatError::WriterUnsupported("stripe_width"))?;
+    sink.begin_archive(volume_count)?;
+
+    let mut state = WriterEmissionState {
+        volume_headers: Vec::with_capacity(volume_count),
+        bytes_written: vec![0u64; volume_count],
+        record_counts: vec![0u64; volume_count],
+        data_leaf_hashes: Vec::new(),
+        next_block_index: 0,
+    };
+
+    for volume_index in 0..volume_count {
+        let volume_index_u32 = u32::try_from(volume_index)
+            .map_err(|_| FormatError::WriterUnsupported("volume_index"))?;
+        let volume_header = VolumeHeader {
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV,
+            volume_index: volume_index_u32,
+            stripe_width: options.stripe_width,
+            archive_uuid,
+            session_id,
+            crypto_header_offset: VOLUME_HEADER_LEN as u32,
+            crypto_header_length: u32_len(crypto_header.len(), "CryptoHeader")?,
+            header_crc32c: 0,
+        };
+        let volume_header_bytes = volume_header.to_bytes();
+        sink.write_volume(volume_index, &volume_header_bytes)?;
+        sink.write_volume(volume_index, crypto_header)?;
+        state.bytes_written[volume_index] = checked_u64_add(
+            VOLUME_HEADER_LEN as u64,
+            crypto_header.len() as u64,
+            "volume header",
+        )?;
+        state.volume_headers.push(volume_header_bytes);
+    }
+
+    Ok(state)
 }
 
 fn plan_single_pass_writer_options(options: WriterOptions) -> Result<WriterOptions, FormatError> {
@@ -1746,41 +1764,13 @@ where
     O: ArchiveWriteSink,
 {
     let subkeys = Subkeys::derive(master_key, &plan.archive_uuid, &plan.session_id)?;
-    let volume_count = plan.options.stripe_width as usize;
-    sink.begin_archive(volume_count)?;
-
-    let mut state = WriterEmissionState {
-        volume_headers: Vec::with_capacity(volume_count),
-        bytes_written: vec![0u64; volume_count],
-        record_counts: vec![0u64; volume_count],
-        data_leaf_hashes: Vec::new(),
-        next_block_index: 0,
-    };
-
-    for volume_index in 0..volume_count {
-        let volume_index_u32 = u32::try_from(volume_index)
-            .map_err(|_| FormatError::WriterUnsupported("volume_index"))?;
-        let volume_header = VolumeHeader {
-            format_version: FORMAT_VERSION,
-            volume_format_rev: VOLUME_FORMAT_REV,
-            volume_index: volume_index_u32,
-            stripe_width: plan.options.stripe_width,
-            archive_uuid: plan.archive_uuid,
-            session_id: plan.session_id,
-            crypto_header_offset: VOLUME_HEADER_LEN as u32,
-            crypto_header_length: u32_len(plan.crypto_header.len(), "CryptoHeader")?,
-            header_crc32c: 0,
-        };
-        let volume_header_bytes = volume_header.to_bytes();
-        sink.write_volume(volume_index, &volume_header_bytes)?;
-        sink.write_volume(volume_index, &plan.crypto_header)?;
-        state.bytes_written[volume_index] = checked_u64_add(
-            VOLUME_HEADER_LEN as u64,
-            plan.crypto_header.len() as u64,
-            "volume header",
-        )?;
-        state.volume_headers.push(volume_header_bytes);
-    }
+    let mut state = begin_writer_emission_state(
+        sink,
+        plan.options,
+        &plan.crypto_header,
+        plan.archive_uuid,
+        plan.session_id,
+    )?;
 
     emit_payload_stream(
         files,
@@ -4983,6 +4973,9 @@ impl Read for StreamingMemberReader<'_> {
             self.remaining_file_bytes -= count as u64;
             written += count;
             if written == out.len() {
+                return Ok(written);
+            }
+            if self.remaining_file_bytes > 0 {
                 return Ok(written);
             }
         }

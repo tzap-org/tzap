@@ -681,6 +681,7 @@ fn run(cli: Cli) -> Result<()> {
                 has_dictionary: dictionary.is_some(),
                 volumes,
                 volume_size: volume_size.as_deref(),
+                volume_loss_tolerance,
             })?;
 
             ensure_create_output_paths_can_be_written(
@@ -1769,6 +1770,7 @@ struct CreateStdinArgs<'a> {
     has_dictionary: bool,
     volumes: Option<u32>,
     volume_size: Option<&'a str>,
+    volume_loss_tolerance: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1927,22 +1929,25 @@ fn write_archive_outputs(output: &str, volumes: &[Vec<u8>]) -> Result<()> {
     Ok(())
 }
 
-struct SingleVolumeFileSink<'a> {
-    file: &'a mut File,
+struct PathBackedArchiveSink<'a> {
+    temps: &'a mut [tempfile::NamedTempFile],
     bootstrap_sidecar: Vec<u8>,
 }
 
-impl ArchiveWriteSink for SingleVolumeFileSink<'_> {
+impl ArchiveWriteSink for PathBackedArchiveSink<'_> {
     fn begin_archive(&mut self, volume_count: usize) -> std::result::Result<(), ArchiveWriteError> {
-        if volume_count != 1 {
-            return Err(
-                FormatError::WriterUnsupported("stdin create is single-volume only").into(),
-            );
+        if volume_count != self.temps.len() {
+            return Err(FormatError::WriterInvariant(
+                "stdin file sink volume count does not match output paths",
+            )
+            .into());
         }
-        self.file.set_len(0).map_err(ArchiveWriteError::Io)?;
-        self.file
-            .seek(SeekFrom::Start(0))
-            .map_err(ArchiveWriteError::Io)?;
+        for temp in self.temps.iter_mut() {
+            let file = temp.as_file_mut();
+            file.set_len(0).map_err(ArchiveWriteError::Io)?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(ArchiveWriteError::Io)?;
+        }
         self.bootstrap_sidecar.clear();
         Ok(())
     }
@@ -1952,12 +1957,15 @@ impl ArchiveWriteSink for SingleVolumeFileSink<'_> {
         volume_index: usize,
         bytes: &[u8],
     ) -> std::result::Result<(), ArchiveWriteError> {
-        if volume_index != 0 {
-            return Err(
-                FormatError::WriterInvariant("stdin file sink received a non-zero volume").into(),
-            );
-        }
-        self.file.write_all(bytes).map_err(ArchiveWriteError::Io)
+        let temp = self
+            .temps
+            .get_mut(volume_index)
+            .ok_or(FormatError::WriterInvariant(
+                "stdin file sink volume index is out of bounds",
+            ))?;
+        temp.as_file_mut()
+            .write_all(bytes)
+            .map_err(ArchiveWriteError::Io)
     }
 
     fn write_bootstrap_sidecar(
@@ -2001,7 +2009,8 @@ fn write_tar_stdin_archive_output_from_reader<R: Read>(
     root_auth: Option<RootAuthWriterConfig<'_>>,
     authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
 ) -> Result<(StreamingTarWriterSummary, Vec<u8>)> {
-    write_stdin_archive_output_with_sink(output, |sink| {
+    let volume_count = options.stripe_width as usize;
+    write_stdin_archive_output_with_sink(output, volume_count, |sink| {
         write_tar_stream_archive_to_sink_with_kdf_and_root_auth(
             reader,
             &key.master_key,
@@ -2061,7 +2070,8 @@ fn write_raw_stdin_archive_output_from_reader<R: Read>(
     root_auth: Option<RootAuthWriterConfig<'_>>,
     authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
 ) -> Result<(StreamingRawWriterSummary, Vec<u8>)> {
-    write_stdin_archive_output_with_sink(output, |sink| {
+    let volume_count = options.stripe_width as usize;
+    write_stdin_archive_output_with_sink(output, volume_count, |sink| {
         write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth(
             reader,
             archive_path,
@@ -2078,42 +2088,78 @@ fn write_raw_stdin_archive_output_from_reader<R: Read>(
 
 fn write_stdin_archive_output_with_sink<T>(
     output: &str,
+    volume_count: usize,
     write_archive: impl FnOnce(
-        &mut SingleVolumeFileSink<'_>,
+        &mut PathBackedArchiveSink<'_>,
     ) -> std::result::Result<T, ArchiveWriteError>,
 ) -> Result<(T, Vec<u8>)> {
-    let output_path = Path::new(output);
-    let parent = output_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut temp = tempfile::Builder::new()
-        .prefix(".tzap-create-")
-        .suffix(".partial")
-        .tempfile_in(parent)
-        .with_context(|| {
-            format!(
-                "failed to create temporary archive output in {}",
-                parent.display()
-            )
-        })?;
+    if volume_count == 0 {
+        bail!("writer returned no volumes");
+    }
+    let output_paths = create_output_paths(output, volume_count);
+    let mut temps = output_paths
+        .iter()
+        .map(|output_path| {
+            let parent = output_path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            tempfile::Builder::new()
+                .prefix(".tzap-create-")
+                .suffix(".partial")
+                .tempfile_in(parent)
+                .with_context(|| {
+                    format!(
+                        "failed to create temporary archive output in {}",
+                        parent.display()
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let (summary, bootstrap_sidecar) = {
-        let mut sink = SingleVolumeFileSink {
-            file: temp.as_file_mut(),
+        let mut sink = PathBackedArchiveSink {
+            temps: temps.as_mut_slice(),
             bootstrap_sidecar: Vec::new(),
         };
         let summary = write_archive(&mut sink)?;
         (summary, sink.bootstrap_sidecar)
     };
-    temp.as_file_mut()
-        .flush()
-        .with_context(|| format!("failed to flush temporary archive for {output}"))?;
-    temp.as_file_mut()
-        .sync_all()
-        .with_context(|| format!("failed to sync temporary archive for {output}"))?;
-    temp.persist(output_path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("failed to publish archive {output}"))?;
+    for (temp, output_path) in temps.iter_mut().zip(&output_paths) {
+        temp.as_file_mut().flush().with_context(|| {
+            format!(
+                "failed to flush temporary archive for {}",
+                output_path.display()
+            )
+        })?;
+        temp.as_file_mut().sync_all().with_context(|| {
+            format!(
+                "failed to sync temporary archive for {}",
+                output_path.display()
+            )
+        })?;
+    }
+
+    let publish_order = if volume_count == 1 {
+        vec![0]
+    } else {
+        (1..volume_count).chain(std::iter::once(0)).collect()
+    };
+    let mut temp_slots = temps.into_iter().map(Some).collect::<Vec<_>>();
+    let mut persisted_paths = Vec::new();
+    for volume_index in publish_order {
+        let temp = temp_slots[volume_index]
+            .take()
+            .ok_or_else(|| anyhow!("missing temporary archive volume {volume_index}"))?;
+        let output_path = &output_paths[volume_index];
+        if let Err(error) = temp.persist(output_path) {
+            for path in &persisted_paths {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error.error)
+                .with_context(|| format!("failed to publish archive {}", output_path.display()));
+        }
+        persisted_paths.push(output_path.clone());
+    }
     Ok((summary, bootstrap_sidecar))
 }
 
@@ -2194,14 +2240,21 @@ fn validate_create_stdin_mode(args: CreateStdinArgs<'_>) -> Result<Option<Create
             "--dictionary is not supported with stdin create modes",
         )));
     }
-    if matches!(args.volumes, Some(volumes) if volumes > 1) {
-        return Err(anyhow!(FormatError::WriterUnsupported(
-            "--volumes > 1 is not supported with stdin create modes",
-        )));
-    }
     if args.volume_size.is_some() {
         return Err(anyhow!(FormatError::WriterUnsupported(
             "--volume-size is not supported with stdin create modes",
+        )));
+    }
+    if args.volume_loss_tolerance != 0 {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--volume-loss-tolerance > 0 is not supported with stdin create modes",
+        )));
+    }
+    if matches!(args.volumes, Some(volumes) if volumes > 1)
+        && !matches!(mode, CreateStdinMode::Tar | CreateStdinMode::RawKnownSize)
+    {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--volumes > 1 is supported only with --tar-stdin or known-size --raw-stdin",
         )));
     }
 

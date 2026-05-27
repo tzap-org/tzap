@@ -121,7 +121,7 @@ where
     R: Read,
     O: ArchiveWriteSink,
 {
-    validate_streaming_tar_writer_options(options)?;
+    validate_streaming_create_writer_options(options)?;
     let archive_path = normalize_lookup_file_path(archive_path, options.max_path_length)?;
     let archive = write_single_pass_archive_to_sink(
         master_key,
@@ -174,7 +174,7 @@ where
     R: Read,
     O: ArchiveWriteSink,
 {
-    validate_streaming_tar_writer_options(options)?;
+    validate_streaming_create_writer_options(options)?;
     let mut input_summary = None;
     let archive = write_single_pass_archive_to_sink(
         master_key,
@@ -220,20 +220,15 @@ fn format_error_from_archive_write_error(error: ArchiveWriteError) -> FormatErro
     }
 }
 
-fn validate_streaming_tar_writer_options(options: WriterOptions) -> Result<(), FormatError> {
-    if options.stripe_width != 1 {
-        return Err(FormatError::WriterUnsupported(
-            "streaming tar stdin is single-volume only",
-        ));
-    }
+fn validate_streaming_create_writer_options(options: WriterOptions) -> Result<(), FormatError> {
     if options.volume_loss_tolerance != 0 {
         return Err(FormatError::WriterUnsupported(
-            "streaming tar stdin cannot tolerate volume loss",
+            "streaming create cannot tolerate volume loss",
         ));
     }
     if options.target_volume_size.is_some() {
         return Err(FormatError::WriterUnsupported(
-            "streaming tar stdin does not support target volume sizing",
+            "streaming create does not support target volume sizing",
         ));
     }
     Ok(())
@@ -786,7 +781,7 @@ mod tests {
 
     use crate::crypto::MasterKey;
     use crate::format::{FormatError, BLOCK_RECORD_FRAMING_LEN, MASTER_KEY_LEN, VOLUME_HEADER_LEN};
-    use crate::reader::open_archive;
+    use crate::reader::{open_archive, open_archive_volumes};
     use crate::root_auth::data_block_merkle_leaf_hash;
     use crate::wire::{BlockRecord, CryptoHeader, VolumeHeader};
     use crate::writer::{write_archive, RegularFile};
@@ -818,6 +813,14 @@ mod tests {
             // declared class, not against the legacy default that can be raised
             // after payload planning.
             index_root_fec_data_shards: u16::MAX,
+            ..options()
+        }
+    }
+
+    fn multi_volume_options(stripe_width: u32) -> WriterOptions {
+        WriterOptions {
+            stripe_width,
+            volume_loss_tolerance: 0,
             ..options()
         }
     }
@@ -1004,6 +1007,37 @@ mod tests {
     }
 
     #[test]
+    fn sized_raw_stdin_known_size_multi_volume_round_trips() {
+        let input = (0..150_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut sink = MemoryArchiveSink::default();
+
+        let summary = write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth(
+            input.as_slice(),
+            "raw/data.bin",
+            input.len() as u64,
+            &master_key(),
+            multi_volume_options(3),
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(summary.archive.volume_count, 3);
+        assert_eq!(sink.volumes.len(), 3);
+        let refs = sink.volumes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let opened = open_archive_volumes(&refs, &master_key()).unwrap();
+        opened.verify().unwrap();
+        assert_eq!(
+            opened.extract_file("raw/data.bin").unwrap(),
+            Some(input.to_vec())
+        );
+    }
+
+    #[test]
     fn sized_raw_stdin_rejects_short_input() {
         let mut sink = MemoryArchiveSink::default();
 
@@ -1065,6 +1099,67 @@ mod tests {
             .unwrap()
             .verify()
             .unwrap();
+    }
+
+    #[test]
+    fn tar_stdin_large_single_volume_round_trips() {
+        let beta = (0..150_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let input = tar_stream(&[
+            ("alpha.txt", b"alpha payload".as_slice()),
+            ("dir/beta.bin", beta.as_slice()),
+        ]);
+
+        let archive = write_tar_stream_archive(&input[..], &master_key(), options()).unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+
+        opened.verify().unwrap();
+        assert_eq!(opened.extract_file("dir/beta.bin").unwrap(), Some(beta));
+    }
+
+    #[test]
+    fn tar_stdin_multi_volume_round_trips_list_verify_and_extract() {
+        let beta = (0..150_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let input = tar_stream(&[
+            ("alpha.txt", b"alpha payload".as_slice()),
+            ("dir/beta.bin", beta.as_slice()),
+        ]);
+        let mut reader = TinyReadCursor::new(input, 31);
+        let mut sink = MemoryArchiveSink::default();
+
+        let summary = write_tar_stream_archive_to_sink(
+            &mut reader,
+            &master_key(),
+            multi_volume_options(4),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(reader.reads > 10);
+        assert_eq!(summary.input_member_count, 2);
+        assert_eq!(summary.archive.volume_count, 4);
+        assert_eq!(sink.volumes.len(), 4);
+        let refs = sink.volumes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let opened = open_archive_volumes(&refs, &master_key()).unwrap();
+        assert_eq!(
+            opened.extract_file("alpha.txt").unwrap(),
+            Some(b"alpha payload".to_vec())
+        );
+        assert_eq!(
+            opened.extract_file("dir/beta.bin").unwrap(),
+            Some(beta.clone())
+        );
+        opened.verify().unwrap();
+        let listed = opened
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        assert_eq!(listed, vec!["alpha.txt", "dir/beta.bin"]);
     }
 
     #[test]
@@ -1225,9 +1320,9 @@ mod tests {
     }
 
     #[test]
-    fn tar_stdin_rejects_multi_volume_options() {
+    fn tar_stdin_rejects_volume_loss_tolerance() {
         let mut bad = options();
-        bad.stripe_width = 2;
+        bad.volume_loss_tolerance = 1;
 
         let error = write_tar_stream_archive(
             &tar_stream(&[("x", b"x".as_slice())])[..],
@@ -1238,7 +1333,7 @@ mod tests {
 
         assert_eq!(
             error,
-            FormatError::WriterUnsupported("streaming tar stdin is single-volume only")
+            FormatError::WriterUnsupported("streaming create cannot tolerate volume loss")
         );
     }
 }

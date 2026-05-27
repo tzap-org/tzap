@@ -362,7 +362,7 @@ fn public_docs_keep_boundaries_out_of_readme_marketing() {
     assert!(boundaries.contains("tzap extract --keyfile project.key -C restored -"));
     assert!(!boundaries.contains("current live core stream API is verify-only"));
     assert!(!boundaries.contains("future API, not current CLI behavior"));
-    assert!(boundaries.contains("lower-level core writer also exposes an append-only sink API"));
+    assert!(boundaries.contains("lower-level core writer also exposes a sink API"));
     assert!(writer.contains("sink writer when archive bytes should be delivered incrementally"));
     assert!(reader.contains("not a live provisional-output API"));
     assert!(cli.contains("--output - is not archive stdout"));

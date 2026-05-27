@@ -275,11 +275,12 @@ What to do:
 ## Create outputs are archive files, not stdout
 
 The convenience core writer APIs, such as `write_archive`, return completed
-volume buffers. The lower-level core writer also exposes an append-only sink API
-for re-openable sources, but the CLI currently writes completed outputs to
-explicit archive paths. The CLI does not expose archive stdout, multipart-upload
-sink, or pipe output modes for `tzap create`. `-o -` is rejected instead of
-being treated as an archive stdout sentinel.
+volume buffers. The lower-level core writer also exposes a sink API used by the
+CLI's path-backed stdin create modes; those paths stream archive bytes into
+temporary files and publish the final output path or volume set only after
+terminal metadata and optional RootAuth signing finish. The CLI does not expose
+archive stdout, multipart-upload sink, or pipe output modes for `tzap create`.
+`-o -` is rejected instead of being treated as an archive stdout sentinel.
 
 Example:
 
@@ -290,12 +291,16 @@ tzap create --keyfile project.key -o - ./project
 
 ## Streaming create stdin modes
 
-The CLI supports single-volume tar stdin create and single-volume raw stdin
-create:
+The CLI supports tar stdin create and known-size raw stdin create with either
+one output file or a fixed `--volumes N` output set. Unknown-size raw stdin is
+supported only through the explicit plaintext spool path, and that spool path is
+single-volume in this CLI:
 
 ```sh
 tar cf - ./project | tzap create --tar-stdin --keyfile project.key -o project.tzap -
+tar cf - ./project | tzap create --tar-stdin --volumes 3 --keyfile project.key -o project.tzap -
 cat disk.img | tzap create --raw-stdin --stdin-name disk.img --stdin-size "$(stat -c%s disk.img)" --keyfile project.key -o disk.tzap -
+cat disk.img | tzap create --raw-stdin --stdin-name disk.img --stdin-size "$(stat -c%s disk.img)" --volumes 3 --keyfile project.key -o disk.tzap -
 producer | tzap create --raw-stdin --stdin-name data/export.bin --spool-stdin --keyfile project.key -o export.tzap -
 ```
 
@@ -304,14 +309,16 @@ file-backed path is also much faster for later selected-file workflows because
 seekable readers can use random access.
 
 Known-size raw stdin (`--stdin-size`) is consumed once and archived as one
-regular-file member in the standard tar-member v41 profile. Short stdin or
+regular-file member in the standard tar-member v41 profile. With `--volumes N`,
+the same member is striped across the fixed output volume set. Short stdin or
 extra bytes after the declared size reject the create and remove the temporary
-archive output.
+archive output or volume set.
 
 Unknown-size raw stdin is supported only with explicit `--spool-stdin`. That
 mode writes plaintext stdin to a restrictive temporary file, then archives that
 file as a regular tar-member v41 member. The spool is removed after the command
 finishes, but the plaintext exists on local disk while the command is running.
+The current CLI does not combine `--spool-stdin` with `--volumes > 1`.
 
 The no-spool unknown-size raw profile remains reserved for future support:
 
@@ -320,16 +327,19 @@ producer | tzap create --raw-stdin --stdin-name data/export.bin --keyfile projec
 ```
 
 That accepted-looking no-spool raw stdin shape exits with
-`16 unsupported-feature` until `raw_stream_v1` lands. Multi-volume stdin create
-also remains unsupported for now.
+`16 unsupported-feature` until `raw_stream_v1` lands. Adding `--volumes > 1`
+does not change that; no-spool unknown-size raw multi-volume remains future
+work.
 
 The following combinations are rejected before stdin payload bytes, keyfiles,
 dictionaries, or ordinary input paths are read:
 
 - `--password` or `--password-stdin` with `--tar-stdin` or `--raw-stdin`
 - `--dictionary` with `--tar-stdin` or `--raw-stdin`
-- `--volumes > 1` with stdin create modes
+- `--volumes > 1` with `--raw-stdin --spool-stdin` or no-size/no-spool
+  `--raw-stdin`
 - `--volume-size` with stdin create modes
+- `--volume-loss-tolerance > 0` with stdin create modes
 - ordinary input paths mixed with stdin create modes; use exactly one input
   path, `-`
 - `-o -`; create output must remain a path-backed archive file

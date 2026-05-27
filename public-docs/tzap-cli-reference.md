@@ -30,11 +30,13 @@ tzap create --keyfile project.key --signing-cert signer.pem --signing-private-ke
 # Multi-volume recovery settings
 tzap create --keyfile project.key --volumes 3 --volume-loss-tolerance 1 -o backup.tzap ./project
 
-# Single-volume tar stream from stdin
+# Tar stream from stdin, single-volume or fixed multi-volume
 tar cf - ./project | tzap create --tar-stdin --keyfile project.key -o project.tzap -
+tar cf - ./project | tzap create --tar-stdin --volumes 3 --keyfile project.key -o project.tzap -
 
-# Single-volume raw stream from stdin with a known size
+# Raw stream from stdin with a known size, single-volume or fixed multi-volume
 cat disk.img | tzap create --raw-stdin --stdin-name disk.img --stdin-size "$(stat -c%s disk.img)" --keyfile project.key -o disk.tzap -
+cat disk.img | tzap create --raw-stdin --stdin-name disk.img --stdin-size "$(stat -c%s disk.img)" --volumes 3 --keyfile project.key -o disk.tzap -
 
 # Explicit plaintext spool for unknown-size raw stdin
 producer | tzap create --raw-stdin --stdin-name data/export.bin --spool-stdin --keyfile project.key -o export.tzap -
@@ -54,7 +56,7 @@ Useful flags:
 - `--signing-private-key`: private key for `--signing-cert`
 - `--signing-chain`: optional PEM or DER intermediate certificate chain
 - `--bootstrap-out`: sidecar output path for single-volume archives only
-- `--tar-stdin`: create a single-volume archive from a tar stream at input path `-`
+- `--tar-stdin`: create an archive from a tar stream at input path `-`
 - `--raw-stdin`: create from one raw stdin member at input path `-`
 - `--stdin-name`: archive member path for `--raw-stdin`
 - `--stdin-size`: known byte size for single-pass raw stdin
@@ -72,19 +74,22 @@ Notes:
 - `--tar-stdin` requires exactly one input path, `-`, and writes to a
   file-backed archive path. `-o -` is not supported; using a normal output file
   is also much faster for later selected-file workflows because readers can use
-  random access.
+  random access. Add `--volumes N` for fixed-count multi-volume output.
 - `--tar-stdin` rejects `--password`, `--password-stdin`, `--dictionary`,
-  `--volumes > 1`, and `--volume-size` before reading payload stdin.
+  `--volume-size`, and `--volume-loss-tolerance > 0` before reading payload
+  stdin.
 - `--raw-stdin --stdin-size SIZE` streams exactly `SIZE` bytes into one
-  regular-file member in the standard tar-member v41 profile. Short or
-  overlong stdin is rejected and the temporary archive is not published.
+  regular-file member in the standard tar-member v41 profile. Add `--volumes N`
+  for fixed-count multi-volume output. Short or overlong stdin is rejected and
+  the temporary archive path or volume set is not published.
 - `--raw-stdin --spool-stdin` writes stdin to an explicit plaintext temporary
-  spool first, then archives it as the same tar-member v41 profile. Use it only
-  when the plaintext spool tradeoff is acceptable.
+  spool first, then archives it as the same tar-member v41 profile. It remains
+  single-volume in this CLI. Use it only when the plaintext spool tradeoff is
+  acceptable.
 - `--raw-stdin` without `--stdin-size` or `--spool-stdin` is reserved for the
   future no-spool `raw_stream_v1` profile and exits with `unsupported-feature`.
 - The convenience core writer APIs return completed in-memory archive artifacts.
-  The `--tar-stdin` and single-volume raw stdin CLI paths use the core sink
+  The `--tar-stdin` and raw stdin CLI paths use the core sink
   writer and publish the output file only after terminal metadata and optional
   RootAuth signing finish.
 - No append-only sink or multipart-upload create mode is exposed by the CLI.
