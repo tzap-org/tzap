@@ -24,6 +24,7 @@ use crate::metadata::{
     EnvelopeEntry, FileEntry, FrameEntry, IndexRoot, IndexShard, MetadataLimits, ShardEntry,
 };
 use crate::non_seekable_reader::StreamedPayloadSummary;
+use crate::raw_stream_profile::reject_unsupported_raw_stream_profile;
 use crate::root_auth::{
     archive_root, critical_metadata_digest, data_block_merkle_root, fec_layout_digest,
     index_digest, root_auth_descriptor_digest, signer_identity_digest, ArchiveRootInputs,
@@ -38,7 +39,7 @@ use crate::tar_model::{
 use crate::wire::{
     BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage, CriticalMetadataRecoveryHeader,
     CriticalMetadataRecoveryShard, CriticalRecoveryLocator, CryptoHeader, CryptoHeaderFixed,
-    ManifestFooter, RootAuthFooterV1, VolumeHeader, VolumeTrailer,
+    ExtensionTlv, ManifestFooter, RootAuthFooterV1, VolumeHeader, VolumeTrailer,
 };
 
 const TRAILER_HMAC_COVERED_LEN: usize = 96;
@@ -1026,6 +1027,7 @@ impl OpenedArchive {
             &parsed_crypto.header_hmac,
         )?;
         parsed_crypto.validate_extension_semantics()?;
+        reject_unsupported_raw_stream_profile(&parsed_crypto.extensions)?;
         validate_bootstrap_single_volume_input(&volume_header, &parsed_crypto.fixed)?;
         validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
 
@@ -2604,7 +2606,11 @@ fn parse_seekable_volume(
         &parsed_crypto.header_hmac,
     )?;
     parsed_crypto.validate_extension_semantics()?;
-    validate_seekable_supported_volume(&volume_header, &parsed_crypto.fixed)?;
+    validate_seekable_supported_volume(
+        &volume_header,
+        &parsed_crypto.fixed,
+        &parsed_crypto.extensions,
+    )?;
     validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
 
     let terminal = locate_v41_terminal(
@@ -2715,7 +2721,11 @@ fn parse_seekable_read_at_volume(
         &parsed_crypto.header_hmac,
     )?;
     parsed_crypto.validate_extension_semantics()?;
-    validate_seekable_supported_volume(&volume_header, &parsed_crypto.fixed)?;
+    validate_seekable_supported_volume(
+        &volume_header,
+        &parsed_crypto.fixed,
+        &parsed_crypto.extensions,
+    )?;
     validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
 
     let terminal = locate_v41_terminal_read_at(
@@ -2910,7 +2920,11 @@ fn parse_public_no_key_volume(
     let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
     let parsed_crypto = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length)?;
     parsed_crypto.validate_extension_semantics()?;
-    validate_seekable_supported_volume(&volume_header, &parsed_crypto.fixed)?;
+    validate_seekable_supported_volume(
+        &volume_header,
+        &parsed_crypto.fixed,
+        &parsed_crypto.extensions,
+    )?;
     validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
 
     let terminal =
@@ -3009,7 +3023,9 @@ fn manifest_footer_copy_error_is_recoverable(error: &FormatError) -> bool {
 fn validate_seekable_supported_volume(
     volume_header: &VolumeHeader,
     crypto_header: &CryptoHeaderFixed,
+    extensions: &[ExtensionTlv<'_>],
 ) -> Result<(), FormatError> {
+    reject_unsupported_raw_stream_profile(extensions)?;
     if crypto_header.stripe_width != volume_header.stripe_width {
         return Err(FormatError::InvalidArchive(
             "VolumeHeader and CryptoHeader stripe_width differ",
@@ -5819,7 +5835,11 @@ fn sequential_extract_tar_stream_with_options(
         &parsed_crypto.header_hmac,
     )?;
     parsed_crypto.validate_extension_semantics()?;
-    validate_sequential_supported_volume(&volume_header, &parsed_crypto.fixed)?;
+    validate_sequential_supported_volume(
+        &volume_header,
+        &parsed_crypto.fixed,
+        &parsed_crypto.extensions,
+    )?;
     validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
 
     let block_size = parsed_crypto.fixed.block_size as usize;
@@ -5969,7 +5989,9 @@ fn sequential_extract_tar_stream_with_options(
 fn validate_sequential_supported_volume(
     volume_header: &VolumeHeader,
     crypto_header: &CryptoHeaderFixed,
+    extensions: &[ExtensionTlv<'_>],
 ) -> Result<(), FormatError> {
+    reject_unsupported_raw_stream_profile(extensions)?;
     if volume_header.stripe_width != 1 || volume_header.volume_index != 0 {
         return Err(FormatError::ReaderUnsupported(
             "sequential reader supports only single-volume archive input",

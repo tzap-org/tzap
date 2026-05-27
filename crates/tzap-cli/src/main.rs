@@ -33,6 +33,9 @@ use tzap_plugin_signing::ed25519_raw::{
     ED25519_AUTHENTICATOR_VALUE_LEN,
 };
 
+#[allow(dead_code)]
+mod plaintext_spool;
+
 const EXIT_USAGE: u8 = 2;
 const EXIT_IO: u8 = 3;
 const EXIT_WRONG_KEY: u8 = 10;
@@ -193,6 +196,38 @@ enum Command {
             help = "Write bootstrap recovery sidecar to FILE (single-volume output only)."
         )]
         bootstrap_out: Option<String>,
+
+        #[arg(
+            long = "tar-stdin",
+            help = "Treat PATH '-' as a tar stream read from stdin (streaming writer pending)."
+        )]
+        tar_stdin: bool,
+
+        #[arg(
+            long = "raw-stdin",
+            help = "Treat PATH '-' as one raw stdin member named by --stdin-name (streaming writer pending)."
+        )]
+        raw_stdin: bool,
+
+        #[arg(
+            long = "stdin-name",
+            value_name = "PATH",
+            help = "Archive member path for --raw-stdin."
+        )]
+        stdin_name: Option<String>,
+
+        #[arg(
+            long = "stdin-size",
+            value_name = "SIZE",
+            help = "Expected byte size for known-size --raw-stdin."
+        )]
+        stdin_size: Option<String>,
+
+        #[arg(
+            long = "spool-stdin",
+            help = "Allow future plaintext spool mode for unknown-size raw stdin."
+        )]
+        spool_stdin: bool,
 
         #[arg(
             long = "compression-level",
@@ -548,6 +583,11 @@ fn run(cli: Cli) -> Result<()> {
             dictionary,
             signing_key,
             bootstrap_out,
+            tar_stdin,
+            raw_stdin,
+            stdin_name,
+            stdin_size,
+            spool_stdin,
             compression_level,
             chunk_size,
             envelope_size,
@@ -575,6 +615,23 @@ fn run(cli: Cli) -> Result<()> {
                 .into());
             }
             reject_create_stdout_sentinels(&output, bootstrap_out.as_deref())?;
+            let stdin_mode = validate_create_stdin_mode(CreateStdinArgs {
+                tar_stdin,
+                raw_stdin,
+                stdin_name: stdin_name.as_deref(),
+                stdin_size: stdin_size.as_deref(),
+                spool_stdin,
+                paths: &paths,
+                password_stdin,
+                has_dictionary: dictionary.is_some(),
+                volume_size: volume_size.as_deref(),
+            })?;
+            if stdin_mode.is_some() {
+                return Err(FormatError::WriterUnsupported(
+                    "streaming create from stdin is not implemented in this CLI/core version",
+                )
+                .into());
+            }
 
             ensure_create_output_paths_can_be_written(
                 &output,
@@ -1494,6 +1551,27 @@ struct CreateKey {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum CreateStdinMode {
+    Tar,
+    RawUnknownSize,
+    RawKnownSize,
+    RawSpool,
+}
+
+#[derive(Debug)]
+struct CreateStdinArgs<'a> {
+    tar_stdin: bool,
+    raw_stdin: bool,
+    stdin_name: Option<&'a str>,
+    stdin_size: Option<&'a str>,
+    spool_stdin: bool,
+    paths: &'a [String],
+    password_stdin: bool,
+    has_dictionary: bool,
+    volume_size: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct Diagnostic {
     label: &'static str,
     exit_code: u8,
@@ -1661,6 +1739,104 @@ fn reject_create_stdout_sentinels(output: &str, bootstrap_out: Option<&str>) -> 
         )));
     }
     Ok(())
+}
+
+fn validate_create_stdin_mode(args: CreateStdinArgs<'_>) -> Result<Option<CreateStdinMode>> {
+    if args.tar_stdin && args.raw_stdin {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--tar-stdin and --raw-stdin cannot be used together",
+        )));
+    }
+    if args.spool_stdin && !args.raw_stdin {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--spool-stdin requires --raw-stdin",
+        )));
+    }
+    if args.stdin_name.is_some() && !args.raw_stdin {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--stdin-name requires --raw-stdin",
+        )));
+    }
+    if args.stdin_size.is_some() && !args.raw_stdin {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--stdin-size requires --raw-stdin",
+        )));
+    }
+
+    let Some(mode) = (if args.tar_stdin {
+        Some(CreateStdinMode::Tar)
+    } else if args.raw_stdin && args.spool_stdin {
+        Some(CreateStdinMode::RawSpool)
+    } else if args.raw_stdin && args.stdin_size.is_some() {
+        Some(CreateStdinMode::RawKnownSize)
+    } else if args.raw_stdin {
+        Some(CreateStdinMode::RawUnknownSize)
+    } else {
+        None
+    }) else {
+        return Ok(None);
+    };
+
+    if args.paths != ["-"] {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "stdin create modes require exactly one archive input path: -",
+        )));
+    }
+    if args.password_stdin {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--password-stdin cannot be used when stdin carries archive payload bytes",
+        )));
+    }
+    if args.has_dictionary {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--dictionary is not supported with stdin create modes",
+        )));
+    }
+    if args.volume_size.is_some() {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--volume-size is not supported with stdin create modes",
+        )));
+    }
+
+    match mode {
+        CreateStdinMode::Tar => {
+            if args.stdin_name.is_some() || args.stdin_size.is_some() || args.spool_stdin {
+                return Err(anyhow!(FormatError::WriterUnsupported(
+                    "--stdin-name, --stdin-size, and --spool-stdin require --raw-stdin",
+                )));
+            }
+        }
+        CreateStdinMode::RawUnknownSize => {
+            if args.stdin_name.is_none() {
+                return Err(anyhow!(FormatError::WriterUnsupported(
+                    "--raw-stdin requires --stdin-name PATH",
+                )));
+            }
+        }
+        CreateStdinMode::RawKnownSize => {
+            if args.stdin_name.is_none() {
+                return Err(anyhow!(FormatError::WriterUnsupported(
+                    "--raw-stdin requires --stdin-name PATH",
+                )));
+            }
+            parse_size(args.stdin_size.expect("checked raw known-size stdin"))
+                .with_context(|| UsageError("invalid stdin-size"))?;
+        }
+        CreateStdinMode::RawSpool => {
+            if args.stdin_name.is_none() {
+                return Err(anyhow!(FormatError::WriterUnsupported(
+                    "--raw-stdin requires --stdin-name PATH",
+                )));
+            }
+            if args.stdin_size.is_some() {
+                return Err(anyhow!(FormatError::WriterUnsupported(
+                    "--spool-stdin is for unknown-size raw stdin; omit --stdin-size",
+                )));
+            }
+        }
+    }
+
+    Ok(Some(mode))
 }
 
 fn ensure_create_output_paths_can_be_written(
@@ -2577,6 +2753,13 @@ fn decode_hex_nibble(byte: u8) -> Result<u8> {
 }
 
 fn classify_error(err: &anyhow::Error) -> Diagnostic {
+    if err.downcast_ref::<UsageError>().is_some() {
+        return Diagnostic {
+            label: "invalid-arguments",
+            exit_code: EXIT_USAGE,
+            action: "check command arguments",
+        };
+    }
     for cause in err.chain() {
         if let Some(usage) = cause.downcast_ref::<UsageError>() {
             let _ = usage;

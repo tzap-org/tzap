@@ -22,7 +22,7 @@ fn write_file(path: &Path, data: &[u8]) {
 }
 
 #[test]
-fn milestone11_readme_documents_required_workflows() {
+fn readme_documents_required_workflows() {
     let readme = read_workspace_file("README.md");
 
     assert!(readme.contains("## Quick start (passphrase mode)"));
@@ -40,7 +40,7 @@ fn milestone11_readme_documents_required_workflows() {
 }
 
 #[test]
-fn milestone11_readme_has_exit_code_and_platform_sections() {
+fn readme_has_exit_code_and_platform_sections() {
     let readme = read_workspace_file("README.md");
 
     assert!(readme.contains("Supported target artifacts:"));
@@ -56,7 +56,7 @@ fn milestone11_readme_has_exit_code_and_platform_sections() {
 }
 
 #[test]
-fn milestone11_public_reference_file_exists_and_covers_commands() {
+fn public_reference_file_exists_and_covers_commands() {
     let reference = read_workspace_file("public-docs/tzap-cli-reference.md");
     let boundaries = read_workspace_file("public-docs/tzap-operational-boundaries.md");
     let root_readme = read_workspace_file("README.md");
@@ -81,6 +81,8 @@ fn milestone11_public_reference_file_exists_and_covers_commands() {
     assert!(reference.contains("--volume"));
     assert!(reference.contains("--dry-run"));
     assert!(reference.contains("JSON output"));
+    assert!(reference.contains("For selected-file workflows, use a file-backed archive path"));
+    assert!(reference.contains("the random-access reader uses the authenticated index"));
     assert!(reference.contains("tzap-operational-boundaries.md"));
     assert!(reference.contains("## Operational boundaries"));
     assert!(boundaries.contains("Writer shape validation"));
@@ -96,7 +98,7 @@ fn milestone11_public_reference_file_exists_and_covers_commands() {
 }
 
 #[test]
-fn milestone11_public_spec_file_remains_linked() {
+fn public_spec_file_remains_linked() {
     let spec = read_workspace_file("specs/tzap-format-revisedv41.md");
     let root_readme = read_workspace_file("README.md");
     let cli_readme = read_workspace_file("crates/tzap-cli/README.md");
@@ -108,7 +110,7 @@ fn milestone11_public_spec_file_remains_linked() {
 }
 
 #[test]
-fn milestone11_readme_passphrase_quickstart_commands_execute() {
+fn readme_passphrase_quickstart_commands_execute() {
     let temp = tempdir().unwrap();
     let source = temp.path().join("project");
     let archive = temp.path().join("backup.tzap");
@@ -190,7 +192,7 @@ fn milestone11_readme_passphrase_quickstart_commands_execute() {
 }
 
 #[test]
-fn milestone11_readme_raw_key_workflow_commands_execute() {
+fn readme_raw_key_workflow_commands_execute() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("project.key");
     let source = temp.path().join("payload.txt");
@@ -261,7 +263,7 @@ fn milestone11_readme_raw_key_workflow_commands_execute() {
 }
 
 #[test]
-fn milestone11_readme_multivolume_recovery_example_executes() {
+fn readme_multivolume_recovery_example_executes() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("project.key");
     let source = temp.path().join("project.bin");
@@ -342,7 +344,7 @@ fn milestone11_readme_multivolume_recovery_example_executes() {
 }
 
 #[test]
-fn milestone11_public_docs_keep_boundaries_out_of_readme_marketing() {
+fn public_docs_keep_boundaries_out_of_readme_marketing() {
     let readme = read_workspace_file("README.md");
     let reference = read_workspace_file("public-docs/tzap-cli-reference.md");
     let boundaries = read_workspace_file("public-docs/tzap-operational-boundaries.md");
@@ -354,6 +356,10 @@ fn milestone11_public_docs_keep_boundaries_out_of_readme_marketing() {
     assert!(boundaries.contains("Create outputs are archive files, not stdout"));
     assert!(boundaries.contains("Archive stdin and file paths"));
     assert!(boundaries.contains("Sequential reader and provisional output"));
+    assert!(boundaries.contains("tzap list --keyfile project.key"));
+    assert!(boundaries.contains("tzap extract --keyfile project.key -C restored -"));
+    assert!(!boundaries.contains("current live core stream API is verify-only"));
+    assert!(!boundaries.contains("future API, not current CLI behavior"));
     assert!(boundaries.contains("lower-level core writer also exposes an append-only sink API"));
     assert!(writer.contains("sink writer when archive bytes should be delivered incrementally"));
     assert!(reader.contains("not a live provisional-output API"));
@@ -383,7 +389,7 @@ fn milestone11_public_docs_keep_boundaries_out_of_readme_marketing() {
 }
 
 #[test]
-fn milestone11_public_docs_pin_tar_metadata_profile() {
+fn public_docs_pin_tar_metadata_profile() {
     let reference = read_workspace_file("public-docs/tzap-cli-reference.md");
     let boundaries = read_workspace_file("public-docs/tzap-operational-boundaries.md");
 

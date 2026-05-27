@@ -28,6 +28,10 @@ tzap create --keyfile project.key --signing-key root.signing.hex -o backup.tzap 
 
 # Multi-volume recovery settings
 tzap create --keyfile project.key --volumes 3 --volume-loss-tolerance 1 -o backup.tzap ./project
+
+# Future streaming-create shapes; currently reject with unsupported-feature
+tar cf - ./project | tzap create --tar-stdin --keyfile project.key -o project.tzap -
+producer | tzap create --raw-stdin --stdin-name data/export.bin --keyfile project.key -o export.tzap -
 ```
 
 Useful flags:
@@ -41,6 +45,11 @@ Useful flags:
 - `--dictionary`: optional zstd dictionary
 - `--signing-key`: Ed25519 signing seed for v41 RootAuth
 - `--bootstrap-out`: sidecar output path for single-volume archives only
+- `--tar-stdin`: future create mode where input path `-` is a tar stream
+- `--raw-stdin`: future create mode where input path `-` is one raw member
+- `--stdin-name`: archive member path for `--raw-stdin`
+- `--stdin-size`: known byte size for raw stdin
+- `--spool-stdin`: future plaintext spool mode for unknown-size raw stdin
 - `--compression-level`, `--chunk-size`, `--envelope-size`, `--block-size`
 - `--dry-run`: print planned actions without writing bytes
 - `--force`: allow overwrite of outputs and bootstrap
@@ -51,6 +60,10 @@ Notes:
   `unsupported-feature`.
 - Create writes archive files to explicit paths. `-o -` is not archive stdout;
   the current CLI rejects that sentinel with `unsupported-feature`.
+- Streaming-create flags are present for future tar/raw stdin support, but the
+  current CLI public surface still returns `unsupported-feature` for
+  accepted-looking stdin create shapes. Incompatible combinations reject before
+  stdin, keyfiles, dictionaries, or ordinary input paths are read.
 - The convenience core writer APIs return completed in-memory archive artifacts.
   A lower-level core append-only sink API exists for re-openable sources, but no
   append-only sink or multipart-upload create mode is exposed by the CLI.
@@ -86,6 +99,10 @@ Notes:
   `--keyfile`. Dictionary-compressed streams require `--bootstrap`. It rejects
   selected paths, `--stdout`, extra `--volume` inputs, and passphrase modes
   because stdin is the archive byte stream.
+- For selected-file workflows, use a file-backed archive path. This is the fast
+  path: the random-access reader uses the authenticated index to read only the
+  selected member's metadata and payload envelopes instead of streaming through
+  unrelated archive content.
 - Key-holding extract opens archive files through the core file-backed
   random-access reader. Selecting one path reads the authenticated terminal,
   index metadata, and the payload envelopes needed for that path; it does not

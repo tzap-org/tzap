@@ -11,6 +11,7 @@ use crate::fec::repair_data_gf16;
 use crate::format::{
     BlockKind, ExtractError, FormatError, BLOCK_RECORD_FRAMING_LEN, VOLUME_HEADER_LEN,
 };
+use crate::raw_stream_profile::reject_unsupported_raw_stream_profile;
 use crate::reader::{
     block_record_error_is_recoverable_erasure, expected_stream_block_index,
     manifest_bootstrap_fields_match, observed_archive_size, parse_non_seekable_bootstrap_material,
@@ -22,7 +23,9 @@ use crate::tar_model::{
     NoopTarStreamObserver, SafeExtractionOptions, TarStreamFilesystemRestoreObserver,
     TarStreamMemberSummary, TarStreamObserver, TarStreamSummary, TarStreamSummaryValidator,
 };
-use crate::wire::{BlockRecord, CryptoHeader, CryptoHeaderFixed, RootAuthFooterV1, VolumeHeader};
+use crate::wire::{
+    BlockRecord, CryptoHeader, CryptoHeaderFixed, ExtensionTlv, RootAuthFooterV1, VolumeHeader,
+};
 
 const DEFAULT_MAX_RETAINED_METADATA_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_INCOMPLETE_TAR_GROUP_BYTES: usize = 1024 * 1024;
@@ -352,6 +355,7 @@ where
         &parsed_crypto.header_hmac,
     )?;
     parsed_crypto.validate_extension_semantics()?;
+    reject_unsupported_raw_stream_profile(&parsed_crypto.extensions)?;
     validate_crypto_class_parity_exactness(&crypto_header)?;
     let bootstrap = bootstrap_sidecar
         .map(|sidecar| {
@@ -361,6 +365,7 @@ where
     validate_sequential_verify_supported_volume(
         &volume_header,
         &crypto_header,
+        &parsed_crypto.extensions,
         bootstrap.as_ref(),
     )?;
 
@@ -749,8 +754,10 @@ fn read_dir_sorted(path: &Path) -> Result<Vec<fs::DirEntry>, FormatError> {
 fn validate_sequential_verify_supported_volume(
     volume_header: &VolumeHeader,
     crypto_header: &CryptoHeaderFixed,
+    extensions: &[ExtensionTlv<'_>],
     bootstrap: Option<&NonSeekableBootstrapMaterial>,
 ) -> Result<(), FormatError> {
+    reject_unsupported_raw_stream_profile(extensions)?;
     if volume_header.stripe_width != 1 || volume_header.volume_index != 0 {
         return Err(FormatError::ReaderUnsupported(
             "sequential reader supports only single-volume archive input",

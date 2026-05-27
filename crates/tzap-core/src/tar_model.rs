@@ -864,7 +864,10 @@ fn checked_u64_add(lhs: u64, rhs: u64) -> Result<u64, FormatError> {
     ))
 }
 
-fn try_tar_member_group_end(stream: &[u8], start: usize) -> Result<Option<usize>, FormatError> {
+pub(crate) fn try_tar_member_group_end(
+    stream: &[u8],
+    start: usize,
+) -> Result<Option<usize>, FormatError> {
     let mut cursor = start;
     let mut metadata = LocalMetadata::default();
 

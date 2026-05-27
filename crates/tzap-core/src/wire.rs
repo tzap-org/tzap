@@ -15,6 +15,9 @@ use crate::format::{
     READER_MAX_STRIPE_WIDTH, ROOT_AUTH_FOOTER_FIXED_LEN, ROOT_AUTH_SPEC_ID,
     SERIALIZED_REGION_HEADER_LEN, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
+use crate::raw_stream_profile::{
+    validate_raw_stream_content_model_extension, RAW_STREAM_CONTENT_MODEL_EXTENSION_TAG,
+};
 
 const TZAP_MAGIC: [u8; 4] = *b"TZAP";
 const TZCH_MAGIC: [u8; 4] = *b"TZCH";
@@ -435,6 +438,16 @@ pub fn validate_crypto_extension_semantics(
         let is_critical = extension.tag & 0x8000 != 0;
         if matches!(ext_tag, 0x0004 | 0x0006) {
             return Err(FormatError::ForbiddenExtensionTag(ext_tag));
+        }
+        if ext_tag == RAW_STREAM_CONTENT_MODEL_EXTENSION_TAG {
+            if is_critical {
+                if seen_known.contains(&ext_tag) {
+                    return Err(FormatError::DuplicateKnownExtension(ext_tag));
+                }
+                validate_raw_stream_content_model_extension(is_critical, extension.value)?;
+                seen_known.push(ext_tag);
+            }
+            continue;
         }
         if is_known_extension(ext_tag) {
             if seen_known.contains(&ext_tag) {

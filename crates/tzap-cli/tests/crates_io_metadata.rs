@@ -81,7 +81,7 @@ fn assert_package_metadata(
 }
 
 #[test]
-fn milestone12_manifests_have_crates_io_metadata() {
+fn manifests_have_crates_io_metadata() {
     assert_package_metadata(
         "crates/tzap-core/Cargo.toml",
         "tzap-core",
@@ -106,7 +106,7 @@ fn milestone12_manifests_have_crates_io_metadata() {
 }
 
 #[test]
-fn milestone12_publish_dependencies_are_versioned() {
+fn publish_dependencies_are_versioned() {
     let manifest = read_workspace_file("crates/tzap-cli/Cargo.toml");
     let plugin_manifest = read_workspace_file("crates/tzap-plugin-signing/Cargo.toml");
 
@@ -118,7 +118,7 @@ fn milestone12_publish_dependencies_are_versioned() {
 }
 
 #[test]
-fn milestone12_keywords_and_categories_fit_crates_io_limits() {
+fn keywords_and_categories_fit_crates_io_limits() {
     for manifest_path in [
         "Cargo.toml",
         "crates/tzap-core/Cargo.toml",
@@ -151,7 +151,7 @@ fn milestone12_keywords_and_categories_fit_crates_io_limits() {
 }
 
 #[test]
-fn milestone12_package_readmes_render_without_workspace_paths() {
+fn package_readmes_render_without_workspace_paths() {
     let root_readme = read_workspace_file("README.md");
     let cli_readme = read_workspace_file("crates/tzap-cli/README.md");
     let core_readme = read_workspace_file("crates/tzap-core/README.md");
@@ -182,7 +182,7 @@ fn milestone12_package_readmes_render_without_workspace_paths() {
 }
 
 #[test]
-fn milestone12_package_trees_are_small_and_focused() {
+fn package_trees_are_small_and_focused() {
     for package_dir in [
         "crates/tzap-core",
         "crates/tzap-cli",
@@ -224,7 +224,7 @@ fn milestone12_package_trees_are_small_and_focused() {
 }
 
 #[test]
-fn milestone12_public_package_docs_do_not_link_private_docs() {
+fn public_package_docs_do_not_link_private_docs() {
     let root_readme = read_workspace_file("README.md");
     let cli_readme = read_workspace_file("crates/tzap-cli/README.md");
     let signing_readme = read_workspace_file("crates/tzap-plugin-signing/README.md");

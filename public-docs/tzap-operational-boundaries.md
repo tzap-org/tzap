@@ -232,15 +232,18 @@ tzap extract --keyfile project.key --stdout project.tzap project/readme.txt
 # stdout receives bytes only after project.tzap has opened and authenticated
 
 tzap verify --keyfile project.key -
-# exit 3: io, because "-" is treated as a literal file path
+# reads a single-volume archive stream from stdin and reports after EOF
 ```
 
 What to do:
 
-- Store archive bytes in a file before using the CLI.
-- Treat live provisional stdout or staged filesystem extraction from a
-  non-seekable archive stream as a future API, not current CLI behavior. The
-  current live core stream API is verify-only.
+- Use `tzap verify --keyfile project.key -`, `tzap list --keyfile project.key
+  -`, or `tzap extract --keyfile project.key -C restored -` for live
+  single-volume archive streams.
+- Provide `--bootstrap <path>` for dictionary-compressed archive streams.
+- Store archive bytes in files when you need selected-path extraction,
+  `--stdout`, passphrase KDF discovery, public no-key verification,
+  RootAuth external verification, or multi-volume recovery.
 
 ## Create outputs are archive files, not stdout
 
@@ -257,6 +260,35 @@ Example:
 tzap create --keyfile project.key -o - ./project
 # exit 16: unsupported-feature
 ```
+
+## Streaming create stdin modes
+
+The CLI reserves the future streaming-create shapes now:
+
+```sh
+tar cf - ./project | tzap create --tar-stdin --keyfile project.key -o project.tzap -
+producer | tzap create --raw-stdin --stdin-name data/export.bin --keyfile project.key -o export.tzap -
+cat disk.img | tzap create --raw-stdin --stdin-name disk.img --stdin-size 8G --volumes 4 --keyfile project.key -o disk.tzap -
+producer | tzap create --raw-stdin --stdin-name data/export.bin --spool-stdin --volumes 4 --keyfile project.key -o export.tzap -
+```
+
+Until CLI streaming-create integration lands, those accepted-looking shapes exit
+with `16 unsupported-feature`.
+
+The following combinations are rejected before stdin payload bytes, keyfiles,
+dictionaries, or ordinary input paths are read:
+
+- `--password-stdin` with `--tar-stdin` or `--raw-stdin`
+- `--dictionary` with `--tar-stdin` or `--raw-stdin`
+- `--volume-size` with stdin create modes
+- ordinary input paths mixed with stdin create modes; use exactly one input
+  path, `-`
+- `-o -`; create output must remain a path-backed archive file
+
+Raw stdin stores one archive member and therefore requires `--stdin-name PATH`.
+`--stdin-size SIZE` declares a known raw stdin length for future fixed-volume
+streaming. `--spool-stdin` is reserved for a future plaintext spool path and is
+valid only with unknown-size `--raw-stdin`.
 
 Sidecar output is also file-path based:
 

@@ -16,6 +16,13 @@ pub mod tar_model;
 pub mod wire;
 pub mod writer;
 
+#[allow(dead_code)]
+mod raw_stream_profile;
+#[allow(dead_code)]
+mod streaming_volume_distributor;
+#[allow(dead_code)]
+mod streaming_writer;
+
 pub use crypto::{HmacDomain, KdfParams, MasterKey, Subkeys};
 pub use format::{
     AeadAlgo, ArchiveWriteError, CompressionAlgo, ExtractError, FecAlgo, FormatError, KdfAlgo,

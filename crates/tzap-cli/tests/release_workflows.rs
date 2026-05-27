@@ -22,7 +22,7 @@ fn assert_contains_in_order(text: &str, labels: &[&str]) {
 }
 
 #[test]
-fn milestone10_ci_workflow_has_cross_platform_matrix() {
+fn ci_workflow_has_cross_platform_matrix() {
     let workflow = read_workspace_file(".github/workflows/ci.yml");
 
     assert!(workflow.contains("include:"));
@@ -56,7 +56,7 @@ fn milestone10_ci_workflow_has_cross_platform_matrix() {
 }
 
 #[test]
-fn milestone10_release_workflow_has_all_release_archives() {
+fn release_workflow_has_all_release_archives() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
 
     assert!(workflow.contains("tzap-${{ github.ref_name }}-linux-x86_64-musl.tar.gz"));
@@ -69,7 +69,7 @@ fn milestone10_release_workflow_has_all_release_archives() {
 }
 
 #[test]
-fn milestone10_release_workflow_targets_distinct_build_triples() {
+fn release_workflow_targets_distinct_build_triples() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
 
     assert!(workflow.contains("x86_64-unknown-linux-musl"));
@@ -82,7 +82,7 @@ fn milestone10_release_workflow_targets_distinct_build_triples() {
 }
 
 #[test]
-fn milestone10_release_workflow_uses_pinned_baseline_runners() {
+fn release_workflow_uses_pinned_baseline_runners() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
 
     assert!(workflow.contains("os: ubuntu-22.04"));
@@ -104,7 +104,7 @@ fn milestone10_release_workflow_uses_pinned_baseline_runners() {
 }
 
 #[test]
-fn milestone10_release_workflow_has_smoke_checks() {
+fn release_workflow_has_smoke_checks() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
 
     assert!(workflow.contains("preflight:"));
@@ -156,7 +156,7 @@ fn milestone10_release_workflow_has_smoke_checks() {
 }
 
 #[test]
-fn milestone10_release_workflow_uploads_checksum_artifacts() {
+fn release_workflow_uploads_checksum_artifacts() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
 
     assert!(workflow.contains("Generate checksum (Unix)"));
@@ -183,7 +183,7 @@ fn milestone10_release_workflow_uploads_checksum_artifacts() {
 }
 
 #[test]
-fn milestone10_internal_docs_are_not_public_release_inputs() {
+fn internal_docs_are_not_public_release_inputs() {
     let gitignore = read_workspace_file(".gitignore");
     let workflow = read_workspace_file(".github/workflows/release.yml");
 

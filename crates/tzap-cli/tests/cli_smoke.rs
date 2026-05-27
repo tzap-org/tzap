@@ -288,12 +288,19 @@ fn cli_create_help_includes_examples_and_flags() {
     assert!(stdout.contains("--dictionary <FILE>"));
     assert!(stdout.contains("--signing-key <FILE>"));
     assert!(stdout.contains("--bootstrap-out <FILE>"));
+    assert!(stdout.contains("--tar-stdin"));
+    assert!(stdout.contains("--raw-stdin"));
+    assert!(stdout.contains("--stdin-name <PATH>"));
+    assert!(stdout.contains("--stdin-size <SIZE>"));
+    assert!(stdout.contains("--spool-stdin"));
     assert!(stdout.contains("--compression-level <LEVEL>"));
     assert!(stdout.contains("--chunk-size <SIZE>"));
     assert!(stdout.contains("--envelope-size <SIZE>"));
     assert!(stdout.contains("--block-size <SIZE>"));
     assert!(stdout.contains("--force"));
     assert!(stdout.contains("--dry-run"));
+    assert!(!stdout.contains("tar cf -"));
+    assert!(!stdout.contains("producer | tzap create --raw-stdin"));
 }
 
 #[test]
@@ -500,6 +507,297 @@ fn cli_create_rejects_password_source_conflicts() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn cli_create_stdin_modes_reject_incompatible_stdin_consumers() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("stdin.tzap");
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--tar-stdin",
+            "--password-stdin",
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains(
+            "--password-stdin cannot be used when stdin carries archive payload bytes",
+        ));
+}
+
+#[test]
+fn cli_create_stdin_modes_reject_dictionary_before_reading_it() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("stdin.tzap");
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--tar-stdin",
+            "--keyfile",
+            "missing-key.hex",
+            "--dictionary",
+            "missing-dictionary.zstd",
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains(
+            "--dictionary is not supported with stdin create modes",
+        ));
+}
+
+#[test]
+fn cli_create_stdin_modes_reject_volume_size_and_stdout_output() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("stdin.tzap");
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "data.bin",
+            "--keyfile",
+            "missing-key.hex",
+            "--volume-size",
+            "1M",
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains(
+            "--volume-size is not supported with stdin create modes",
+        ));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--tar-stdin",
+            "--keyfile",
+            "missing-key.hex",
+            "-o",
+            "-",
+            "-",
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains("--output - is not archive stdout"));
+}
+
+#[test]
+fn cli_create_stdin_modes_reject_mixed_ordinary_input_paths() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("stdin.tzap");
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--tar-stdin",
+            "--keyfile",
+            "missing-key.hex",
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+            "ordinary.txt",
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains(
+            "stdin create modes require exactly one archive input path: -",
+        ));
+}
+
+#[test]
+fn cli_create_raw_stdin_requires_member_name_and_valid_size() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("stdin.tzap");
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--keyfile",
+            "missing-key.hex",
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains(
+            "--raw-stdin requires --stdin-name PATH",
+        ));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "data.bin",
+            "--stdin-size",
+            "not-a-size",
+            "--keyfile",
+            "missing-key.hex",
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid stdin-size"));
+}
+
+#[test]
+fn cli_create_stdin_modes_reject_conflicting_mode_flags() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("stdin.tzap");
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--tar-stdin",
+            "--raw-stdin",
+            "--stdin-name",
+            "data.bin",
+            "--keyfile",
+            "missing-key.hex",
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains(
+            "--tar-stdin and --raw-stdin cannot be used together",
+        ));
+}
+
+#[test]
+fn cli_create_stdin_modes_reject_raw_adjunct_flags_without_raw_stdin() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("stdin.tzap");
+
+    for (args, expected) in [
+        (
+            vec!["--stdin-name", "data.bin"],
+            "--stdin-name requires --raw-stdin",
+        ),
+        (
+            vec!["--stdin-size", "4K"],
+            "--stdin-size requires --raw-stdin",
+        ),
+        (vec!["--spool-stdin"], "--spool-stdin requires --raw-stdin"),
+    ] {
+        let mut command_args = vec!["create"];
+        command_args.extend(args);
+        command_args.extend([
+            "--keyfile",
+            "missing-key.hex",
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ]);
+
+        Command::cargo_bin("tzap")
+            .unwrap()
+            .args(command_args)
+            .assert()
+            .code(16)
+            .stderr(predicate::str::contains(expected));
+    }
+}
+
+#[test]
+fn cli_create_raw_stdin_spool_rejects_known_size() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("stdin.tzap");
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--raw-stdin",
+            "--stdin-name",
+            "data.bin",
+            "--stdin-size",
+            "4K",
+            "--spool-stdin",
+            "--keyfile",
+            "missing-key.hex",
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ])
+        .assert()
+        .code(16)
+        .stderr(predicate::str::contains(
+            "--spool-stdin is for unknown-size raw stdin; omit --stdin-size",
+        ));
+}
+
+#[test]
+fn cli_create_stdin_modes_accept_shape_but_return_core_blocker() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("stdin.tzap");
+
+    for args in [
+        vec!["--tar-stdin"],
+        vec!["--raw-stdin", "--stdin-name", "data.bin"],
+        vec![
+            "--raw-stdin",
+            "--stdin-name",
+            "data.bin",
+            "--stdin-size",
+            "4K",
+            "--volumes",
+            "2",
+        ],
+        vec![
+            "--raw-stdin",
+            "--stdin-name",
+            "data.bin",
+            "--spool-stdin",
+            "--volumes",
+            "2",
+        ],
+    ] {
+        let mut command_args = vec!["create"];
+        command_args.extend(args);
+        command_args.extend([
+            "--keyfile",
+            "missing-key.hex",
+            "-o",
+            output.to_str().unwrap(),
+            "-",
+        ]);
+
+        Command::cargo_bin("tzap")
+            .unwrap()
+            .args(command_args)
+            .assert()
+            .code(16)
+            .stderr(predicate::str::contains(
+                "streaming create from stdin is not implemented",
+            ));
+    }
 }
 
 #[test]
