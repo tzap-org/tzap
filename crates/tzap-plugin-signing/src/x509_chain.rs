@@ -100,6 +100,7 @@ impl X509RootAuthSigner {
         signed_at_unix_seconds: i64,
     ) -> Result<Self, X509RootAuthError> {
         let leaf_certificate = X509::from_der(&leaf_certificate_der)?;
+        let leaf_certificate_der = leaf_certificate.to_der()?;
         let leaf_public_key = leaf_certificate.public_key()?;
         if !leaf_public_key.public_eq(&private_key) {
             return Err(X509RootAuthError::Invalid(
@@ -111,6 +112,7 @@ impl X509RootAuthSigner {
                 "EdDSA X.509 keys are not supported by this RootAuth profile",
             ));
         }
+        let chain_certificate_der = normalize_certificate_der_chain(chain_certificate_der)?;
         let signature_capacity = private_key.size();
         let signer = Self {
             leaf_certificate_der,
@@ -119,7 +121,7 @@ impl X509RootAuthSigner {
             signed_at_unix_seconds,
             signature_capacity,
         };
-        let _ = signer.authenticator_value_length()?;
+        signer.authenticator_value_length()?;
         Ok(signer)
     }
 
@@ -225,6 +227,15 @@ pub fn certificates_der_from_pem_or_der(bytes: &[u8]) -> Result<Vec<Vec<u8>>, X5
             .collect();
     }
     Ok(vec![X509::from_der(bytes)?.to_der()?])
+}
+
+fn normalize_certificate_der_chain(
+    chain_certificate_der: Vec<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>, X509RootAuthError> {
+    chain_certificate_der
+        .into_iter()
+        .map(|cert_der| Ok(X509::from_der(&cert_der)?.to_der()?))
+        .collect()
 }
 
 pub fn verify_root_auth_footer(
@@ -657,6 +668,25 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("certificate"));
+    }
+
+    #[test]
+    fn signer_rejects_invalid_chain_certificate_der() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_leaf_cert(
+            "Acme Release Signing",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+        );
+        let err = X509RootAuthSigner::new(
+            leaf_cert.to_der().unwrap(),
+            leaf_key,
+            vec![b"not a DER certificate".to_vec()],
+            now_unix_seconds(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, X509RootAuthError::Crypto(_)));
     }
 
     #[test]

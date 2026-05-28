@@ -1096,7 +1096,6 @@ fn run(cli: Cli) -> Result<()> {
                 reject_archive_stdin_open_options(ArchiveStdinOpenOptions {
                     paths: &paths,
                     stdout,
-                    bootstrap: bootstrap.as_deref(),
                     volumes: &volumes,
                     password_stdin,
                     password,
@@ -1243,7 +1242,6 @@ fn run(cli: Cli) -> Result<()> {
             reject_multi_volume_bootstrap(1 + volumes.len(), bootstrap.as_deref())?;
             if archive == "-" {
                 reject_archive_stdin_list_options(
-                    bootstrap.as_deref(),
                     &volumes,
                     password_stdin,
                     password,
@@ -2733,7 +2731,6 @@ fn reject_stdout_extract_shape(stdout: bool, path_count: usize) -> Result<()> {
 struct ArchiveStdinOpenOptions<'a> {
     paths: &'a [String],
     stdout: bool,
-    bootstrap: Option<&'a str>,
     volumes: &'a [String],
     password_stdin: bool,
     password: bool,
@@ -2742,7 +2739,6 @@ struct ArchiveStdinOpenOptions<'a> {
 }
 
 fn reject_archive_stdin_open_options(options: ArchiveStdinOpenOptions<'_>) -> Result<()> {
-    let _ = options.bootstrap;
     if !options.volumes.is_empty() {
         return Err(anyhow!(FormatError::ReaderUnsupported(
             "archive stdin must be the only archive input",
@@ -2767,7 +2763,6 @@ fn reject_archive_stdin_open_options(options: ArchiveStdinOpenOptions<'_>) -> Re
 }
 
 fn reject_archive_stdin_list_options(
-    _bootstrap: Option<&str>,
     volumes: &[String],
     password_stdin: bool,
     password: bool,
