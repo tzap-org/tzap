@@ -51,7 +51,9 @@ Useful flags:
 - `--output -o`: base archive path
 - `--volumes`: fixed number of output volumes
 - `--volume-size`: split by target bytes (e.g. `8M`, `512KiB`)
-- `--volume-loss-tolerance`: allowed missing-volume recoverability
+- `--volume-loss-tolerance`: allowed missing-volume recoverability. When omitted,
+  file-backed multi-volume create defaults to 1; single-volume and stdin create
+  modes default to 0.
 - `--bit-rot-buffer-pct`: recovery budget as percentage
 - `--argon2-*`: passphrase derivation tuning
 - `--insecure-zero-key`: use a 32-byte all-zero raw key for explicit

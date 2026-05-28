@@ -548,6 +548,7 @@ Example without enough recovery budget:
 tzap create \
   --keyfile project.key \
   --volumes 2 \
+  --volume-loss-tolerance 0 \
   --bit-rot-buffer-pct 0 \
   -o project.tzap \
   ./project
@@ -564,6 +565,9 @@ What to do:
 
 - Set `--volume-loss-tolerance N` to the number of whole volumes the archive
   should survive losing.
+- File-backed multi-volume create defaults to `N = 1`; pass
+  `--volume-loss-tolerance 0` when a striped archive should not spend parity on
+  whole-volume loss.
 - Keep at least `N + 1` volumes available for recovery.
 - Do not pass duplicate volume files as a recovery strategy; keep one trusted
   copy per volume index.

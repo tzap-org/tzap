@@ -19,7 +19,8 @@ use crate::reader::{
     manifest_bootstrap_fields_match, observed_archive_size, parse_non_seekable_bootstrap_material,
     parse_terminal_material_read_at, required_object_parity, total_extraction_size_cap,
     v41_terminal_tail_cap, validate_crypto_class_parity_exactness, ArchiveEntry, ArchiveReadAt,
-    NonSeekableBootstrapMaterial, OpenedArchive, ReaderOptions, StreamedArchiveOpenParts,
+    KeyHoldingTerminalContext, NonSeekableBootstrapMaterial, OpenedArchive, ReaderOptions,
+    StreamedArchiveOpenParts,
 };
 use crate::tar_model::{
     NoopTarStreamObserver, SafeExtractionOptions, TarStreamFilesystemRestoreObserver,
@@ -481,9 +482,12 @@ where
         terminal_tail.stream_len,
         terminal_tail.start_offset,
         observed_block_count,
-        &subkeys,
-        &volume_header,
-        &crypto_header,
+        KeyHoldingTerminalContext {
+            subkeys: &subkeys,
+            volume_header: &volume_header,
+            crypto_header: &crypto_header,
+            crypto_header_bytes: &crypto_header_bytes,
+        },
     )?;
     if let Some(bootstrap) = &bootstrap {
         if !manifest_bootstrap_fields_match(&terminal.manifest_footer, &bootstrap.manifest_footer) {

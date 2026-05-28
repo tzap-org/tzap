@@ -122,10 +122,9 @@ enum Command {
         #[arg(
             long = "volume-loss-tolerance",
             value_name = "COUNT",
-            help = "Allowed missing-volume recovery tolerance for multi-volume archives.",
-            default_value_t = 0
+            help = "Allowed missing-volume recovery tolerance for multi-volume archives."
         )]
-        volume_loss_tolerance: u8,
+        volume_loss_tolerance: Option<u8>,
 
         #[arg(
             long = "bit-rot-buffer-pct",
@@ -687,6 +686,12 @@ fn run(cli: Cli) -> Result<()> {
             block_size,
             paths,
         } => {
+            let resolved_volume_loss_tolerance = resolve_create_volume_loss_tolerance(
+                volume_loss_tolerance,
+                volumes,
+                volume_size.as_deref(),
+                tar_stdin || raw_stdin || spool_stdin,
+            );
             let options = WriterOptions {
                 stripe_width: volumes.unwrap_or(1),
                 target_volume_size: volume_size
@@ -695,7 +700,7 @@ fn run(cli: Cli) -> Result<()> {
                         parse_size(value).with_context(|| format!("invalid volume-size: {value}"))
                     })
                     .transpose()?,
-                volume_loss_tolerance,
+                volume_loss_tolerance: resolved_volume_loss_tolerance,
                 bit_rot_buffer_pct,
                 zstd_level: compression_level,
                 chunk_size: parse_size_u32(&chunk_size, "chunk-size")?,
@@ -810,7 +815,7 @@ fn run(cli: Cli) -> Result<()> {
                             summary.input_tar_bytes,
                             summary.archive.archive_bytes,
                             summary.archive.volume_count,
-                            volume_loss_tolerance,
+                            resolved_volume_loss_tolerance,
                             bit_rot_buffer_pct
                         );
                         (bootstrap_sidecar, summary_text)
@@ -833,7 +838,7 @@ fn run(cli: Cli) -> Result<()> {
                             summary.input_bytes,
                             summary.archive.archive_bytes,
                             summary.archive.volume_count,
-                            volume_loss_tolerance,
+                            resolved_volume_loss_tolerance,
                             bit_rot_buffer_pct
                         );
                         (bootstrap_sidecar, summary_text)
@@ -863,7 +868,7 @@ fn run(cli: Cli) -> Result<()> {
                             summary.input_bytes,
                             summary.archive.archive_bytes,
                             summary.archive.volume_count,
-                            volume_loss_tolerance,
+                            resolved_volume_loss_tolerance,
                             bit_rot_buffer_pct
                         );
                         (bootstrap_sidecar, summary_text)
@@ -1059,7 +1064,7 @@ fn run(cli: Cli) -> Result<()> {
                 input_specs.iter().map(|entry| entry.size).sum::<u64>(),
                 archive.volumes.iter().map(|volume| volume.len() as u64).sum::<u64>(),
                 archive.volumes.len(),
-                volume_loss_tolerance,
+                resolved_volume_loss_tolerance,
                 bit_rot_buffer_pct
             );
             emit_success_summary(quiet, &summary)?;
@@ -1881,7 +1886,7 @@ struct CreateStdinArgs<'a> {
     has_dictionary: bool,
     volumes: Option<u32>,
     volume_size: Option<&'a str>,
-    volume_loss_tolerance: u8,
+    volume_loss_tolerance: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2357,7 +2362,7 @@ fn validate_create_stdin_mode(args: CreateStdinArgs<'_>) -> Result<Option<Create
             "--volume-size is not supported with stdin create modes",
         )));
     }
-    if args.volume_loss_tolerance != 0 {
+    if args.volume_loss_tolerance.unwrap_or(0) != 0 {
         return Err(anyhow!(FormatError::WriterUnsupported(
             "--volume-loss-tolerance > 0 is not supported with stdin create modes",
         )));
@@ -2503,6 +2508,21 @@ fn check_archive_paths_free_for_write(paths: &[PathBuf]) -> Result<()> {
         check_output_path_free("archive output", path)?;
     }
     Ok(())
+}
+
+fn resolve_create_volume_loss_tolerance(
+    explicit: Option<u8>,
+    volumes: Option<u32>,
+    volume_size: Option<&str>,
+    stdin_payload_mode_requested: bool,
+) -> u8 {
+    explicit.unwrap_or_else(|| {
+        if stdin_payload_mode_requested || (volumes.unwrap_or(1) <= 1 && volume_size.is_none()) {
+            0
+        } else {
+            1
+        }
+    })
 }
 
 fn validate_create_writer_options(options: &WriterOptions) -> Result<()> {

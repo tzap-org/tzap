@@ -1043,18 +1043,24 @@ impl OpenedArchive {
                 bytes,
                 terminal_offset,
                 observed_block_count,
-                &subkeys,
-                &volume_header,
-                &parsed_crypto.fixed,
+                KeyHoldingTerminalContext {
+                    subkeys: &subkeys,
+                    volume_header: &volume_header,
+                    crypto_header: &parsed_crypto.fixed,
+                    crypto_header_bytes: crypto_bytes,
+                },
                 options,
             )?),
             BootstrapSidecarUse::NonSeekableRandomAccess => parse_terminal_material(
                 bytes,
                 terminal_offset,
                 observed_block_count,
-                &subkeys,
-                &volume_header,
-                &parsed_crypto.fixed,
+                KeyHoldingTerminalContext {
+                    subkeys: &subkeys,
+                    volume_header: &volume_header,
+                    crypto_header: &parsed_crypto.fixed,
+                    crypto_header_bytes: crypto_bytes,
+                },
                 options,
             )
             .ok(),
@@ -2562,9 +2568,12 @@ fn parse_seekable_volume(
 
     let terminal = locate_v41_terminal(
         bytes,
-        &subkeys,
-        &volume_header,
-        &parsed_crypto.fixed,
+        KeyHoldingTerminalContext {
+            subkeys: &subkeys,
+            volume_header: &volume_header,
+            crypto_header: &parsed_crypto.fixed,
+            crypto_header_bytes: crypto_bytes,
+        },
         options,
     )?;
     let trailer_offset = to_usize(terminal.image.volume_trailer_offset, "VolumeTrailer")?;
@@ -2678,9 +2687,12 @@ fn parse_seekable_read_at_volume(
     let terminal = locate_v41_terminal_read_at(
         reader.as_ref(),
         observed_len,
-        &subkeys,
-        &volume_header,
-        &parsed_crypto.fixed,
+        KeyHoldingTerminalContext {
+            subkeys: &subkeys,
+            volume_header: &volume_header,
+            crypto_header: &parsed_crypto.fixed,
+            crypto_header_bytes: &crypto_bytes,
+        },
         options,
     )?;
     let volume_trailer = terminal.volume_trailer.clone();
@@ -3213,49 +3225,36 @@ enum CmraRecoveryMode {
     PublicNoKey,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct KeyHoldingTerminalContext<'a> {
+    pub(crate) subkeys: &'a Subkeys,
+    pub(crate) volume_header: &'a VolumeHeader,
+    pub(crate) crypto_header: &'a CryptoHeaderFixed,
+    pub(crate) crypto_header_bytes: &'a [u8],
+}
+
 fn locate_v41_terminal(
     bytes: &[u8],
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    context: KeyHoldingTerminalContext<'_>,
     options: ReaderOptions,
 ) -> Result<V41Terminal, FormatError> {
-    locate_v41_terminal_candidate(bytes, subkeys, volume_header, crypto_header, options)
-        .map(|candidate| candidate.terminal)
+    locate_v41_terminal_candidate(bytes, context, options).map(|candidate| candidate.terminal)
 }
 
 fn locate_v41_terminal_read_at(
     reader: &dyn ArchiveReadAt,
     len: u64,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    context: KeyHoldingTerminalContext<'_>,
     options: ReaderOptions,
 ) -> Result<V41Terminal, FormatError> {
     let mut candidates = Vec::new();
     if len >= CRITICAL_RECOVERY_LOCATOR_LEN as u64 {
         let final_offset = len - CRITICAL_RECOVERY_LOCATOR_LEN as u64;
-        collect_v41_locator_candidate_read_at(
-            reader,
-            final_offset,
-            0,
-            subkeys,
-            volume_header,
-            crypto_header,
-            &mut candidates,
-        );
+        collect_v41_locator_candidate_read_at(reader, final_offset, 0, context, &mut candidates);
     }
     if len >= LOCATOR_PAIR_LEN as u64 {
         let mirror_offset = len - LOCATOR_PAIR_LEN as u64;
-        collect_v41_locator_candidate_read_at(
-            reader,
-            mirror_offset,
-            1,
-            subkeys,
-            volume_header,
-            crypto_header,
-            &mut candidates,
-        );
+        collect_v41_locator_candidate_read_at(reader, mirror_offset, 1, context, &mut candidates);
     }
 
     if candidates.is_empty() {
@@ -3271,19 +3270,13 @@ fn locate_v41_terminal_read_at(
                     reader,
                     absolute_offset,
                     2,
-                    subkeys,
-                    volume_header,
-                    crypto_header,
+                    context,
                     &mut candidates,
                 );
             } else if tail.get(offset..offset + 4) == Some(b"TZCR") {
-                if let Ok(candidate) = parse_locatorless_cmra_candidate_read_at(
-                    reader,
-                    absolute_offset,
-                    subkeys,
-                    volume_header,
-                    crypto_header,
-                ) {
+                if let Ok(candidate) =
+                    parse_locatorless_cmra_candidate_read_at(reader, absolute_offset, context)
+                {
                     candidates.push(candidate);
                 }
             }
@@ -3299,35 +3292,17 @@ fn locate_v41_terminal_read_at(
 
 fn locate_v41_terminal_candidate(
     bytes: &[u8],
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    context: KeyHoldingTerminalContext<'_>,
     options: ReaderOptions,
 ) -> Result<TerminalCandidate, FormatError> {
     let mut candidates = Vec::new();
     if bytes.len() >= CRITICAL_RECOVERY_LOCATOR_LEN {
         let final_offset = bytes.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
-        collect_v41_locator_candidate(
-            bytes,
-            final_offset,
-            0,
-            subkeys,
-            volume_header,
-            crypto_header,
-            &mut candidates,
-        );
+        collect_v41_locator_candidate(bytes, final_offset, 0, context, &mut candidates);
     }
     if bytes.len() >= LOCATOR_PAIR_LEN {
         let mirror_offset = bytes.len() - LOCATOR_PAIR_LEN;
-        collect_v41_locator_candidate(
-            bytes,
-            mirror_offset,
-            1,
-            subkeys,
-            volume_header,
-            crypto_header,
-            &mut candidates,
-        );
+        collect_v41_locator_candidate(bytes, mirror_offset, 1, context, &mut candidates);
     }
 
     if candidates.is_empty() {
@@ -3336,23 +3311,9 @@ fn locate_v41_terminal_candidate(
         let mut offset = bytes.len().saturating_sub(4);
         while offset >= scan_start {
             if bytes.get(offset..offset + 4) == Some(b"TZCL") {
-                collect_v41_locator_candidate(
-                    bytes,
-                    offset,
-                    2,
-                    subkeys,
-                    volume_header,
-                    crypto_header,
-                    &mut candidates,
-                );
+                collect_v41_locator_candidate(bytes, offset, 2, context, &mut candidates);
             } else if bytes.get(offset..offset + 4) == Some(b"TZCR") {
-                if let Ok(candidate) = parse_locatorless_cmra_candidate(
-                    bytes,
-                    offset,
-                    subkeys,
-                    volume_header,
-                    crypto_header,
-                ) {
+                if let Ok(candidate) = parse_locatorless_cmra_candidate(bytes, offset, context) {
                     candidates.push(candidate);
                 }
             }
@@ -3434,9 +3395,7 @@ fn collect_v41_locator_candidate(
     bytes: &[u8],
     offset: usize,
     expected_sequence: u32,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    context: KeyHoldingTerminalContext<'_>,
     candidates: &mut Vec<TerminalCandidate>,
 ) {
     let Some(raw) = bytes.get(offset..offset + CRITICAL_RECOVERY_LOCATOR_LEN) else {
@@ -3448,14 +3407,7 @@ fn collect_v41_locator_candidate(
     if expected_sequence <= 1 && locator.locator_sequence != expected_sequence {
         return;
     }
-    if let Ok(candidate) = parse_locator_cmra_candidate(
-        bytes,
-        offset,
-        locator,
-        subkeys,
-        volume_header,
-        crypto_header,
-    ) {
+    if let Ok(candidate) = parse_locator_cmra_candidate(bytes, offset, locator, context) {
         candidates.push(candidate);
     }
 }
@@ -3464,9 +3416,7 @@ fn collect_v41_locator_candidate_read_at(
     reader: &dyn ArchiveReadAt,
     offset: u64,
     expected_sequence: u32,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    context: KeyHoldingTerminalContext<'_>,
     candidates: &mut Vec<TerminalCandidate>,
 ) {
     let Ok(raw) = read_at_vec(
@@ -3483,14 +3433,7 @@ fn collect_v41_locator_candidate_read_at(
     if expected_sequence <= 1 && locator.locator_sequence != expected_sequence {
         return;
     }
-    if let Ok(candidate) = parse_locator_cmra_candidate_read_at(
-        reader,
-        offset,
-        locator,
-        subkeys,
-        volume_header,
-        crypto_header,
-    ) {
+    if let Ok(candidate) = parse_locator_cmra_candidate_read_at(reader, offset, locator, context) {
         candidates.push(candidate);
     }
 }
@@ -3561,9 +3504,7 @@ fn parse_locator_cmra_candidate(
     bytes: &[u8],
     locator_offset: usize,
     locator: CriticalRecoveryLocator,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    context: KeyHoldingTerminalContext<'_>,
 ) -> Result<TerminalCandidate, FormatError> {
     let tuple = CmraDecoderTuple::from(locator);
     validate_cmra_decoder_tuple(tuple)?;
@@ -3590,14 +3531,7 @@ fn parse_locator_cmra_candidate(
         Some(CmraIdentityHints::from(locator)),
         &recovered.image,
     )?;
-    let terminal = validate_recovered_terminal(
-        recovered.image,
-        recovered.tuple,
-        bytes,
-        subkeys,
-        volume_header,
-        crypto_header,
-    )?;
+    let terminal = validate_recovered_terminal(recovered.image, recovered.tuple, bytes, context)?;
     Ok(TerminalCandidate {
         terminal,
         anchor: locator_offset
@@ -3613,9 +3547,7 @@ fn parse_locator_cmra_candidate_read_at(
     reader: &dyn ArchiveReadAt,
     locator_offset: u64,
     locator: CriticalRecoveryLocator,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    context: KeyHoldingTerminalContext<'_>,
 ) -> Result<TerminalCandidate, FormatError> {
     let tuple = CmraDecoderTuple::from(locator);
     validate_cmra_decoder_tuple(tuple)?;
@@ -3645,14 +3577,8 @@ fn parse_locator_cmra_candidate_read_at(
         Some(CmraIdentityHints::from(locator)),
         &recovered.image,
     )?;
-    let terminal = validate_recovered_terminal_read_at(
-        recovered.image,
-        recovered.tuple,
-        reader,
-        subkeys,
-        volume_header,
-        crypto_header,
-    )?;
+    let terminal =
+        validate_recovered_terminal_read_at(recovered.image, recovered.tuple, reader, context)?;
     Ok(TerminalCandidate {
         terminal,
         anchor: to_usize(
@@ -3716,9 +3642,7 @@ fn parse_public_locator_cmra_candidate(
 fn parse_locatorless_cmra_candidate(
     bytes: &[u8],
     cmra_offset: usize,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    context: KeyHoldingTerminalContext<'_>,
 ) -> Result<TerminalCandidate, FormatError> {
     let recovered = recover_cmra(
         bytes,
@@ -3743,14 +3667,7 @@ fn parse_locatorless_cmra_candidate(
         ));
     }
     validate_cmra_identity_hints(recovered.header_hints, None, &recovered.image)?;
-    let terminal = validate_recovered_terminal(
-        recovered.image,
-        recovered.tuple,
-        bytes,
-        subkeys,
-        volume_header,
-        crypto_header,
-    )?;
+    let terminal = validate_recovered_terminal(recovered.image, recovered.tuple, bytes, context)?;
     Ok(TerminalCandidate {
         terminal,
         anchor: cmra_offset
@@ -3765,9 +3682,7 @@ fn parse_locatorless_cmra_candidate(
 fn parse_locatorless_cmra_candidate_read_at(
     reader: &dyn ArchiveReadAt,
     cmra_offset: u64,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    context: KeyHoldingTerminalContext<'_>,
 ) -> Result<TerminalCandidate, FormatError> {
     let recovered = recover_cmra_read_at(reader, cmra_offset, None, CmraRecoveryMode::KeyHolding)?;
     if recovered.image.body_bytes_before_cmra != cmra_offset {
@@ -3787,14 +3702,8 @@ fn parse_locatorless_cmra_candidate_read_at(
         ));
     }
     validate_cmra_identity_hints(recovered.header_hints, None, &recovered.image)?;
-    let terminal = validate_recovered_terminal_read_at(
-        recovered.image,
-        recovered.tuple,
-        reader,
-        subkeys,
-        volume_header,
-        crypto_header,
-    )?;
+    let terminal =
+        validate_recovered_terminal_read_at(recovered.image, recovered.tuple, reader, context)?;
     Ok(TerminalCandidate {
         terminal,
         anchor: to_usize(
@@ -4054,7 +3963,7 @@ fn recover_cmra_from_bytes(
         return Err(FormatError::InvalidArchive("CMRA image SHA-256 mismatch"));
     }
     let image = CriticalMetadataImage::parse(&image_bytes)?;
-    validate_critical_metadata_image(&image, tuple, mode)?;
+    validate_critical_metadata_image(&image, mode)?;
     Ok(RecoveredCmra {
         image,
         tuple,
@@ -4183,7 +4092,6 @@ fn validate_cmra_shard(
 
 fn validate_critical_metadata_image(
     image: &CriticalMetadataImage,
-    tuple: CmraDecoderTuple,
     mode: CmraRecoveryMode,
 ) -> Result<(), FormatError> {
     let root_auth_present = image.layout_flags & 0x0000_0001 != 0;
@@ -4339,17 +4247,12 @@ fn validate_critical_metadata_image(
         || (root_auth_present && sha256_region(image, 4)? != image.root_auth_footer_sha256)
         || (!root_auth_present && image.root_auth_footer_sha256 != [0u8; 32])
         || sha256_region(image, 5)? != image.volume_trailer_sha256
-        || sha256_bytes_from_tuple(tuple) != tuple.image_sha256
     {
         return Err(FormatError::InvalidArchive(
             "CriticalMetadataImage region digest mismatch",
         ));
     }
     Ok(())
-}
-
-fn sha256_bytes_from_tuple(tuple: CmraDecoderTuple) -> [u8; 32] {
-    tuple.image_sha256
 }
 
 fn image_block_record_len_from_region(image: &CriticalMetadataImage) -> Result<usize, FormatError> {
@@ -4413,50 +4316,33 @@ fn validate_recovered_terminal(
     image: CriticalMetadataImage,
     tuple: CmraDecoderTuple,
     bytes: &[u8],
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    context: KeyHoldingTerminalContext<'_>,
 ) -> Result<V41Terminal, FormatError> {
     let cmra_offset = to_usize(image.body_bytes_before_cmra, "CMRA")?;
     let cmra_boundary_magic_ok = bytes.get(cmra_offset..cmra_offset + 4) == Some(b"TZCR");
-    validate_recovered_terminal_inner(
-        image,
-        tuple,
-        cmra_boundary_magic_ok,
-        subkeys,
-        volume_header,
-        crypto_header,
-    )
+    validate_recovered_terminal_inner(image, tuple, cmra_boundary_magic_ok, context)
 }
 
 fn validate_recovered_terminal_read_at(
     image: CriticalMetadataImage,
     tuple: CmraDecoderTuple,
     reader: &dyn ArchiveReadAt,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    context: KeyHoldingTerminalContext<'_>,
 ) -> Result<V41Terminal, FormatError> {
     let mut magic = [0u8; 4];
     reader.read_exact_at(image.body_bytes_before_cmra, &mut magic)?;
-    validate_recovered_terminal_inner(
-        image,
-        tuple,
-        magic == *b"TZCR",
-        subkeys,
-        volume_header,
-        crypto_header,
-    )
+    validate_recovered_terminal_inner(image, tuple, magic == *b"TZCR", context)
 }
 
 fn validate_recovered_terminal_inner(
     image: CriticalMetadataImage,
     tuple: CmraDecoderTuple,
     cmra_boundary_magic_ok: bool,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    context: KeyHoldingTerminalContext<'_>,
 ) -> Result<V41Terminal, FormatError> {
+    let subkeys = context.subkeys;
+    let volume_header = context.volume_header;
+    let crypto_header = context.crypto_header;
     let volume_header_region = image
         .region(1)
         .ok_or(FormatError::InvalidArchive("missing VolumeHeader region"))?;
@@ -4472,6 +4358,26 @@ fn validate_recovered_terminal_inner(
         .ok_or(FormatError::InvalidArchive("missing CryptoHeader region"))?;
     let recovered_crypto = CryptoHeader::parse(&crypto_region.bytes, image.crypto_header_length)?;
     if recovered_crypto.fixed != *crypto_header {
+        return Err(FormatError::InvalidArchive(
+            "CMRA CryptoHeader differs from parsed CryptoHeader",
+        ));
+    }
+    let recovered_pre_hmac_len = crypto_region
+        .bytes
+        .len()
+        .checked_sub(CRYPTO_HEADER_HMAC_LEN)
+        .ok_or(FormatError::InvalidArchive(
+            "CMRA CryptoHeader is too short",
+        ))?;
+    let parsed_pre_hmac_len = context
+        .crypto_header_bytes
+        .len()
+        .checked_sub(CRYPTO_HEADER_HMAC_LEN)
+        .ok_or(FormatError::InvalidArchive("CryptoHeader is too short"))?;
+    if recovered_pre_hmac_len != parsed_pre_hmac_len
+        || crypto_region.bytes[..recovered_pre_hmac_len]
+            != context.crypto_header_bytes[..parsed_pre_hmac_len]
+    {
         return Err(FormatError::InvalidArchive(
             "CMRA CryptoHeader differs from parsed CryptoHeader",
         ));
@@ -5606,13 +5512,10 @@ fn parse_terminal_material(
     bytes: &[u8],
     manifest_offset: usize,
     observed_block_count: u64,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    context: KeyHoldingTerminalContext<'_>,
     options: ReaderOptions,
 ) -> Result<(ManifestFooter, VolumeTrailer, Option<RootAuthFooterV1>), FormatError> {
-    let candidate =
-        locate_v41_terminal_candidate(bytes, subkeys, volume_header, crypto_header, options)?;
+    let candidate = locate_v41_terminal_candidate(bytes, context, options)?;
     if !terminal_candidate_reaches_eof(&candidate, bytes.len())? {
         return Err(FormatError::InvalidArchive(
             "sequential terminal does not end at EOF",
@@ -5642,9 +5545,7 @@ pub(crate) fn parse_terminal_material_read_at(
     input_len: u64,
     manifest_offset: u64,
     observed_block_count: u64,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    context: KeyHoldingTerminalContext<'_>,
 ) -> Result<SequentialTerminalMaterial, FormatError> {
     let mut candidates = Vec::new();
     if input_len >= CRITICAL_RECOVERY_LOCATOR_LEN as u64 {
@@ -5652,9 +5553,7 @@ pub(crate) fn parse_terminal_material_read_at(
             reader,
             input_len - CRITICAL_RECOVERY_LOCATOR_LEN as u64,
             0,
-            subkeys,
-            volume_header,
-            crypto_header,
+            context,
             &mut candidates,
         );
     }
@@ -5663,9 +5562,7 @@ pub(crate) fn parse_terminal_material_read_at(
             reader,
             input_len - LOCATOR_PAIR_LEN as u64,
             1,
-            subkeys,
-            volume_header,
-            crypto_header,
+            context,
             &mut candidates,
         );
     }
@@ -5939,9 +5836,12 @@ fn sequential_extract_tar_stream_with_options(
         bytes,
         offset,
         observed_block_count,
-        &subkeys,
-        &volume_header,
-        &parsed_crypto.fixed,
+        KeyHoldingTerminalContext {
+            subkeys: &subkeys,
+            volume_header: &volume_header,
+            crypto_header: &parsed_crypto.fixed,
+            crypto_header_bytes: crypto_bytes,
+        },
         options,
     )?;
     // This public helper is intentionally whole-buffer: decoded payload bytes
@@ -6938,8 +6838,9 @@ mod tests {
         NonSeekableReaderOptions, SequentialRootAuthStatus,
     };
     use crate::writer::{
-        write_archive, write_archive_with_dictionary, write_archive_with_root_auth, RegularFile,
-        RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions,
+        write_archive, write_archive_with_dictionary, write_archive_with_kdf,
+        write_archive_with_root_auth, RegularFile, RootAuthSigningRequest, RootAuthWriterConfig,
+        WriterOptions,
     };
 
     fn master_key() -> MasterKey {
@@ -7423,9 +7324,12 @@ mod tests {
                 &malformed,
                 final_offset,
                 locator,
-                &subkeys,
-                &volume_header,
-                &crypto_header.fixed,
+                KeyHoldingTerminalContext {
+                    subkeys: &subkeys,
+                    volume_header: &volume_header,
+                    crypto_header: &crypto_header.fixed,
+                    crypto_header_bytes: &malformed[crypto_start..crypto_end],
+                },
             )
             .unwrap_err(),
             FormatError::InvalidArchive(
@@ -7470,9 +7374,12 @@ mod tests {
                 &archive.bytes,
                 final_offset,
                 locator,
-                &subkeys,
-                &volume_header,
-                &crypto_header.fixed,
+                KeyHoldingTerminalContext {
+                    subkeys: &subkeys,
+                    volume_header: &volume_header,
+                    crypto_header: &crypto_header.fixed,
+                    crypto_header_bytes: &archive.bytes[crypto_start..crypto_end],
+                },
             )
             .unwrap_err(),
             FormatError::InvalidArchive("CMRA shard_size is invalid")
@@ -11185,6 +11092,76 @@ mod tests {
     }
 
     #[test]
+    fn rejects_cmra_crypto_header_pre_hmac_mismatch() {
+        let kdf_params = crate::crypto::KdfParams::Argon2id {
+            t_cost: 1,
+            m_cost_kib: 8,
+            parallelism: 1,
+            salt: b"0123456789abcdef".to_vec(),
+        };
+        let archive = write_archive_with_kdf(
+            &[RegularFile::new("cmra-crypto.txt", b"same fixed header")],
+            &master_key(),
+            single_stream_options(),
+            &kdf_params,
+        )
+        .unwrap();
+        let mut mutated = archive.bytes.clone();
+        let volume_header = VolumeHeader::parse(&mutated[..VOLUME_HEADER_LEN]).unwrap();
+        let subkeys = Subkeys::derive(
+            &master_key(),
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+        )
+        .unwrap();
+
+        rewrite_cmra_image(&mut mutated, CmraRecoveryMode::KeyHolding, |image| {
+            let crypto_region = image
+                .regions
+                .iter_mut()
+                .find(|region| region.region_type == 2)
+                .unwrap();
+            let hmac_offset = crypto_region.bytes.len() - CRYPTO_HEADER_HMAC_LEN;
+            let salt_start = CRYPTO_HEADER_FIXED_LEN + 16;
+            crypto_region.bytes[salt_start] ^= 0x01;
+            let hmac = compute_hmac(
+                HmacDomain::CryptoHeader,
+                &subkeys.mac_key,
+                &volume_header.archive_uuid,
+                &volume_header.session_id,
+                &crypto_region.bytes[..hmac_offset],
+            );
+            crypto_region.bytes[hmac_offset..].copy_from_slice(&hmac);
+        });
+
+        let final_offset = mutated.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
+        let locator = final_recovery_locator(&mutated);
+        let crypto_start = volume_header.crypto_header_offset as usize;
+        let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
+        let parsed_crypto = CryptoHeader::parse(
+            &mutated[crypto_start..crypto_end],
+            volume_header.crypto_header_length,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_locator_cmra_candidate(
+                &mutated,
+                final_offset,
+                locator,
+                KeyHoldingTerminalContext {
+                    subkeys: &subkeys,
+                    volume_header: &volume_header,
+                    crypto_header: &parsed_crypto.fixed,
+                    crypto_header_bytes: &mutated[crypto_start..crypto_end],
+                },
+            )
+            .unwrap_err(),
+            FormatError::InvalidArchive("CMRA CryptoHeader differs from parsed CryptoHeader")
+        );
+        assert!(open_archive(&mutated, &master_key()).is_err());
+    }
+
+    #[test]
     fn rejects_same_key_crypto_header_splice_with_session_mismatch() {
         let base = WriterOptions {
             archive_uuid: Some([0x11; 16]),
@@ -11669,16 +11646,18 @@ mod tests {
         volume: &mut [u8],
         mutate: impl FnOnce(&mut CriticalMetadataImage),
     ) {
+        rewrite_cmra_image(volume, CmraRecoveryMode::PublicNoKey, mutate);
+    }
+
+    fn rewrite_cmra_image(
+        volume: &mut [u8],
+        mode: CmraRecoveryMode,
+        mutate: impl FnOnce(&mut CriticalMetadataImage),
+    ) {
         let final_offset = volume.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
         let locator = final_recovery_locator(volume);
         let tuple = CmraDecoderTuple::from(locator);
-        let recovered = recover_cmra(
-            volume,
-            locator.cmra_offset,
-            Some(tuple),
-            CmraRecoveryMode::PublicNoKey,
-        )
-        .unwrap();
+        let recovered = recover_cmra(volume, locator.cmra_offset, Some(tuple), mode).unwrap();
         let mut image = recovered.image;
         mutate(&mut image);
         refresh_critical_image_region_digests(&mut image);
