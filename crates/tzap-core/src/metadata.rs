@@ -483,33 +483,39 @@ impl IndexShard {
         let mut cursor = INDEX_SHARD_HEADER_LEN;
         let files = parse_counted_table(
             bytes,
-            structure,
-            "file table",
-            header.file_count as u64,
-            header.file_table_offset as u64,
-            FILE_ENTRY_LEN,
+            CountedTableSpec {
+                structure,
+                name: "file table",
+                count: header.file_count as u64,
+                offset: header.file_table_offset as u64,
+                entry_len: FILE_ENTRY_LEN,
+                parse: parse_file_entry,
+            },
             &mut cursor,
-            parse_file_entry,
         )?;
         let frames = parse_counted_table(
             bytes,
-            structure,
-            "frame table",
-            header.frame_count as u64,
-            header.frame_table_offset as u64,
-            FRAME_ENTRY_LEN,
+            CountedTableSpec {
+                structure,
+                name: "frame table",
+                count: header.frame_count as u64,
+                offset: header.frame_table_offset as u64,
+                entry_len: FRAME_ENTRY_LEN,
+                parse: parse_frame_entry,
+            },
             &mut cursor,
-            parse_frame_entry,
         )?;
         let envelopes = parse_counted_table(
             bytes,
-            structure,
-            "envelope table",
-            header.envelope_count as u64,
-            header.envelope_table_offset as u64,
-            ENVELOPE_ENTRY_LEN,
+            CountedTableSpec {
+                structure,
+                name: "envelope table",
+                count: header.envelope_count as u64,
+                offset: header.envelope_table_offset as u64,
+                entry_len: ENVELOPE_ENTRY_LEN,
+                parse: parse_envelope_entry,
+            },
             &mut cursor,
-            parse_envelope_entry,
         )?;
         let string_pool = if header.string_pool_size == 0 {
             if header.string_pool_offset != 0 {
@@ -867,16 +873,14 @@ impl DirectoryHintTable {
     pub fn lookup_directory_index(&self, normalized_dir_path: &[u8]) -> Option<usize> {
         let target_hash = hash_prefix(normalized_dir_path);
         let lower = self.lower_bound_directory_key(target_hash, normalized_dir_path);
-        for idx in lower..self.entries.len() {
-            let entry = &self.entries[idx];
-            if entry.dir_hash != target_hash
-                || self.entry_paths[idx].as_slice() != normalized_dir_path
-            {
-                break;
-            }
-            return Some(idx);
+        let entry = self.entries.get(lower)?;
+        if entry.dir_hash == target_hash
+            && self.entry_paths[lower].as_slice() == normalized_dir_path
+        {
+            Some(lower)
+        } else {
+            None
         }
-        None
     }
 
     fn lower_bound_directory_key(&self, target_hash: [u8; 8], target_path: &[u8]) -> usize {
@@ -1348,7 +1352,7 @@ fn validate_index_shard_tables(
         let envelope = envelope_by_index
             .get(&frame.envelope_index)
             .and_then(|idx| envelopes.get(*idx))
-            .ok_or_else(|| FormatError::InvalidMetadata {
+            .ok_or(FormatError::InvalidMetadata {
                 structure: "FrameEntry",
                 reason: "referenced EnvelopeEntry is missing",
             })?;
@@ -1836,7 +1840,7 @@ fn is_windows_device_component(component: &str) -> bool {
         .split('.')
         .next()
         .unwrap_or(component)
-        .trim_end_matches(|ch| ch == ' ' || ch == '.');
+        .trim_end_matches([' ', '.']);
     let upper = stem.to_ascii_uppercase();
     matches!(
         upper.as_str(),
@@ -1931,28 +1935,32 @@ fn frame_for_file<'a>(
         })
 }
 
-fn parse_counted_table<T>(
-    bytes: &[u8],
+struct CountedTableSpec<T> {
     structure: &'static str,
     name: &'static str,
     count: u64,
     offset: u64,
     entry_len: usize,
-    cursor: &mut usize,
     parse: fn(&[u8]) -> Result<T, FormatError>,
+}
+
+fn parse_counted_table<T>(
+    bytes: &[u8],
+    spec: CountedTableSpec<T>,
+    cursor: &mut usize,
 ) -> Result<Vec<T>, FormatError> {
-    if count == 0 {
-        if offset != 0 {
-            return invalid(structure, "absent counted table has non-zero offset");
+    if spec.count == 0 {
+        if spec.offset != 0 {
+            return invalid(spec.structure, "absent counted table has non-zero offset");
         }
         return Ok(Vec::new());
     }
-    expect_offset(structure, name, offset, *cursor)?;
-    let count = to_usize(count, structure)?;
-    let bytes_len = checked_mul(count, entry_len, structure)?;
-    let table = slice(bytes, *cursor, bytes_len, structure)?;
-    *cursor = checked_add(*cursor, bytes_len, structure)?;
-    table.chunks_exact(entry_len).map(parse).collect()
+    expect_offset(spec.structure, spec.name, spec.offset, *cursor)?;
+    let count = to_usize(spec.count, spec.structure)?;
+    let bytes_len = checked_mul(count, spec.entry_len, spec.structure)?;
+    let table = slice(bytes, *cursor, bytes_len, spec.structure)?;
+    *cursor = checked_add(*cursor, bytes_len, spec.structure)?;
+    table.chunks_exact(spec.entry_len).map(spec.parse).collect()
 }
 
 fn parse_u32_array(bytes: &[u8], structure: &'static str) -> Result<Vec<u32>, FormatError> {
@@ -2095,7 +2103,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_reader_caps_match_v36() {
+    fn default_reader_caps_match_v41() {
         let limits = MetadataLimits::default();
         assert_eq!(limits.max_shard_count, 1_000_000);
         assert_eq!(limits.max_directory_hint_shards, 1_000_000);
@@ -2125,8 +2133,10 @@ mod tests {
             }],
             directory_hint_shards: Vec::new(),
         };
-        let mut limits = MetadataLimits::default();
-        limits.max_index_parity_shards = 1;
+        let limits = MetadataLimits {
+            max_index_parity_shards: 1,
+            ..MetadataLimits::default()
+        };
 
         assert_eq!(
             IndexRoot::parse(&root.to_bytes(), false, limits).unwrap_err(),
@@ -2459,14 +2469,19 @@ mod tests {
                 entry_count: 1,
             }],
         };
-        let mut limits = MetadataLimits::default();
-        limits.max_shard_count = 1;
-        limits.max_directory_hint_shards = 1;
+        let limits = MetadataLimits {
+            max_shard_count: 1,
+            max_directory_hint_shards: 1,
+            ..MetadataLimits::default()
+        };
         IndexRoot::parse(&root.to_bytes(), false, limits).unwrap();
 
-        limits.max_directory_hint_shards = 0;
+        let rejecting_limits = MetadataLimits {
+            max_directory_hint_shards: 0,
+            ..limits
+        };
         assert_eq!(
-            IndexRoot::parse(&root.to_bytes(), false, limits).unwrap_err(),
+            IndexRoot::parse(&root.to_bytes(), false, rejecting_limits).unwrap_err(),
             FormatError::InvalidMetadata {
                 structure: "IndexRoot",
                 reason: "directory hint shard count exceeds resource cap",
@@ -2510,8 +2525,10 @@ mod tests {
             decompressed_size: bytes.len() as u32,
             entry_count: 1,
         };
-        let mut limits = MetadataLimits::default();
-        limits.max_path_length = 3;
+        let limits = MetadataLimits {
+            max_path_length: 3,
+            ..MetadataLimits::default()
+        };
 
         assert_eq!(
             DirectoryHintTable::parse(&bytes, &locating, 1, limits).unwrap_err(),
@@ -3249,8 +3266,10 @@ mod tests {
             directory_hint_shards: Vec::new(),
         };
 
-        let mut limits = MetadataLimits::default();
-        limits.max_hash_collision_shard_scan = 0;
+        let mut limits = MetadataLimits {
+            max_hash_collision_shard_scan: 0,
+            ..MetadataLimits::default()
+        };
         assert_eq!(
             root.candidate_shards_for_path(path, limits).unwrap_err(),
             FormatError::HashPrefixCollisionRunExceeded

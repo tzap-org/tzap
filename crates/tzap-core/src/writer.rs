@@ -129,6 +129,9 @@ pub struct RootAuthSigningRequest {
     pub archive_root: [u8; 32],
 }
 
+pub type RootAuthAuthenticator<'a> =
+    dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError> + 'a;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegularFile<'a> {
     pub path: &'a str,
@@ -293,8 +296,8 @@ struct PlannedDirectoryHintShard {
     last_dir_hash: [u8; 8],
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct PayloadEnvelope {
     envelope_index: u64,
     plaintext: Vec<u8>,
@@ -636,6 +639,7 @@ pub fn write_archive_with_dictionary_and_kdf(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn write_archive_sources_to_sink<S, O>(
     files: &[S],
     master_key: &MasterKey,
@@ -643,7 +647,7 @@ pub fn write_archive_sources_to_sink<S, O>(
     dictionary: Option<&[u8]>,
     kdf_params: &KdfParams,
     root_auth: Option<RootAuthWriterConfig<'_>>,
-    authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
     sink: &mut O,
 ) -> Result<WrittenArchiveSummary, ArchiveWriteError>
 where
@@ -669,7 +673,7 @@ fn write_archive_inner(
     dictionary: Option<&[u8]>,
     kdf_params: &KdfParams,
     root_auth: Option<RootAuthWriterConfig<'_>>,
-    authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
 ) -> Result<WrittenArchive, FormatError> {
     let mut sink = MemoryArchiveSink::default();
     let summary = write_archive_stream_inner(
@@ -705,6 +709,7 @@ fn format_error_from_archive_write_error(error: ArchiveWriteError) -> FormatErro
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_archive_stream_inner<S, O>(
     files: &[S],
     master_key: &MasterKey,
@@ -712,9 +717,7 @@ fn write_archive_stream_inner<S, O>(
     dictionary: Option<&[u8]>,
     kdf_params: &KdfParams,
     root_auth: Option<RootAuthWriterConfig<'_>>,
-    mut authenticator: Option<
-        &mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
-    >,
+    mut authenticator: Option<&mut RootAuthAuthenticator<'_>>,
     sink: &mut O,
 ) -> Result<WrittenArchiveSummary, ArchiveWriteError>
 where
@@ -793,6 +796,7 @@ fn validate_dictionary_inputs(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_writer_plan<S: RegularFileSource>(
     files: &[S],
     master_key: &MasterKey,
@@ -936,19 +940,18 @@ fn build_writer_plan_from_payload(
         });
     }
 
-    let index_root_plaintext = build_index_root_plaintext(
-        &shard_entries,
-        payload.frames.len() as u64,
-        payload.payload_objects.len() as u64,
-        payload.tar_members.len() as u64,
-        payload.payload_block_count,
-        payload.tar_total_size,
-        payload.content_sha256,
-        &directory_hint_entries,
-        dictionary_extent
-            .zip(dictionary_decompressed_size)
-            .map(|(extent, decompressed_size)| (extent, decompressed_size)),
-    );
+    let dictionary_extent = dictionary_extent.zip(dictionary_decompressed_size);
+    let index_root_plaintext = build_index_root_plaintext(IndexRootPlaintextInput {
+        shard_entries: &shard_entries,
+        frame_count: payload.frames.len() as u64,
+        envelope_count: payload.payload_objects.len() as u64,
+        file_count: payload.tar_members.len() as u64,
+        payload_block_count: payload.payload_block_count,
+        tar_total_size: payload.tar_total_size,
+        content_sha256: payload.content_sha256,
+        directory_hint_entries: &directory_hint_entries,
+        dictionary_extent,
+    });
     let compressed_index_root = compress_zstd_frame(&index_root_plaintext, options.zstd_level)?;
     let metadata_class = plan_index_root_metadata_class(
         options,
@@ -989,9 +992,7 @@ fn build_writer_plan_from_payload(
         index_shard_objects,
         shard_entries,
         compressed_dictionary,
-        dictionary_extent: dictionary_extent
-            .zip(dictionary_decompressed_size)
-            .map(|(extent, decompressed_size)| (extent, decompressed_size)),
+        dictionary_extent,
         directory_hint_objects,
         directory_hint_entries,
         root_auth_footer_length,
@@ -1077,19 +1078,23 @@ fn plan_payload_stream<S: RegularFileSource>(
             let chunk = &chunk[..chunk_len];
             hasher.update(chunk);
             append_payload_frame_to_plan(
-                &mut envelope,
-                &mut payload_objects,
-                &mut payload_block_count,
-                next_block_index,
-                &mut frames,
-                &frame,
-                chunk_len,
-                member_index,
-                member_start,
-                member_offset,
-                member_group_size,
-                &mut next_frame_index,
-                options,
+                PayloadFramePlanState {
+                    envelope: &mut envelope,
+                    payload_objects: &mut payload_objects,
+                    payload_block_count: &mut payload_block_count,
+                    next_block_index,
+                    frames: &mut frames,
+                    next_frame_index: &mut next_frame_index,
+                    options,
+                },
+                PayloadFramePlanInput {
+                    frame: &frame,
+                    decompressed_size: chunk_len,
+                    member_index,
+                    member_start,
+                    member_offset,
+                    member_group_size,
+                },
             )?;
             member_offset = checked_u64_add(member_offset, chunk_len as u64, "payload chunk")?;
             tar_total_size = checked_u64_add(tar_total_size, chunk_len as u64, "tar stream")?;
@@ -1124,7 +1129,7 @@ pub(crate) fn write_single_pass_archive_to_sink<O, F>(
     options: WriterOptions,
     kdf_params: &KdfParams,
     root_auth: Option<RootAuthWriterConfig<'_>>,
-    authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
     sink: &mut O,
     drive_members: F,
 ) -> Result<WrittenArchiveSummary, ArchiveWriteError>
@@ -1423,18 +1428,20 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
         let extent = ObjectExtent::new(self.emission_state.next_block_index, object_plan)?;
         let object = encrypt_object(
             &self.envelope.plaintext,
-            &self.subkeys.enc_key,
-            &self.subkeys.nonce_seed,
-            b"envelope",
-            self.envelope.envelope_index,
-            BlockKind::PayloadData,
-            BlockKind::PayloadParity,
-            self.options.fec_data_shards,
-            self.options.fec_parity_shards,
+            ObjectEncryptionContext {
+                key: &self.subkeys.enc_key,
+                nonce_seed: &self.subkeys.nonce_seed,
+                domain: b"envelope",
+                counter: self.envelope.envelope_index,
+                data_kind: BlockKind::PayloadData,
+                parity_kind: BlockKind::PayloadParity,
+                data_shard_max: self.options.fec_data_shards,
+                class_parity_shard_max: self.options.fec_parity_shards,
+                archive_uuid: &self.archive_uuid,
+                session_id: &self.session_id,
+            },
             &mut self.emission_state.next_block_index,
             self.options,
-            &self.archive_uuid,
-            &self.session_id,
         )?;
         validate_planned_extent(&object, extent)?;
         for record in &object.records {
@@ -1468,9 +1475,7 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
         master_key: &MasterKey,
         kdf_params: &KdfParams,
         root_auth: Option<RootAuthWriterConfig<'_>>,
-        authenticator: Option<
-            &mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
-        >,
+        authenticator: Option<&mut RootAuthAuthenticator<'_>>,
     ) -> Result<WrittenArchiveSummary, ArchiveWriteError> {
         self.flush_payload_envelope()?;
         let digest = self.hasher.finalize();
@@ -1512,65 +1517,82 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
     }
 }
 
-fn append_payload_frame_to_plan(
-    envelope: &mut PayloadEnvelopeBuilder,
-    payload_objects: &mut Vec<PayloadObject>,
-    payload_block_count: &mut u64,
-    next_block_index: &mut u64,
-    frames: &mut Vec<PayloadFrame>,
-    frame: &[u8],
+struct PayloadFramePlanState<'a> {
+    envelope: &'a mut PayloadEnvelopeBuilder,
+    payload_objects: &'a mut Vec<PayloadObject>,
+    payload_block_count: &'a mut u64,
+    next_block_index: &'a mut u64,
+    frames: &'a mut Vec<PayloadFrame>,
+    next_frame_index: &'a mut u64,
+    options: WriterOptions,
+}
+
+struct PayloadFramePlanInput<'a> {
+    frame: &'a [u8],
     decompressed_size: usize,
     member_index: usize,
     member_start: u64,
     member_offset: u64,
     member_group_size: u64,
-    next_frame_index: &mut u64,
-    options: WriterOptions,
+}
+
+fn append_payload_frame_to_plan(
+    state: PayloadFramePlanState<'_>,
+    input: PayloadFramePlanInput<'_>,
 ) -> Result<(), FormatError> {
-    let next_len = checked_usize_add(envelope.plaintext.len(), frame.len(), "payload")?;
-    if !envelope.plaintext.is_empty()
-        && (next_len > options.envelope_target_size as usize
-            || !payload_object_can_fit(next_len, options)?)
+    let next_len = checked_usize_add(state.envelope.plaintext.len(), input.frame.len(), "payload")?;
+    if !state.envelope.plaintext.is_empty()
+        && (next_len > state.options.envelope_target_size as usize
+            || !payload_object_can_fit(next_len, state.options)?)
     {
         flush_payload_envelope_plan(
-            envelope,
-            payload_objects,
-            payload_block_count,
-            next_block_index,
-            options,
+            state.envelope,
+            state.payload_objects,
+            state.payload_block_count,
+            state.next_block_index,
+            state.options,
         )?;
     }
-    if envelope.plaintext.is_empty() && !payload_object_can_fit(frame.len(), options)? {
+    if state.envelope.plaintext.is_empty()
+        && !payload_object_can_fit(input.frame.len(), state.options)?
+    {
         return Err(FormatError::WriterUnsupported(
             "payload frame exceeds envelope object limits",
         ));
     }
-    let offset = u32_len(envelope.plaintext.len(), "FrameEntry.offset_in_envelope")?;
-    envelope.plaintext.extend_from_slice(frame);
+    let offset = u32_len(
+        state.envelope.plaintext.len(),
+        "FrameEntry.offset_in_envelope",
+    )?;
+    state.envelope.plaintext.extend_from_slice(input.frame);
     let mut flags = 0u32;
-    if member_offset == 0 {
+    if input.member_offset == 0 {
         flags |= 0x0000_0001;
     }
-    if checked_u64_add(member_offset, decompressed_size as u64, "payload chunk")?
-        == member_group_size
+    if checked_u64_add(
+        input.member_offset,
+        input.decompressed_size as u64,
+        "payload chunk",
+    )? == input.member_group_size
     {
         flags |= 0x0000_0002;
     }
-    frames.push(PayloadFrame {
-        frame_index: *next_frame_index,
-        envelope_index: envelope.envelope_index,
-        member_index,
+    state.frames.push(PayloadFrame {
+        frame_index: *state.next_frame_index,
+        envelope_index: state.envelope.envelope_index,
+        member_index: input.member_index,
         offset_in_envelope: offset,
-        compressed_size: u32_len(frame.len(), "FrameEntry.compressed_size")?,
-        decompressed_size: u32_len(decompressed_size, "FrameEntry.decompressed_size")?,
+        compressed_size: u32_len(input.frame.len(), "FrameEntry.compressed_size")?,
+        decompressed_size: u32_len(input.decompressed_size, "FrameEntry.decompressed_size")?,
         flags,
         tar_stream_offset: checked_u64_add(
-            member_start,
-            member_offset,
+            input.member_start,
+            input.member_offset,
             "PayloadFrame.tar_stream_offset",
         )?,
     });
-    *next_frame_index = checked_u64_add(*next_frame_index, 1, "PayloadFrame.frame_index")?;
+    *state.next_frame_index =
+        checked_u64_add(*state.next_frame_index, 1, "PayloadFrame.frame_index")?;
     Ok(())
 }
 
@@ -1705,34 +1727,34 @@ fn planned_v41_volume_size(
         MANIFEST_FOOTER_LEN as u64 + u64::from(plan.root_auth_footer_length.unwrap_or(0)),
         "VolumeTrailer",
     )?;
-    let trailer = build_volume_trailer(
+    let trailer = build_volume_trailer(VolumeTrailerBuildInput {
         subkeys,
-        plan.archive_uuid,
-        plan.session_id,
+        archive_uuid: plan.archive_uuid,
+        session_id: plan.session_id,
         volume_index,
         block_count,
-        trailer_offset,
+        bytes_written: trailer_offset,
         manifest_footer_offset,
-        plan.options.closed_at_ns,
-        root_auth_footer_offset.zip(plan.root_auth_footer_length),
-    );
+        closed_at_ns: plan.options.closed_at_ns,
+        root_auth_footer: root_auth_footer_offset.zip(plan.root_auth_footer_length),
+    });
     let cmra_offset = checked_u64_add(trailer_offset, VOLUME_TRAILER_LEN as u64, "CMRA")?;
-    let cmra = build_v41_cmra(
-        &volume_header_bytes,
-        &plan.crypto_header,
+    let cmra = build_v41_cmra(CmraBuildInput {
+        volume_header_bytes: &volume_header_bytes,
+        crypto_header: &plan.crypto_header,
         block_count,
         manifest_footer_offset,
-        &manifest_footer,
+        manifest_footer: &manifest_footer,
         root_auth_footer_offset,
-        root_auth_footer.as_deref(),
+        root_auth_footer: root_auth_footer.as_deref(),
         trailer_offset,
-        &trailer,
+        trailer: &trailer,
         cmra_offset,
-        plan.options,
-        plan.archive_uuid,
-        plan.session_id,
+        options: plan.options,
+        archive_uuid: plan.archive_uuid,
+        session_id: plan.session_id,
         volume_index,
-    )?;
+    })?;
     checked_u64_add(
         checked_u64_add(cmra_offset, cmra.bytes.len() as u64, "CMRA")?,
         (CRITICAL_RECOVERY_LOCATOR_LEN * 2) as u64,
@@ -1755,7 +1777,7 @@ fn emit_writer_plan<S, O>(
     master_key: &MasterKey,
     dictionary: Option<&[u8]>,
     root_auth: Option<RootAuthWriterConfig<'_>>,
-    authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
     plan: WriterPlan,
     sink: &mut O,
 ) -> Result<WrittenArchiveSummary, ArchiveWriteError>
@@ -1790,7 +1812,7 @@ where
 fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
     subkeys: &Subkeys,
     root_auth: Option<RootAuthWriterConfig<'_>>,
-    authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
     plan: WriterPlan,
     sink: &mut O,
     mut state: WriterEmissionState,
@@ -1900,7 +1922,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
     }
 
     let volume_zero_manifest = build_manifest_footer(
-        &subkeys,
+        subkeys,
         plan.archive_uuid,
         plan.session_id,
         0,
@@ -1916,18 +1938,20 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
             Some(build_root_auth_footer_from_leaf_hashes(
                 config,
                 signer,
-                plan.archive_uuid,
-                plan.session_id,
-                plan.options,
-                &plan.crypto_header,
-                &volume_zero_manifest,
-                &plan.index_root_plaintext,
-                plan.index_root_extent,
-                plan.dictionary_extent,
-                &plan.shard_entries,
-                &plan.payload_objects,
-                &plan.directory_hint_entries,
-                &state.data_leaf_hashes,
+                RootAuthFooterBuildInput {
+                    archive_uuid: plan.archive_uuid,
+                    session_id: plan.session_id,
+                    options: plan.options,
+                    crypto_header: &plan.crypto_header,
+                    volume_zero_manifest: &volume_zero_manifest,
+                    index_root_plaintext: &plan.index_root_plaintext,
+                    index_root_extent: plan.index_root_extent,
+                    dictionary_extent: plan.dictionary_extent,
+                    shard_entries: &plan.shard_entries,
+                    payload_objects: &plan.payload_objects,
+                    directory_hint_entries: &plan.directory_hint_entries,
+                    data_leaf_hashes: &state.data_leaf_hashes,
+                },
             )?)
         }
         None => None,
@@ -1942,7 +1966,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
             .map_err(|_| FormatError::WriterUnsupported("volume_index"))?;
         let manifest_footer_offset = state.bytes_written[volume_index];
         let manifest_footer = build_manifest_footer(
-            &subkeys,
+            subkeys,
             plan.archive_uuid,
             plan.session_id,
             volume_index_u32,
@@ -1971,17 +1995,17 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
         };
 
         let trailer_offset = state.bytes_written[volume_index];
-        let trailer = build_volume_trailer(
-            &subkeys,
-            plan.archive_uuid,
-            plan.session_id,
-            volume_index_u32,
-            state.record_counts[volume_index],
-            trailer_offset,
+        let trailer = build_volume_trailer(VolumeTrailerBuildInput {
+            subkeys,
+            archive_uuid: plan.archive_uuid,
+            session_id: plan.session_id,
+            volume_index: volume_index_u32,
+            block_count: state.record_counts[volume_index],
+            bytes_written: trailer_offset,
             manifest_footer_offset,
-            plan.options.closed_at_ns,
-            root_auth_footer_offset.zip(root_auth_footer_length),
-        );
+            closed_at_ns: plan.options.closed_at_ns,
+            root_auth_footer: root_auth_footer_offset.zip(root_auth_footer_length),
+        });
         sink.write_volume(volume_index, &trailer)?;
         state.bytes_written[volume_index] = checked_u64_add(
             state.bytes_written[volume_index],
@@ -1990,22 +2014,22 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
         )?;
 
         let cmra_offset = state.bytes_written[volume_index];
-        let cmra = build_v41_cmra(
-            &state.volume_headers[volume_index],
-            &plan.crypto_header,
-            state.record_counts[volume_index],
+        let cmra = build_v41_cmra(CmraBuildInput {
+            volume_header_bytes: &state.volume_headers[volume_index],
+            crypto_header: &plan.crypto_header,
+            block_count: state.record_counts[volume_index],
             manifest_footer_offset,
-            &manifest_footer,
+            manifest_footer: &manifest_footer,
             root_auth_footer_offset,
-            root_auth_footer.as_deref(),
+            root_auth_footer: root_auth_footer.as_deref(),
             trailer_offset,
-            &trailer,
+            trailer: &trailer,
             cmra_offset,
-            plan.options,
-            plan.archive_uuid,
-            plan.session_id,
-            volume_index_u32,
-        )?;
+            options: plan.options,
+            archive_uuid: plan.archive_uuid,
+            session_id: plan.session_id,
+            volume_index: volume_index_u32,
+        })?;
         sink.write_volume(volume_index, &cmra.bytes)?;
         state.bytes_written[volume_index] = checked_u64_add(
             state.bytes_written[volume_index],
@@ -2049,7 +2073,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
 
     let bootstrap_sidecar_bytes = if plan.options.stripe_width == 1 {
         let sidecar = build_bootstrap_sidecar(
-            &subkeys,
+            subkeys,
             plan.archive_uuid,
             plan.session_id,
             &volume_zero_manifest,
@@ -2096,18 +2120,20 @@ fn emit_encrypted_object<O: ArchiveWriteSink>(
 ) -> Result<EncryptedObject, ArchiveWriteError> {
     let object = encrypt_object(
         payload,
-        key,
-        nonce_seed,
-        domain,
-        counter,
-        data_kind,
-        parity_kind,
-        data_shard_max,
-        class_parity_shard_max,
+        ObjectEncryptionContext {
+            key,
+            nonce_seed,
+            domain,
+            counter,
+            data_kind,
+            parity_kind,
+            data_shard_max,
+            class_parity_shard_max,
+            archive_uuid,
+            session_id,
+        },
         next_block_index,
         options,
-        archive_uuid,
-        session_id,
     )
     .map_err(|error| match metadata_kind {
         Some(kind) => map_metadata_encrypt_error(error, kind),
@@ -2410,529 +2436,6 @@ fn flush_payload_envelope_emit<O: ArchiveWriteSink>(
     Ok(())
 }
 
-#[allow(dead_code)]
-fn write_archive_once(
-    files: &[RegularFile<'_>],
-    master_key: &MasterKey,
-    mut options: WriterOptions,
-    dictionary: Option<&[u8]>,
-    kdf_params: &KdfParams,
-    archive_uuid: [u8; 16],
-    session_id: [u8; 16],
-    root_auth: Option<RootAuthWriterConfig<'_>>,
-    mut authenticator: Option<
-        &mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
-    >,
-) -> Result<WrittenArchive, FormatError> {
-    let subkeys = Subkeys::derive(master_key, &archive_uuid, &session_id)?;
-    let mut next_block_index = 0u64;
-    let mut block_records = Vec::new();
-    let (tar_stream, tar_members) = build_tar_stream(files, options.max_path_length)?;
-    let tar_total_size = tar_stream.len() as u64;
-    let content_sha256 = sha256_bytes(&tar_stream);
-
-    let (payload_objects, frames, payload_block_count) = if tar_stream.is_empty() {
-        (Vec::new(), Vec::new(), 0u64)
-    } else {
-        let (payload_envelopes, frames) =
-            build_payload_envelopes(&tar_stream, &tar_members, options, dictionary)?;
-        let mut objects = Vec::with_capacity(payload_envelopes.len());
-        let mut payload_block_count = 0u64;
-        for envelope in payload_envelopes {
-            let plaintext_size = u32_len(envelope.plaintext.len(), "EnvelopeEntry.plaintext_size")?;
-            let object = encrypt_object(
-                &envelope.plaintext,
-                &subkeys.enc_key,
-                &subkeys.nonce_seed,
-                b"envelope",
-                envelope.envelope_index,
-                BlockKind::PayloadData,
-                BlockKind::PayloadParity,
-                options.fec_data_shards,
-                options.fec_parity_shards,
-                &mut next_block_index,
-                options,
-                &archive_uuid,
-                &session_id,
-            )?;
-            payload_block_count = checked_u64_add(
-                payload_block_count,
-                object.data_block_count as u64,
-                "payload",
-            )?;
-            block_records.extend(object.records.clone());
-            objects.push(PayloadObject {
-                envelope_index: envelope.envelope_index,
-                plaintext_size,
-                object: ObjectExtent::from(&object),
-            });
-        }
-        (objects, frames, payload_block_count)
-    };
-
-    let (shard_file_rows, planned_index_shards) = if tar_members.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        let rows = sorted_file_rows(&tar_members);
-        let shard_file_rows = partition_file_rows(rows)?;
-        let planned_index_shards =
-            build_index_shard_plaintexts(&shard_file_rows, &frames, &payload_objects, options)?;
-        (shard_file_rows, planned_index_shards)
-    };
-
-    let mut shard_entries = Vec::with_capacity(planned_index_shards.len());
-    for planned in planned_index_shards {
-        let compressed = compress_zstd_frame(&planned.plaintext, options.zstd_level)?;
-        let object = encrypt_object(
-            &compressed,
-            &subkeys.index_shard_key,
-            &subkeys.index_nonce_seed,
-            b"idxshard",
-            planned.shard_index,
-            BlockKind::IndexShardData,
-            BlockKind::IndexShardParity,
-            options.index_fec_data_shards,
-            options.index_fec_parity_shards,
-            &mut next_block_index,
-            options,
-            &archive_uuid,
-            &session_id,
-        )?;
-        shard_entries.push(ShardEntry {
-            shard_index: planned.shard_index,
-            first_block_index: object.first_block_index,
-            data_block_count: object.data_block_count,
-            parity_block_count: object.parity_block_count,
-            encrypted_size: object.encrypted_size,
-            decompressed_size: u32_len(planned.plaintext.len(), "IndexShard")?,
-            file_count: planned.file_count,
-            first_path_hash: planned.first_path_hash,
-            last_path_hash: planned.last_path_hash,
-        });
-        block_records.extend(object.records.clone());
-    }
-    let frame_count = frames.len() as u64;
-    let envelope_count = payload_objects.len() as u64;
-
-    let compressed_dictionary = dictionary
-        .map(|dictionary| compress_zstd_frame(dictionary, options.zstd_level))
-        .transpose()?;
-    let dictionary_decompressed_size = dictionary
-        .map(|dictionary| u32_len(dictionary.len(), "dictionary"))
-        .transpose()?;
-    let dictionary_plan = compressed_dictionary
-        .as_ref()
-        .map(|compressed| {
-            plan_metadata_object_without_class(
-                compressed.len(),
-                options,
-                MetadataObjectKind::Dictionary,
-            )
-        })
-        .transpose()?;
-    let dictionary_extent = dictionary_plan
-        .map(|plan| ObjectExtent::new(next_block_index, plan))
-        .transpose()?;
-    let next_after_dictionary = if let Some(extent) = dictionary_extent {
-        extent.next_block_index()?
-    } else {
-        next_block_index
-    };
-
-    let planned_directory_hint_shards = if should_emit_directory_hints(tar_members.len()) {
-        build_directory_hint_plaintexts(&shard_file_rows, options)?
-    } else {
-        Vec::new()
-    };
-    let mut directory_hint_entries = Vec::with_capacity(planned_directory_hint_shards.len());
-    let mut planned_directory_hint_objects =
-        Vec::with_capacity(planned_directory_hint_shards.len());
-    let mut planned_next_block_index = next_after_dictionary;
-    for planned in planned_directory_hint_shards {
-        let compressed = compress_zstd_frame(&planned.plaintext, options.zstd_level)?;
-        let object_plan = plan_encrypted_object(
-            compressed.len(),
-            options.index_fec_data_shards,
-            options.index_fec_parity_shards,
-            options,
-        )?;
-        let extent = ObjectExtent::new(planned_next_block_index, object_plan)?;
-        planned_next_block_index = extent.next_block_index()?;
-        directory_hint_entries.push(DirectoryHintShardEntry {
-            hint_shard_index: planned.hint_shard_index,
-            first_dir_hash: planned.first_dir_hash,
-            last_dir_hash: planned.last_dir_hash,
-            first_block_index: extent.first_block_index,
-            data_block_count: extent.data_block_count,
-            parity_block_count: extent.parity_block_count,
-            encrypted_size: extent.encrypted_size,
-            decompressed_size: u32_len(planned.plaintext.len(), "DirectoryHintTable")?,
-            entry_count: planned.entry_count,
-        });
-        planned_directory_hint_objects.push(PlannedDirectoryHintObject {
-            hint_shard_index: planned.hint_shard_index,
-            compressed,
-            extent,
-        });
-    }
-
-    let index_root_plaintext = build_index_root_plaintext(
-        &shard_entries,
-        frame_count,
-        envelope_count,
-        tar_members.len() as u64,
-        payload_block_count,
-        tar_total_size,
-        content_sha256,
-        &directory_hint_entries,
-        dictionary_extent
-            .zip(dictionary_decompressed_size)
-            .map(|(extent, decompressed_size)| (extent, decompressed_size)),
-    );
-    let compressed_index_root = compress_zstd_frame(&index_root_plaintext, options.zstd_level)?;
-    let metadata_class = plan_index_root_metadata_class(
-        options,
-        compressed_index_root.len(),
-        compressed_dictionary.as_ref().map(Vec::len),
-    )?;
-    options = metadata_class.options;
-    let crypto_header = build_crypto_header(
-        options,
-        dictionary.is_some(),
-        &subkeys,
-        &archive_uuid,
-        &session_id,
-        kdf_params,
-    )?;
-
-    let actual_dictionary_extent =
-        if let (Some(compressed_dictionary), Some(expected_extent), Some(decompressed_size)) = (
-            compressed_dictionary.as_ref(),
-            dictionary_extent,
-            dictionary_decompressed_size,
-        ) {
-            let object = encrypt_object(
-                compressed_dictionary,
-                &subkeys.dictionary_key,
-                &subkeys.index_nonce_seed,
-                b"dict",
-                0,
-                BlockKind::DictionaryData,
-                BlockKind::DictionaryParity,
-                options.index_root_fec_data_shards,
-                options.index_root_fec_parity_shards,
-                &mut next_block_index,
-                options,
-                &archive_uuid,
-                &session_id,
-            )
-            .map_err(|err| map_metadata_encrypt_error(err, MetadataObjectKind::Dictionary))?;
-            if let Some(dictionary_plan) = metadata_class.dictionary {
-                validate_planned_object(&object, dictionary_plan)?;
-            }
-            validate_planned_extent(&object, expected_extent)?;
-            block_records.extend(object.records.clone());
-            Some((object, decompressed_size))
-        } else {
-            None
-        };
-    for planned in planned_directory_hint_objects {
-        let object = encrypt_object(
-            &planned.compressed,
-            &subkeys.dir_hint_key,
-            &subkeys.index_nonce_seed,
-            b"dirhint",
-            planned.hint_shard_index,
-            BlockKind::DirectoryHintData,
-            BlockKind::DirectoryHintParity,
-            options.index_fec_data_shards,
-            options.index_fec_parity_shards,
-            &mut next_block_index,
-            options,
-            &archive_uuid,
-            &session_id,
-        )?;
-        validate_planned_extent(&object, planned.extent)?;
-        block_records.extend(object.records.clone());
-    }
-    let index_root_extent = encrypt_object(
-        &compressed_index_root,
-        &subkeys.index_root_key,
-        &subkeys.index_nonce_seed,
-        b"idxroot",
-        0,
-        BlockKind::IndexRootData,
-        BlockKind::IndexRootParity,
-        options.index_root_fec_data_shards,
-        options.index_root_fec_parity_shards,
-        &mut next_block_index,
-        options,
-        &archive_uuid,
-        &session_id,
-    )
-    .map_err(|err| map_metadata_encrypt_error(err, MetadataObjectKind::IndexRoot))?;
-    validate_planned_object(&index_root_extent, metadata_class.index_root)?;
-    block_records.extend(index_root_extent.records.clone());
-
-    let stripe_width = options.stripe_width as usize;
-    let mut striped_records = vec![Vec::<BlockRecord>::new(); stripe_width];
-    for record in &block_records {
-        let volume_index = (record.block_index % options.stripe_width as u64) as usize;
-        striped_records[volume_index].push(record.clone());
-    }
-
-    let volume_zero_manifest = build_manifest_footer(
-        &subkeys,
-        archive_uuid,
-        session_id,
-        0,
-        options.stripe_width,
-        &ObjectExtent::from(&index_root_extent),
-        index_root_plaintext.len(),
-    )?;
-    let root_auth_footer = match root_auth {
-        Some(config) => {
-            let signer = authenticator
-                .as_deref_mut()
-                .ok_or(FormatError::WriterInvariant(
-                    "missing root-auth authenticator",
-                ))?;
-            Some(build_root_auth_footer(
-                config,
-                signer,
-                archive_uuid,
-                session_id,
-                options,
-                &crypto_header,
-                &volume_zero_manifest,
-                &index_root_plaintext,
-                &index_root_extent,
-                actual_dictionary_extent
-                    .as_ref()
-                    .map(|(object, decompressed_size)| (object, *decompressed_size)),
-                &shard_entries,
-                &payload_objects,
-                &directory_hint_entries,
-                &block_records,
-            )?)
-        }
-        None => None,
-    };
-
-    let mut volumes = Vec::with_capacity(stripe_width);
-    for (volume_index, records) in striped_records.iter().enumerate() {
-        let volume_index = u32::try_from(volume_index)
-            .map_err(|_| FormatError::WriterUnsupported("volume_index"))?;
-        let volume_header = VolumeHeader {
-            format_version: FORMAT_VERSION,
-            volume_format_rev: VOLUME_FORMAT_REV,
-            volume_index,
-            stripe_width: options.stripe_width,
-            archive_uuid,
-            session_id,
-            crypto_header_offset: VOLUME_HEADER_LEN as u32,
-            crypto_header_length: u32_len(crypto_header.len(), "CryptoHeader")?,
-            header_crc32c: 0,
-        };
-        let volume_header_bytes = volume_header.to_bytes();
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&volume_header_bytes);
-        bytes.extend_from_slice(&crypto_header);
-        for record in records {
-            bytes.extend_from_slice(&record.to_bytes());
-        }
-
-        let manifest_footer_offset = bytes.len() as u64;
-        let manifest_footer = build_manifest_footer(
-            &subkeys,
-            archive_uuid,
-            session_id,
-            volume_index,
-            options.stripe_width,
-            &ObjectExtent::from(&index_root_extent),
-            index_root_plaintext.len(),
-        )?;
-        bytes.extend_from_slice(&manifest_footer);
-
-        let root_auth_footer_offset = root_auth_footer.as_ref().map(|footer| {
-            let offset = bytes.len() as u64;
-            bytes.extend_from_slice(footer);
-            offset
-        });
-        let root_auth_footer_length = root_auth_footer
-            .as_ref()
-            .map(|footer| u32_len(footer.len(), "RootAuthFooterV1"))
-            .transpose()?;
-        let trailer_offset = bytes.len() as u64;
-        let trailer = build_volume_trailer(
-            &subkeys,
-            archive_uuid,
-            session_id,
-            volume_index,
-            records.len() as u64,
-            trailer_offset,
-            manifest_footer_offset,
-            options.closed_at_ns,
-            root_auth_footer_offset.zip(root_auth_footer_length),
-        );
-        bytes.extend_from_slice(&trailer);
-        let cmra_offset = bytes.len() as u64;
-        let cmra = build_v41_cmra(
-            &volume_header_bytes,
-            &crypto_header,
-            records.len() as u64,
-            manifest_footer_offset,
-            &manifest_footer,
-            root_auth_footer_offset,
-            root_auth_footer.as_deref(),
-            trailer_offset,
-            &trailer,
-            cmra_offset,
-            options,
-            archive_uuid,
-            session_id,
-            volume_index,
-        )?;
-        bytes.extend_from_slice(&cmra.bytes);
-        let locator_base = CriticalRecoveryLocator {
-            cmra_offset,
-            cmra_length: u32_len(cmra.bytes.len(), "CMRA")?,
-            volume_trailer_offset: trailer_offset,
-            body_bytes_before_cmra: cmra_offset,
-            archive_uuid_hint: archive_uuid,
-            session_id_hint: session_id,
-            volume_index_hint: volume_index,
-            locator_sequence: 1,
-            cmra_shard_size: cmra.shard_size,
-            cmra_data_shard_count: cmra.data_shard_count,
-            cmra_parity_shard_count: cmra.parity_shard_count,
-            cmra_image_length: cmra.image_length,
-            cmra_image_sha256: cmra.image_sha256,
-            locator_crc32c: 0,
-        };
-        let mirror = locator_base.to_bytes();
-        bytes.extend_from_slice(&mirror);
-        let final_locator = CriticalRecoveryLocator {
-            locator_sequence: 0,
-            ..locator_base
-        }
-        .to_bytes();
-        bytes.extend_from_slice(&final_locator);
-
-        if volume_index == 0 {
-            debug_assert_eq!(volume_zero_manifest, manifest_footer);
-        }
-        volumes.push(bytes);
-    }
-
-    let bootstrap_sidecar = if options.stripe_width == 1 {
-        build_bootstrap_sidecar(
-            &subkeys,
-            archive_uuid,
-            session_id,
-            &volume_zero_manifest,
-            &index_root_extent.records,
-            actual_dictionary_extent
-                .as_ref()
-                .map(|(object, _)| object.records.as_slice()),
-        )?
-    } else {
-        Vec::new()
-    };
-
-    Ok(WrittenArchive {
-        bytes: volumes
-            .first()
-            .cloned()
-            .ok_or(FormatError::WriterInvariant("no volumes emitted"))?,
-        volumes,
-        bootstrap_sidecar,
-        archive_uuid,
-        session_id,
-    })
-}
-
-#[allow(dead_code)]
-fn required_stripe_width_for_target(
-    archive: &WrittenArchive,
-    options: WriterOptions,
-    target_volume_size: u64,
-) -> Result<u32, FormatError> {
-    let max_volume_size = archive
-        .volumes
-        .iter()
-        .map(|volume| volume.len() as u64)
-        .max()
-        .unwrap_or(0);
-    if max_volume_size <= target_volume_size {
-        return Ok(options.stripe_width);
-    }
-
-    let first_volume = archive
-        .volumes
-        .first()
-        .ok_or(FormatError::WriterInvariant("no volumes emitted"))?;
-    let block_record_len = options.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
-    let current_overhead = v41_emitted_volume_overhead(first_volume, block_record_len)?;
-    if target_volume_size <= current_overhead {
-        return Err(FormatError::WriterUnsupported(
-            "volume-size is too small for per-volume metadata",
-        ));
-    }
-
-    let records_per_volume = (target_volume_size - current_overhead) / block_record_len;
-    if records_per_volume == 0 {
-        return Err(FormatError::WriterUnsupported(
-            "volume-size is too small for the configured block-size",
-        ));
-    }
-
-    let total_records = archive.volumes.iter().try_fold(0u64, |total, volume| {
-        let volume_len = volume.len() as u64;
-        let overhead = v41_emitted_volume_overhead(volume, block_record_len)?;
-        if volume_len < overhead {
-            return Err(FormatError::WriterInvariant("emitted volume too short"));
-        }
-        let record_bytes = volume_len - overhead;
-        total
-            .checked_add(record_bytes / block_record_len)
-            .ok_or(FormatError::WriterUnsupported("volume count overflow"))
-    })?;
-    let required = ceil_div(total_records, records_per_volume)?
-        .max(options.volume_loss_tolerance as u64 + 1)
-        .max(1);
-    u32::try_from(required).map_err(|_| FormatError::WriterUnsupported("volume count"))
-}
-
-#[allow(dead_code)]
-fn v41_emitted_volume_overhead(volume: &[u8], block_record_len: u64) -> Result<u64, FormatError> {
-    if volume.len() < CRITICAL_RECOVERY_LOCATOR_LEN {
-        return Err(FormatError::WriterInvariant("emitted volume too short"));
-    }
-    let locator_offset = volume.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
-    let locator = CriticalRecoveryLocator::parse(&volume[locator_offset..])?;
-    let trailer_offset = to_usize_writer(locator.volume_trailer_offset, "VolumeTrailer")?;
-    let trailer_end = trailer_offset
-        .checked_add(VOLUME_TRAILER_LEN)
-        .ok_or(FormatError::WriterInvariant("VolumeTrailer overflow"))?;
-    let trailer = VolumeTrailer::parse(volume.get(trailer_offset..trailer_end).ok_or(
-        FormatError::WriterInvariant("truncated emitted VolumeTrailer"),
-    )?)?;
-    let record_bytes =
-        trailer
-            .block_count
-            .checked_mul(block_record_len)
-            .ok_or(FormatError::WriterUnsupported(
-                "volume record byte overflow",
-            ))?;
-    (volume.len() as u64)
-        .checked_sub(record_bytes)
-        .ok_or(FormatError::WriterInvariant(
-            "emitted volume record overflow",
-        ))
-}
-
 pub fn write_empty_archive(master_key: &MasterKey) -> Result<WrittenArchive, FormatError> {
     write_archive(&[], master_key, WriterOptions::default())
 }
@@ -3023,7 +2526,7 @@ fn validate_writer_options_match_reader_caps(options: WriterOptions) -> Result<(
         max_path_length: options.max_path_length,
         expected_volume_size: options.target_volume_size.unwrap_or(0),
     }
-    .validate_v36()
+    .validate_supported_profile()
 }
 
 fn build_crypto_header(
@@ -3132,7 +2635,7 @@ fn serialize_kdf_params(params: &KdfParams) -> Result<Vec<u8>, FormatError> {
     Ok(bytes)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn build_tar_stream(
     files: &[RegularFile<'_>],
     max_path_length: u32,
@@ -3157,7 +2660,7 @@ fn build_tar_stream(
     Ok((stream, members))
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn build_payload_envelopes(
     tar_stream: &[u8],
     members: &[TarMember],
@@ -3710,25 +3213,28 @@ fn serialize_directory_hint_table(
     Ok(bytes)
 }
 
-fn build_index_root_plaintext(
-    shard_entries: &[ShardEntry],
+#[derive(Debug, Clone, Copy)]
+struct IndexRootPlaintextInput<'a> {
+    shard_entries: &'a [ShardEntry],
     frame_count: u64,
     envelope_count: u64,
     file_count: u64,
     payload_block_count: u64,
     tar_total_size: u64,
     content_sha256: [u8; 32],
-    directory_hint_entries: &[DirectoryHintShardEntry],
+    directory_hint_entries: &'a [DirectoryHintShardEntry],
     dictionary_extent: Option<(ObjectExtent, u32)>,
-) -> Vec<u8> {
+}
+
+fn build_index_root_plaintext(input: IndexRootPlaintextInput<'_>) -> Vec<u8> {
     let mut header = IndexRootHeader::empty();
-    header.frame_count = frame_count;
-    header.envelope_count = envelope_count;
-    header.file_count = file_count;
-    header.payload_block_count = payload_block_count;
-    header.tar_total_size = tar_total_size;
-    header.content_sha256 = content_sha256;
-    if let Some((dictionary, decompressed_size)) = dictionary_extent {
+    header.frame_count = input.frame_count;
+    header.envelope_count = input.envelope_count;
+    header.file_count = input.file_count;
+    header.payload_block_count = input.payload_block_count;
+    header.tar_total_size = input.tar_total_size;
+    header.content_sha256 = input.content_sha256;
+    if let Some((dictionary, decompressed_size)) = input.dictionary_extent {
         header.dictionary_first_block = dictionary.first_block_index;
         header.dictionary_data_block_count = dictionary.data_block_count;
         header.dictionary_parity_block_count = dictionary.parity_block_count;
@@ -3737,8 +3243,8 @@ fn build_index_root_plaintext(
     }
     let root = IndexRoot {
         header,
-        shards: shard_entries.to_vec(),
-        directory_hint_shards: directory_hint_entries.to_vec(),
+        shards: input.shard_entries.to_vec(),
+        directory_hint_shards: input.directory_hint_entries.to_vec(),
     };
     root.to_bytes()
 }
@@ -3924,33 +3430,43 @@ fn encrypted_object_data_extent(
     Ok((encrypted_size / options.block_size, encrypted_size))
 }
 
-fn encrypt_object(
-    payload: &[u8],
-    key: &[u8; 32],
-    nonce_seed: &[u8; 32],
-    domain: &[u8],
+#[derive(Debug, Clone, Copy)]
+struct ObjectEncryptionContext<'a> {
+    key: &'a [u8; 32],
+    nonce_seed: &'a [u8; 32],
+    domain: &'a [u8],
     counter: u64,
     data_kind: BlockKind,
     parity_kind: BlockKind,
     data_shard_max: u16,
     class_parity_shard_max: u16,
+    archive_uuid: &'a [u8; 16],
+    session_id: &'a [u8; 16],
+}
+
+fn encrypt_object(
+    payload: &[u8],
+    context: ObjectEncryptionContext<'_>,
     next_block_index: &mut u64,
     options: WriterOptions,
-    archive_uuid: &[u8; 16],
-    session_id: &[u8; 16],
 ) -> Result<EncryptedObject, FormatError> {
     let block_size = options.block_size as usize;
     let padded = suffix_pad_for_aead(payload, options.aead_algo.tag_len(), block_size)?;
     let nonce = derive_nonce(
-        nonce_seed,
-        domain,
-        archive_uuid,
-        session_id,
-        counter,
+        context.nonce_seed,
+        context.domain,
+        context.archive_uuid,
+        context.session_id,
+        context.counter,
         options.aead_algo.nonce_len(),
     )?;
-    let aad = build_aad(domain, archive_uuid, session_id, counter)?;
-    let encrypted = aead_encrypt(options.aead_algo, key, &nonce, &aad, &padded)?;
+    let aad = build_aad(
+        context.domain,
+        context.archive_uuid,
+        context.session_id,
+        context.counter,
+    )?;
+    let encrypted = aead_encrypt(options.aead_algo, context.key, &nonce, &aad, &padded)?;
     if encrypted.len() % block_size != 0 {
         return Err(FormatError::WriterInvariant(
             "encrypted object is not block aligned",
@@ -3967,7 +3483,7 @@ fn encrypt_object(
             "encrypted object has no data blocks",
         ));
     }
-    if data_block_count > data_shard_max as u32 {
+    if data_block_count > context.data_shard_max as u32 {
         return Err(FormatError::WriterUnsupported(
             "encrypted object exceeds its data shard class maximum",
         ));
@@ -3975,9 +3491,9 @@ fn encrypt_object(
     let required_parity = compute_object_parity(
         data_block_count as u64,
         options,
-        class_parity_shard_max as u32,
+        context.class_parity_shard_max as u32,
     )?;
-    if required_parity > class_parity_shard_max as u32 {
+    if required_parity > context.class_parity_shard_max as u32 {
         return Err(FormatError::WriterUnsupported(
             "encrypted object exceeds its parity shard class maximum",
         ));
@@ -3995,7 +3511,7 @@ fn encrypt_object(
     for (index, payload) in data_shards.into_iter().enumerate() {
         records.push(BlockRecord {
             block_index: checked_u64_add(first_block_index, index as u64, "BlockRecord")?,
-            kind: data_kind,
+            kind: context.data_kind,
             flags: if index + 1 == data_block_count as usize {
                 0x01
             } else {
@@ -4009,7 +3525,7 @@ fn encrypt_object(
     for (index, payload) in parity_shards.into_iter().enumerate() {
         records.push(BlockRecord {
             block_index: checked_u64_add(parity_first_block, index as u64, "BlockRecord")?,
-            kind: parity_kind,
+            kind: context.parity_kind,
             flags: 0,
             payload,
             record_crc32c: 0,
@@ -4080,75 +3596,28 @@ fn map_metadata_encrypt_error(error: FormatError, kind: MetadataObjectKind) -> F
     }
 }
 
-#[allow(dead_code)]
-fn build_root_auth_footer(
-    config: RootAuthWriterConfig<'_>,
-    authenticator: &mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
+#[derive(Debug, Clone, Copy)]
+struct RootAuthFooterBuildInput<'a> {
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
     options: WriterOptions,
-    crypto_header: &[u8],
-    volume_zero_manifest: &[u8; MANIFEST_FOOTER_LEN],
-    index_root_plaintext: &[u8],
-    index_root_extent: &EncryptedObject,
-    dictionary_extent: Option<(&EncryptedObject, u32)>,
-    shard_entries: &[ShardEntry],
-    payload_objects: &[PayloadObject],
-    directory_hint_entries: &[DirectoryHintShardEntry],
-    block_records: &[BlockRecord],
-) -> Result<Vec<u8>, FormatError> {
-    let mut data_leaf_hashes = block_records
-        .iter()
-        .filter(|record| record.kind.is_data())
-        .map(|record| {
-            (
-                record.block_index,
-                data_block_merkle_leaf_hash(
-                    record.block_index,
-                    record.kind,
-                    record.flags,
-                    &record.payload,
-                ),
-            )
-        })
-        .collect::<Vec<_>>();
-    data_leaf_hashes.sort_by_key(|(block_index, _)| *block_index);
-    build_root_auth_footer_from_leaf_hashes(
-        config,
-        authenticator,
-        archive_uuid,
-        session_id,
-        options,
-        crypto_header,
-        volume_zero_manifest,
-        index_root_plaintext,
-        ObjectExtent::from(index_root_extent),
-        dictionary_extent
-            .map(|(object, decompressed_size)| (ObjectExtent::from(object), decompressed_size)),
-        shard_entries,
-        payload_objects,
-        directory_hint_entries,
-        &data_leaf_hashes,
-    )
+    crypto_header: &'a [u8],
+    volume_zero_manifest: &'a [u8; MANIFEST_FOOTER_LEN],
+    index_root_plaintext: &'a [u8],
+    index_root_extent: ObjectExtent,
+    dictionary_extent: Option<(ObjectExtent, u32)>,
+    shard_entries: &'a [ShardEntry],
+    payload_objects: &'a [PayloadObject],
+    directory_hint_entries: &'a [DirectoryHintShardEntry],
+    data_leaf_hashes: &'a [(u64, [u8; 32])],
 }
 
 fn build_root_auth_footer_from_leaf_hashes(
     config: RootAuthWriterConfig<'_>,
-    authenticator: &mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
-    archive_uuid: [u8; 16],
-    session_id: [u8; 16],
-    options: WriterOptions,
-    crypto_header: &[u8],
-    volume_zero_manifest: &[u8; MANIFEST_FOOTER_LEN],
-    index_root_plaintext: &[u8],
-    index_root_extent: ObjectExtent,
-    dictionary_extent: Option<(ObjectExtent, u32)>,
-    shard_entries: &[ShardEntry],
-    payload_objects: &[PayloadObject],
-    directory_hint_entries: &[DirectoryHintShardEntry],
-    data_leaf_hashes: &[(u64, [u8; 32])],
+    authenticator: &mut RootAuthAuthenticator<'_>,
+    input: RootAuthFooterBuildInput<'_>,
 ) -> Result<Vec<u8>, FormatError> {
-    let mut sorted_leaf_hashes = data_leaf_hashes.to_vec();
+    let mut sorted_leaf_hashes = input.data_leaf_hashes.to_vec();
     sorted_leaf_hashes.sort_by_key(|(block_index, _)| *block_index);
     let leaf_hashes = sorted_leaf_hashes
         .iter()
@@ -4158,8 +3627,10 @@ fn build_root_auth_footer_from_leaf_hashes(
         .map_err(|_| FormatError::WriterUnsupported("root-auth data block count"))?;
     let data_block_merkle_root = data_block_merkle_root_from_leaf_hashes(&leaf_hashes);
 
-    let parsed_crypto =
-        CryptoHeader::parse(crypto_header, u32_len(crypto_header.len(), "CryptoHeader")?)?;
+    let parsed_crypto = CryptoHeader::parse(
+        input.crypto_header,
+        u32_len(input.crypto_header.len(), "CryptoHeader")?,
+    )?;
     let footer_length = root_auth_footer_wire_length(
         config.signer_identity.len(),
         config.authenticator_value_length as usize,
@@ -4173,12 +3644,12 @@ fn build_root_auth_footer_from_leaf_hashes(
     )?;
     let signer_identity_digest =
         signer_identity_digest(config.signer_identity_type, config.signer_identity)?;
-    let manifest_pre_hmac = manifest_footer_global_pre_hmac_bytes(volume_zero_manifest);
+    let manifest_pre_hmac = manifest_footer_global_pre_hmac_bytes(input.volume_zero_manifest);
     let critical_metadata_digest = critical_metadata_digest(CriticalMetadataDigestInputs {
-        archive_uuid,
-        session_id,
-        stripe_width: options.stripe_width,
-        total_volumes: options.stripe_width,
+        archive_uuid: input.archive_uuid,
+        session_id: input.session_id,
+        stripe_width: input.options.stripe_width,
+        total_volumes: input.options.stripe_width,
         compression_algo: parsed_crypto.fixed.compression_algo,
         aead_algo: parsed_crypto.fixed.aead_algo,
         fec_algo: parsed_crypto.fixed.fec_algo,
@@ -4197,21 +3668,21 @@ fn build_root_auth_footer_from_leaf_hashes(
         bit_rot_buffer_pct: parsed_crypto.fixed.bit_rot_buffer_pct,
         has_dictionary: parsed_crypto.fixed.has_dictionary,
         manifest_footer_global_pre_hmac_bytes: &manifest_pre_hmac,
-        index_root_first_block: index_root_extent.first_block_index,
-        index_root_data_block_count: index_root_extent.data_block_count,
-        index_root_parity_block_count: index_root_extent.parity_block_count,
-        index_root_encrypted_size: index_root_extent.encrypted_size,
-        index_root_decompressed_size: u32_len(index_root_plaintext.len(), "IndexRoot")?,
+        index_root_first_block: input.index_root_extent.first_block_index,
+        index_root_data_block_count: input.index_root_extent.data_block_count,
+        index_root_parity_block_count: input.index_root_extent.parity_block_count,
+        index_root_encrypted_size: input.index_root_extent.encrypted_size,
+        index_root_decompressed_size: u32_len(input.index_root_plaintext.len(), "IndexRoot")?,
         root_auth_descriptor_digest,
     })?;
-    let index_digest = index_digest(index_root_plaintext);
+    let index_digest = index_digest(input.index_root_plaintext);
     let fec_layout_rows = writer_fec_layout_rows_from_extents(
-        index_root_extent,
-        u32_len(index_root_plaintext.len(), "IndexRoot")?,
-        dictionary_extent,
-        shard_entries,
-        payload_objects,
-        directory_hint_entries,
+        input.index_root_extent,
+        u32_len(input.index_root_plaintext.len(), "IndexRoot")?,
+        input.dictionary_extent,
+        input.shard_entries,
+        input.payload_objects,
+        input.directory_hint_entries,
     );
     let expected_data_block_count = fec_layout_rows.iter().try_fold(0u64, |total, row| {
         if row.present {
@@ -4231,8 +3702,8 @@ fn build_root_auth_footer_from_leaf_hashes(
     }
     let fec_layout_digest = fec_layout_digest(&fec_layout_rows)?;
     let archive_root = archive_root(ArchiveRootInputs {
-        archive_uuid,
-        session_id,
+        archive_uuid: input.archive_uuid,
+        session_id: input.session_id,
         format_version: FORMAT_VERSION,
         volume_format_rev: VOLUME_FORMAT_REV,
         compression_algo: parsed_crypto.fixed.compression_algo,
@@ -4248,8 +3719,8 @@ fn build_root_auth_footer_from_leaf_hashes(
         signer_identity_digest,
     });
     let authenticator_value = authenticator(&RootAuthSigningRequest {
-        archive_uuid,
-        session_id,
+        archive_uuid: input.archive_uuid,
+        session_id: input.session_id,
         archive_root,
     })?;
     if authenticator_value.len() != config.authenticator_value_length as usize {
@@ -4259,8 +3730,8 @@ fn build_root_auth_footer_from_leaf_hashes(
     }
 
     RootAuthFooterV1 {
-        archive_uuid,
-        session_id,
+        archive_uuid: input.archive_uuid,
+        session_id: input.session_id,
         authenticator_id: config.authenticator_id,
         signer_identity_type: config.signer_identity_type,
         signer_identity_bytes: config.signer_identity.to_vec(),
@@ -4275,26 +3746,6 @@ fn build_root_auth_footer_from_leaf_hashes(
         footer_crc32c: 0,
     }
     .to_bytes()
-}
-
-#[allow(dead_code)]
-fn writer_fec_layout_rows(
-    index_root_extent: &EncryptedObject,
-    index_root_plain_size: u32,
-    dictionary_extent: Option<(&EncryptedObject, u32)>,
-    shard_entries: &[ShardEntry],
-    payload_objects: &[PayloadObject],
-    directory_hint_entries: &[DirectoryHintShardEntry],
-) -> Vec<FecLayoutObjectRow> {
-    writer_fec_layout_rows_from_extents(
-        ObjectExtent::from(index_root_extent),
-        index_root_plain_size,
-        dictionary_extent
-            .map(|(object, decompressed_size)| (ObjectExtent::from(object), decompressed_size)),
-        shard_entries,
-        payload_objects,
-        directory_hint_entries,
-    )
 }
 
 fn writer_fec_layout_rows_from_extents(
@@ -4470,8 +3921,9 @@ fn build_manifest_footer(
     Ok(bytes)
 }
 
-fn build_volume_trailer(
-    subkeys: &Subkeys,
+#[derive(Debug, Clone, Copy)]
+struct VolumeTrailerBuildInput<'a> {
+    subkeys: &'a Subkeys,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
     volume_index: u32,
@@ -4480,21 +3932,23 @@ fn build_volume_trailer(
     manifest_footer_offset: u64,
     closed_at_ns: i64,
     root_auth_footer: Option<(u64, u32)>,
-) -> [u8; VOLUME_TRAILER_LEN] {
-    let (root_auth_footer_offset, root_auth_footer_length, root_auth_flags) = match root_auth_footer
-    {
-        Some((offset, length)) => (offset, length, 0x0000_0001),
-        None => (0, 0, 0),
-    };
+}
+
+fn build_volume_trailer(input: VolumeTrailerBuildInput<'_>) -> [u8; VOLUME_TRAILER_LEN] {
+    let (root_auth_footer_offset, root_auth_footer_length, root_auth_flags) =
+        match input.root_auth_footer {
+            Some((offset, length)) => (offset, length, 0x0000_0001),
+            None => (0, 0, 0),
+        };
     let mut trailer = VolumeTrailer {
-        archive_uuid,
-        session_id,
-        volume_index,
-        block_count,
-        bytes_written,
-        manifest_footer_offset,
+        archive_uuid: input.archive_uuid,
+        session_id: input.session_id,
+        volume_index: input.volume_index,
+        block_count: input.block_count,
+        bytes_written: input.bytes_written,
+        manifest_footer_offset: input.manifest_footer_offset,
         manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
-        closed_at_ns,
+        closed_at_ns: input.closed_at_ns,
         root_auth_footer_offset,
         root_auth_footer_length,
         root_auth_flags,
@@ -4503,9 +3957,9 @@ fn build_volume_trailer(
     let mut bytes = trailer.to_bytes();
     trailer.trailer_hmac = compute_hmac(
         HmacDomain::VolumeTrailer,
-        &subkeys.mac_key,
-        &archive_uuid,
-        &session_id,
+        &input.subkeys.mac_key,
+        &input.archive_uuid,
+        &input.session_id,
         &bytes[..96],
     );
     bytes = trailer.to_bytes();
@@ -4521,42 +3975,47 @@ struct BuiltCmra {
     image_sha256: [u8; 32],
 }
 
-fn build_v41_cmra(
-    volume_header_bytes: &[u8; VOLUME_HEADER_LEN],
-    crypto_header: &[u8],
+#[derive(Debug, Clone, Copy)]
+struct CmraBuildInput<'a> {
+    volume_header_bytes: &'a [u8; VOLUME_HEADER_LEN],
+    crypto_header: &'a [u8],
     block_count: u64,
     manifest_footer_offset: u64,
-    manifest_footer: &[u8; MANIFEST_FOOTER_LEN],
+    manifest_footer: &'a [u8; MANIFEST_FOOTER_LEN],
     root_auth_footer_offset: Option<u64>,
-    root_auth_footer: Option<&[u8]>,
+    root_auth_footer: Option<&'a [u8]>,
     trailer_offset: u64,
-    trailer: &[u8; VOLUME_TRAILER_LEN],
+    trailer: &'a [u8; VOLUME_TRAILER_LEN],
     cmra_offset: u64,
     options: WriterOptions,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
     volume_index: u32,
-) -> Result<BuiltCmra, FormatError> {
-    let block_record_len = options.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
-    let block_records_offset = VOLUME_HEADER_LEN as u64 + crypto_header.len() as u64;
+}
+
+fn build_v41_cmra(input: CmraBuildInput<'_>) -> Result<BuiltCmra, FormatError> {
+    let block_record_len = input.options.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
+    let block_records_offset = VOLUME_HEADER_LEN as u64 + input.crypto_header.len() as u64;
     let block_records_length = checked_u64_mul(
-        block_count,
+        input.block_count,
         block_record_len,
         "CMRA BlockRecord length overflow",
     )?;
-    let manifest_end = manifest_footer_offset
+    let manifest_end = input
+        .manifest_footer_offset
         .checked_add(MANIFEST_FOOTER_LEN as u64)
         .ok_or(FormatError::WriterUnsupported("CMRA terminal overflow"))?;
-    let root_auth_footer_length = root_auth_footer
+    let root_auth_footer_length = input
+        .root_auth_footer
         .map(|footer| u32_len(footer.len(), "RootAuthFooterV1"))
         .transpose()?;
-    match (root_auth_footer_offset, root_auth_footer_length) {
+    match (input.root_auth_footer_offset, root_auth_footer_length) {
         (Some(offset), Some(length)) => {
             if manifest_end != offset
                 || offset
                     .checked_add(length as u64)
                     .ok_or(FormatError::WriterUnsupported("CMRA terminal overflow"))?
-                    != trailer_offset
+                    != input.trailer_offset
             {
                 return Err(FormatError::WriterInvariant(
                     "RootAuthFooter does not sit between ManifestFooter and VolumeTrailer",
@@ -4564,7 +4023,7 @@ fn build_v41_cmra(
             }
         }
         (None, None) => {
-            if manifest_end != trailer_offset {
+            if manifest_end != input.trailer_offset {
                 return Err(FormatError::WriterInvariant(
                     "ManifestFooter does not end at VolumeTrailer",
                 ));
@@ -4576,10 +4035,11 @@ fn build_v41_cmra(
             ));
         }
     }
-    let body_bytes_before_cmra = trailer_offset
+    let body_bytes_before_cmra = input
+        .trailer_offset
         .checked_add(VOLUME_TRAILER_LEN as u64)
         .ok_or(FormatError::WriterUnsupported("CMRA terminal overflow"))?;
-    if body_bytes_before_cmra != cmra_offset {
+    if body_bytes_before_cmra != input.cmra_offset {
         return Err(FormatError::WriterInvariant(
             "CMRA does not start after VolumeTrailer",
         ));
@@ -4589,20 +4049,20 @@ fn build_v41_cmra(
         SerializedRegion {
             region_type: 1,
             offset: 0,
-            bytes: volume_header_bytes.to_vec(),
+            bytes: input.volume_header_bytes.to_vec(),
         },
         SerializedRegion {
             region_type: 2,
             offset: VOLUME_HEADER_LEN as u64,
-            bytes: crypto_header.to_vec(),
+            bytes: input.crypto_header.to_vec(),
         },
         SerializedRegion {
             region_type: 3,
-            offset: manifest_footer_offset,
-            bytes: manifest_footer.to_vec(),
+            offset: input.manifest_footer_offset,
+            bytes: input.manifest_footer.to_vec(),
         },
     ];
-    if let (Some(offset), Some(footer)) = (root_auth_footer_offset, root_auth_footer) {
+    if let (Some(offset), Some(footer)) = (input.root_auth_footer_offset, input.root_auth_footer) {
         regions.push(SerializedRegion {
             region_type: 4,
             offset,
@@ -4611,15 +4071,15 @@ fn build_v41_cmra(
     }
     regions.push(SerializedRegion {
         region_type: 5,
-        offset: trailer_offset,
-        bytes: trailer.to_vec(),
+        offset: input.trailer_offset,
+        bytes: input.trailer.to_vec(),
     });
     let image = CriticalMetadataImage {
-        archive_uuid,
-        session_id,
-        volume_index,
-        stripe_width: options.stripe_width,
-        layout_flags: if root_auth_footer.is_some() {
+        archive_uuid: input.archive_uuid,
+        session_id: input.session_id,
+        volume_index: input.volume_index,
+        stripe_width: input.options.stripe_width,
+        layout_flags: if input.root_auth_footer.is_some() {
             0x0000_0001
         } else {
             0
@@ -4627,22 +4087,25 @@ fn build_v41_cmra(
         volume_header_offset: 0,
         volume_header_length: VOLUME_HEADER_LEN as u32,
         crypto_header_offset: VOLUME_HEADER_LEN as u64,
-        crypto_header_length: u32_len(crypto_header.len(), "CryptoHeader")?,
+        crypto_header_length: u32_len(input.crypto_header.len(), "CryptoHeader")?,
         block_records_offset,
         block_records_length,
-        block_count,
-        manifest_footer_offset,
+        block_count: input.block_count,
+        manifest_footer_offset: input.manifest_footer_offset,
         manifest_footer_length: MANIFEST_FOOTER_LEN as u32,
-        root_auth_footer_offset: root_auth_footer_offset.unwrap_or(0),
+        root_auth_footer_offset: input.root_auth_footer_offset.unwrap_or(0),
         root_auth_footer_length: root_auth_footer_length.unwrap_or(0),
-        volume_trailer_offset: trailer_offset,
+        volume_trailer_offset: input.trailer_offset,
         volume_trailer_length: VOLUME_TRAILER_LEN as u32,
         body_bytes_before_cmra,
-        volume_header_sha256: sha256_bytes(volume_header_bytes),
-        crypto_header_sha256: sha256_bytes(crypto_header),
-        manifest_footer_sha256: sha256_bytes(manifest_footer),
-        root_auth_footer_sha256: root_auth_footer.map(sha256_bytes).unwrap_or([0u8; 32]),
-        volume_trailer_sha256: sha256_bytes(trailer),
+        volume_header_sha256: sha256_bytes(input.volume_header_bytes),
+        crypto_header_sha256: sha256_bytes(input.crypto_header),
+        manifest_footer_sha256: sha256_bytes(input.manifest_footer),
+        root_auth_footer_sha256: input
+            .root_auth_footer
+            .map(sha256_bytes)
+            .unwrap_or([0u8; 32]),
+        volume_trailer_sha256: sha256_bytes(input.trailer),
         regions,
     };
     let image_bytes = image.to_bytes()?;
@@ -4650,7 +4113,7 @@ fn build_v41_cmra(
     let data_shard_count = ceil_div(image_bytes.len() as u64, CMRA_SHARD_SIZE as u64)?;
     let data_shard_count_u16 = u16::try_from(data_shard_count)
         .map_err(|_| FormatError::WriterUnsupported("CMRA data shard count"))?;
-    let parity_lower = cmra_min_parity_shards(data_shard_count, options.bit_rot_buffer_pct)?;
+    let parity_lower = cmra_min_parity_shards(data_shard_count, input.options.bit_rot_buffer_pct)?;
     let parity_upper = cmra_min_parity_shards(data_shard_count, READER_MAX_CMRA_PARITY_PCT as u8)?;
     if parity_lower > parity_upper {
         return Err(FormatError::WriterUnsupported("CMRA parity bounds"));
@@ -4675,9 +4138,9 @@ fn build_v41_cmra(
         data_shard_count: data_shard_count_u16,
         parity_shard_count: parity_shard_count_u16,
         image_length: u32_len(image_bytes.len(), "CriticalMetadataImageV1")?,
-        archive_uuid_hint: archive_uuid,
-        session_id_hint: session_id,
-        volume_index_hint: volume_index,
+        archive_uuid_hint: input.archive_uuid,
+        session_id_hint: input.session_id,
+        volume_index_hint: input.volume_index,
         image_sha256,
         header_crc32c: 0,
     };
@@ -5020,7 +4483,7 @@ fn build_regular_file_member_prefix(
     Ok(out)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn build_regular_file_member_group(
     path: &[u8],
     contents: &[u8],
@@ -5219,7 +4682,7 @@ mod tests {
     use std::rc::Rc;
 
     #[test]
-    fn writer_defaults_use_v36_sizing_and_parallel_mode() {
+    fn writer_defaults_use_v41_sizing_and_parallel_mode() {
         let options = WriterOptions::default();
 
         assert_eq!(options.chunk_size, 256 * 1024);
@@ -5383,7 +4846,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_hints_are_required_only_above_v36_threshold() {
+    fn directory_hints_are_required_only_above_v41_threshold() {
         assert!(!should_emit_directory_hints(0));
         assert!(!should_emit_directory_hints(
             DIRECTORY_HINT_REQUIRED_FILE_COUNT
@@ -5570,7 +5033,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_auto_scaling_matches_v36_examples() {
+    fn parity_auto_scaling_matches_v41_examples() {
         let options = WriterOptions {
             fec_data_shards: 224,
             stripe_width: 8,
@@ -5622,7 +5085,7 @@ mod tests {
     }
 
     #[test]
-    fn index_root_data_shard_maximum_obeys_v36_minimum() {
+    fn index_root_data_shard_maximum_obeys_v41_minimum() {
         let planned = plan_writer_options(WriterOptions {
             index_root_fec_data_shards: 1,
             ..WriterOptions::default()

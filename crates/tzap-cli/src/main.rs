@@ -29,9 +29,9 @@ use tzap_core::{
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
     write_tar_stream_archive_to_sink_with_kdf_and_root_auth, ArchiveWriteError, ArchiveWriteSink,
     ExtractError, KdfParams, MasterKey, MetadataDiagnostic, NonSeekableReaderOptions,
-    OpenedArchive, RegularFile, RootAuthSigningRequest, RootAuthVerification, RootAuthWriterConfig,
-    SafeExtractionOptions, StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind,
-    WriterOptions,
+    OpenedArchive, PublicNoKeyVerification, RegularFile, RootAuthSigningRequest,
+    RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions, StreamingRawWriterSummary,
+    StreamingTarWriterSummary, TarEntryKind, WriterOptions,
 };
 use tzap_plugin_signing::ed25519_raw::{
     self, Ed25519RootAuthOutcome, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
@@ -41,7 +41,6 @@ use tzap_plugin_signing::x509_chain::{
     self, X509RootAuthReport, X509RootAuthSigner, X509_AUTHENTICATOR_ID,
 };
 
-#[allow(dead_code)]
 mod plaintext_spool;
 use plaintext_spool::{spool_unknown_size_raw_stdin, ExplicitPlaintextSpool};
 
@@ -61,6 +60,9 @@ const DEFAULT_ARGON2_PARALLELISM: u32 = 4;
 const DEFAULT_ARGON2_SALT_LEN: usize = 16;
 const INSECURE_ZERO_KEY: [u8; 32] = [0; 32];
 
+type CliRootAuthAuthenticator<'a> =
+    dyn FnMut(&RootAuthSigningRequest) -> std::result::Result<Vec<u8>, FormatError> + 'a;
+
 #[derive(Debug, Parser)]
 #[command(name = "tzap")]
 #[command(version)]
@@ -79,6 +81,7 @@ struct Cli {
     verbose: bool,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     #[command(
@@ -485,7 +488,7 @@ enum Command {
     #[command(
         about = "Verify archive integrity",
         long_about = "Verify archive signatures and checksum integrity. No payload changes are made.\n\nBy default verify is key-holding and requires --keyfile, --password, --password-stdin, or --insecure-zero-key. With --public-no-key, verify uses the v41 public RootAuth profile and does not require the archive key.",
-        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex backup.tzap backup.tzap.001\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives, the first positional argument is the primary archive.\nAdditional positionals are optional extra volumes."
+        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --public-no-key --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --keyfile key.hex backup.tzap backup.tzap.001\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives, the first positional argument is the primary archive.\nAdditional positionals are optional extra volumes."
     )]
     Verify {
         #[arg(
@@ -538,14 +541,12 @@ enum Command {
         #[arg(
             long = "trusted-ca-cert",
             value_name = "FILE",
-            conflicts_with = "public_no_key",
             help = "Verify X.509 RootAuth with trusted CA certificate FILE."
         )]
         trusted_ca_cert: Vec<String>,
 
         #[arg(
             long = "trusted-system-roots",
-            conflicts_with = "public_no_key",
             help = "Allow X.509 RootAuth verification with OpenSSL default trust roots."
         )]
         trusted_system_roots: bool,
@@ -686,20 +687,22 @@ fn run(cli: Cli) -> Result<()> {
             block_size,
             paths,
         } => {
-            let mut options = WriterOptions::default();
-            options.stripe_width = volumes.unwrap_or(1);
-            options.target_volume_size = volume_size
-                .as_deref()
-                .map(|value| {
-                    parse_size(value).with_context(|| format!("invalid volume-size: {value}"))
-                })
-                .transpose()?;
-            options.volume_loss_tolerance = volume_loss_tolerance;
-            options.bit_rot_buffer_pct = bit_rot_buffer_pct;
-            options.zstd_level = compression_level;
-            options.chunk_size = parse_size_u32(&chunk_size, "chunk-size")?;
-            options.envelope_target_size = parse_size_u32(&envelope_size, "envelope-size")?;
-            options.block_size = parse_size_u32(&block_size, "block-size")?;
+            let options = WriterOptions {
+                stripe_width: volumes.unwrap_or(1),
+                target_volume_size: volume_size
+                    .as_deref()
+                    .map(|value| {
+                        parse_size(value).with_context(|| format!("invalid volume-size: {value}"))
+                    })
+                    .transpose()?,
+                volume_loss_tolerance,
+                bit_rot_buffer_pct,
+                zstd_level: compression_level,
+                chunk_size: parse_size_u32(&chunk_size, "chunk-size")?,
+                envelope_target_size: parse_size_u32(&envelope_size, "envelope-size")?,
+                block_size: parse_size_u32(&block_size, "block-size")?,
+                ..WriterOptions::default()
+            };
             if bootstrap_out.is_some() && (volumes.unwrap_or(1) > 1 || volume_size.is_some()) {
                 return Err(FormatError::WriterUnsupported(
                     "--bootstrap-out is currently supported only for single-volume output",
@@ -1085,16 +1088,16 @@ fn run(cli: Cli) -> Result<()> {
             reject_multi_volume_bootstrap(1 + volumes.len(), bootstrap.as_deref())?;
             reject_stdout_extract_shape(stdout, paths.len())?;
             if archive == "-" {
-                reject_archive_stdin_open_options(
-                    &paths,
+                reject_archive_stdin_open_options(ArchiveStdinOpenOptions {
+                    paths: &paths,
                     stdout,
-                    bootstrap.as_deref(),
-                    &volumes,
+                    bootstrap: bootstrap.as_deref(),
+                    volumes: &volumes,
                     password_stdin,
                     password,
-                    keyfile.as_deref(),
+                    keyfile: keyfile.as_deref(),
                     insecure_zero_key,
-                )?;
+                })?;
                 if dry_run {
                     eprintln!("extract dry-run summary:");
                     eprintln!("  input: archive stdin");
@@ -1505,19 +1508,19 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             if public_no_key {
-                return run_public_no_key_verify(
-                    &archive_paths,
-                    trusted_public_key.as_deref(),
-                    &trusted_ca_cert,
+                return run_public_no_key_verify(PublicNoKeyVerifyRequest {
+                    archive_paths: &archive_paths,
+                    trusted_public_key: trusted_public_key.as_deref(),
+                    trusted_ca_cert: &trusted_ca_cert,
                     trusted_system_roots,
                     password_stdin,
                     password,
-                    keyfile.as_deref(),
+                    keyfile: keyfile.as_deref(),
                     insecure_zero_key,
-                    bootstrap.as_deref(),
+                    bootstrap: bootstrap.as_deref(),
                     quiet,
                     json,
-                );
+                });
             }
             if let Err(err) = validate_verify_key_holding_key_source(
                 keyfile.as_deref(),
@@ -1837,6 +1840,26 @@ enum VerifiedRootAuth {
     },
 }
 
+#[derive(Debug)]
+enum PublicNoKeyTrust {
+    Ed25519 {
+        public_key: [u8; 32],
+    },
+    X509 {
+        trusted_roots_der: Vec<Vec<u8>>,
+        trusted_system_roots: bool,
+    },
+}
+
+#[derive(Debug)]
+enum VerifiedPublicNoKeyRootAuth {
+    Ed25519(PublicNoKeyVerification),
+    X509 {
+        verification: PublicNoKeyVerification,
+        report: X509RootAuthReport,
+    },
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CreateStdinMode {
     Tar,
@@ -2095,7 +2118,7 @@ fn write_tar_stdin_archive_output_from_reader<R: Read>(
     key: &CreateKey,
     options: WriterOptions,
     root_auth: Option<RootAuthWriterConfig<'_>>,
-    authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
+    authenticator: Option<&mut CliRootAuthAuthenticator<'_>>,
 ) -> Result<(StreamingTarWriterSummary, Vec<u8>)> {
     let volume_count = options.stripe_width as usize;
     write_stdin_archive_output_with_sink(output, volume_count, |sink| {
@@ -2111,6 +2134,7 @@ fn write_tar_stdin_archive_output_from_reader<R: Read>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_raw_stdin_archive_output<R: Read>(
     output: &str,
     mut reader: R,
@@ -2156,7 +2180,7 @@ fn write_raw_stdin_archive_output_from_reader<R: Read>(
     key: &CreateKey,
     options: WriterOptions,
     root_auth: Option<RootAuthWriterConfig<'_>>,
-    authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
+    authenticator: Option<&mut CliRootAuthAuthenticator<'_>>,
 ) -> Result<(StreamingRawWriterSummary, Vec<u8>)> {
     let volume_count = options.stripe_width as usize;
     write_stdin_archive_output_with_sink(output, volume_count, |sink| {
@@ -2471,7 +2495,7 @@ fn looks_like_numbered_volume(path_name: &str, base: &str) -> bool {
     if suffix.len() != 3 {
         return false;
     }
-    suffix.bytes().all(|byte| matches!(byte, b'0'..=b'9'))
+    suffix.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn check_archive_paths_free_for_write(paths: &[PathBuf]) -> Result<()> {
@@ -2577,7 +2601,7 @@ fn describe_planned_volume_mode(volumes: Option<u32>, volume_size: Option<&str>)
     if let Some(size) = volume_size {
         return format!("volume-size mode, target size {size}");
     }
-    format!("single volume")
+    "single volume".to_string()
 }
 
 fn create_key_mode_label(
@@ -2686,32 +2710,40 @@ fn reject_stdout_extract_shape(stdout: bool, path_count: usize) -> Result<()> {
     Ok(())
 }
 
-fn reject_archive_stdin_open_options(
-    paths: &[String],
+struct ArchiveStdinOpenOptions<'a> {
+    paths: &'a [String],
     stdout: bool,
-    _bootstrap: Option<&str>,
-    volumes: &[String],
+    bootstrap: Option<&'a str>,
+    volumes: &'a [String],
     password_stdin: bool,
     password: bool,
-    keyfile: Option<&str>,
+    keyfile: Option<&'a str>,
     insecure_zero_key: bool,
-) -> Result<()> {
-    if !volumes.is_empty() {
+}
+
+fn reject_archive_stdin_open_options(options: ArchiveStdinOpenOptions<'_>) -> Result<()> {
+    let _ = options.bootstrap;
+    if !options.volumes.is_empty() {
         return Err(anyhow!(FormatError::ReaderUnsupported(
             "archive stdin must be the only archive input",
         )));
     }
-    if stdout {
+    if options.stdout {
         return Err(anyhow!(FormatError::ReaderUnsupported(
             "--stdout is not supported for archive stdin extraction",
         )));
     }
-    if !paths.is_empty() {
+    if !options.paths.is_empty() {
         return Err(anyhow!(FormatError::ReaderUnsupported(
             "selected-path extraction is not supported for archive stdin",
         )));
     }
-    reject_archive_stdin_key_options(password_stdin, password, keyfile, insecure_zero_key)
+    reject_archive_stdin_key_options(
+        options.password_stdin,
+        options.password,
+        options.keyfile,
+        options.insecure_zero_key,
+    )
 }
 
 fn reject_archive_stdin_list_options(
@@ -2812,96 +2844,128 @@ fn validate_verify_key_holding_key_source(
     Ok(())
 }
 
-fn run_public_no_key_verify(
-    archive_paths: &[String],
-    trusted_public_key: Option<&str>,
-    trusted_ca_cert: &[String],
+struct PublicNoKeyVerifyRequest<'a> {
+    archive_paths: &'a [String],
+    trusted_public_key: Option<&'a str>,
+    trusted_ca_cert: &'a [String],
     trusted_system_roots: bool,
     password_stdin: bool,
     password: bool,
-    keyfile: Option<&str>,
+    keyfile: Option<&'a str>,
     insecure_zero_key: bool,
-    bootstrap: Option<&str>,
+    bootstrap: Option<&'a str>,
     quiet: bool,
     json: bool,
-) -> Result<()> {
-    if let Err(err) = validate_public_no_key_inputs(
-        trusted_public_key,
-        trusted_ca_cert,
-        trusted_system_roots,
-        password_stdin,
-        password,
-        keyfile,
-        insecure_zero_key,
-        bootstrap,
-    ) {
-        if json {
-            emit_verify_json_error(archive_paths, None, None, &err)?;
-        }
-        return Err(err);
-    }
-    let trusted_public_key = trusted_public_key.expect("validated trusted public key");
-    let public_key = match load_ed25519_public_key(trusted_public_key) {
-        Ok(public_key) => public_key,
+}
+
+fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()> {
+    let trust = match load_public_no_key_trust(&request) {
+        Ok(trust) => trust,
         Err(err) => {
-            if json {
-                emit_verify_json_error(archive_paths, None, None, &err)?;
+            if request.json {
+                emit_verify_json_error(request.archive_paths, None, None, &err)?;
             }
             return Err(err);
         }
     };
-    let first = archive_paths
+    let first = request
+        .archive_paths
         .first()
-        .ok_or_else(|| UsageError("at least one archive volume is required"))?;
-    let volume_bytes = match read_volume_inputs(first, &archive_paths[1..]) {
+        .ok_or(UsageError("at least one archive volume is required"))?;
+    let volume_bytes = match read_volume_inputs(first, &request.archive_paths[1..]) {
         Ok(volume_bytes) => volume_bytes,
         Err(err) => {
-            if json {
-                emit_verify_json_error(archive_paths, None, None, &err)?;
+            if request.json {
+                emit_verify_json_error(request.archive_paths, None, None, &err)?;
             }
             return Err(err);
         }
     };
     let borrowed = volume_bytes.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    let verification = match public_no_key_verify_volumes_with(&borrowed, |footer, archive_root| {
-        Ok(matches!(
-            ed25519_raw::verify_root_auth_footer(
-                footer,
-                archive_root,
-                Some(public_key),
-                Ed25519VerificationMode::PublicNoKey,
-            ),
-            Ed25519RootAuthOutcome::PublicDataBlockCommitmentVerified { .. }
-        ))
-    })
-    .with_context(|| format!("failed to verify public RootAuth for {first}"))
-    {
-        Ok(verification) => verification,
-        Err(err) => {
-            if json {
-                emit_verify_json_error(archive_paths, None, None, &err)?;
+    let mut x509_report = None;
+    let mut x509_error = None;
+    let verification =
+        match public_no_key_verify_volumes_with(&borrowed, |footer, archive_root| match &trust {
+            PublicNoKeyTrust::Ed25519 { public_key } => {
+                if footer.authenticator_id != ED25519_AUTHENTICATOR_ID {
+                    return Err(FormatError::ReaderUnsupported(
+                        "trusted public key can only verify Ed25519 RootAuth",
+                    ));
+                }
+                Ok(matches!(
+                    ed25519_raw::verify_root_auth_footer(
+                        footer,
+                        archive_root,
+                        Some(*public_key),
+                        Ed25519VerificationMode::PublicNoKey,
+                    ),
+                    Ed25519RootAuthOutcome::PublicDataBlockCommitmentVerified { .. }
+                ))
             }
-            return Err(err);
+            PublicNoKeyTrust::X509 {
+                trusted_roots_der,
+                trusted_system_roots,
+            } => {
+                if footer.authenticator_id != X509_AUTHENTICATOR_ID {
+                    return Err(FormatError::ReaderUnsupported(
+                        "X.509 trust can only verify X.509 RootAuth",
+                    ));
+                }
+                match x509_chain::verify_root_auth_footer(
+                    footer,
+                    archive_root,
+                    trusted_roots_der,
+                    *trusted_system_roots,
+                ) {
+                    Ok(report) => {
+                        x509_report = Some(report);
+                        Ok(true)
+                    }
+                    Err(err) => {
+                        x509_error = Some(err.to_string());
+                        Ok(false)
+                    }
+                }
+            }
+        })
+        .map_err(|err| {
+            if let Some(detail) = x509_error.take() {
+                anyhow!("{err}: {detail}")
+            } else {
+                anyhow!(err)
+            }
+        })
+        .with_context(|| format!("failed to verify public RootAuth for {first}"))
+        {
+            Ok(verification) => verification,
+            Err(err) => {
+                if request.json {
+                    emit_verify_json_error(request.archive_paths, None, None, &err)?;
+                }
+                return Err(err);
+            }
+        };
+    let root_auth = match trust {
+        PublicNoKeyTrust::Ed25519 { .. } => VerifiedPublicNoKeyRootAuth::Ed25519(verification),
+        PublicNoKeyTrust::X509 { .. } => {
+            let report = x509_report.ok_or(FormatError::InvalidArchive(
+                "missing X.509 public no-key verification report",
+            ))?;
+            VerifiedPublicNoKeyRootAuth::X509 {
+                verification,
+                report,
+            }
         }
     };
-    if json {
+    if request.json {
         println!(
             "{}",
             serde_json::to_string(&json!({
                 "ok": true,
-                "archives": archive_paths,
+                "archives": request.archive_paths,
                 "verification_mode": "public-no-key",
-                "volume_count": archive_paths.len(),
-                "root_auth": {
-                    "status": "public_data_block_commitment_verified",
-                    "authenticator": "ed25519",
-                    "archive_root": encode_hex(&verification.archive_root),
-                    "key_id": encode_hex(&public_key),
-                    "authenticator_id": verification.authenticator_id,
-                    "signer_identity_type": verification.signer_identity_type,
-                    "signer_identity": encode_hex(&verification.signer_identity_bytes),
-                    "total_data_block_count": verification.total_data_block_count,
-                },
+                "volume_count": request.archive_paths.len(),
+                "root_auth": public_no_key_root_auth_json(&root_auth),
                 "public_diagnostics": public_no_key_success_diagnostics(),
             }))
             .context("failed to encode verify output as JSON")?
@@ -2909,49 +2973,58 @@ fn run_public_no_key_verify(
         return Ok(());
     }
     emit_success_stdout(
-        quiet,
+        request.quiet,
         &format!(
             "{}: OK public no-key ({} volume(s), {} data block(s))",
             first,
-            archive_paths.len(),
-            verification.total_data_block_count
+            request.archive_paths.len(),
+            public_no_key_total_data_block_count(&root_auth)
         ),
     )?;
+    emit_public_no_key_root_auth_stdout(request.quiet, &root_auth)?;
     for diagnostic in public_no_key_success_diagnostics() {
-        emit_success_stdout(quiet, &format!("public-no-key: {diagnostic}"))?;
+        emit_success_stdout(request.quiet, &format!("public-no-key: {diagnostic}"))?;
     }
     Ok(())
 }
 
-fn validate_public_no_key_inputs(
-    trusted_public_key: Option<&str>,
-    trusted_ca_cert: &[String],
-    trusted_system_roots: bool,
-    password_stdin: bool,
-    password: bool,
-    keyfile: Option<&str>,
-    insecure_zero_key: bool,
-    bootstrap: Option<&str>,
-) -> Result<()> {
-    if trusted_public_key.is_none() {
-        return Err(UsageError("--public-no-key requires --trusted-public-key FILE").into());
-    }
-    if !trusted_ca_cert.is_empty() || trusted_system_roots {
+fn load_public_no_key_trust(request: &PublicNoKeyVerifyRequest<'_>) -> Result<PublicNoKeyTrust> {
+    let wants_ed25519 = request.trusted_public_key.is_some();
+    let wants_x509 = !request.trusted_ca_cert.is_empty() || request.trusted_system_roots;
+    if !wants_ed25519 && !wants_x509 {
         return Err(UsageError(
-            "--public-no-key supports Ed25519 RootAuth only; use --trusted-public-key",
+            "--public-no-key requires --trusted-public-key FILE, --trusted-ca-cert FILE, or --trusted-system-roots",
         )
         .into());
     }
-    if password_stdin || password || keyfile.is_some() || insecure_zero_key {
+    if wants_ed25519 && wants_x509 {
+        return Err(UsageError(
+            "use either --trusted-public-key or X.509 trust options with --public-no-key, not both",
+        )
+        .into());
+    }
+    if request.password_stdin
+        || request.password
+        || request.keyfile.is_some()
+        || request.insecure_zero_key
+    {
         return Err(UsageError(
             "--public-no-key cannot be combined with --keyfile, --password, --password-stdin, or --insecure-zero-key",
         )
         .into());
     }
-    if bootstrap.is_some() {
+    if request.bootstrap.is_some() {
         return Err(UsageError("--public-no-key does not use --bootstrap sidecars").into());
     }
-    Ok(())
+    if let Some(path) = request.trusted_public_key {
+        return Ok(PublicNoKeyTrust::Ed25519 {
+            public_key: load_ed25519_public_key(path)?,
+        });
+    }
+    Ok(PublicNoKeyTrust::X509 {
+        trusted_roots_der: load_x509_certificate_files(request.trusted_ca_cert)?,
+        trusted_system_roots: request.trusted_system_roots,
+    })
 }
 
 fn verify_opened_root_auth_ed25519(
@@ -3141,6 +3214,97 @@ fn emit_root_auth_stdout(quiet: bool, root_auth: &VerifiedRootAuth) -> io::Resul
                     encode_hex(&report.certificate_sha256)
                 ),
             )
+        }
+    }
+}
+
+fn public_no_key_root_auth_json(root_auth: &VerifiedPublicNoKeyRootAuth) -> serde_json::Value {
+    match root_auth {
+        VerifiedPublicNoKeyRootAuth::Ed25519(verification) => {
+            let mut payload = json!({
+                "status": "public_data_block_commitment_verified",
+                "authenticator": "ed25519",
+                "archive_root": encode_hex(&verification.archive_root),
+                "authenticator_id": verification.authenticator_id,
+                "signer_identity_type": verification.signer_identity_type,
+                "signer_identity": encode_hex(&verification.signer_identity_bytes),
+                "total_data_block_count": verification.total_data_block_count,
+            });
+            if verification.signer_identity_type == 1
+                && verification.signer_identity_bytes.len() == 32
+            {
+                payload["key_id"] = json!(encode_hex(&verification.signer_identity_bytes));
+            }
+            payload
+        }
+        VerifiedPublicNoKeyRootAuth::X509 {
+            verification,
+            report,
+        } => json!({
+            "status": "public_data_block_commitment_verified",
+            "authenticator": "x509",
+            "archive_root": encode_hex(&verification.archive_root),
+            "authenticator_id": verification.authenticator_id,
+            "signer_identity_type": verification.signer_identity_type,
+            "signer_identity": encode_hex(&verification.signer_identity_bytes),
+            "total_data_block_count": verification.total_data_block_count,
+            "subject": &report.subject,
+            "issuer": &report.issuer,
+            "serial_number": &report.serial_number_hex,
+            "certificate_sha256": encode_hex(&report.certificate_sha256),
+            "signed_at_unix_seconds": report.signed_at_unix_seconds,
+            "signed_at": format_unix_timestamp(report.signed_at_unix_seconds),
+            "time_source": "signer_claimed",
+            "verified_chain_subjects": &report.verified_chain_subjects,
+            "trust_anchor_subject": &report.trust_anchor_subject,
+        }),
+    }
+}
+
+fn emit_public_no_key_root_auth_stdout(
+    quiet: bool,
+    root_auth: &VerifiedPublicNoKeyRootAuth,
+) -> io::Result<()> {
+    match root_auth {
+        VerifiedPublicNoKeyRootAuth::Ed25519(verification) => emit_success_stdout(
+            quiet,
+            &format!(
+                "root-auth: OK public-no-key ed25519 {}",
+                encode_hex(&verification.archive_root)
+            ),
+        ),
+        VerifiedPublicNoKeyRootAuth::X509 {
+            verification,
+            report,
+        } => {
+            emit_success_stdout(
+                quiet,
+                &format!(
+                    "root-auth: OK public-no-key x509 {}",
+                    encode_hex(&verification.archive_root)
+                ),
+            )?;
+            emit_success_stdout(quiet, &format!("root-auth signer: {}", report.subject))?;
+            emit_success_stdout(quiet, &format!("root-auth issuer: {}", report.issuer))?;
+            if let Some(trust_anchor) = &report.trust_anchor_subject {
+                emit_success_stdout(quiet, &format!("root-auth trust-anchor: {trust_anchor}"))?;
+            }
+            emit_success_stdout(
+                quiet,
+                &format!(
+                    "root-auth signed-at: {} (signer-claimed)",
+                    format_unix_timestamp(report.signed_at_unix_seconds)
+                ),
+            )
+        }
+    }
+}
+
+fn public_no_key_total_data_block_count(root_auth: &VerifiedPublicNoKeyRootAuth) -> u64 {
+    match root_auth {
+        VerifiedPublicNoKeyRootAuth::Ed25519(verification) => verification.total_data_block_count,
+        VerifiedPublicNoKeyRootAuth::X509 { verification, .. } => {
+            verification.total_data_block_count
         }
     }
 }
@@ -3689,16 +3853,22 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
         | FormatError::UnknownAeadAlgo(_)
         | FormatError::UnknownFecAlgo(_)
         | FormatError::UnknownKdfAlgo(_)
-        | FormatError::UnsupportedCompressionForV36(_)
-        | FormatError::UnsupportedFecForV36(_)
+        | FormatError::UnsupportedCompression(_)
+        | FormatError::UnsupportedFec(_)
         | FormatError::UnsupportedBootstrapSidecarVersion(_) => Diagnostic {
             label: "unsupported-revision",
             exit_code: EXIT_UNSUPPORTED_REVISION,
             action: "use the matching tzap version for this archive",
         },
-        FormatError::BadMagic { structure: "VolumeHeader" }
-        | FormatError::BadMagic { structure: "VolumeTrailer" }
-        | FormatError::BadMagic { structure: "ManifestFooter" } => Diagnostic {
+        FormatError::BadMagic {
+            structure: "VolumeHeader",
+        }
+        | FormatError::BadMagic {
+            structure: "VolumeTrailer",
+        }
+        | FormatError::BadMagic {
+            structure: "ManifestFooter",
+        } => Diagnostic {
             label: "corrupt-header",
             exit_code: EXIT_CORRUPT_ARCHIVE,
             action: "verify the archive header/trailer bytes and source file path",
@@ -3740,11 +3910,23 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
             exit_code: EXIT_CORRUPT_ARCHIVE,
             action: "verify archive payload integrity",
         },
-        FormatError::BadCrc { structure: "VolumeHeader" }
-        | FormatError::BadCrc { structure: "VolumeTrailer" }
-        | FormatError::BadCrc { structure: "ManifestFooter" }
-        | FormatError::InvalidMetadata { structure: "ManifestFooter", .. }
-        | FormatError::InvalidMetadata { structure: "VolumeHeader", .. } => Diagnostic {
+        FormatError::BadCrc {
+            structure: "VolumeHeader",
+        }
+        | FormatError::BadCrc {
+            structure: "VolumeTrailer",
+        }
+        | FormatError::BadCrc {
+            structure: "ManifestFooter",
+        }
+        | FormatError::InvalidMetadata {
+            structure: "ManifestFooter",
+            ..
+        }
+        | FormatError::InvalidMetadata {
+            structure: "VolumeHeader",
+            ..
+        } => Diagnostic {
             label: "corrupt-header",
             exit_code: EXIT_CORRUPT_ARCHIVE,
             action: "inspect archive metadata and source file path",
@@ -3760,26 +3942,29 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
             action: message,
         },
         FormatError::InvalidMetadata { structure, .. } => Diagnostic {
-            label: if *structure == "IndexRoot" || *structure == "FrameEntry" || *structure == "EnvelopeEntry"
+            label: if *structure == "IndexRoot"
+                || *structure == "FrameEntry"
+                || *structure == "EnvelopeEntry"
             {
                 "corrupt-payload"
             } else {
                 "corrupt-header"
             },
             exit_code: EXIT_CORRUPT_ARCHIVE,
-            action: if *structure == "IndexRoot" || *structure == "FrameEntry" || *structure == "EnvelopeEntry"
+            action: if *structure == "IndexRoot"
+                || *structure == "FrameEntry"
+                || *structure == "EnvelopeEntry"
             {
                 "inspect archive metadata tables and payload"
             } else {
                 "inspect archive header metadata"
             },
         },
-        FormatError::ReaderResourceLimitExceeded { field, .. } => Diagnostic {
+        FormatError::ReaderResourceLimitExceeded { .. } => Diagnostic {
             label: "invalid-arguments",
             exit_code: EXIT_USAGE,
-            action: match field {
-                _ => "check argon2 flags (--argon2-t-cost, --argon2-m-cost-kib, --argon2-parallelism)",
-            },
+            action:
+                "check argon2 flags (--argon2-t-cost, --argon2-m-cost-kib, --argon2-parallelism)",
         },
         FormatError::UnsafeArchivePath => Diagnostic {
             label: "unsafe-path",
@@ -3950,7 +4135,7 @@ mod tests {
             )
             .unwrap();
             let known_size_source = spool.known_size_source();
-            spool_path = known_size_source.path().to_path_buf();
+            spool_path = spool.path().to_path_buf();
             let mut spool_reader = spool.reopen().unwrap();
 
             let error = write_raw_stdin_archive_output_from_reader(

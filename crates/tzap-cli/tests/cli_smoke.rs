@@ -2473,7 +2473,7 @@ fn cli_verify_json_success_reports_machine_readable_summary() {
         .clone();
     let value: Value = serde_json::from_slice(&output).unwrap();
 
-    assert_eq!(value.get("ok").unwrap().as_bool().unwrap(), true);
+    assert!(value.get("ok").unwrap().as_bool().unwrap());
     assert_eq!(value.get("volume_count").unwrap().as_u64().unwrap(), 1);
     assert_eq!(value.get("file_count").unwrap().as_u64().unwrap(), 1);
     let archives = value.get("archives").unwrap().as_array().unwrap();
@@ -2792,6 +2792,57 @@ fn cli_create_x509_signed_archive_and_verify_certificate_details() {
     assert_eq!(value["root_auth"]["subject"], "CN=Acme Release Signing");
     assert_eq!(value["root_auth"]["issuer"], "CN=Acme Test Root CA");
     assert_eq!(value["root_auth"]["time_source"], "signer_claimed");
+    assert_eq!(
+        value["root_auth"]["trust_anchor_subject"],
+        "CN=Acme Test Root CA"
+    );
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--public-no-key",
+            "--trusted-ca-cert",
+            root_ca.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("OK public no-key")
+                .and(predicate::str::contains("root-auth: OK public-no-key x509"))
+                .and(predicate::str::contains(
+                    "root-auth signer: CN=Acme Release Signing",
+                ))
+                .and(predicate::str::contains(
+                    "public_data_block_commitment_verified",
+                )),
+        );
+
+    let output = Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--json",
+            "--public-no-key",
+            "--trusted-ca-cert",
+            root_ca.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["verification_mode"], "public-no-key");
+    assert_eq!(value["root_auth"]["authenticator"], "x509");
+    assert_eq!(
+        value["root_auth"]["status"],
+        "public_data_block_commitment_verified"
+    );
+    assert_eq!(value["root_auth"]["subject"], "CN=Acme Release Signing");
     assert_eq!(
         value["root_auth"]["trust_anchor_subject"],
         "CN=Acme Test Root CA"
@@ -3839,7 +3890,7 @@ fn cli_verify_json_failure_reports_error_object() {
         .clone();
     let value: Value = serde_json::from_slice(&output).unwrap();
 
-    assert_eq!(value.get("ok").unwrap().as_bool().unwrap(), false);
+    assert!(!value.get("ok").unwrap().as_bool().unwrap());
     let error = value.get("error").unwrap();
     assert_eq!(error.get("label").unwrap().as_str().unwrap(), "io-error");
 }
@@ -6462,8 +6513,8 @@ fn cli_extract_recovers_when_one_volume_is_missing_but_tolerance_allows_it() {
     let output_base = temp.path().join("recoverable.tzap");
     let output = temp.path().join("out");
     let mut data = vec![0u8; 64 * 1024];
-    for idx in 0..data.len() {
-        data[idx] = (idx % 251) as u8;
+    for (idx, byte) in data.iter_mut().enumerate() {
+        *byte = (idx % 251) as u8;
     }
 
     fs::write(&keyfile, KEY_HEX).unwrap();

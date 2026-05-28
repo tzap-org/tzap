@@ -47,6 +47,7 @@ tzap verify --keyfile project.key --trusted-public-key root.public.hex signed.tz
 tzap verify --public-no-key --trusted-public-key root.public.hex signed.tzap
 tzap create --keyfile project.key --signing-cert signer.pem --signing-private-key signer.key -o signed-x509.tzap ./project
 tzap verify --keyfile project.key --trusted-ca-cert root-ca.pem signed-x509.tzap
+tzap verify --public-no-key --trusted-ca-cert root-ca.pem signed-x509.tzap
 ```
 
 The CLI composes `tzap-core` with `tzap-plugin-signing` for Ed25519 and X.509

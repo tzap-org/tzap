@@ -17,15 +17,15 @@ pub fn encode_parity_gf16(
     let symbol_count = shard_size / 2;
     let mut parity = vec![vec![0u8; shard_size]; parity_shard_count];
 
-    for j in 0..parity_shard_count {
-        for i in 0..data_shard_count {
+    for (j, parity_shard) in parity.iter_mut().enumerate().take(parity_shard_count) {
+        for (i, data_shard) in data_shards.iter().enumerate().take(data_shard_count) {
             let coefficient = cauchy_coefficient(data_shard_count, j, i);
             for k in 0..symbol_count {
-                let symbol = read_symbol(&data_shards[i], k);
+                let symbol = read_symbol(data_shard, k);
                 let value = gf16_mul(symbol, coefficient);
                 let offset = 2 * k;
-                let current = u16::from_le_bytes([parity[j][offset], parity[j][offset + 1]]);
-                parity[j][offset..offset + 2].copy_from_slice(&(current ^ value).to_le_bytes());
+                let current = u16::from_le_bytes([parity_shard[offset], parity_shard[offset + 1]]);
+                parity_shard[offset..offset + 2].copy_from_slice(&(current ^ value).to_le_bytes());
             }
         }
     }
@@ -172,11 +172,11 @@ fn validate_fec_counts(
     Ok(())
 }
 
-fn validate_available_shard(shard: &Vec<u8>, shard_size: usize) -> Result<Vec<u8>, FormatError> {
+fn validate_available_shard(shard: &[u8], shard_size: usize) -> Result<Vec<u8>, FormatError> {
     if shard.len() != shard_size {
         return Err(FormatError::FecInconsistentShardSize);
     }
-    Ok(shard.clone())
+    Ok(shard.to_owned())
 }
 
 fn cauchy_coefficient(data_shard_count: usize, parity_row: usize, data_col: usize) -> u16 {

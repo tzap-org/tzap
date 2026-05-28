@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
@@ -9,7 +9,9 @@ use crate::compression::{
     decompress_exact_zstd_frame, decompress_exact_zstd_frame_with_dictionary,
     validate_exact_zstd_frame,
 };
-use crate::crypto::{decrypt_padded_aead_object, verify_hmac, HmacDomain, MasterKey, Subkeys};
+use crate::crypto::{
+    decrypt_padded_aead_object, verify_hmac, AeadObjectContext, HmacDomain, MasterKey, Subkeys,
+};
 use crate::fec::repair_data_gf16;
 use crate::format::{
     BlockKind, ExtractError, FormatError, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN,
@@ -52,6 +54,9 @@ const DIRECTORY_HINT_REQUIRED_FILE_COUNT: u64 = 100_000;
 
 pub trait ArchiveReadAt: Send + Sync + 'static {
     fn len(&self) -> Result<u64, FormatError>;
+    fn is_empty(&self) -> Result<bool, FormatError> {
+        Ok(self.len()? == 0)
+    }
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError>;
 }
 
@@ -388,11 +393,9 @@ impl BlockProvider for OpenedBlockProvider<'_> {
 }
 
 type DirectoryHintMap = BTreeMap<Vec<u8>, BTreeSet<u32>>;
+pub type ExtractedRegularFile = (Vec<u8>, Vec<MetadataDiagnostic>);
 
-pub fn open_archive<'a>(
-    bytes: &'a [u8],
-    master_key: &MasterKey,
-) -> Result<OpenedArchive, FormatError> {
+pub fn open_archive(bytes: &[u8], master_key: &MasterKey) -> Result<OpenedArchive, FormatError> {
     OpenedArchive::open_with_options(bytes, master_key, ReaderOptions::default())
 }
 
@@ -613,11 +616,10 @@ impl OpenedArchive {
         }
 
         let first = first.ok_or(FormatError::InvalidArchive("no volumes supplied"))?;
-        let manifest_footer =
-            manifest_authority.ok_or_else(|| match first_manifest_footer_error {
-                Some(err) => err,
-                None => FormatError::InvalidArchive("no authenticated ManifestFooter found"),
-            })?;
+        let manifest_footer = manifest_authority.ok_or(match first_manifest_footer_error {
+            Some(err) => err,
+            None => FormatError::InvalidArchive("no authenticated ManifestFooter found"),
+        })?;
         let authority_volume_header = manifest_authority_volume_header.ok_or(
             FormatError::InvalidArchive("no authenticated ManifestFooter found"),
         )?;
@@ -643,23 +645,17 @@ impl OpenedArchive {
         let limits = metadata_limits(&first.crypto_header);
         let index_root_plaintext = load_metadata_object_from_parts(
             &blocks,
-            &first.subkeys,
-            &first.volume_header,
-            &first.crypto_header,
-            ObjectExtent {
-                first_block_index: manifest_footer.index_root_first_block,
-                data_block_count: manifest_footer.index_root_data_block_count,
-                parity_block_count: manifest_footer.index_root_parity_block_count,
-                encrypted_size: manifest_footer.index_root_encrypted_size,
-            },
-            BlockKind::IndexRootData,
-            BlockKind::IndexRootParity,
-            &first.subkeys.index_root_key,
-            &first.subkeys.index_nonce_seed,
-            b"idxroot",
-            0,
-            first.crypto_header.index_root_fec_data_shards,
-            first.crypto_header.index_root_fec_parity_shards,
+            ObjectLoadContext::index_root(
+                &first.volume_header,
+                &first.crypto_header,
+                &first.subkeys,
+                ObjectExtent {
+                    first_block_index: manifest_footer.index_root_first_block,
+                    data_block_count: manifest_footer.index_root_data_block_count,
+                    parity_block_count: manifest_footer.index_root_parity_block_count,
+                    encrypted_size: manifest_footer.index_root_encrypted_size,
+                },
+            ),
             manifest_footer.index_root_decompressed_size,
         )?;
         let index_root = IndexRoot::parse(
@@ -837,11 +833,10 @@ impl OpenedArchive {
         }
 
         let first = first.ok_or(FormatError::InvalidArchive("no volumes supplied"))?;
-        let manifest_footer =
-            manifest_authority.ok_or_else(|| match first_manifest_footer_error {
-                Some(err) => err,
-                None => FormatError::InvalidArchive("no authenticated ManifestFooter found"),
-            })?;
+        let manifest_footer = manifest_authority.ok_or(match first_manifest_footer_error {
+            Some(err) => err,
+            None => FormatError::InvalidArchive("no authenticated ManifestFooter found"),
+        })?;
         let authority_volume_header = manifest_authority_volume_header.ok_or(
             FormatError::InvalidArchive("no authenticated ManifestFooter found"),
         )?;
@@ -887,13 +882,15 @@ impl OpenedArchive {
             if let Some((offset, length)) = sidecar.index_root_records_section {
                 let index_root_records = parse_sidecar_block_records(
                     sidecar_bytes,
-                    offset,
-                    length,
                     first.crypto_header.block_size as usize,
-                    index_root_extent_from_manifest(&manifest_footer),
-                    BlockKind::IndexRootData,
-                    BlockKind::IndexRootParity,
-                    "IndexRoot",
+                    SidecarBlockRecordsSection {
+                        offset,
+                        length,
+                        extent: index_root_extent_from_manifest(&manifest_footer),
+                        data_kind: BlockKind::IndexRootData,
+                        parity_kind: BlockKind::IndexRootParity,
+                        structure: "IndexRoot",
+                    },
                 )?;
                 insert_sidecar_records(&mut blocks, index_root_records)?;
             }
@@ -910,18 +907,12 @@ impl OpenedArchive {
         let limits = metadata_limits(&first.crypto_header);
         let index_root_plaintext = load_metadata_object_from_parts(
             &block_provider,
-            &first.subkeys,
-            &first.volume_header,
-            &first.crypto_header,
-            index_root_extent_from_manifest(&manifest_footer),
-            BlockKind::IndexRootData,
-            BlockKind::IndexRootParity,
-            &first.subkeys.index_root_key,
-            &first.subkeys.index_nonce_seed,
-            b"idxroot",
-            0,
-            first.crypto_header.index_root_fec_data_shards,
-            first.crypto_header.index_root_fec_parity_shards,
+            ObjectLoadContext::index_root(
+                &first.volume_header,
+                &first.crypto_header,
+                &first.subkeys,
+                index_root_extent_from_manifest(&manifest_footer),
+            ),
             manifest_footer.index_root_decompressed_size,
         )?;
         let index_root = IndexRoot::parse(
@@ -934,13 +925,15 @@ impl OpenedArchive {
                 if let Some((offset, length)) = sidecar.dictionary_records_section {
                     let dictionary_records = parse_sidecar_block_records(
                         sidecar_bytes,
-                        offset,
-                        length,
                         first.crypto_header.block_size as usize,
-                        dictionary_extent_from_index_root(&index_root)?,
-                        BlockKind::DictionaryData,
-                        BlockKind::DictionaryParity,
-                        "Dictionary",
+                        SidecarBlockRecordsSection {
+                            offset,
+                            length,
+                            extent: dictionary_extent_from_index_root(&index_root)?,
+                            data_kind: BlockKind::DictionaryData,
+                            parity_kind: BlockKind::DictionaryParity,
+                            structure: "Dictionary",
+                        },
                     )?;
                     insert_sidecar_records(&mut blocks, dictionary_records)?;
                 }
@@ -1103,13 +1096,15 @@ impl OpenedArchive {
         if let Some((offset, length)) = sidecar.index_root_records_section {
             let index_root_records = parse_sidecar_block_records(
                 bootstrap_sidecar,
-                offset,
-                length,
                 parsed_crypto.fixed.block_size as usize,
-                index_root_extent_from_manifest(&manifest_authority),
-                BlockKind::IndexRootData,
-                BlockKind::IndexRootParity,
-                "IndexRoot",
+                SidecarBlockRecordsSection {
+                    offset,
+                    length,
+                    extent: index_root_extent_from_manifest(&manifest_authority),
+                    data_kind: BlockKind::IndexRootData,
+                    parity_kind: BlockKind::IndexRootParity,
+                    structure: "IndexRoot",
+                },
             )?;
             insert_sidecar_records(&mut blocks, index_root_records)?;
         }
@@ -1117,18 +1112,12 @@ impl OpenedArchive {
         let limits = metadata_limits(&parsed_crypto.fixed);
         let index_root_plaintext = load_metadata_object_from_parts(
             &blocks,
-            &subkeys,
-            &volume_header,
-            &parsed_crypto.fixed,
-            index_root_extent_from_manifest(&manifest_authority),
-            BlockKind::IndexRootData,
-            BlockKind::IndexRootParity,
-            &subkeys.index_root_key,
-            &subkeys.index_nonce_seed,
-            b"idxroot",
-            0,
-            parsed_crypto.fixed.index_root_fec_data_shards,
-            parsed_crypto.fixed.index_root_fec_parity_shards,
+            ObjectLoadContext::index_root(
+                &volume_header,
+                &parsed_crypto.fixed,
+                &subkeys,
+                index_root_extent_from_manifest(&manifest_authority),
+            ),
             manifest_authority.index_root_decompressed_size,
         )?;
         let index_root = IndexRoot::parse(
@@ -1140,13 +1129,15 @@ impl OpenedArchive {
             if let Some((offset, length)) = sidecar.dictionary_records_section {
                 let dictionary_records = parse_sidecar_block_records(
                     bootstrap_sidecar,
-                    offset,
-                    length,
                     parsed_crypto.fixed.block_size as usize,
-                    dictionary_extent_from_index_root(&index_root)?,
-                    BlockKind::DictionaryData,
-                    BlockKind::DictionaryParity,
-                    "dictionary",
+                    SidecarBlockRecordsSection {
+                        offset,
+                        length,
+                        extent: dictionary_extent_from_index_root(&index_root)?,
+                        data_kind: BlockKind::DictionaryData,
+                        parity_kind: BlockKind::DictionaryParity,
+                        structure: "dictionary",
+                    },
                 )?;
                 insert_sidecar_records(&mut blocks, dictionary_records)?;
             }
@@ -1248,7 +1239,7 @@ impl OpenedArchive {
     pub fn extract_file_with_diagnostics(
         &self,
         path: &str,
-    ) -> Result<Option<(Vec<u8>, Vec<MetadataDiagnostic>)>, FormatError> {
+    ) -> Result<Option<ExtractedRegularFile>, FormatError> {
         self.extract_member(path)?
             .map(|member| {
                 if member.kind != TarEntryKind::Regular {
@@ -1462,23 +1453,17 @@ impl OpenedArchive {
         let limits = metadata_limits(&parts.crypto_header);
         let index_root_plaintext = load_metadata_object_from_parts(
             &parts.blocks,
-            &parts.subkeys,
-            &parts.volume_header,
-            &parts.crypto_header,
-            ObjectExtent {
-                first_block_index: parts.manifest_footer.index_root_first_block,
-                data_block_count: parts.manifest_footer.index_root_data_block_count,
-                parity_block_count: parts.manifest_footer.index_root_parity_block_count,
-                encrypted_size: parts.manifest_footer.index_root_encrypted_size,
-            },
-            BlockKind::IndexRootData,
-            BlockKind::IndexRootParity,
-            &parts.subkeys.index_root_key,
-            &parts.subkeys.index_nonce_seed,
-            b"idxroot",
-            0,
-            parts.crypto_header.index_root_fec_data_shards,
-            parts.crypto_header.index_root_fec_parity_shards,
+            ObjectLoadContext::index_root(
+                &parts.volume_header,
+                &parts.crypto_header,
+                &parts.subkeys,
+                ObjectExtent {
+                    first_block_index: parts.manifest_footer.index_root_first_block,
+                    data_block_count: parts.manifest_footer.index_root_data_block_count,
+                    parity_block_count: parts.manifest_footer.index_root_parity_block_count,
+                    encrypted_size: parts.manifest_footer.index_root_encrypted_size,
+                },
+            ),
             parts.manifest_footer.index_root_decompressed_size,
         )?;
         let index_root = IndexRoot::parse(
@@ -1752,23 +1737,12 @@ impl OpenedArchive {
         let block_provider = self.block_provider();
         let plaintext = load_metadata_object_from_parts(
             &block_provider,
-            &self.subkeys,
-            &self.volume_header,
-            &self.crypto_header,
-            ObjectExtent {
-                first_block_index: entry.first_block_index,
-                data_block_count: entry.data_block_count,
-                parity_block_count: entry.parity_block_count,
-                encrypted_size: entry.encrypted_size,
-            },
-            BlockKind::IndexShardData,
-            BlockKind::IndexShardParity,
-            &self.subkeys.index_shard_key,
-            &self.subkeys.index_nonce_seed,
-            b"idxshard",
-            entry.shard_index,
-            self.crypto_header.index_fec_data_shards,
-            self.crypto_header.index_fec_parity_shards,
+            ObjectLoadContext::index_shard(
+                &self.volume_header,
+                &self.crypto_header,
+                &self.subkeys,
+                entry,
+            ),
             entry.decompressed_size,
         )?;
         IndexShard::parse(&plaintext, entry, self.metadata_limits())
@@ -1789,23 +1763,12 @@ impl OpenedArchive {
         let block_provider = self.block_provider();
         let plaintext = load_metadata_object_from_parts(
             &block_provider,
-            &self.subkeys,
-            &self.volume_header,
-            &self.crypto_header,
-            ObjectExtent {
-                first_block_index: entry.first_block_index,
-                data_block_count: entry.data_block_count,
-                parity_block_count: entry.parity_block_count,
-                encrypted_size: entry.encrypted_size,
-            },
-            BlockKind::DirectoryHintData,
-            BlockKind::DirectoryHintParity,
-            &self.subkeys.dir_hint_key,
-            &self.subkeys.index_nonce_seed,
-            b"dirhint",
-            entry.hint_shard_index,
-            self.crypto_header.index_fec_data_shards,
-            self.crypto_header.index_fec_parity_shards,
+            ObjectLoadContext::directory_hint(
+                &self.volume_header,
+                &self.crypto_header,
+                &self.subkeys,
+                entry,
+            ),
             entry.decompressed_size,
         )?;
         DirectoryHintTable::parse(
@@ -1820,22 +1783,12 @@ impl OpenedArchive {
         let block_provider = self.block_provider();
         let plaintext = load_decrypted_object_from_parts(
             &block_provider,
-            &self.volume_header,
-            &self.crypto_header,
-            ObjectExtent {
-                first_block_index: envelope.first_block_index,
-                data_block_count: envelope.data_block_count,
-                parity_block_count: envelope.parity_block_count,
-                encrypted_size: envelope.encrypted_size,
-            },
-            BlockKind::PayloadData,
-            BlockKind::PayloadParity,
-            &self.subkeys.enc_key,
-            &self.subkeys.nonce_seed,
-            b"envelope",
-            envelope.envelope_index,
-            self.crypto_header.fec_data_shards,
-            self.crypto_header.fec_parity_shards,
+            ObjectLoadContext::payload(
+                &self.volume_header,
+                &self.crypto_header,
+                &self.subkeys,
+                envelope,
+            ),
         )?;
         if plaintext.len() != envelope.plaintext_size as usize {
             return Err(FormatError::InvalidArchive(
@@ -1994,11 +1947,8 @@ impl OpenedArchive {
                 .ok_or(FormatError::InvalidArchive(
                     "FrameEntry references missing EnvelopeEntry",
                 ))?;
-            if !envelope_cache.contains_key(&envelope.envelope_index) {
-                envelope_cache.insert(
-                    envelope.envelope_index,
-                    self.load_payload_envelope(envelope)?,
-                );
+            if let Entry::Vacant(entry) = envelope_cache.entry(envelope.envelope_index) {
+                entry.insert(self.load_payload_envelope(envelope)?);
             }
             let envelope_plaintext = envelope_cache
                 .get(&envelope.envelope_index)
@@ -2455,10 +2405,7 @@ impl TarMemberGroupReader for DecodedTarMemberGroupReader<'_> {
     }
 }
 
-fn frame_by_index<'a>(
-    shard: &'a IndexShard,
-    frame_index: u64,
-) -> Result<&'a FrameEntry, FormatError> {
+fn frame_by_index(shard: &IndexShard, frame_index: u64) -> Result<&FrameEntry, FormatError> {
     shard
         .frames
         .binary_search_by_key(&frame_index, |entry| entry.frame_index)
@@ -2466,10 +2413,10 @@ fn frame_by_index<'a>(
         .map_err(|_| FormatError::InvalidArchive("FileEntry references missing FrameEntry"))
 }
 
-fn envelope_by_index<'a>(
-    shard: &'a IndexShard,
+fn envelope_by_index(
+    shard: &IndexShard,
     envelope_index: u64,
-) -> Result<&'a EnvelopeEntry, FormatError> {
+) -> Result<&EnvelopeEntry, FormatError> {
     shard
         .envelopes
         .binary_search_by_key(&envelope_index, |entry| entry.envelope_index)
@@ -4076,10 +4023,19 @@ fn recover_cmra_from_bytes(
         if let Some(shard) = shard {
             validate_cmra_shard(&shard, idx, tuple)?;
             if shard.shard_role == 0 {
-                data_shards[idx] = Some(shard.payload);
+                let data_slot = data_shards
+                    .get_mut(idx)
+                    .ok_or(FormatError::InvalidArchive("CMRA data shard out of range"))?;
+                *data_slot = Some(shard.payload);
             } else {
                 let parity_idx = idx - tuple.data_shard_count as usize;
-                parity_shards[parity_idx] = Some(shard.payload);
+                let parity_slot =
+                    parity_shards
+                        .get_mut(parity_idx)
+                        .ok_or(FormatError::InvalidArchive(
+                            "CMRA parity shard out of range",
+                        ))?;
+                *parity_slot = Some(shard.payload);
             }
         }
         cursor = checked_add(
@@ -4401,7 +4357,7 @@ fn image_block_record_len_from_region(image: &CriticalMetadataImage) -> Result<u
         .region(2)
         .ok_or(FormatError::InvalidArchive("missing CryptoHeader region"))?;
     let crypto = CryptoHeader::parse(&crypto_region.bytes, image.crypto_header_length)?;
-    crypto.fixed.validate_v36()?;
+    crypto.fixed.validate_supported_profile()?;
     Ok(crypto.fixed.block_size as usize + BLOCK_RECORD_FRAMING_LEN)
 }
 
@@ -4929,31 +4885,27 @@ pub(crate) fn parse_non_seekable_bootstrap_material(
             ))?;
     let index_root_records = parse_sidecar_block_records(
         bootstrap_sidecar,
-        offset,
-        length,
         crypto_header.block_size as usize,
-        index_root_extent_from_manifest(&manifest_footer),
-        BlockKind::IndexRootData,
-        BlockKind::IndexRootParity,
-        "IndexRoot",
+        SidecarBlockRecordsSection {
+            offset,
+            length,
+            extent: index_root_extent_from_manifest(&manifest_footer),
+            data_kind: BlockKind::IndexRootData,
+            parity_kind: BlockKind::IndexRootParity,
+            structure: "IndexRoot",
+        },
     )?;
     insert_sidecar_records(&mut blocks, index_root_records)?;
 
     let limits = metadata_limits(crypto_header);
     let index_root_plaintext = load_metadata_object_from_parts(
         &blocks,
-        subkeys,
-        volume_header,
-        crypto_header,
-        index_root_extent_from_manifest(&manifest_footer),
-        BlockKind::IndexRootData,
-        BlockKind::IndexRootParity,
-        &subkeys.index_root_key,
-        &subkeys.index_nonce_seed,
-        b"idxroot",
-        0,
-        crypto_header.index_root_fec_data_shards,
-        crypto_header.index_root_fec_parity_shards,
+        ObjectLoadContext::index_root(
+            volume_header,
+            crypto_header,
+            subkeys,
+            index_root_extent_from_manifest(&manifest_footer),
+        ),
         manifest_footer.index_root_decompressed_size,
     )?;
     let index_root = IndexRoot::parse(
@@ -4971,13 +4923,15 @@ pub(crate) fn parse_non_seekable_bootstrap_material(
                 ))?;
         let dictionary_records = parse_sidecar_block_records(
             bootstrap_sidecar,
-            offset,
-            length,
             crypto_header.block_size as usize,
-            dictionary_extent_from_index_root(&index_root)?,
-            BlockKind::DictionaryData,
-            BlockKind::DictionaryParity,
-            "dictionary",
+            SidecarBlockRecordsSection {
+                offset,
+                length,
+                extent: dictionary_extent_from_index_root(&index_root)?,
+                data_kind: BlockKind::DictionaryData,
+                parity_kind: BlockKind::DictionaryParity,
+                structure: "dictionary",
+            },
         )?;
         insert_sidecar_records(&mut blocks, dictionary_records)?;
     }
@@ -5021,12 +4975,10 @@ fn parse_bootstrap_sidecar(
     header.validate_packed_layout(bytes.len() as u64)?;
     validate_sidecar_size_cap(&header, crypto_header, bytes.len() as u64)?;
 
-    if header.has_dictionary_records() {
-        if crypto_header.has_dictionary == 0 {
-            return Err(FormatError::InvalidArchive(
-                "bootstrap sidecar has dictionary records while has_dictionary is false",
-            ));
-        }
+    if header.has_dictionary_records() && crypto_header.has_dictionary == 0 {
+        return Err(FormatError::InvalidArchive(
+            "bootstrap sidecar has dictionary records while has_dictionary is false",
+        ));
     }
 
     let manifest_footer = if header.has_manifest_footer() {
@@ -5196,37 +5148,43 @@ fn validate_sidecar_size_cap(
     Ok(())
 }
 
-fn parse_sidecar_block_records(
-    sidecar_bytes: &[u8],
+#[derive(Debug, Clone, Copy)]
+struct SidecarBlockRecordsSection {
     offset: u64,
     length: u64,
-    block_size: usize,
     extent: ObjectExtent,
     data_kind: BlockKind,
     parity_kind: BlockKind,
     structure: &'static str,
+}
+
+fn parse_sidecar_block_records(
+    sidecar_bytes: &[u8],
+    block_size: usize,
+    section: SidecarBlockRecordsSection,
 ) -> Result<Vec<BlockRecord>, FormatError> {
     let record_len = block_size
         .checked_add(BLOCK_RECORD_FRAMING_LEN)
         .ok_or(FormatError::InvalidArchive("BlockRecord length overflow"))?;
-    if length % record_len as u64 != 0 {
+    if section.length % record_len as u64 != 0 {
         return Err(FormatError::InvalidArchive(
             "sidecar BlockRecord section is not aligned",
         ));
     }
-    let expected_count = extent.data_block_count as usize + extent.parity_block_count as usize;
-    let actual_count = usize::try_from(length / record_len as u64)
+    let expected_count =
+        section.extent.data_block_count as usize + section.extent.parity_block_count as usize;
+    let actual_count = usize::try_from(section.length / record_len as u64)
         .map_err(|_| FormatError::InvalidArchive("sidecar BlockRecord count overflow"))?;
     if actual_count != expected_count {
         return Err(FormatError::InvalidArchive(
             "sidecar BlockRecord section does not match declared extent",
         ));
     }
-    let start = to_usize(offset, "BootstrapSidecarHeader")?;
+    let start = to_usize(section.offset, "BootstrapSidecarHeader")?;
     let raw = slice(
         sidecar_bytes,
         start,
-        to_usize(length, "BootstrapSidecarHeader")?,
+        to_usize(section.length, "BootstrapSidecarHeader")?,
         "BootstrapSidecarHeader",
     )?;
     let mut records = Vec::with_capacity(expected_count);
@@ -5236,25 +5194,29 @@ fn parse_sidecar_block_records(
             slice(raw, idx * record_len, record_len, "BlockRecord")?,
             block_size,
         )?;
-        let expected_block_index =
-            checked_u64_add(extent.first_block_index, idx as u64, structure)?;
+        let expected_block_index = checked_u64_add(
+            section.extent.first_block_index,
+            idx as u64,
+            section.structure,
+        )?;
         if record.block_index != expected_block_index {
             return Err(FormatError::InvalidArchive(
                 "sidecar BlockRecord section has missing or duplicate blocks",
             ));
         }
-        let expected_kind = if idx < extent.data_block_count as usize {
-            data_kind
+        let expected_kind = if idx < section.extent.data_block_count as usize {
+            section.data_kind
         } else {
-            parity_kind
+            section.parity_kind
         };
         if record.kind != expected_kind {
             return Err(FormatError::InvalidArchive(
                 "sidecar BlockRecord section has wrong kind",
             ));
         }
-        let should_be_last = idx + 1 == extent.data_block_count as usize;
-        if idx < extent.data_block_count as usize && record.is_last_data() != should_be_last {
+        let should_be_last = idx + 1 == section.extent.data_block_count as usize;
+        if idx < section.extent.data_block_count as usize && record.is_last_data() != should_be_last
+        {
             return Err(FormatError::InvalidArchive(
                 "sidecar BlockRecord section has wrong last-data flag",
             ));
@@ -5893,13 +5855,15 @@ fn sequential_extract_tar_stream_with_options(
                 if pending.saw_last_data {
                     finalize_sequential_envelope(
                         &mut pending,
-                        &parsed_crypto.fixed,
-                        &subkeys,
-                        &volume_header,
-                        &mut next_envelope_index,
-                        &mut tar_stream,
-                        max_tar_stream_size,
-                        &mut tar_stream_total_validator,
+                        SequentialEnvelopeDecodeContext {
+                            crypto_header: &parsed_crypto.fixed,
+                            subkeys: &subkeys,
+                            volume_header: &volume_header,
+                            next_envelope_index: &mut next_envelope_index,
+                            tar_stream: &mut tar_stream,
+                            max_tar_stream_size,
+                            tar_stream_total_validator: &mut tar_stream_total_validator,
+                        },
                     )?;
                 }
                 let is_last_data = record.is_last_data();
@@ -5938,13 +5902,15 @@ fn sequential_extract_tar_stream_with_options(
                 if !pending.is_empty() {
                     finalize_sequential_envelope(
                         &mut pending,
-                        &parsed_crypto.fixed,
-                        &subkeys,
-                        &volume_header,
-                        &mut next_envelope_index,
-                        &mut tar_stream,
-                        max_tar_stream_size,
-                        &mut tar_stream_total_validator,
+                        SequentialEnvelopeDecodeContext {
+                            crypto_header: &parsed_crypto.fixed,
+                            subkeys: &subkeys,
+                            volume_header: &volume_header,
+                            next_envelope_index: &mut next_envelope_index,
+                            tar_stream: &mut tar_stream,
+                            max_tar_stream_size,
+                            tar_stream_total_validator: &mut tar_stream_total_validator,
+                        },
                     )?;
                 }
                 metadata_seen = true;
@@ -5957,13 +5923,15 @@ fn sequential_extract_tar_stream_with_options(
     if !pending.is_empty() {
         finalize_sequential_envelope(
             &mut pending,
-            &parsed_crypto.fixed,
-            &subkeys,
-            &volume_header,
-            &mut next_envelope_index,
-            &mut tar_stream,
-            max_tar_stream_size,
-            &mut tar_stream_total_validator,
+            SequentialEnvelopeDecodeContext {
+                crypto_header: &parsed_crypto.fixed,
+                subkeys: &subkeys,
+                volume_header: &volume_header,
+                next_envelope_index: &mut next_envelope_index,
+                tar_stream: &mut tar_stream,
+                max_tar_stream_size,
+                tar_stream_total_validator: &mut tar_stream_total_validator,
+            },
         )?;
     }
 
@@ -6010,32 +5978,37 @@ fn validate_sequential_supported_volume(
     Ok(())
 }
 
+struct SequentialEnvelopeDecodeContext<'a> {
+    crypto_header: &'a CryptoHeaderFixed,
+    subkeys: &'a Subkeys,
+    volume_header: &'a VolumeHeader,
+    next_envelope_index: &'a mut u64,
+    tar_stream: &'a mut Vec<u8>,
+    max_tar_stream_size: usize,
+    tar_stream_total_validator: &'a mut TarStreamTotalExtractionSizeValidator,
+}
+
 fn finalize_sequential_envelope(
     pending: &mut PendingSequentialEnvelope,
-    crypto_header: &CryptoHeaderFixed,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    next_envelope_index: &mut u64,
-    tar_stream: &mut Vec<u8>,
-    max_tar_stream_size: usize,
-    tar_stream_total_validator: &mut TarStreamTotalExtractionSizeValidator,
+    context: SequentialEnvelopeDecodeContext<'_>,
 ) -> Result<(), FormatError> {
     if !pending.saw_last_data {
         return Err(FormatError::InvalidArchive(
             "sequential payload envelope is missing last-data flag",
         ));
     }
-    if pending.data_shards.len() > crypto_header.fec_data_shards as usize {
+    if pending.data_shards.len() > context.crypto_header.fec_data_shards as usize {
         return Err(FormatError::InvalidArchive(
             "sequential payload envelope exceeds data-shard cap",
         ));
     }
-    if pending.parity_shards.len() > crypto_header.fec_parity_shards as usize {
+    if pending.parity_shards.len() > context.crypto_header.fec_parity_shards as usize {
         return Err(FormatError::InvalidArchive(
             "sequential payload envelope exceeds parity-shard cap",
         ));
     }
-    let required_parity = required_object_parity(pending.data_shards.len() as u64, crypto_header)?;
+    let required_parity =
+        required_object_parity(pending.data_shards.len() as u64, context.crypto_header)?;
     if pending.parity_shards.len() < required_parity as usize {
         return Err(FormatError::InvalidArchive(
             "sequential payload envelope has insufficient parity for recovery settings",
@@ -6045,30 +6018,33 @@ fn finalize_sequential_envelope(
     let repaired = repair_data_gf16(
         &pending.data_shards,
         &pending.parity_shards,
-        crypto_header.block_size as usize,
+        context.crypto_header.block_size as usize,
     )?;
-    let mut encrypted = Vec::with_capacity(repaired.len() * crypto_header.block_size as usize);
+    let mut encrypted =
+        Vec::with_capacity(repaired.len() * context.crypto_header.block_size as usize);
     for shard in repaired {
         encrypted.extend_from_slice(&shard);
     }
     let plaintext = decrypt_padded_aead_object(
-        crypto_header.aead_algo,
-        &subkeys.enc_key,
-        &subkeys.nonce_seed,
-        b"envelope",
-        &volume_header.archive_uuid,
-        &volume_header.session_id,
-        *next_envelope_index,
+        AeadObjectContext {
+            algo: context.crypto_header.aead_algo,
+            key: &context.subkeys.enc_key,
+            nonce_seed: &context.subkeys.nonce_seed,
+            domain: b"envelope",
+            archive_uuid: &context.volume_header.archive_uuid,
+            session_id: &context.volume_header.session_id,
+            counter: *context.next_envelope_index,
+        },
         &encrypted,
     )?;
     decode_concatenated_zstd_frames_with_cap(
         &plaintext,
         None,
-        tar_stream,
-        max_tar_stream_size,
-        Some(tar_stream_total_validator),
+        context.tar_stream,
+        context.max_tar_stream_size,
+        Some(context.tar_stream_total_validator),
     )?;
-    *next_envelope_index = next_envelope_index
+    *context.next_envelope_index = (*context.next_envelope_index)
         .checked_add(1)
         .ok_or(FormatError::InvalidArchive("envelope counter overflow"))?;
     *pending = PendingSequentialEnvelope::default();
@@ -6099,9 +6075,7 @@ fn decode_concatenated_zstd_frames_with_cap(
                 &mut decoder,
                 output,
                 max_output_len,
-                tar_stream_total_validator
-                    .as_mut()
-                    .map(|validator| &mut **validator),
+                tar_stream_total_validator.as_deref_mut(),
             )?;
         } else {
             let mut decoder = zstd::stream::Decoder::new(&plaintext[cursor..end])
@@ -6110,9 +6084,7 @@ fn decode_concatenated_zstd_frames_with_cap(
                 &mut decoder,
                 output,
                 max_output_len,
-                tar_stream_total_validator
-                    .as_mut()
-                    .map(|validator| &mut **validator),
+                tar_stream_total_validator.as_deref_mut(),
             )?;
         }
         cursor = end;
@@ -6164,21 +6136,147 @@ fn load_archive_dictionary(
     }
     let plaintext = load_metadata_object_from_parts(
         blocks,
-        subkeys,
-        volume_header,
-        crypto_header,
-        dictionary_extent_from_index_root(index_root)?,
-        BlockKind::DictionaryData,
-        BlockKind::DictionaryParity,
-        &subkeys.dictionary_key,
-        &subkeys.index_nonce_seed,
-        b"dict",
-        0,
-        crypto_header.index_root_fec_data_shards,
-        crypto_header.index_root_fec_parity_shards,
+        ObjectLoadContext::dictionary(volume_header, crypto_header, subkeys, index_root)?,
         index_root.header.dictionary_decompressed_size,
     )?;
     Ok(Some(plaintext))
+}
+
+#[derive(Clone, Copy)]
+struct ObjectLoadContext<'a> {
+    volume_header: &'a VolumeHeader,
+    crypto_header: &'a CryptoHeaderFixed,
+    extent: ObjectExtent,
+    data_kind: BlockKind,
+    parity_kind: BlockKind,
+    key: &'a [u8; 32],
+    nonce_seed: &'a [u8; 32],
+    domain: &'a [u8],
+    counter: u64,
+    class_data_shard_max: u16,
+    class_parity_shard_max: u16,
+}
+
+impl<'a> ObjectLoadContext<'a> {
+    fn index_root(
+        volume_header: &'a VolumeHeader,
+        crypto_header: &'a CryptoHeaderFixed,
+        subkeys: &'a Subkeys,
+        extent: ObjectExtent,
+    ) -> Self {
+        Self {
+            volume_header,
+            crypto_header,
+            extent,
+            data_kind: BlockKind::IndexRootData,
+            parity_kind: BlockKind::IndexRootParity,
+            key: &subkeys.index_root_key,
+            nonce_seed: &subkeys.index_nonce_seed,
+            domain: b"idxroot",
+            counter: 0,
+            class_data_shard_max: crypto_header.index_root_fec_data_shards,
+            class_parity_shard_max: crypto_header.index_root_fec_parity_shards,
+        }
+    }
+
+    fn index_shard(
+        volume_header: &'a VolumeHeader,
+        crypto_header: &'a CryptoHeaderFixed,
+        subkeys: &'a Subkeys,
+        entry: &ShardEntry,
+    ) -> Self {
+        Self {
+            volume_header,
+            crypto_header,
+            extent: ObjectExtent {
+                first_block_index: entry.first_block_index,
+                data_block_count: entry.data_block_count,
+                parity_block_count: entry.parity_block_count,
+                encrypted_size: entry.encrypted_size,
+            },
+            data_kind: BlockKind::IndexShardData,
+            parity_kind: BlockKind::IndexShardParity,
+            key: &subkeys.index_shard_key,
+            nonce_seed: &subkeys.index_nonce_seed,
+            domain: b"idxshard",
+            counter: entry.shard_index,
+            class_data_shard_max: crypto_header.index_fec_data_shards,
+            class_parity_shard_max: crypto_header.index_fec_parity_shards,
+        }
+    }
+
+    fn directory_hint(
+        volume_header: &'a VolumeHeader,
+        crypto_header: &'a CryptoHeaderFixed,
+        subkeys: &'a Subkeys,
+        entry: &DirectoryHintShardEntry,
+    ) -> Self {
+        Self {
+            volume_header,
+            crypto_header,
+            extent: ObjectExtent {
+                first_block_index: entry.first_block_index,
+                data_block_count: entry.data_block_count,
+                parity_block_count: entry.parity_block_count,
+                encrypted_size: entry.encrypted_size,
+            },
+            data_kind: BlockKind::DirectoryHintData,
+            parity_kind: BlockKind::DirectoryHintParity,
+            key: &subkeys.dir_hint_key,
+            nonce_seed: &subkeys.index_nonce_seed,
+            domain: b"dirhint",
+            counter: entry.hint_shard_index,
+            class_data_shard_max: crypto_header.index_fec_data_shards,
+            class_parity_shard_max: crypto_header.index_fec_parity_shards,
+        }
+    }
+
+    fn dictionary(
+        volume_header: &'a VolumeHeader,
+        crypto_header: &'a CryptoHeaderFixed,
+        subkeys: &'a Subkeys,
+        index_root: &IndexRoot,
+    ) -> Result<Self, FormatError> {
+        Ok(Self {
+            volume_header,
+            crypto_header,
+            extent: dictionary_extent_from_index_root(index_root)?,
+            data_kind: BlockKind::DictionaryData,
+            parity_kind: BlockKind::DictionaryParity,
+            key: &subkeys.dictionary_key,
+            nonce_seed: &subkeys.index_nonce_seed,
+            domain: b"dict",
+            counter: 0,
+            class_data_shard_max: crypto_header.index_root_fec_data_shards,
+            class_parity_shard_max: crypto_header.index_root_fec_parity_shards,
+        })
+    }
+
+    fn payload(
+        volume_header: &'a VolumeHeader,
+        crypto_header: &'a CryptoHeaderFixed,
+        subkeys: &'a Subkeys,
+        envelope: &EnvelopeEntry,
+    ) -> Self {
+        Self {
+            volume_header,
+            crypto_header,
+            extent: ObjectExtent {
+                first_block_index: envelope.first_block_index,
+                data_block_count: envelope.data_block_count,
+                parity_block_count: envelope.parity_block_count,
+                encrypted_size: envelope.encrypted_size,
+            },
+            data_kind: BlockKind::PayloadData,
+            parity_kind: BlockKind::PayloadParity,
+            key: &subkeys.enc_key,
+            nonce_seed: &subkeys.nonce_seed,
+            domain: b"envelope",
+            counter: envelope.envelope_index,
+            class_data_shard_max: crypto_header.fec_data_shards,
+            class_parity_shard_max: crypto_header.fec_parity_shards,
+        }
+    }
 }
 
 fn dictionary_extent_from_index_root(index_root: &IndexRoot) -> Result<ObjectExtent, FormatError> {
@@ -6198,79 +6296,46 @@ fn dictionary_extent_from_index_root(index_root: &IndexRoot) -> Result<ObjectExt
 
 fn load_metadata_object_from_parts(
     blocks: &impl BlockProvider,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
-    extent: ObjectExtent,
-    data_kind: BlockKind,
-    parity_kind: BlockKind,
-    key: &[u8; 32],
-    nonce_seed: &[u8; 32],
-    domain: &[u8],
-    counter: u64,
-    class_data_shard_max: u16,
-    class_parity_shard_max: u16,
+    context: ObjectLoadContext<'_>,
     decompressed_size: u32,
 ) -> Result<Vec<u8>, FormatError> {
-    let compressed = load_decrypted_object_from_parts(
-        blocks,
-        volume_header,
-        crypto_header,
-        extent,
-        data_kind,
-        parity_kind,
-        key,
-        nonce_seed,
-        domain,
-        counter,
-        class_data_shard_max,
-        class_parity_shard_max,
-    )?;
-    let _ = subkeys;
+    let compressed = load_decrypted_object_from_parts(blocks, context)?;
     decompress_exact_zstd_frame(&compressed, decompressed_size as usize)
 }
 
 fn load_decrypted_object_from_parts(
     blocks: &impl BlockProvider,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
-    extent: ObjectExtent,
-    data_kind: BlockKind,
-    parity_kind: BlockKind,
-    key: &[u8; 32],
-    nonce_seed: &[u8; 32],
-    domain: &[u8],
-    counter: u64,
-    class_data_shard_max: u16,
-    class_parity_shard_max: u16,
+    context: ObjectLoadContext<'_>,
 ) -> Result<Vec<u8>, FormatError> {
     let repaired = load_repaired_object_data_shards_from_parts(
         blocks,
-        crypto_header,
-        extent,
-        data_kind,
-        parity_kind,
-        class_data_shard_max,
-        class_parity_shard_max,
+        context.crypto_header,
+        context.extent,
+        context.data_kind,
+        context.parity_kind,
+        context.class_data_shard_max,
+        context.class_parity_shard_max,
     )?;
-    let mut encrypted = Vec::with_capacity(extent.encrypted_size as usize);
+    let mut encrypted = Vec::with_capacity(context.extent.encrypted_size as usize);
     for shard in repaired {
         encrypted.extend_from_slice(&shard);
     }
-    if encrypted.len() != extent.encrypted_size as usize {
+    if encrypted.len() != context.extent.encrypted_size as usize {
         return Err(FormatError::InvalidArchive(
             "object encrypted size does not match repaired shards",
         ));
     }
 
     decrypt_padded_aead_object(
-        crypto_header.aead_algo,
-        key,
-        nonce_seed,
-        domain,
-        &volume_header.archive_uuid,
-        &volume_header.session_id,
-        counter,
+        AeadObjectContext {
+            algo: context.crypto_header.aead_algo,
+            key: context.key,
+            nonce_seed: context.nonce_seed,
+            domain: context.domain,
+            archive_uuid: &context.volume_header.archive_uuid,
+            session_id: &context.volume_header.session_id,
+            counter: context.counter,
+        },
         &encrypted,
     )
 }
@@ -7868,10 +7933,7 @@ mod tests {
 
         impl std::io::Write for FailOnFirstWrite {
             fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "sink stopped",
-                ))
+                Err(std::io::Error::other("sink stopped"))
             }
 
             fn flush(&mut self) -> std::io::Result<()> {
@@ -8281,8 +8343,10 @@ mod tests {
             single_stream_options(),
         )
         .unwrap();
-        let mut options = ReaderOptions::default();
-        options.max_total_extraction_size = 3;
+        let options = ReaderOptions {
+            max_total_extraction_size: 3,
+            ..ReaderOptions::default()
+        };
         let opened =
             OpenedArchive::open_with_options(&archive.bytes, &master_key(), options).unwrap();
 
@@ -8300,8 +8364,10 @@ mod tests {
             single_stream_options(),
         )
         .unwrap();
-        let mut options = ReaderOptions::default();
-        options.max_total_extraction_size = 3;
+        let options = ReaderOptions {
+            max_total_extraction_size: 3,
+            ..ReaderOptions::default()
+        };
         let opened =
             OpenedArchive::open_with_options(&archive.bytes, &master_key(), options).unwrap();
 
@@ -8321,8 +8387,10 @@ mod tests {
             single_stream_options(),
         )
         .unwrap();
-        let mut options = ReaderOptions::default();
-        options.max_verify_tar_size = 1;
+        let options = ReaderOptions {
+            max_verify_tar_size: 1,
+            ..ReaderOptions::default()
+        };
         let opened =
             OpenedArchive::open_with_options(&archive.bytes, &master_key(), options).unwrap();
 
@@ -8538,8 +8606,10 @@ mod tests {
             single_stream_options(),
         )
         .unwrap();
-        let mut options = ReaderOptions::default();
-        options.max_total_extraction_size = 3;
+        let options = ReaderOptions {
+            max_total_extraction_size: 3,
+            ..ReaderOptions::default()
+        };
 
         assert_eq!(
             sequential_extract_tar_stream_with_options(&archive.bytes, &master_key(), options)
@@ -8556,8 +8626,10 @@ mod tests {
             single_stream_options(),
         )
         .unwrap();
-        let mut options = ReaderOptions::default();
-        options.max_verify_tar_size = 512;
+        let options = ReaderOptions {
+            max_verify_tar_size: 512,
+            ..ReaderOptions::default()
+        };
 
         assert_eq!(
             sequential_extract_tar_stream_with_options(&archive.bytes, &master_key(), options)
@@ -9926,10 +9998,13 @@ mod tests {
         add_expected_directory_hint_rows(&mut map, 4, b"foo/bar", TarEntryKind::Directory);
 
         assert_eq!(map.get(&Vec::new()), Some(&BTreeSet::from([2, 4])));
-        assert_eq!(map.get(&b"foo".to_vec()), Some(&BTreeSet::from([2, 4])));
-        assert_eq!(map.get(&b"foo/bar".to_vec()), Some(&BTreeSet::from([2, 4])));
-        assert!(!map.contains_key(&b"foo/bar/baz.txt".to_vec()));
-        assert!(!map.contains_key(&b"foobar".to_vec()));
+        assert_eq!(map.get(b"foo".as_slice()), Some(&BTreeSet::from([2, 4])));
+        assert_eq!(
+            map.get(b"foo/bar".as_slice()),
+            Some(&BTreeSet::from([2, 4]))
+        );
+        assert!(!map.contains_key(b"foo/bar/baz.txt".as_slice()));
+        assert!(!map.contains_key(b"foobar".as_slice()));
     }
 
     #[test]
@@ -9940,7 +10015,8 @@ mod tests {
         let rows = sorted_directory_hint_rows(&expected);
         let table = directory_hint_table_from_rows(7, &rows, 2);
 
-        validate_directory_hint_tables_against_expected(&[table.clone()], &expected).unwrap();
+        validate_directory_hint_tables_against_expected(std::slice::from_ref(&table), &expected)
+            .unwrap();
 
         let mut missing_root = expected.clone();
         missing_root.remove(&Vec::new());
@@ -9954,12 +10030,12 @@ mod tests {
 
         let mut expected_missing_directory_entry = expected.clone();
         expected_missing_directory_entry
-            .get_mut(&b"foo".to_vec())
+            .get_mut(b"foo".as_slice())
             .unwrap()
             .remove(&1);
         assert_eq!(
             validate_directory_hint_tables_against_expected(
-                &[table.clone()],
+                std::slice::from_ref(&table),
                 &expected_missing_directory_entry,
             )
             .unwrap_err(),
@@ -10377,18 +10453,12 @@ mod tests {
         assert_eq!(
             load_metadata_object_from_parts(
                 &index_root_records,
-                &subkeys,
-                &volume_header,
-                &crypto_header,
-                index_root_extent,
-                BlockKind::IndexRootData,
-                BlockKind::IndexRootParity,
-                &subkeys.index_root_key,
-                &subkeys.index_nonce_seed,
-                b"idxroot",
-                0,
-                crypto_header.index_root_fec_data_shards,
-                crypto_header.index_root_fec_parity_shards,
+                ObjectLoadContext::index_root(
+                    &volume_header,
+                    &crypto_header,
+                    &subkeys,
+                    index_root_extent,
+                ),
                 index_root_payload.len() as u32,
             )
             .unwrap_err(),
@@ -10417,18 +10487,19 @@ mod tests {
         assert_eq!(
             load_metadata_object_from_parts(
                 &index_shard_records,
-                &subkeys,
-                &volume_header,
-                &crypto_header,
-                index_shard_extent,
-                BlockKind::IndexShardData,
-                BlockKind::IndexShardParity,
-                &subkeys.index_shard_key,
-                &subkeys.index_nonce_seed,
-                b"idxshard",
-                1,
-                crypto_header.index_fec_data_shards,
-                crypto_header.index_fec_parity_shards,
+                ObjectLoadContext {
+                    volume_header: &volume_header,
+                    crypto_header: &crypto_header,
+                    extent: index_shard_extent,
+                    data_kind: BlockKind::IndexShardData,
+                    parity_kind: BlockKind::IndexShardParity,
+                    key: &subkeys.index_shard_key,
+                    nonce_seed: &subkeys.index_nonce_seed,
+                    domain: b"idxshard",
+                    counter: 1,
+                    class_data_shard_max: crypto_header.index_fec_data_shards,
+                    class_parity_shard_max: crypto_header.index_fec_parity_shards,
+                },
                 index_shard_payload.len() as u32,
             )
             .unwrap_err(),
@@ -10457,18 +10528,19 @@ mod tests {
         assert_eq!(
             load_metadata_object_from_parts(
                 &directory_hint_records,
-                &subkeys,
-                &volume_header,
-                &crypto_header,
-                directory_hint_extent,
-                BlockKind::DirectoryHintData,
-                BlockKind::DirectoryHintParity,
-                &subkeys.dir_hint_key,
-                &subkeys.index_nonce_seed,
-                b"dirhint",
-                0,
-                crypto_header.index_fec_data_shards,
-                crypto_header.index_fec_parity_shards,
+                ObjectLoadContext {
+                    volume_header: &volume_header,
+                    crypto_header: &crypto_header,
+                    extent: directory_hint_extent,
+                    data_kind: BlockKind::DirectoryHintData,
+                    parity_kind: BlockKind::DirectoryHintParity,
+                    key: &subkeys.dir_hint_key,
+                    nonce_seed: &subkeys.index_nonce_seed,
+                    domain: b"dirhint",
+                    counter: 0,
+                    class_data_shard_max: crypto_header.index_fec_data_shards,
+                    class_parity_shard_max: crypto_header.index_fec_parity_shards,
+                },
                 directory_hint_payload.len() as u32,
             )
             .unwrap_err(),
@@ -10497,18 +10569,19 @@ mod tests {
         assert_eq!(
             load_metadata_object_from_parts(
                 &dictionary_records,
-                &subkeys,
-                &volume_header,
-                &crypto_header,
-                dictionary_extent,
-                BlockKind::DictionaryData,
-                BlockKind::DictionaryParity,
-                &subkeys.dictionary_key,
-                &subkeys.index_nonce_seed,
-                b"dict",
-                0,
-                crypto_header.index_root_fec_data_shards,
-                crypto_header.index_root_fec_parity_shards,
+                ObjectLoadContext {
+                    volume_header: &volume_header,
+                    crypto_header: &crypto_header,
+                    extent: dictionary_extent,
+                    data_kind: BlockKind::DictionaryData,
+                    parity_kind: BlockKind::DictionaryParity,
+                    key: &subkeys.dictionary_key,
+                    nonce_seed: &subkeys.index_nonce_seed,
+                    domain: b"dict",
+                    counter: 0,
+                    class_data_shard_max: crypto_header.index_root_fec_data_shards,
+                    class_parity_shard_max: crypto_header.index_root_fec_parity_shards,
+                },
                 dictionary_payload.len() as u32,
             )
             .unwrap_err(),
@@ -10985,8 +11058,10 @@ mod tests {
             single_stream_options(),
         )
         .unwrap();
-        let mut strict_options = ReaderOptions::default();
-        strict_options.max_trailing_garbage_scan = 0;
+        let strict_options = ReaderOptions {
+            max_trailing_garbage_scan: 0,
+            ..ReaderOptions::default()
+        };
 
         let manifest_offset = terminal_material_offset(&archive.bytes);
         for offset in [
@@ -11205,10 +11280,9 @@ mod tests {
             single_stream_options(),
         )
         .unwrap();
-        let strict_options = {
-            let mut options = ReaderOptions::default();
-            options.max_trailing_garbage_scan = 0;
-            options
+        let strict_options = ReaderOptions {
+            max_trailing_garbage_scan: 0,
+            ..ReaderOptions::default()
         };
         let bytes = archive.bytes;
         let manifest_offset = terminal_material_offset(&bytes);
@@ -11269,8 +11343,10 @@ mod tests {
             single_stream_options(),
         )
         .unwrap();
-        let mut options = ReaderOptions::default();
-        options.max_trailing_garbage_scan = 8;
+        let options = ReaderOptions {
+            max_trailing_garbage_scan: 8,
+            ..ReaderOptions::default()
+        };
 
         let mut within_scan = archive.bytes.clone();
         within_scan.resize(within_scan.len() + options.max_trailing_garbage_scan, 0xAA);
@@ -12502,6 +12578,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encrypt_test_object(
         plaintext: &[u8],
         key: &[u8; 32],
@@ -12515,13 +12592,15 @@ mod tests {
     ) -> TestObject {
         let block_size = crypto_header.block_size as usize;
         let encrypted = encrypt_padded_aead_object(
-            crypto_header.aead_algo,
-            key,
-            nonce_seed,
-            domain,
-            &volume_header.archive_uuid,
-            &volume_header.session_id,
-            counter,
+            AeadObjectContext {
+                algo: crypto_header.aead_algo,
+                key,
+                nonce_seed,
+                domain,
+                archive_uuid: &volume_header.archive_uuid,
+                session_id: &volume_header.session_id,
+                counter,
+            },
             block_size,
             plaintext,
         )
@@ -12564,6 +12643,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_metadata_object_from_payload(
         payload: &[u8],
         _subkeys: &Subkeys,
@@ -12590,6 +12670,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_metadata_object_from_compressed(
         compressed: &[u8],
         key: &[u8; 32],
@@ -12620,10 +12701,11 @@ mod tests {
         (object.extent, blocks)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assert_metadata_object_from_compressed(
         compressed: &[u8],
         decompressed_size: usize,
-        subkeys: &Subkeys,
+        _subkeys: &Subkeys,
         volume_header: &VolumeHeader,
         crypto_header: &CryptoHeaderFixed,
         key: &[u8; 32],
@@ -12650,18 +12732,19 @@ mod tests {
         );
         let error = load_metadata_object_from_parts(
             &blocks,
-            subkeys,
-            volume_header,
-            crypto_header,
-            extent,
-            data_kind,
-            parity_kind,
-            key,
-            nonce_seed,
-            domain,
-            counter,
-            class_data_shards,
-            class_parity_shards,
+            ObjectLoadContext {
+                volume_header,
+                crypto_header,
+                extent,
+                data_kind,
+                parity_kind,
+                key,
+                nonce_seed,
+                domain,
+                counter,
+                class_data_shard_max: class_data_shards,
+                class_parity_shard_max: class_parity_shards,
+            },
             decompressed_size as u32,
         )
         .unwrap_err();

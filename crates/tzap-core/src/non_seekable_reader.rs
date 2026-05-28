@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::compression::validate_exact_zstd_frame;
-use crate::crypto::{decrypt_padded_aead_object, verify_hmac, HmacDomain, MasterKey, Subkeys};
+use crate::crypto::{
+    decrypt_padded_aead_object, verify_hmac, AeadObjectContext, HmacDomain, MasterKey, Subkeys,
+};
 use crate::fec::repair_data_gf16;
 use crate::format::{
     BlockKind, ExtractError, FormatError, BLOCK_RECORD_FRAMING_LEN, VOLUME_HEADER_LEN,
@@ -429,26 +431,33 @@ where
                 handle_live_record(
                     record,
                     &mut pending,
-                    &mut payload,
-                    &subkeys,
-                    &volume_header,
-                    &crypto_header,
-                    &mut next_envelope_index,
-                    &mut metadata_seen,
-                    &mut metadata_blocks,
-                    &mut retained_metadata_bytes,
-                    options.max_retained_metadata_bytes,
+                    LiveStreamContext {
+                        payload: &mut payload,
+                        subkeys: &subkeys,
+                        volume_header: &volume_header,
+                        crypto_header: &crypto_header,
+                        next_envelope_index: &mut next_envelope_index,
+                        metadata_seen: &mut metadata_seen,
+                        metadata_blocks: &mut metadata_blocks,
+                        retained_metadata_bytes: &mut retained_metadata_bytes,
+                        max_retained_metadata_bytes: options.max_retained_metadata_bytes,
+                    },
                 )?;
             }
             Err(err) if block_record_error_is_recoverable_erasure(&err) => {
                 handle_live_erasure(
                     &mut pending,
-                    &mut payload,
-                    &subkeys,
-                    &volume_header,
-                    &crypto_header,
-                    &mut next_envelope_index,
-                    &mut metadata_seen,
+                    LiveStreamContext {
+                        payload: &mut payload,
+                        subkeys: &subkeys,
+                        volume_header: &volume_header,
+                        crypto_header: &crypto_header,
+                        next_envelope_index: &mut next_envelope_index,
+                        metadata_seen: &mut metadata_seen,
+                        metadata_blocks: &mut metadata_blocks,
+                        retained_metadata_bytes: &mut retained_metadata_bytes,
+                        max_retained_metadata_bytes: options.max_retained_metadata_bytes,
+                    },
                     expected_block_index,
                 )?;
             }
@@ -780,22 +789,26 @@ fn validate_sequential_verify_supported_volume(
     Ok(())
 }
 
+struct LiveStreamContext<'a, O: TarStreamObserver> {
+    payload: &'a mut StreamedPayloadCollector<O>,
+    subkeys: &'a Subkeys,
+    volume_header: &'a VolumeHeader,
+    crypto_header: &'a CryptoHeaderFixed,
+    next_envelope_index: &'a mut u64,
+    metadata_seen: &'a mut bool,
+    metadata_blocks: &'a mut BTreeMap<u64, BlockRecord>,
+    retained_metadata_bytes: &'a mut usize,
+    max_retained_metadata_bytes: usize,
+}
+
 fn handle_live_record<O: TarStreamObserver>(
     record: BlockRecord,
     pending: &mut PendingLiveEnvelope,
-    payload: &mut StreamedPayloadCollector<O>,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
-    next_envelope_index: &mut u64,
-    metadata_seen: &mut bool,
-    metadata_blocks: &mut BTreeMap<u64, BlockRecord>,
-    retained_metadata_bytes: &mut usize,
-    max_retained_metadata_bytes: usize,
+    context: LiveStreamContext<'_, O>,
 ) -> Result<(), FormatError> {
     match record.kind {
         BlockKind::PayloadData => {
-            if *metadata_seen {
+            if *context.metadata_seen {
                 return Err(FormatError::InvalidArchive(
                     "payload BlockRecord appears after metadata",
                 ));
@@ -808,11 +821,11 @@ fn handle_live_record<O: TarStreamObserver>(
             if pending.saw_last_data {
                 finalize_live_envelope(
                     pending,
-                    payload,
-                    subkeys,
-                    volume_header,
-                    crypto_header,
-                    next_envelope_index,
+                    &mut *context.payload,
+                    context.subkeys,
+                    context.volume_header,
+                    context.crypto_header,
+                    &mut *context.next_envelope_index,
                 )?;
             }
             pending.note_block(record.block_index);
@@ -821,14 +834,14 @@ fn handle_live_record<O: TarStreamObserver>(
             if is_last_data {
                 pending.saw_last_data = true;
             }
-            if pending.data_shards.len() > crypto_header.fec_data_shards as usize {
+            if pending.data_shards.len() > context.crypto_header.fec_data_shards as usize {
                 return Err(FormatError::InvalidArchive(
                     "sequential payload envelope exceeds data-shard cap",
                 ));
             }
         }
         BlockKind::PayloadParity => {
-            if *metadata_seen {
+            if *context.metadata_seen {
                 return Err(FormatError::InvalidArchive(
                     "payload parity BlockRecord appears after metadata",
                 ));
@@ -843,7 +856,7 @@ fn handle_live_record<O: TarStreamObserver>(
             }
             pending.note_block(record.block_index);
             pending.parity_shards.push(Some(record.payload));
-            if pending.parity_shards.len() > crypto_header.fec_parity_shards as usize {
+            if pending.parity_shards.len() > context.crypto_header.fec_parity_shards as usize {
                 return Err(FormatError::InvalidArchive(
                     "sequential payload envelope exceeds parity-shard cap",
                 ));
@@ -853,19 +866,19 @@ fn handle_live_record<O: TarStreamObserver>(
             if !pending.is_empty() {
                 finalize_live_envelope(
                     pending,
-                    payload,
-                    subkeys,
-                    volume_header,
-                    crypto_header,
-                    next_envelope_index,
+                    &mut *context.payload,
+                    context.subkeys,
+                    context.volume_header,
+                    context.crypto_header,
+                    &mut *context.next_envelope_index,
                 )?;
             }
-            *metadata_seen = true;
+            *context.metadata_seen = true;
             retain_metadata_record(
-                metadata_blocks,
+                &mut *context.metadata_blocks,
                 record,
-                retained_metadata_bytes,
-                max_retained_metadata_bytes,
+                &mut *context.retained_metadata_bytes,
+                context.max_retained_metadata_bytes,
             )?;
         }
     }
@@ -899,30 +912,26 @@ fn retain_metadata_record(
 
 fn handle_live_erasure<O: TarStreamObserver>(
     pending: &mut PendingLiveEnvelope,
-    payload: &mut StreamedPayloadCollector<O>,
-    subkeys: &Subkeys,
-    volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
-    next_envelope_index: &mut u64,
-    metadata_seen: &mut bool,
+    context: LiveStreamContext<'_, O>,
     expected_block_index: u64,
 ) -> Result<(), FormatError> {
-    if *metadata_seen {
+    if *context.metadata_seen {
         return Ok(());
     }
     if pending.saw_last_data
         && pending.parity_shards.len()
-            >= required_object_parity(pending.data_shards.len() as u64, crypto_header)? as usize
+            >= required_object_parity(pending.data_shards.len() as u64, context.crypto_header)?
+                as usize
     {
         finalize_live_envelope(
             pending,
-            payload,
-            subkeys,
-            volume_header,
-            crypto_header,
-            next_envelope_index,
+            &mut *context.payload,
+            context.subkeys,
+            context.volume_header,
+            context.crypto_header,
+            &mut *context.next_envelope_index,
         )?;
-        *metadata_seen = true;
+        *context.metadata_seen = true;
         return Ok(());
     }
     if pending.saw_last_data {
@@ -930,7 +939,7 @@ fn handle_live_erasure<O: TarStreamObserver>(
             structure: "BlockRecord",
         });
     }
-    if !sequential_payload_parity_is_guaranteed(crypto_header) {
+    if !sequential_payload_parity_is_guaranteed(context.crypto_header) {
         return Err(FormatError::BadCrc {
             structure: "BlockRecord",
         });
@@ -938,7 +947,7 @@ fn handle_live_erasure<O: TarStreamObserver>(
     pending.note_block(expected_block_index);
     pending.data_shards.push(None);
     pending.awaiting_tentative_parity = true;
-    if pending.data_shards.len() > crypto_header.fec_data_shards as usize {
+    if pending.data_shards.len() > context.crypto_header.fec_data_shards as usize {
         return Err(FormatError::InvalidArchive(
             "sequential payload envelope exceeds data-shard cap",
         ));
@@ -996,13 +1005,15 @@ fn finalize_live_envelope<O: TarStreamObserver>(
         encrypted.extend_from_slice(&shard);
     }
     let plaintext = decrypt_padded_aead_object(
-        crypto_header.aead_algo,
-        &subkeys.enc_key,
-        &subkeys.nonce_seed,
-        b"envelope",
-        &volume_header.archive_uuid,
-        &volume_header.session_id,
-        *next_envelope_index,
+        AeadObjectContext {
+            algo: crypto_header.aead_algo,
+            key: &subkeys.enc_key,
+            nonce_seed: &subkeys.nonce_seed,
+            domain: b"envelope",
+            archive_uuid: &volume_header.archive_uuid,
+            session_id: &volume_header.session_id,
+            counter: *next_envelope_index,
+        },
         &encrypted,
     )?;
     payload.decode_envelope(

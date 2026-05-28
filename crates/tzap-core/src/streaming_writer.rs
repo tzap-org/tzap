@@ -6,7 +6,7 @@ use crate::metadata::{
     normalize_lookup_file_path, validate_directory_path_bytes, validate_file_path_bytes,
 };
 use crate::writer::{
-    write_single_pass_archive_to_sink, ArchiveWriteSink, MemoryArchiveSink, RootAuthSigningRequest,
+    write_single_pass_archive_to_sink, ArchiveWriteSink, MemoryArchiveSink, RootAuthAuthenticator,
     RootAuthWriterConfig, StreamingRegularMember, WriterOptions, WrittenArchive,
     WrittenArchiveSummary,
 };
@@ -114,7 +114,7 @@ pub fn write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth<R, O>(
     options: WriterOptions,
     kdf_params: &KdfParams,
     root_auth: Option<RootAuthWriterConfig<'_>>,
-    authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
     sink: &mut O,
 ) -> Result<StreamingRawWriterSummary, ArchiveWriteError>
 where
@@ -167,7 +167,7 @@ pub fn write_tar_stream_archive_to_sink_with_kdf_and_root_auth<R, O>(
     options: WriterOptions,
     kdf_params: &KdfParams,
     root_auth: Option<RootAuthWriterConfig<'_>>,
-    authenticator: Option<&mut dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
     sink: &mut O,
 ) -> Result<StreamingTarWriterSummary, ArchiveWriteError>
 where

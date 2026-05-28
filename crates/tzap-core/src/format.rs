@@ -260,10 +260,10 @@ pub enum FormatError {
     CryptoHeaderLengthMismatch { fixed: u32, volume: u32 },
 
     #[error("compression algorithm {0:?} is not valid for v0.41")]
-    UnsupportedCompressionForV36(CompressionAlgo),
+    UnsupportedCompression(CompressionAlgo),
 
     #[error("FEC algorithm {0:?} is not valid for v0.41")]
-    UnsupportedFecForV36(FecAlgo),
+    UnsupportedFec(FecAlgo),
 
     #[error("invalid boolean field {field}={value}")]
     InvalidBoolean { field: &'static str, value: u8 },

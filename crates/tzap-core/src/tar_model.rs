@@ -64,17 +64,9 @@ impl ParsedTarMember<'_> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SafeExtractionOptions {
     pub overwrite_existing: bool,
-}
-
-impl Default for SafeExtractionOptions {
-    fn default() -> Self {
-        Self {
-            overwrite_existing: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

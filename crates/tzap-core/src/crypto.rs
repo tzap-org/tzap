@@ -329,50 +329,59 @@ pub fn aead_decrypt(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AeadObjectContext<'a> {
+    pub algo: AeadAlgo,
+    pub key: &'a [u8; SUBKEY_LEN],
+    pub nonce_seed: &'a [u8; SUBKEY_LEN],
+    pub domain: &'a [u8],
+    pub archive_uuid: &'a [u8; 16],
+    pub session_id: &'a [u8; 16],
+    pub counter: u64,
+}
+
 pub fn encrypt_padded_aead_object(
-    algo: AeadAlgo,
-    key: &[u8; SUBKEY_LEN],
-    nonce_seed: &[u8; SUBKEY_LEN],
-    domain: &[u8],
-    archive_uuid: &[u8; 16],
-    session_id: &[u8; 16],
-    counter: u64,
+    context: AeadObjectContext<'_>,
     block_size: usize,
     payload: &[u8],
 ) -> Result<Vec<u8>, FormatError> {
     let nonce = derive_nonce(
-        nonce_seed,
-        domain,
-        archive_uuid,
-        session_id,
-        counter,
-        algo.nonce_len(),
+        context.nonce_seed,
+        context.domain,
+        context.archive_uuid,
+        context.session_id,
+        context.counter,
+        context.algo.nonce_len(),
     )?;
-    let aad = build_aad(domain, archive_uuid, session_id, counter)?;
-    let padded = suffix_pad_for_aead(payload, algo.tag_len(), block_size)?;
-    aead_encrypt(algo, key, &nonce, &aad, &padded)
+    let aad = build_aad(
+        context.domain,
+        context.archive_uuid,
+        context.session_id,
+        context.counter,
+    )?;
+    let padded = suffix_pad_for_aead(payload, context.algo.tag_len(), block_size)?;
+    aead_encrypt(context.algo, context.key, &nonce, &aad, &padded)
 }
 
 pub fn decrypt_padded_aead_object(
-    algo: AeadAlgo,
-    key: &[u8; SUBKEY_LEN],
-    nonce_seed: &[u8; SUBKEY_LEN],
-    domain: &[u8],
-    archive_uuid: &[u8; 16],
-    session_id: &[u8; 16],
-    counter: u64,
+    context: AeadObjectContext<'_>,
     ciphertext_and_tag: &[u8],
 ) -> Result<Vec<u8>, FormatError> {
     let nonce = derive_nonce(
-        nonce_seed,
-        domain,
-        archive_uuid,
-        session_id,
-        counter,
-        algo.nonce_len(),
+        context.nonce_seed,
+        context.domain,
+        context.archive_uuid,
+        context.session_id,
+        context.counter,
+        context.algo.nonce_len(),
     )?;
-    let aad = build_aad(domain, archive_uuid, session_id, counter)?;
-    let padded = aead_decrypt(algo, key, &nonce, &aad, ciphertext_and_tag)?;
+    let aad = build_aad(
+        context.domain,
+        context.archive_uuid,
+        context.session_id,
+        context.counter,
+    )?;
+    let padded = aead_decrypt(context.algo, context.key, &nonce, &aad, ciphertext_and_tag)?;
     Ok(depad_suffix_padding(&padded)?.to_vec())
 }
 
@@ -405,7 +414,7 @@ fn parse_argon2id_kdf_params(bytes: &[u8]) -> Result<(KdfParams, usize), FormatE
     let m_cost_kib = read_u32(bytes, 6)?;
     let parallelism = read_u32(bytes, 10)?;
     let salt_length = read_u16(bytes, 14)?;
-    if salt_length < ARGON2ID_MIN_SALT_LEN || salt_length > ARGON2ID_MAX_SALT_LEN {
+    if !(ARGON2ID_MIN_SALT_LEN..=ARGON2ID_MAX_SALT_LEN).contains(&salt_length) {
         return Err(FormatError::InvalidKdfParams(
             "argon2id salt length must be 8..64 bytes",
         ));
@@ -443,7 +452,7 @@ fn validate_argon2id_bounds(
     parallelism: u32,
     salt_length: u16,
 ) -> Result<(), FormatError> {
-    if salt_length < ARGON2ID_MIN_SALT_LEN || salt_length > ARGON2ID_MAX_SALT_LEN {
+    if !(ARGON2ID_MIN_SALT_LEN..=ARGON2ID_MAX_SALT_LEN).contains(&salt_length) {
         return Err(FormatError::InvalidKdfParams(
             "argon2id salt length must be 8..64 bytes",
         ));
@@ -750,7 +759,7 @@ mod tests {
             parallelism: 1,
             salt: b"12345678".to_vec(),
         };
-        let v36 = MasterKey::derive_from_passphrase(&params, "e\u{301}").unwrap();
+        let current = MasterKey::derive_from_passphrase(&params, "e\u{301}").unwrap();
 
         let argon_params = Params::new(8, 1, 1, Some(MASTER_KEY_LEN)).unwrap();
         let old_argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x10, argon_params);
@@ -761,10 +770,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            hex::encode(v36.0),
+            hex::encode(current.0),
             "24709642204c04bf88fb36550c478769eb10a0400c0493c9695d30fbf7082241"
         );
-        assert_ne!(old_output, v36.0);
+        assert_ne!(old_output, current.0);
     }
 
     #[test]
@@ -946,18 +955,19 @@ mod tests {
         let domain = b"idxroot";
 
         let ciphertext = encrypt_padded_aead_object(
-            AeadAlgo::AesGcmSiv256,
-            &key,
-            &nonce_seed,
-            domain,
-            &uuid,
-            &session,
-            counter,
+            AeadObjectContext {
+                algo: AeadAlgo::AesGcmSiv256,
+                key: &key,
+                nonce_seed: &nonce_seed,
+                domain,
+                archive_uuid: &uuid,
+                session_id: &session,
+                counter,
+            },
             4096,
             b"index-root",
         )
         .unwrap();
-
         let mut legacy_nonce = vec![0u8; AeadAlgo::AesGcmSiv256.nonce_len()];
         Hkdf::<Sha256>::from_prk(&nonce_seed)
             .unwrap()
@@ -1043,42 +1053,29 @@ mod tests {
     fn padded_aead_object_round_trips_with_derived_nonce_and_aad() {
         let key = [0x66; SUBKEY_LEN];
         let nonce_seed = [0x77; SUBKEY_LEN];
-        let ciphertext = encrypt_padded_aead_object(
-            AeadAlgo::AesGcmSiv256,
-            &key,
-            &nonce_seed,
-            b"envelope",
-            &uuid(),
-            &session(),
-            3,
-            4096,
-            b"packed frames",
-        )
-        .unwrap();
+        let uuid = uuid();
+        let session = session();
+        let context = AeadObjectContext {
+            algo: AeadAlgo::AesGcmSiv256,
+            key: &key,
+            nonce_seed: &nonce_seed,
+            domain: b"envelope",
+            archive_uuid: &uuid,
+            session_id: &session,
+            counter: 3,
+        };
+        let ciphertext = encrypt_padded_aead_object(context, 4096, b"packed frames").unwrap();
         assert_eq!(ciphertext.len() % 4096, 0);
 
-        let plaintext = decrypt_padded_aead_object(
-            AeadAlgo::AesGcmSiv256,
-            &key,
-            &nonce_seed,
-            b"envelope",
-            &uuid(),
-            &session(),
-            3,
-            &ciphertext,
-        )
-        .unwrap();
+        let plaintext = decrypt_padded_aead_object(context, &ciphertext).unwrap();
         assert_eq!(plaintext, b"packed frames");
 
         assert_eq!(
             decrypt_padded_aead_object(
-                AeadAlgo::AesGcmSiv256,
-                &key,
-                &nonce_seed,
-                b"idxroot",
-                &uuid(),
-                &session(),
-                3,
+                AeadObjectContext {
+                    domain: b"idxroot",
+                    ..context
+                },
                 &ciphertext,
             )
             .unwrap_err(),
@@ -1094,13 +1091,15 @@ mod tests {
         let session = session();
 
         let ciphertext = encrypt_padded_aead_object(
-            AeadAlgo::AesGcmSiv256,
-            &key,
-            &nonce_seed,
-            b"idxroot",
-            &uuid,
-            &session,
-            0,
+            AeadObjectContext {
+                algo: AeadAlgo::AesGcmSiv256,
+                key: &key,
+                nonce_seed: &nonce_seed,
+                domain: b"idxroot",
+                archive_uuid: &uuid,
+                session_id: &session,
+                counter: 0,
+            },
             4096,
             b"index-root-meta",
         )

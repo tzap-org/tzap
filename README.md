@@ -191,6 +191,8 @@ tzap signing-keygen --secret-output root.signing.hex --public-output root.public
 tzap create --keyfile project.key --signing-key root.signing.hex -o signed.tzap ./project
 tzap verify --keyfile project.key --trusted-public-key root.public.hex signed.tzap
 tzap verify --public-no-key --trusted-public-key root.public.hex signed.tzap
+tzap create --keyfile project.key --signing-cert signer.pem --signing-private-key signer.key -o signed-x509.tzap ./project
+tzap verify --public-no-key --trusted-ca-cert root-ca.pem signed-x509.tzap
 ```
 
 ## Multi-volume workflow (recoverable)
@@ -383,6 +385,8 @@ Important `verify` options:
 - `--trusted-public-key <path>`: require Ed25519 RootAuth verification
 - `--public-no-key`: verify signed public RootAuth commitments without the
   archive key
+- `--trusted-ca-cert <path>` / `--trusted-system-roots`: verify X.509 RootAuth
+  signatures, including public no-key verification
 - `--json`: emit machine-readable verification status
 
 Stable diagnostics cover key validation, archive integrity, revision
@@ -440,7 +444,7 @@ crates/tzap-core   Format parsing, validation, crypto, compression, FEC, reader,
                    writer, metadata, and safe extraction primitives.
 crates/tzap-cli    Command-line interface for create, extract, list, and verify.
 crates/tzap-plugin-signing
-                   RootAuth signing profiles, including Ed25519 raw signing.
+                   RootAuth signing profiles, including Ed25519 raw and X.509.
 specs/             tzap archive format specification.
 fuzz/              Parser fuzz targets, deterministic seeds, and fuzz smoke.
 ```

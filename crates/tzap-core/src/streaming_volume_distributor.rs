@@ -97,20 +97,8 @@ where
         Self::begin(sink, StreamingVolumeMode::FixedMultiVolume { volume_count })
     }
 
-    pub fn stripe_width(&self) -> usize {
-        self.stripe_width
-    }
-
-    pub fn next_block_index(&self) -> u64 {
-        self.next_block_index
-    }
-
     pub fn progress(&self) -> Vec<StreamingVolumeProgress> {
         self.volumes.iter().map(|volume| volume.progress).collect()
-    }
-
-    pub fn volume_progress(&self, volume_index: usize) -> Option<StreamingVolumeProgress> {
-        self.volumes.get(volume_index).map(|volume| volume.progress)
     }
 
     pub fn write_volume_preamble(
@@ -187,10 +175,6 @@ where
         }
         volume.progress.terminal_offset = Some(offset);
         Ok(offset)
-    }
-
-    pub fn write_bootstrap_sidecar(&mut self, bytes: &[u8]) -> Result<(), ArchiveWriteError> {
-        self.sink.write_bootstrap_sidecar(bytes)
     }
 
     pub fn finish(self) -> Result<(S, StreamingVolumeSetSummary), ArchiveWriteError> {

@@ -16,9 +16,8 @@ pub mod tar_model;
 pub mod wire;
 pub mod writer;
 
-#[allow(dead_code)]
 mod raw_stream_profile;
-#[allow(dead_code)]
+#[cfg(test)]
 mod streaming_volume_distributor;
 mod streaming_writer;
 

@@ -193,18 +193,16 @@ impl CryptoHeaderFixed {
             max_path_length: read_u32(bytes, 48)?,
             expected_volume_size: read_u64(bytes, 52)?,
         };
-        header.validate_v36()?;
+        header.validate_supported_profile()?;
         Ok(header)
     }
 
-    pub fn validate_v36(&self) -> Result<(), FormatError> {
+    pub fn validate_supported_profile(&self) -> Result<(), FormatError> {
         if self.compression_algo != CompressionAlgo::ZstdFramed {
-            return Err(FormatError::UnsupportedCompressionForV36(
-                self.compression_algo,
-            ));
+            return Err(FormatError::UnsupportedCompression(self.compression_algo));
         }
         if self.fec_algo != FecAlgo::ReedSolomonGF16 {
-            return Err(FormatError::UnsupportedFecForV36(self.fec_algo));
+            return Err(FormatError::UnsupportedFec(self.fec_algo));
         }
         if self.has_dictionary > 1 {
             return Err(FormatError::InvalidBoolean {
@@ -1982,12 +1980,12 @@ mod tests {
     }
 
     #[test]
-    fn crypto_header_fixed_rejects_v36_incompatible_values() {
+    fn crypto_header_fixed_rejects_unsupported_profile_values() {
         let mut header = crypto_fixed();
         header.compression_algo = CompressionAlgo::None;
         assert_eq!(
             CryptoHeaderFixed::parse(&header.to_bytes(), header.length).unwrap_err(),
-            FormatError::UnsupportedCompressionForV36(CompressionAlgo::None)
+            FormatError::UnsupportedCompression(CompressionAlgo::None)
         );
 
         let mut header = crypto_fixed();
@@ -2044,7 +2042,7 @@ mod tests {
                     fec_algo: FecAlgo::None,
                     ..crypto_fixed()
                 },
-                FormatError::UnsupportedFecForV36(FecAlgo::None),
+                FormatError::UnsupportedFec(FecAlgo::None),
             ),
             (
                 "unsupported FEC Wirehair",
@@ -2052,7 +2050,7 @@ mod tests {
                     fec_algo: FecAlgo::Wirehair,
                     ..crypto_fixed()
                 },
-                FormatError::UnsupportedFecForV36(FecAlgo::Wirehair),
+                FormatError::UnsupportedFec(FecAlgo::Wirehair),
             ),
             (
                 "invalid dictionary flag",

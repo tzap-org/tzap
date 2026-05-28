@@ -20,16 +20,11 @@ impl ExplicitPlaintextSpool {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct KnownSizePlaintextSource<'a> {
-    path: &'a Path,
+pub(crate) struct KnownSizePlaintextSource {
     size: u64,
 }
 
-impl<'a> KnownSizePlaintextSource<'a> {
-    pub(crate) fn path(&self) -> &'a Path {
-        self.path
-    }
-
+impl KnownSizePlaintextSource {
     pub(crate) fn size(&self) -> u64 {
         self.size
     }
@@ -43,11 +38,13 @@ pub(crate) struct PlaintextSpool {
 }
 
 impl PlaintextSpool {
-    pub(crate) fn known_size_source(&self) -> KnownSizePlaintextSource<'_> {
-        KnownSizePlaintextSource {
-            path: &self.path,
-            size: self.size,
-        }
+    pub(crate) fn known_size_source(&self) -> KnownSizePlaintextSource {
+        KnownSizePlaintextSource { size: self.size }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     pub(crate) fn reopen(&self) -> Result<File> {
@@ -182,7 +179,7 @@ mod tests {
         )
         .unwrap();
         let source = spool.known_size_source();
-        let spool_path = source.path().to_path_buf();
+        let spool_path = spool.path().to_path_buf();
 
         assert_eq!(source.size(), 15);
         assert!(spool_path.exists());
@@ -240,11 +237,7 @@ mod tests {
             explicit(),
         )
         .unwrap();
-        let mode = fs::metadata(spool.known_size_source().path())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
+        let mode = fs::metadata(spool.path()).unwrap().permissions().mode() & 0o777;
 
         assert_eq!(mode, 0o600);
     }

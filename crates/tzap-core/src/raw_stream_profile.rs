@@ -2,17 +2,24 @@ use crate::format::FormatError;
 use crate::wire::ExtensionTlv;
 
 pub const RAW_STREAM_CONTENT_MODEL_EXTENSION_TAG: u16 = 0x0007;
+#[cfg(test)]
 pub const RAW_STREAM_CONTENT_MODEL_EXTENSION_CRITICAL_TAG: u16 =
     0x8000 | RAW_STREAM_CONTENT_MODEL_EXTENSION_TAG;
 pub const RAW_STREAM_CONTENT_MODEL_VALUE: &[u8] = b"raw_stream_v1";
 pub const RAW_STREAM_UNSUPPORTED_MESSAGE: &str =
     "raw-stream content profile is not supported by the base v41 tar reader";
 
+#[cfg(test)]
 pub const RAW_STREAM_INDEX_ROOT_V1_MAGIC: [u8; 8] = *b"TZRSIDX1";
+#[cfg(test)]
 pub const RAW_STREAM_INDEX_ROOT_V1_VERSION: u16 = 1;
+#[cfg(test)]
 pub const RAW_STREAM_INDEX_ROOT_V1_LEN: usize = 112;
+#[cfg(test)]
 pub const RAW_FILE_ENTRY_V1_LEN: usize = 88;
+#[cfg(test)]
 pub const RAW_FRAME_ENTRY_V1_LEN: usize = 48;
+#[cfg(test)]
 pub const RAW_ENVELOPE_ENTRY_V1_LEN: usize = 56;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +28,7 @@ pub enum ContentProfile {
     RawStreamV1,
 }
 
+#[cfg(test)]
 pub fn serialize_raw_stream_content_model_extension() -> Vec<u8> {
     let mut bytes = Vec::with_capacity(6 + RAW_STREAM_CONTENT_MODEL_VALUE.len());
     bytes.extend_from_slice(&RAW_STREAM_CONTENT_MODEL_EXTENSION_CRITICAL_TAG.to_le_bytes());
@@ -67,6 +75,7 @@ pub fn reject_unsupported_raw_stream_profile(
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawStreamIndexRootV1 {
     pub file_count: u32,
@@ -82,6 +91,7 @@ pub struct RawStreamIndexRootV1 {
     pub string_pool_size: u32,
 }
 
+#[cfg(test)]
 impl RawStreamIndexRootV1 {
     pub fn parse(bytes: &[u8]) -> Result<Self, FormatError> {
         expect_len(
@@ -138,6 +148,7 @@ impl RawStreamIndexRootV1 {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawFileEntryV1 {
     pub path_hash: [u8; 8],
@@ -151,6 +162,7 @@ pub struct RawFileEntryV1 {
     pub content_sha256: [u8; 32],
 }
 
+#[cfg(test)]
 impl RawFileEntryV1 {
     pub fn parse(bytes: &[u8]) -> Result<Self, FormatError> {
         expect_len("RawFileEntryV1", RAW_FILE_ENTRY_V1_LEN, bytes.len())?;
@@ -183,6 +195,7 @@ impl RawFileEntryV1 {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawFrameEntryV1 {
     pub frame_index: u64,
@@ -193,6 +206,7 @@ pub struct RawFrameEntryV1 {
     pub raw_stream_offset: u64,
 }
 
+#[cfg(test)]
 impl RawFrameEntryV1 {
     pub fn parse(bytes: &[u8]) -> Result<Self, FormatError> {
         expect_len("RawFrameEntryV1", RAW_FRAME_ENTRY_V1_LEN, bytes.len())?;
@@ -220,6 +234,7 @@ impl RawFrameEntryV1 {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawEnvelopeEntryV1 {
     pub envelope_index: u64,
@@ -232,6 +247,7 @@ pub struct RawEnvelopeEntryV1 {
     pub frame_count: u64,
 }
 
+#[cfg(test)]
 impl RawEnvelopeEntryV1 {
     pub fn parse(bytes: &[u8]) -> Result<Self, FormatError> {
         expect_len("RawEnvelopeEntryV1", RAW_ENVELOPE_ENTRY_V1_LEN, bytes.len())?;
@@ -262,6 +278,7 @@ impl RawEnvelopeEntryV1 {
     }
 }
 
+#[cfg(test)]
 fn expect_len(structure: &'static str, expected: usize, actual: usize) -> Result<(), FormatError> {
     if actual != expected {
         return Err(FormatError::InvalidLength {
@@ -273,6 +290,7 @@ fn expect_len(structure: &'static str, expected: usize, actual: usize) -> Result
     Ok(())
 }
 
+#[cfg(test)]
 fn expect_magic(
     structure: &'static str,
     expected: [u8; 8],
@@ -284,6 +302,7 @@ fn expect_magic(
     Ok(())
 }
 
+#[cfg(test)]
 fn expect_zero(structure: &'static str, bytes: &[u8]) -> Result<(), FormatError> {
     if bytes.iter().any(|byte| *byte != 0) {
         return Err(FormatError::NonZeroReserved { structure });
@@ -291,6 +310,7 @@ fn expect_zero(structure: &'static str, bytes: &[u8]) -> Result<(), FormatError>
     Ok(())
 }
 
+#[cfg(test)]
 fn read_array_8(
     bytes: &[u8],
     offset: usize,
@@ -311,6 +331,7 @@ fn read_array_8(
         })
 }
 
+#[cfg(test)]
 fn read_array_32(
     bytes: &[u8],
     offset: usize,
@@ -331,6 +352,7 @@ fn read_array_32(
         })
 }
 
+#[cfg(test)]
 fn read_u16(bytes: &[u8], offset: usize, structure: &'static str) -> Result<u16, FormatError> {
     let raw = bytes
         .get(offset..offset + 2)
@@ -348,6 +370,7 @@ fn read_u16(bytes: &[u8], offset: usize, structure: &'static str) -> Result<u16,
     })?))
 }
 
+#[cfg(test)]
 fn read_u32(bytes: &[u8], offset: usize, structure: &'static str) -> Result<u32, FormatError> {
     let raw = bytes
         .get(offset..offset + 4)
@@ -365,6 +388,7 @@ fn read_u32(bytes: &[u8], offset: usize, structure: &'static str) -> Result<u32,
     })?))
 }
 
+#[cfg(test)]
 fn read_u64(bytes: &[u8], offset: usize, structure: &'static str) -> Result<u64, FormatError> {
     let raw = bytes
         .get(offset..offset + 8)
@@ -382,14 +406,17 @@ fn read_u64(bytes: &[u8], offset: usize, structure: &'static str) -> Result<u64,
     })?))
 }
 
+#[cfg(test)]
 fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
     bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
+#[cfg(test)]
 fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+#[cfg(test)]
 fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
@@ -545,7 +572,7 @@ mod tests {
             value: b"ignored by base v41",
         };
 
-        validate_crypto_extension_semantics(&[extension.clone()]).unwrap();
+        validate_crypto_extension_semantics(std::slice::from_ref(&extension)).unwrap();
         assert_eq!(
             content_profile_from_extensions(&[extension]).unwrap(),
             ContentProfile::TarMemberV41
