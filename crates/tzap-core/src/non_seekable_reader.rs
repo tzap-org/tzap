@@ -38,8 +38,6 @@ const DEFAULT_MAX_STREAMED_MEMBER_COUNT: u64 = 1_000_000;
 pub enum SequentialRootAuthStatus {
     Absent,
     WireValidOnly,
-    Deferred,
-    Verified,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

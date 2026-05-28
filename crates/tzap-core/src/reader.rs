@@ -153,6 +153,7 @@ pub struct ExtractedArchiveMember {
 pub struct OpenedArchive {
     options: ReaderOptions,
     observed_archive_bytes: u64,
+    observed_volume_count: u32,
     subkeys: Subkeys,
     blocks: BTreeMap<u64, BlockRecord>,
     lazy_blocks: Option<Arc<SeekableBlockSource>>,
@@ -166,6 +167,61 @@ pub struct OpenedArchive {
     payload_dictionary: Option<Vec<u8>>,
 }
 
+#[derive(Debug)]
+pub struct ArchiveContentVerification<'a> {
+    archive: &'a OpenedArchive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootAuthDiagnostic {
+    RootAuthContentVerified,
+    RootAuthDeferredFullArchiveScanRequired,
+    AuthenticatedMetadataNotRootSigned,
+    RecoveryMarginNotRootAuthenticated,
+    ReplicatedGlobalCopyUncheckedDueToVolumeLoss,
+    RecoveryMarginChecked,
+    RecoveryMarginFailed,
+    RecoveryMarginUnchecked,
+}
+
+impl RootAuthDiagnostic {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RootAuthContentVerified => "root_auth_content_verified",
+            Self::RootAuthDeferredFullArchiveScanRequired => {
+                "root_auth_deferred_full_archive_scan_required"
+            }
+            Self::AuthenticatedMetadataNotRootSigned => "authenticated_metadata_not_root_signed",
+            Self::RecoveryMarginNotRootAuthenticated => "recovery_margin_not_root_authenticated",
+            Self::ReplicatedGlobalCopyUncheckedDueToVolumeLoss => {
+                "replicated_global_copy_unchecked_due_to_volume_loss"
+            }
+            Self::RecoveryMarginChecked => "recovery_margin_checked",
+            Self::RecoveryMarginFailed => "recovery_margin_failed",
+            Self::RecoveryMarginUnchecked => "recovery_margin_unchecked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicNoKeyDiagnostic {
+    PublicDataBlockCommitmentVerified,
+    PublicPhysicalCompletenessUnverified,
+    PublicRecoveryMarginUnchecked,
+}
+
+impl PublicNoKeyDiagnostic {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PublicDataBlockCommitmentVerified => "public_data_block_commitment_verified",
+            Self::PublicPhysicalCompletenessUnverified => {
+                "public_physical_completeness_unverified"
+            }
+            Self::PublicRecoveryMarginUnchecked => "public_recovery_margin_unchecked",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootAuthVerification {
     pub archive_root: [u8; 32],
@@ -173,6 +229,7 @@ pub struct RootAuthVerification {
     pub signer_identity_type: u16,
     pub signer_identity_bytes: Vec<u8>,
     pub total_data_block_count: u64,
+    pub diagnostics: Vec<RootAuthDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +239,7 @@ pub struct PublicNoKeyVerification {
     pub signer_identity_type: u16,
     pub signer_identity_bytes: Vec<u8>,
     pub total_data_block_count: u64,
+    pub diagnostics: Vec<PublicNoKeyDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,6 +567,25 @@ impl OpenedArchive {
         }
     }
 
+    fn missing_volume_count(&self) -> u32 {
+        self.crypto_header
+            .stripe_width
+            .saturating_sub(self.observed_volume_count)
+    }
+
+    fn root_auth_success_diagnostics(&self) -> Vec<RootAuthDiagnostic> {
+        let mut diagnostics = vec![
+            RootAuthDiagnostic::RootAuthContentVerified,
+            RootAuthDiagnostic::AuthenticatedMetadataNotRootSigned,
+            RootAuthDiagnostic::RecoveryMarginNotRootAuthenticated,
+        ];
+        if self.missing_volume_count() > 0 {
+            diagnostics.push(RootAuthDiagnostic::ReplicatedGlobalCopyUncheckedDueToVolumeLoss);
+        }
+        diagnostics.push(RootAuthDiagnostic::RecoveryMarginUnchecked);
+        diagnostics
+    }
+
     pub fn open_with_options(
         bytes: &[u8],
         master_key: &MasterKey,
@@ -674,6 +751,7 @@ impl OpenedArchive {
         Ok(Self {
             options,
             observed_archive_bytes,
+            observed_volume_count,
             subkeys: first.subkeys,
             blocks,
             lazy_blocks: None,
@@ -954,6 +1032,7 @@ impl OpenedArchive {
         Ok(Self {
             options,
             observed_archive_bytes,
+            observed_volume_count,
             subkeys: first.subkeys,
             blocks,
             lazy_blocks: Some(lazy_source),
@@ -1159,6 +1238,7 @@ impl OpenedArchive {
         Ok(Self {
             options,
             observed_archive_bytes,
+            observed_volume_count: 1,
             subkeys,
             blocks,
             lazy_blocks: None,
@@ -1301,6 +1381,10 @@ impl OpenedArchive {
     }
 
     pub fn verify(&self) -> Result<(), FormatError> {
+        self.verify_content().map(|_| ())
+    }
+
+    pub fn verify_content(&self) -> Result<ArchiveContentVerification<'_>, FormatError> {
         if let Some(source) = &self.lazy_blocks {
             if source.is_complete_volume_set() {
                 source.validate_complete_coverage()?;
@@ -1450,7 +1534,7 @@ impl OpenedArchive {
             validate_directory_hint_tables_against_expected(&hint_tables, &directory_hint_map)?;
         }
 
-        Ok(())
+        Ok(ArchiveContentVerification { archive: self })
     }
 
     pub(crate) fn from_streamed_parts(
@@ -1488,6 +1572,7 @@ impl OpenedArchive {
         Ok(Self {
             options: parts.options,
             observed_archive_bytes: parts.observed_archive_bytes,
+            observed_volume_count: 1,
             subkeys: parts.subkeys,
             blocks: parts.blocks,
             lazy_blocks: None,
@@ -1694,16 +1779,32 @@ impl OpenedArchive {
 
     pub fn verify_root_auth_with<F>(
         &self,
+        verifier: F,
+    ) -> Result<RootAuthVerification, FormatError>
+    where
+        F: FnMut(&RootAuthFooterV1, &[u8; 32]) -> Result<bool, FormatError>,
+    {
+        let content_verification = self.verify_content()?;
+        self.verify_root_auth_with_verified_content(&content_verification, verifier)
+    }
+
+    pub fn verify_root_auth_with_verified_content<F>(
+        &self,
+        content_verification: &ArchiveContentVerification<'_>,
         mut verifier: F,
     ) -> Result<RootAuthVerification, FormatError>
     where
         F: FnMut(&RootAuthFooterV1, &[u8; 32]) -> Result<bool, FormatError>,
     {
+        if !std::ptr::eq(content_verification.archive, self) {
+            return Err(FormatError::InvalidArchive(
+                "content verification does not match archive",
+            ));
+        }
         let footer = self
             .root_auth_footer
             .as_ref()
             .ok_or(FormatError::ReaderUnsupported("root-auth footer is absent"))?;
-        self.verify()?;
         let material = self.recompute_root_auth_material(footer)?;
         if material.critical_metadata_digest != footer.critical_metadata_digest
             || material.index_digest != footer.index_digest
@@ -1728,6 +1829,7 @@ impl OpenedArchive {
             signer_identity_type: footer.signer_identity_type,
             signer_identity_bytes: footer.signer_identity_bytes.clone(),
             total_data_block_count: footer.total_data_block_count,
+            diagnostics: self.root_auth_success_diagnostics(),
         })
     }
 
@@ -2858,6 +2960,11 @@ where
         signer_identity_type: footer.signer_identity_type,
         signer_identity_bytes: footer.signer_identity_bytes.clone(),
         total_data_block_count,
+        diagnostics: vec![
+            PublicNoKeyDiagnostic::PublicDataBlockCommitmentVerified,
+            PublicNoKeyDiagnostic::PublicPhysicalCompletenessUnverified,
+            PublicNoKeyDiagnostic::PublicRecoveryMarginUnchecked,
+        ],
     })
 }
 
@@ -7095,6 +7202,15 @@ mod tests {
             verified.archive_root,
             opened.root_auth_footer.as_ref().unwrap().archive_root
         );
+        assert_eq!(
+            verified.diagnostics,
+            vec![
+                RootAuthDiagnostic::RootAuthContentVerified,
+                RootAuthDiagnostic::AuthenticatedMetadataNotRootSigned,
+                RootAuthDiagnostic::RecoveryMarginNotRootAuthenticated,
+                RootAuthDiagnostic::RecoveryMarginUnchecked,
+            ]
+        );
     }
 
     #[test]
@@ -7441,6 +7557,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!(public.archive_root, root_auth.archive_root);
+        assert_eq!(
+            public.diagnostics,
+            vec![
+                PublicNoKeyDiagnostic::PublicDataBlockCommitmentVerified,
+                PublicNoKeyDiagnostic::PublicPhysicalCompletenessUnverified,
+                PublicNoKeyDiagnostic::PublicRecoveryMarginUnchecked,
+            ]
+        );
     }
 
     #[test]
@@ -7470,11 +7594,14 @@ mod tests {
         .unwrap();
 
         let opened = open_archive_volumes(&[archive.volumes[0].as_slice()], &master_key()).unwrap();
-        opened
+        let root_auth = opened
             .verify_root_auth_with(|footer, archive_root| {
                 Ok(test_root_auth_verifies(footer, archive_root))
             })
             .unwrap();
+        assert!(root_auth.diagnostics.contains(
+            &RootAuthDiagnostic::ReplicatedGlobalCopyUncheckedDueToVolumeLoss
+        ));
     }
 
     #[test]
@@ -9778,6 +9905,7 @@ mod tests {
         let opened = OpenedArchive {
             options: ReaderOptions::default(),
             observed_archive_bytes: 1_000_000,
+            observed_volume_count: 1,
             subkeys,
             blocks,
             lazy_blocks: None,
@@ -12388,6 +12516,7 @@ mod tests {
         let opened = OpenedArchive {
             options: ReaderOptions::default(),
             observed_archive_bytes: 1_000_000,
+            observed_volume_count: 1,
             subkeys,
             blocks,
             lazy_blocks: None,

@@ -28,10 +28,10 @@ use tzap_core::{
     write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
     write_tar_stream_archive_to_sink_with_kdf_and_root_auth, ArchiveWriteError, ArchiveWriteSink,
-    ExtractError, KdfParams, MasterKey, MetadataDiagnostic, NonSeekableReaderOptions,
-    OpenedArchive, PublicNoKeyVerification, RegularFile, RootAuthSigningRequest,
-    RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions, StreamingRawWriterSummary,
-    StreamingTarWriterSummary, TarEntryKind, WriterOptions,
+    ArchiveContentVerification, ExtractError, KdfParams, MasterKey, MetadataDiagnostic,
+    NonSeekableReaderOptions, OpenedArchive, PublicNoKeyVerification, RegularFile,
+    RootAuthSigningRequest, RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions,
+    StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind, WriterOptions,
 };
 use tzap_plugin_signing::ed25519_raw::{
     self, Ed25519RootAuthOutcome, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
@@ -1579,14 +1579,15 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 };
             let result = opened
-                .verify()
+                .verify_content()
                 .with_context(|| format!("failed to verify archive {first}"));
             let volume_count = opened.manifest_footer.total_volumes;
             let file_count = opened.index_root.header.file_count;
             match result {
-                Ok(()) => {
+                Ok(content_verification) => {
                     let root_auth = match verify_opened_root_auth(
                         &opened,
+                        &content_verification,
                         trusted_public_key.as_deref(),
                         &trusted_ca_cert,
                         trusted_system_roots,
@@ -1617,8 +1618,7 @@ fn run(cli: Cli) -> Result<()> {
                             "file_count": file_count,
                         });
                         if let Some(root_auth) = &root_auth {
-                            payload["root_auth"] =
-                                root_auth_json(root_auth, "root_auth_content_verified");
+                            payload["root_auth"] = root_auth_json(root_auth);
                         }
                         println!(
                             "{}",
@@ -2981,7 +2981,7 @@ fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()>
                 "verification_mode": "public-no-key",
                 "volume_count": request.archive_paths.len(),
                 "root_auth": public_no_key_root_auth_json(&root_auth),
-                "public_diagnostics": public_no_key_success_diagnostics(),
+                "public_diagnostics": public_no_key_diagnostic_labels_for_root_auth(&root_auth),
             }))
             .context("failed to encode verify output as JSON")?
         );
@@ -2997,7 +2997,7 @@ fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()>
         ),
     )?;
     emit_public_no_key_root_auth_stdout(request.quiet, &root_auth)?;
-    for diagnostic in public_no_key_success_diagnostics() {
+    for diagnostic in public_no_key_diagnostic_labels_for_root_auth(&root_auth) {
         emit_success_stdout(request.quiet, &format!("public-no-key: {diagnostic}"))?;
     }
     Ok(())
@@ -3044,11 +3044,12 @@ fn load_public_no_key_trust(request: &PublicNoKeyVerifyRequest<'_>) -> Result<Pu
 
 fn verify_opened_root_auth_ed25519(
     opened: &OpenedArchive,
+    content_verification: &ArchiveContentVerification<'_>,
     trusted_public_key: &str,
 ) -> Result<RootAuthVerification> {
     let public_key = load_ed25519_public_key(trusted_public_key)?;
     opened
-        .verify_root_auth_with(|footer, archive_root| {
+        .verify_root_auth_with_verified_content(content_verification, |footer, archive_root| {
             Ok(matches!(
                 ed25519_raw::verify_root_auth_footer(
                     footer,
@@ -3064,6 +3065,7 @@ fn verify_opened_root_auth_ed25519(
 
 fn verify_opened_root_auth(
     opened: &OpenedArchive,
+    content_verification: &ArchiveContentVerification<'_>,
     trusted_public_key: Option<&str>,
     trusted_ca_cert: &[String],
     trusted_system_roots: bool,
@@ -3086,13 +3088,14 @@ fn verify_opened_root_auth(
         ED25519_AUTHENTICATOR_ID if wants_ed25519 => {
             let public_key = trusted_public_key.expect("checked Ed25519 trust request");
             Ok(Some(VerifiedRootAuth::Ed25519(
-                verify_opened_root_auth_ed25519(opened, public_key)?,
+                verify_opened_root_auth_ed25519(opened, content_verification, public_key)?,
             )))
         }
         X509_AUTHENTICATOR_ID if wants_x509 => {
             let trusted_roots_der = load_x509_certificate_files(trusted_ca_cert)?;
             Ok(Some(verify_opened_root_auth_x509(
                 opened,
+                content_verification,
                 &trusted_roots_der,
                 trusted_system_roots,
             )?))
@@ -3110,13 +3113,14 @@ fn verify_opened_root_auth(
 
 fn verify_opened_root_auth_x509(
     opened: &OpenedArchive,
+    content_verification: &ArchiveContentVerification<'_>,
     trusted_roots_der: &[Vec<u8>],
     trusted_system_roots: bool,
 ) -> Result<VerifiedRootAuth> {
     let mut report = None;
     let mut x509_error = None;
     let verification = opened
-        .verify_root_auth_with(|footer, archive_root| {
+        .verify_root_auth_with_verified_content(content_verification, |footer, archive_root| {
             match x509_chain::verify_root_auth_footer(
                 footer,
                 archive_root,
@@ -3149,11 +3153,12 @@ fn verify_opened_root_auth_x509(
     })
 }
 
-fn root_auth_json(root_auth: &VerifiedRootAuth, status: &str) -> serde_json::Value {
+fn root_auth_json(root_auth: &VerifiedRootAuth) -> serde_json::Value {
     match root_auth {
         VerifiedRootAuth::Ed25519(root_auth) => {
             let mut payload = json!({
-                "status": status,
+                "status": root_auth_status(root_auth),
+                "diagnostics": root_auth_diagnostic_labels(root_auth),
                 "authenticator": "ed25519",
                 "archive_root": encode_hex(&root_auth.archive_root),
                 "authenticator_id": root_auth.authenticator_id,
@@ -3170,7 +3175,8 @@ fn root_auth_json(root_auth: &VerifiedRootAuth, status: &str) -> serde_json::Val
             verification,
             report,
         } => json!({
-            "status": status,
+            "status": root_auth_status(verification),
+            "diagnostics": root_auth_diagnostic_labels(verification),
             "authenticator": "x509",
             "archive_root": encode_hex(&verification.archive_root),
             "authenticator_id": verification.authenticator_id,
@@ -3190,15 +3196,34 @@ fn root_auth_json(root_auth: &VerifiedRootAuth, status: &str) -> serde_json::Val
     }
 }
 
+fn root_auth_status(root_auth: &RootAuthVerification) -> &'static str {
+    root_auth
+        .diagnostics
+        .first()
+        .map(|diagnostic| diagnostic.label())
+        .unwrap_or("root_auth_content_verified")
+}
+
+fn root_auth_diagnostic_labels(root_auth: &RootAuthVerification) -> Vec<&'static str> {
+    root_auth
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.label())
+        .collect()
+}
+
 fn emit_root_auth_stdout(quiet: bool, root_auth: &VerifiedRootAuth) -> io::Result<()> {
     match root_auth {
-        VerifiedRootAuth::Ed25519(verification) => emit_success_stdout(
-            quiet,
-            &format!(
-                "root-auth: OK ed25519 {}",
-                encode_hex(&verification.archive_root)
-            ),
-        ),
+        VerifiedRootAuth::Ed25519(verification) => {
+            emit_success_stdout(
+                quiet,
+                &format!(
+                    "root-auth: OK ed25519 {}",
+                    encode_hex(&verification.archive_root)
+                ),
+            )?;
+            emit_root_auth_diagnostics_stdout(quiet, verification)
+        }
         VerifiedRootAuth::X509 {
             verification,
             report,
@@ -3228,16 +3253,28 @@ fn emit_root_auth_stdout(quiet: bool, root_auth: &VerifiedRootAuth) -> io::Resul
                     "root-auth certificate-sha256: {}",
                     encode_hex(&report.certificate_sha256)
                 ),
-            )
+            )?;
+            emit_root_auth_diagnostics_stdout(quiet, verification)
         }
     }
+}
+
+fn emit_root_auth_diagnostics_stdout(
+    quiet: bool,
+    verification: &RootAuthVerification,
+) -> io::Result<()> {
+    for diagnostic in &verification.diagnostics {
+        emit_success_stdout(quiet, &format!("root-auth: {}", diagnostic.label()))?;
+    }
+    Ok(())
 }
 
 fn public_no_key_root_auth_json(root_auth: &VerifiedPublicNoKeyRootAuth) -> serde_json::Value {
     match root_auth {
         VerifiedPublicNoKeyRootAuth::Ed25519(verification) => {
             let mut payload = json!({
-                "status": "public_data_block_commitment_verified",
+                "status": public_no_key_status(verification),
+                "diagnostics": public_no_key_diagnostic_labels(verification),
                 "authenticator": "ed25519",
                 "archive_root": encode_hex(&verification.archive_root),
                 "authenticator_id": verification.authenticator_id,
@@ -3256,7 +3293,8 @@ fn public_no_key_root_auth_json(root_auth: &VerifiedPublicNoKeyRootAuth) -> serd
             verification,
             report,
         } => json!({
-            "status": "public_data_block_commitment_verified",
+            "status": public_no_key_status(verification),
+            "diagnostics": public_no_key_diagnostic_labels(verification),
             "authenticator": "x509",
             "archive_root": encode_hex(&verification.archive_root),
             "authenticator_id": verification.authenticator_id,
@@ -3273,6 +3311,37 @@ fn public_no_key_root_auth_json(root_auth: &VerifiedPublicNoKeyRootAuth) -> serd
             "verified_chain_subjects": &report.verified_chain_subjects,
             "trust_anchor_subject": &report.trust_anchor_subject,
         }),
+    }
+}
+
+fn public_no_key_status(verification: &PublicNoKeyVerification) -> &'static str {
+    verification
+        .diagnostics
+        .first()
+        .map(|diagnostic| diagnostic.label())
+        .unwrap_or("public_data_block_commitment_verified")
+}
+
+fn public_no_key_diagnostic_labels(
+    verification: &PublicNoKeyVerification,
+) -> Vec<&'static str> {
+    verification
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.label())
+        .collect()
+}
+
+fn public_no_key_diagnostic_labels_for_root_auth(
+    root_auth: &VerifiedPublicNoKeyRootAuth,
+) -> Vec<&'static str> {
+    match root_auth {
+        VerifiedPublicNoKeyRootAuth::Ed25519(verification) => {
+            public_no_key_diagnostic_labels(verification)
+        }
+        VerifiedPublicNoKeyRootAuth::X509 { verification, .. } => {
+            public_no_key_diagnostic_labels(verification)
+        }
     }
 }
 
@@ -3331,14 +3400,6 @@ fn format_unix_timestamp(unix_seconds: i64) -> String {
             .unwrap_or_else(|_| unix_seconds.to_string()),
         Err(_) => unix_seconds.to_string(),
     }
-}
-
-fn public_no_key_success_diagnostics() -> [&'static str; 3] {
-    [
-        "public_data_block_commitment_verified",
-        "public_physical_completeness_unverified",
-        "public_recovery_margin_unchecked",
-    ]
 }
 
 fn generate_random_key_material() -> Result<[u8; 32]> {

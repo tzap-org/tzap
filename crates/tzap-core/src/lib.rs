@@ -38,7 +38,8 @@ pub use reader::{
     open_non_seekable_archive, open_seekable_archive, open_seekable_archive_volumes,
     open_seekable_archive_with_bootstrap_sidecar, public_no_key_verify_archive_with,
     public_no_key_verify_volumes_with, sequential_extract_tar_stream, ArchiveEntry,
-    ArchiveIndexEntry, ArchiveReadAt, OpenedArchive, PublicNoKeyVerification, ReaderOptions,
+    ArchiveContentVerification, ArchiveIndexEntry, ArchiveReadAt, OpenedArchive,
+    PublicNoKeyDiagnostic, PublicNoKeyVerification, ReaderOptions, RootAuthDiagnostic,
     RootAuthVerification,
 };
 pub use streaming_writer::{
