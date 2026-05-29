@@ -68,6 +68,43 @@ For public results, record:
 
 Use `n/a` where a tool does not provide a comparable built-in workflow.
 
+## Benchmark runner
+
+Use the repository benchmark runner to generate deterministic data sets and
+result tables:
+
+```sh
+python3 scripts/tzap_benchmark.py --profile smoke --tools tzap
+```
+
+The smoke profile is intentionally small and is useful for checking the harness.
+It writes generated data, archives, logs, and result sheets under:
+
+```text
+target/tzap-bench/
+```
+
+Useful outputs:
+
+```text
+target/tzap-bench/results/results.csv
+target/tzap-bench/results/recovery.csv
+target/tzap-bench/results/results.md
+target/tzap-bench/results/metadata.json
+```
+
+Run the broader local comparison set with:
+
+```sh
+python3 scripts/tzap_benchmark.py \
+  --profile standard \
+  --tools tzap,tar-zstd,tar-zstd-age,7z,zip
+```
+
+Missing comparison tools are recorded as skipped rows instead of failing the
+whole run. Peak RSS is recorded when GNU `time` is available; on macOS, install
+`gtime` if memory columns matter.
+
 ## Example command shape
 
 Build `tzap` in release mode:

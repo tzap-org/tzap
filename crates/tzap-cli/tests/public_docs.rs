@@ -109,6 +109,8 @@ fn public_reference_file_exists_and_covers_commands() {
     assert!(recovery.contains("What \"5% bit-rot buffer\" means"));
     assert!(benchmarks.contains("What to measure"));
     assert!(benchmarks.contains("Suggested comparison set"));
+    assert!(benchmarks.contains("scripts/tzap_benchmark.py"));
+    assert!(workspace_root().join("scripts/tzap_benchmark.py").is_file());
     assert!(installation.contains("From GitHub release assets"));
     assert!(development.contains("Project layout"));
     assert!(development.contains("Format overview"));
