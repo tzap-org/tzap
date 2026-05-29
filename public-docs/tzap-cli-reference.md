@@ -11,6 +11,21 @@ This document is a compact command reference for `tzap` operators and automation
 - `--verbose`: emit verbose diagnostics
 - `--help`: usage for current context
 
+## Exit codes
+
+| Exit code | Label | Meaning |
+| --- | --- | --- |
+| 0 | success | Command completed successfully |
+| 1 | error | Unexpected runtime or internal error |
+| 2 | usage | Invalid args / command-line usage |
+| 3 | io-error | Filesystem I/O or permission problem |
+| 10 | wrong-key | Wrong passphrase or key for archive |
+| 11 | corrupt-archive | Archive integrity or payload problem |
+| 12 | unsupported-revision | Unsupported archive revision |
+| 13 | unsafe-path | Unsafe extraction path |
+| 14 | missing-bootstrap | Bootstrap sidecar required |
+| 16 | unsupported-feature | Unsupported archive feature or writer shape |
+
 ## Command: create
 
 Create one archive (single or multi-volume):

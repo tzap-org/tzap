@@ -25,33 +25,39 @@ fn write_file(path: &Path, data: &[u8]) {
 fn readme_documents_required_workflows() {
     let readme = read_workspace_file("README.md");
 
-    assert!(readme.contains("## Quick start (passphrase mode)"));
-    assert!(readme.contains("## Quick start (raw key)"));
-    assert!(readme.contains("## Multi-volume workflow (recoverable)"));
-    assert!(readme.contains("## Safety notes"));
-    assert!(readme.contains("## Exit codes"));
+    assert!(readme.contains("# tzap - the only open source archive you need"));
+    assert!(readme.contains("Backups should survive real life."));
+    assert!(readme.contains("## Why people choose tzap"));
+    assert!(readme.contains("## Try it in two minutes"));
+    assert!(readme.contains("## Recovery in plain English"));
+    assert!(readme.contains("One command. One archive."));
+    assert!(!readme.contains("## Quick start (raw key)"));
+    assert!(!readme.contains("## Safety notes"));
+    assert!(!readme.contains("## Exit codes"));
     assert!(!readme.contains("## Known limitations"));
 
+    assert!(readme.contains("public-docs/tzap-installation.md"));
     assert!(readme.contains("public-docs/tzap-cli-reference.md"));
+    assert!(readme.contains("public-docs/tzap-development.md"));
     assert!(readme.contains("tzap create --password-stdin"));
-    assert!(readme.contains("tzap keygen --output"));
-    assert!(readme.contains("tzap create --keyfile project.key"));
-    assert!(readme.contains("tzap create --keyfile project.key --volumes"));
+    assert!(readme.contains("--volumes 3"));
+    assert!(readme.contains("--volume-loss-tolerance 1"));
 }
 
 #[test]
 fn readme_has_exit_code_and_platform_sections() {
-    let readme = read_workspace_file("README.md");
+    let install = read_workspace_file("public-docs/tzap-installation.md");
+    let reference = read_workspace_file("public-docs/tzap-cli-reference.md");
 
-    assert!(readme.contains("Supported target artifacts:"));
-    assert!(readme.contains("| Linux x86_64 static/musl |"));
-    assert!(readme.contains("| Linux aarch64 static/musl |"));
-    assert!(readme.contains("| Windows x86_64 |"));
-    assert!(readme.contains("| Windows aarch64 |"));
+    assert!(install.contains("Supported target artifacts:"));
+    assert!(install.contains("| Linux x86_64 static/musl |"));
+    assert!(install.contains("| Linux aarch64 static/musl |"));
+    assert!(install.contains("| Windows x86_64 |"));
+    assert!(install.contains("| Windows aarch64 |"));
 
-    assert!(readme.contains("| 2 | usage | Invalid args / command-line usage |"));
-    assert!(readme.contains("| 10 | wrong-key | Wrong passphrase or key for archive |"));
-    assert!(readme
+    assert!(reference.contains("| 2 | usage | Invalid args / command-line usage |"));
+    assert!(reference.contains("| 10 | wrong-key | Wrong passphrase or key for archive |"));
+    assert!(reference
         .contains("| 16 | unsupported-feature | Unsupported archive feature or writer shape |"));
 }
 
@@ -62,6 +68,8 @@ fn public_reference_file_exists_and_covers_commands() {
     let security = read_workspace_file("public-docs/tzap-security-model.md");
     let recovery = read_workspace_file("public-docs/tzap-recovery-matrix.md");
     let benchmarks = read_workspace_file("public-docs/tzap-benchmark-guide.md");
+    let installation = read_workspace_file("public-docs/tzap-installation.md");
+    let development = read_workspace_file("public-docs/tzap-development.md");
     let root_readme = read_workspace_file("README.md");
     let cli_readme = read_workspace_file("crates/tzap-cli/README.md");
     let gitignore = read_workspace_file(".gitignore");
@@ -101,11 +109,17 @@ fn public_reference_file_exists_and_covers_commands() {
     assert!(recovery.contains("What \"5% bit-rot buffer\" means"));
     assert!(benchmarks.contains("What to measure"));
     assert!(benchmarks.contains("Suggested comparison set"));
+    assert!(installation.contains("From GitHub release assets"));
+    assert!(development.contains("Project layout"));
+    assert!(development.contains("Format overview"));
+    assert!(development.contains("Library usage"));
 
     assert!(root_readme.contains("public-docs/tzap-cli-reference.md"));
+    assert!(root_readme.contains("public-docs/tzap-installation.md"));
     assert!(root_readme.contains("public-docs/tzap-security-model.md"));
     assert!(root_readme.contains("public-docs/tzap-recovery-matrix.md"));
     assert!(root_readme.contains("public-docs/tzap-benchmark-guide.md"));
+    assert!(root_readme.contains("public-docs/tzap-development.md"));
     assert!(cli_readme.contains("public-docs/tzap-cli-reference.md"));
     assert!(cli_readme.contains("public-docs/tzap-security-model.md"));
     assert!(cli_readme.contains("public-docs/tzap-recovery-matrix.md"));
