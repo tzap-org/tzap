@@ -92,7 +92,7 @@ fn manifests_have_crates_io_metadata() {
     assert_package_metadata(
         "crates/tzap-cli/Cargo.toml",
         "tzap",
-        "0.1.1",
+        "0.1.2",
         "https://docs.rs/tzap",
         "Command-line tool",
     );
