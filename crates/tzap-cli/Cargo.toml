@@ -25,8 +25,8 @@ serde_json.workspace = true
 rpassword = "7"
 tempfile.workspace = true
 time.workspace = true
-tzap-core = { path = "../tzap-core", version = "0.1.1" }
-tzap-plugin-signing = { path = "../tzap-plugin-signing", version = "0.1.0" }
+tzap-core = { path = "../tzap-core", version = "0.1.2" }
+tzap-plugin-signing = { path = "../tzap-plugin-signing", version = "0.1.1" }
 
 [dev-dependencies]
 assert_cmd.workspace = true
