@@ -439,6 +439,7 @@ mod tests {
         open_archive, open_archive_with_bootstrap_sidecar, open_non_seekable_archive,
         public_no_key_verify_archive_with, sequential_extract_tar_stream,
     };
+    use crate::tar_model::parse_tar_member_group;
     use crate::wire::{
         validate_crypto_extension_semantics, CryptoHeaderFixed, ExtensionTlv, VolumeHeader,
     };
@@ -566,6 +567,110 @@ mod tests {
     }
 
     #[test]
+    fn raw_stream_profile_rejects_before_tar_metadata_poison_corpus() {
+        let master_key = MasterKey::from_raw_key(&[9; 32]).unwrap();
+        let expected = FormatError::ReaderUnsupported(RAW_STREAM_UNSUPPORTED_MESSAGE);
+
+        let mut bad_checksum = tar_member(b"file.txt", b'0', b"abc", b"");
+        bad_checksum[0] = b'F';
+
+        let mut nonzero_padding = tar_member(b"file.txt", b'0', b"a", b"");
+        nonzero_padding[513] = 1;
+
+        let mut pax_size_exceeds_group =
+            tar_member(b"PaxHeaders/file", b'x', &pax_record("size", b"4096"), b"");
+        pax_size_exceeds_group.extend_from_slice(&tar_member_with_declared_size(
+            b"file", b'0', 0, b"short", b"",
+        ));
+
+        let metadata_only = tar_member(
+            b"PaxHeaders/file",
+            b'x',
+            &pax_record("path", b"safe.txt"),
+            b"",
+        );
+
+        let poison_cases = vec![
+            (
+                "global pax",
+                tar_member(b"global", b'g', &pax_record("path", b"poisoned.txt"), b""),
+                FormatError::InvalidArchive("global PAX headers are not allowed"),
+            ),
+            (
+                "gnu sparse entry",
+                tar_member(b"sparse.bin", b'S', b"", b""),
+                FormatError::ReaderUnsupported("unsupported GNU sparse tar entry"),
+            ),
+            (
+                "unsupported typeflag",
+                tar_member(b"fifo", b'6', b"", b""),
+                FormatError::ReaderUnsupported("unsupported tar entry type"),
+            ),
+            (
+                "unsafe absolute path",
+                tar_member(b"/absolute", b'0', b"abc", b""),
+                FormatError::UnsafeArchivePath,
+            ),
+            (
+                "bad checksum",
+                bad_checksum,
+                FormatError::InvalidArchive("tar header checksum mismatch"),
+            ),
+            (
+                "nonzero padding",
+                nonzero_padding,
+                FormatError::InvalidArchive("tar member padding is non-zero"),
+            ),
+            (
+                "pax size exceeds group",
+                pax_size_exceeds_group,
+                FormatError::InvalidLength {
+                    structure: "tar member",
+                    expected: 5632,
+                    actual: 2048,
+                },
+            ),
+            (
+                "metadata without main entry",
+                metadata_only,
+                FormatError::InvalidArchive(
+                    "tar member group has metadata records but no main entry",
+                ),
+            ),
+        ];
+
+        for (name, tar_body, tar_error) in poison_cases {
+            assert_eq!(
+                parse_tar_member_group(&tar_body, 4096).unwrap_err(),
+                tar_error,
+                "{name}"
+            );
+
+            let archive = minimal_raw_profile_archive_with_body(&master_key, &tar_body);
+            assert_eq!(
+                open_archive(&archive, &master_key).unwrap_err(),
+                expected,
+                "{name}: seekable open"
+            );
+            assert_eq!(
+                sequential_extract_tar_stream(&archive, &master_key).unwrap_err(),
+                expected,
+                "{name}: sequential extraction"
+            );
+            assert_eq!(
+                verify_non_seekable_stream(Cursor::new(&archive), &master_key).unwrap_err(),
+                expected,
+                "{name}: non-seekable verify"
+            );
+            assert_eq!(
+                public_no_key_verify_archive_with(&archive, |_, _| Ok(true)).unwrap_err(),
+                expected,
+                "{name}: public no-key verify"
+            );
+        }
+    }
+
+    #[test]
     fn non_critical_raw_stream_tag_is_forward_compatible_unknown_extension() {
         let extension = ExtensionTlv {
             tag: RAW_STREAM_CONTENT_MODEL_EXTENSION_TAG,
@@ -580,6 +685,10 @@ mod tests {
     }
 
     fn minimal_raw_profile_archive(master_key: &MasterKey) -> Vec<u8> {
+        minimal_raw_profile_archive_with_body(master_key, &[])
+    }
+
+    fn minimal_raw_profile_archive_with_body(master_key: &MasterKey, body: &[u8]) -> Vec<u8> {
         let archive_uuid = [1; 16];
         let session_id = [2; 16];
         let subkeys = Subkeys::derive(master_key, &archive_uuid, &session_id).unwrap();
@@ -638,7 +747,90 @@ mod tests {
         };
         let mut archive = header.to_bytes().to_vec();
         archive.extend_from_slice(&crypto);
-        archive.resize(VOLUME_HEADER_LEN + crypto.len() + VOLUME_TRAILER_LEN, 0);
+        archive.extend_from_slice(body);
+        archive.resize(
+            VOLUME_HEADER_LEN + crypto.len() + body.len() + VOLUME_TRAILER_LEN,
+            0,
+        );
         archive
+    }
+
+    fn tar_header(path: &[u8], kind: u8, size: usize, link: &[u8]) -> [u8; 512] {
+        let mut header = [0u8; 512];
+        header[..path.len()].copy_from_slice(path);
+        write_octal(&mut header[100..108], 0o644);
+        write_octal(&mut header[108..116], 0);
+        write_octal(&mut header[116..124], 0);
+        write_octal(&mut header[124..136], size as u64);
+        write_octal(&mut header[136..148], 0);
+        header[148..156].fill(b' ');
+        header[156] = kind;
+        header[157..157 + link.len()].copy_from_slice(link);
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let checksum = header.iter().map(|byte| *byte as u64).sum::<u64>();
+        write_checksum(&mut header[148..156], checksum);
+        header
+    }
+
+    fn tar_member(path: &[u8], kind: u8, data: &[u8], link: &[u8]) -> Vec<u8> {
+        tar_member_with_declared_size(path, kind, data.len(), data, link)
+    }
+
+    fn tar_member_with_declared_size(
+        path: &[u8],
+        kind: u8,
+        declared_size: usize,
+        data: &[u8],
+        link: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&tar_header(path, kind, declared_size, link));
+        out.extend_from_slice(data);
+        out.resize(out.len() + tar_padding_to_512(data.len()), 0);
+        out
+    }
+
+    fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
+        let mut len = key.len() + value.len() + 4;
+        loop {
+            let candidate = len.to_string().len() + 1 + key.len() + 1 + value.len() + 1;
+            if candidate == len {
+                break;
+            }
+            len = candidate;
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(len.to_string().as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(key.as_bytes());
+        out.push(b'=');
+        out.extend_from_slice(value);
+        out.push(b'\n');
+        out
+    }
+
+    fn write_octal(field: &mut [u8], value: u64) {
+        let digits = format!("{value:o}");
+        field.fill(0);
+        let start = field.len() - 1 - digits.len();
+        field[..start].fill(b'0');
+        field[start..start + digits.len()].copy_from_slice(digits.as_bytes());
+    }
+
+    fn write_checksum(field: &mut [u8], value: u64) {
+        let digits = format!("{value:06o}");
+        field[0..6].copy_from_slice(digits.as_bytes());
+        field[6] = 0;
+        field[7] = b' ';
+    }
+
+    fn tar_padding_to_512(len: usize) -> usize {
+        let remainder = len % 512;
+        if remainder == 0 {
+            0
+        } else {
+            512 - remainder
+        }
     }
 }

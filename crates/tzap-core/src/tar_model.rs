@@ -2021,8 +2021,32 @@ mod tests {
     }
 
     fn member(path: &[u8], kind: u8, data: &[u8], link: &[u8]) -> Vec<u8> {
+        member_with_declared_size(path, kind, data.len(), data, link)
+    }
+
+    fn member_with_declared_size(
+        path: &[u8],
+        kind: u8,
+        declared_size: usize,
+        data: &[u8],
+        link: &[u8],
+    ) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&header(path, kind, data.len(), link));
+        out.extend_from_slice(&header(path, kind, declared_size, link));
+        out.extend_from_slice(data);
+        out.resize(out.len() + padding_to_512(data.len()), 0);
+        out
+    }
+
+    fn member_with_prefix(prefix: &[u8], path: &[u8], kind: u8, data: &[u8]) -> Vec<u8> {
+        let mut header = header(path, kind, data.len(), b"");
+        header[345..345 + prefix.len()].copy_from_slice(prefix);
+        header[148..156].fill(b' ');
+        let checksum = header.iter().map(|byte| *byte as u64).sum::<u64>();
+        write_checksum(&mut header[148..156], checksum);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&header);
         out.extend_from_slice(data);
         out.resize(out.len() + padding_to_512(data.len()), 0);
         out
@@ -2156,6 +2180,327 @@ mod tests {
             parsed.link_target.as_deref(),
             Some(b"target/file.txt".as_slice())
         );
+    }
+
+    #[test]
+    fn supported_tar_metadata_profile_matrix_matches_buffered_and_streaming_parsers() {
+        struct Case {
+            name: &'static str,
+            bytes: Vec<u8>,
+            expected_path: &'static [u8],
+            expected_kind: TarEntryKind,
+            expected_data: &'static [u8],
+            expected_link_target: Option<&'static [u8]>,
+            expected_logical_size: u64,
+        }
+
+        let mut pax_path_and_size = member(
+            b"PaxHeaders/pax-file",
+            b'x',
+            &[
+                pax_record("path", b"deep/pax-name.txt"),
+                pax_record("size", b"5"),
+            ]
+            .concat(),
+            b"",
+        );
+        pax_path_and_size.extend_from_slice(&member_with_declared_size(
+            b"fallback",
+            b'0',
+            0,
+            b"hello",
+            b"",
+        ));
+
+        let mut pax_linkpath = member(
+            b"PaxHeaders/pax-link",
+            b'x',
+            &pax_record("linkpath", b"target/file.txt"),
+            b"",
+        );
+        pax_linkpath.extend_from_slice(&member(b"links/link", b'2', b"", b"fallback-target"));
+
+        let mut gnu_long_name = member(b"././@LongLink", b'L', b"long/path/name.txt\0", b"");
+        gnu_long_name.extend_from_slice(&member(b"short", b'0', b"abc", b""));
+
+        let mut gnu_long_link = member(b"././@LongLink", b'K', b"target/hard.txt\0", b"");
+        gnu_long_link.extend_from_slice(&member(b"links/hard", b'1', b"", b"fallback"));
+
+        let cases = vec![
+            Case {
+                name: "regular ustar member",
+                bytes: member(b"dir/file.txt", b'0', b"hello", b""),
+                expected_path: b"dir/file.txt",
+                expected_kind: TarEntryKind::Regular,
+                expected_data: b"hello",
+                expected_link_target: None,
+                expected_logical_size: 5,
+            },
+            Case {
+                name: "ustar prefix plus name",
+                bytes: member_with_prefix(b"dir/prefix", b"file.txt", b'0', b"abc"),
+                expected_path: b"dir/prefix/file.txt",
+                expected_kind: TarEntryKind::Regular,
+                expected_data: b"abc",
+                expected_link_target: None,
+                expected_logical_size: 3,
+            },
+            Case {
+                name: "directory trailing slash",
+                bytes: member(b"dir/", b'5', b"", b""),
+                expected_path: b"dir",
+                expected_kind: TarEntryKind::Directory,
+                expected_data: b"",
+                expected_link_target: None,
+                expected_logical_size: 0,
+            },
+            Case {
+                name: "local pax path and size",
+                bytes: pax_path_and_size,
+                expected_path: b"deep/pax-name.txt",
+                expected_kind: TarEntryKind::Regular,
+                expected_data: b"hello",
+                expected_link_target: None,
+                expected_logical_size: 5,
+            },
+            Case {
+                name: "local pax linkpath",
+                bytes: pax_linkpath,
+                expected_path: b"links/link",
+                expected_kind: TarEntryKind::Symlink,
+                expected_data: b"",
+                expected_link_target: Some(b"target/file.txt"),
+                expected_logical_size: 0,
+            },
+            Case {
+                name: "gnu long name",
+                bytes: gnu_long_name,
+                expected_path: b"long/path/name.txt",
+                expected_kind: TarEntryKind::Regular,
+                expected_data: b"abc",
+                expected_link_target: None,
+                expected_logical_size: 3,
+            },
+            Case {
+                name: "gnu long link",
+                bytes: gnu_long_link,
+                expected_path: b"links/hard",
+                expected_kind: TarEntryKind::Hardlink,
+                expected_data: b"",
+                expected_link_target: Some(b"target/hard.txt"),
+                expected_logical_size: 0,
+            },
+        ];
+
+        for case in cases {
+            let parsed = parse_tar_member_group(&case.bytes, 4096).unwrap_or_else(|err| {
+                panic!("{} should parse in buffered tar parser: {err:?}", case.name)
+            });
+            assert_eq!(parsed.path, case.expected_path, "{}", case.name);
+            assert_eq!(parsed.kind, case.expected_kind, "{}", case.name);
+            assert_eq!(parsed.data, case.expected_data, "{}", case.name);
+            assert_eq!(
+                parsed.link_target.as_deref(),
+                case.expected_link_target,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                parsed.logical_size, case.expected_logical_size,
+                "{}",
+                case.name
+            );
+
+            let mut streaming = TarStreamSummaryValidator::with_observer(
+                4096,
+                u64::MAX,
+                4096,
+                16,
+                NoopTarStreamObserver,
+            );
+            streaming.observe(&case.bytes).unwrap_or_else(|err| {
+                panic!(
+                    "{} should parse in streaming tar parser: {err:?}",
+                    case.name
+                )
+            });
+            let summary = streaming.finish().unwrap_or_else(|err| {
+                panic!(
+                    "{} should finish in streaming tar parser: {err:?}",
+                    case.name
+                )
+            });
+            assert_eq!(summary.members.len(), 1, "{}", case.name);
+            let member = &summary.members[0];
+            assert_eq!(member.path, case.expected_path, "{}", case.name);
+            assert_eq!(member.kind, case.expected_kind, "{}", case.name);
+            assert_eq!(
+                member.link_target.as_deref(),
+                case.expected_link_target,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                member.logical_size, case.expected_logical_size,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn tar_metadata_rejects_unsafe_or_inconsistent_overrides_matrix() {
+        let mut pax_absolute_path = member(
+            b"PaxHeaders/file",
+            b'x',
+            &pax_record("path", b"/absolute"),
+            b"",
+        );
+        pax_absolute_path.extend_from_slice(&member(b"fallback", b'0', b"abc", b""));
+
+        let mut pax_parent_path = member(
+            b"PaxHeaders/file",
+            b'x',
+            &pax_record("path", b"../escape"),
+            b"",
+        );
+        pax_parent_path.extend_from_slice(&member(b"fallback", b'0', b"abc", b""));
+
+        let mut pax_absolute_link = member(
+            b"PaxHeaders/link",
+            b'x',
+            &pax_record("linkpath", b"/target"),
+            b"",
+        );
+        pax_absolute_link.extend_from_slice(&member(b"links/link", b'2', b"", b"safe"));
+
+        let mut gnu_unsafe_name = member(b"././@LongLink", b'L', b"bad:name.txt\0", b"");
+        gnu_unsafe_name.extend_from_slice(&member(b"fallback", b'0', b"abc", b""));
+
+        let mut gnu_parent_hardlink = member(b"././@LongLink", b'K', b"../target.txt\0", b"");
+        gnu_parent_hardlink.extend_from_slice(&member(b"links/hard", b'1', b"", b"safe"));
+
+        let mut pax_size_on_directory =
+            member(b"PaxHeaders/dir", b'x', &pax_record("size", b"1"), b"");
+        pax_size_on_directory
+            .extend_from_slice(&member_with_declared_size(b"dir", b'5', 0, b"x", b""));
+
+        for (name, bytes, expected) in [
+            (
+                "pax absolute path",
+                pax_absolute_path,
+                FormatError::UnsafeArchivePath,
+            ),
+            (
+                "pax parent path",
+                pax_parent_path,
+                FormatError::UnsafeArchivePath,
+            ),
+            (
+                "pax absolute symlink target",
+                pax_absolute_link,
+                FormatError::UnsafeArchivePath,
+            ),
+            (
+                "gnu unsafe long name",
+                gnu_unsafe_name,
+                FormatError::UnsafeArchivePath,
+            ),
+            (
+                "gnu hardlink parent target",
+                gnu_parent_hardlink,
+                FormatError::UnsafeArchivePath,
+            ),
+            (
+                "pax size on directory",
+                pax_size_on_directory,
+                FormatError::InvalidArchive("non-regular tar entry has non-zero payload size"),
+            ),
+        ] {
+            assert_eq!(
+                parse_tar_member_group(&bytes, 4096).unwrap_err(),
+                expected,
+                "{name}"
+            );
+
+            let mut streaming = TarStreamSummaryValidator::with_observer(
+                4096,
+                u64::MAX,
+                4096,
+                16,
+                NoopTarStreamObserver,
+            );
+            assert_eq!(streaming.observe(&bytes).unwrap_err(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn pax_size_exceeding_available_group_is_rejected_by_buffered_and_streaming_parsers() {
+        let mut bytes = member(b"PaxHeaders/file", b'x', &pax_record("size", b"4096"), b"");
+        bytes.extend_from_slice(&member_with_declared_size(b"file", b'0', 0, b"short", b""));
+
+        assert_eq!(
+            parse_tar_member_group(&bytes, 4096).unwrap_err(),
+            FormatError::InvalidLength {
+                structure: "tar member",
+                expected: 5632,
+                actual: 2048,
+            }
+        );
+
+        let mut streaming = TarStreamSummaryValidator::with_observer(
+            4096,
+            u64::MAX,
+            4096,
+            16,
+            NoopTarStreamObserver,
+        );
+        streaming.observe(&bytes).unwrap();
+        assert_eq!(
+            streaming.finish().unwrap_err(),
+            FormatError::InvalidArchive("tar stream ended inside member group")
+        );
+    }
+
+    #[test]
+    fn malformed_pax_record_matrix_rejects_before_metadata_is_trusted() {
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("missing length", b"path=file\n".to_vec()),
+            ("missing space", b"12path=file\n".to_vec()),
+            ("record too short", b"3 a\n".to_vec()),
+            ("missing newline", b"11 path=file".to_vec()),
+            ("missing equals", b"10 pathfile\n".to_vec()),
+            ("non utf8 key", vec![7, b' ', 0xff, b'=', b'x', b'\n']),
+            ("bad size value", pax_record("size", b"12x")),
+        ];
+
+        for (name, payload) in cases {
+            let mut bytes = member(b"PaxHeaders/file", b'x', &payload, b"");
+            bytes.extend_from_slice(&member(b"file", b'0', b"abc", b""));
+
+            assert!(
+                matches!(
+                    parse_tar_member_group(&bytes, 4096).unwrap_err(),
+                    FormatError::InvalidArchive(_)
+                ),
+                "{name}"
+            );
+
+            let mut streaming = TarStreamSummaryValidator::with_observer(
+                4096,
+                u64::MAX,
+                4096,
+                16,
+                NoopTarStreamObserver,
+            );
+            assert!(
+                matches!(
+                    streaming.observe(&bytes).unwrap_err(),
+                    FormatError::InvalidArchive(_)
+                ),
+                "{name}"
+            );
+        }
     }
 
     #[test]

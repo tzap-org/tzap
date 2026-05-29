@@ -405,3 +405,66 @@ fn public_docs_pin_tar_metadata_profile() {
         .contains("Unsupported local tar metadata profiles and mode/mtime restoration failures"));
     assert!(reference.contains("Verification reports unsupported local tar metadata profiles"));
 }
+
+#[test]
+fn traceability_materials_live_under_requested_folder_and_cover_claim_gates() {
+    let root = workspace_root()
+        .join("implmentation-docs")
+        .join("traceability");
+    assert!(root.is_dir());
+
+    let index = read_workspace_file("implmentation-docs/traceability/README.md");
+    let v41 = read_workspace_file("implmentation-docs/traceability/v41-core-traceability.md");
+    let signing =
+        read_workspace_file("implmentation-docs/traceability/signing-plugin-traceability.md");
+    let runbook = read_workspace_file("implmentation-docs/traceability/verification-runbook.md");
+
+    assert!(index.contains("v41-compliant for the documented supported archive workflows"));
+    assert!(index.contains("implmentation-docs/traceability"));
+    assert!(index.contains("cargo fmt --check"));
+    assert!(index.contains("cargo clippy --workspace --all-targets -- -D warnings"));
+    assert!(index.contains("cargo test --workspace"));
+    assert!(index.contains("cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked"));
+    assert!(index.contains("cargo audit"));
+
+    for required in [
+        "V41-001",
+        "V41-014",
+        "V41-019",
+        "V41-022",
+        "Unsupported and documented",
+        "No implementation gap is recorded",
+    ] {
+        assert!(
+            v41.contains(required),
+            "missing v41 traceability marker {required}"
+        );
+    }
+
+    for required in [
+        "SIGN-001",
+        "SIGN-004",
+        "SIGN-011",
+        "X.509",
+        "Ed25519",
+        "Signing profile boundaries",
+    ] {
+        assert!(
+            signing.contains(required),
+            "missing signing traceability marker {required}"
+        );
+    }
+
+    for required in [
+        "Required local gate",
+        "Bounded fuzz extension",
+        "Dependency audit",
+        "Traceability audit",
+        "Current record",
+    ] {
+        assert!(
+            runbook.contains(required),
+            "missing runbook traceability marker {required}"
+        );
+    }
+}

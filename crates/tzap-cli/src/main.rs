@@ -27,8 +27,8 @@ use tzap_core::{
     write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
     write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
-    write_tar_stream_archive_to_sink_with_kdf_and_root_auth, ArchiveWriteError, ArchiveWriteSink,
-    ArchiveContentVerification, ExtractError, KdfParams, MasterKey, MetadataDiagnostic,
+    write_tar_stream_archive_to_sink_with_kdf_and_root_auth, ArchiveContentVerification,
+    ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfParams, MasterKey, MetadataDiagnostic,
     NonSeekableReaderOptions, OpenedArchive, PublicNoKeyVerification, RegularFile,
     RootAuthSigningRequest, RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions,
     StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind, WriterOptions,
@@ -3322,9 +3322,7 @@ fn public_no_key_status(verification: &PublicNoKeyVerification) -> &'static str 
         .unwrap_or("public_data_block_commitment_verified")
 }
 
-fn public_no_key_diagnostic_labels(
-    verification: &PublicNoKeyVerification,
-) -> Vec<&'static str> {
+fn public_no_key_diagnostic_labels(verification: &PublicNoKeyVerification) -> Vec<&'static str> {
     verification
         .diagnostics
         .iter()

@@ -214,9 +214,7 @@ impl PublicNoKeyDiagnostic {
     pub const fn label(self) -> &'static str {
         match self {
             Self::PublicDataBlockCommitmentVerified => "public_data_block_commitment_verified",
-            Self::PublicPhysicalCompletenessUnverified => {
-                "public_physical_completeness_unverified"
-            }
+            Self::PublicPhysicalCompletenessUnverified => "public_physical_completeness_unverified",
             Self::PublicRecoveryMarginUnchecked => "public_recovery_margin_unchecked",
         }
     }
@@ -1777,10 +1775,7 @@ impl OpenedArchive {
         Ok(())
     }
 
-    pub fn verify_root_auth_with<F>(
-        &self,
-        verifier: F,
-    ) -> Result<RootAuthVerification, FormatError>
+    pub fn verify_root_auth_with<F>(&self, verifier: F) -> Result<RootAuthVerification, FormatError>
     where
         F: FnMut(&RootAuthFooterV1, &[u8; 32]) -> Result<bool, FormatError>,
     {
@@ -7599,9 +7594,9 @@ mod tests {
                 Ok(test_root_auth_verifies(footer, archive_root))
             })
             .unwrap();
-        assert!(root_auth.diagnostics.contains(
-            &RootAuthDiagnostic::ReplicatedGlobalCopyUncheckedDueToVolumeLoss
-        ));
+        assert!(root_auth
+            .diagnostics
+            .contains(&RootAuthDiagnostic::ReplicatedGlobalCopyUncheckedDueToVolumeLoss));
     }
 
     #[test]
