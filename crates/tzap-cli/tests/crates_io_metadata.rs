@@ -94,7 +94,7 @@ fn manifests_have_crates_io_metadata() {
         "tzap",
         "0.1.2",
         "https://docs.rs/tzap",
-        "Command-line tool",
+        "Fast encrypted archive CLI",
     );
     assert_package_metadata(
         "crates/tzap-plugin-signing/Cargo.toml",

@@ -7,13 +7,16 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 Rust reference implementation of the **tzap archive format**: fast compression,
-fast encryption, fast self-healing recovery, and instant random-access restores
-for serious long-term storage.
+fast encryption, self-healing recovery, and instant random-access restores for
+serious long-term storage.
 
 tzap is built for real archives: huge backups, private datasets, cold storage,
 cloud object storage, split volumes, and immediate single-file restores. It
 combines packing, fast compression, strong encryption, authenticated metadata,
 and recovery in one practical format.
+
+One command. One archive. No duct-taping together tar, compression, encryption,
+parity files, split-volume naming, and restore logic.
 
 The implementation currently targets the v0.41 format specification:
 [specs/tzap-format-revisedv41.md](specs/tzap-format-revisedv41.md).
@@ -49,6 +52,17 @@ See the full command guide in
 
 Focused on archive creation, verification, listing, extraction, storage, and
 recovery workflows.
+
+## Proof for serious storage
+
+- [Security model](public-docs/tzap-security-model.md): encryption, integrity,
+  key handling, signing, and safe extraction.
+- [Recovery matrix](public-docs/tzap-recovery-matrix.md): bit rot, damaged
+  blocks, missing volumes, and what users should do.
+- [Benchmark guide](public-docs/tzap-benchmark-guide.md): reproducible create,
+  verify, extract, selected-file restore, and recovery benchmarks.
+- [Operational boundaries](public-docs/tzap-operational-boundaries.md): concrete
+  CLI behavior, exit labels, and operator actions.
 
 ## Install
 

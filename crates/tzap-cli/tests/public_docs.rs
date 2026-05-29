@@ -59,6 +59,9 @@ fn readme_has_exit_code_and_platform_sections() {
 fn public_reference_file_exists_and_covers_commands() {
     let reference = read_workspace_file("public-docs/tzap-cli-reference.md");
     let boundaries = read_workspace_file("public-docs/tzap-operational-boundaries.md");
+    let security = read_workspace_file("public-docs/tzap-security-model.md");
+    let recovery = read_workspace_file("public-docs/tzap-recovery-matrix.md");
+    let benchmarks = read_workspace_file("public-docs/tzap-benchmark-guide.md");
     let root_readme = read_workspace_file("README.md");
     let cli_readme = read_workspace_file("crates/tzap-cli/README.md");
     let gitignore = read_workspace_file(".gitignore");
@@ -91,9 +94,22 @@ fn public_reference_file_exists_and_covers_commands() {
     assert!(boundaries.contains("unsupported-feature"));
     assert!(boundaries.contains("Bootstrap sidecars and multi-volume inputs"));
     assert!(boundaries.contains("Multi-volume recovery budget"));
+    assert!(security.contains("Plain-English promise"));
+    assert!(security.contains("What is encrypted"));
+    assert!(security.contains("Recovery is for accidents"));
+    assert!(recovery.contains("Quick matrix"));
+    assert!(recovery.contains("What \"5% bit-rot buffer\" means"));
+    assert!(benchmarks.contains("What to measure"));
+    assert!(benchmarks.contains("Suggested comparison set"));
 
     assert!(root_readme.contains("public-docs/tzap-cli-reference.md"));
+    assert!(root_readme.contains("public-docs/tzap-security-model.md"));
+    assert!(root_readme.contains("public-docs/tzap-recovery-matrix.md"));
+    assert!(root_readme.contains("public-docs/tzap-benchmark-guide.md"));
     assert!(cli_readme.contains("public-docs/tzap-cli-reference.md"));
+    assert!(cli_readme.contains("public-docs/tzap-security-model.md"));
+    assert!(cli_readme.contains("public-docs/tzap-recovery-matrix.md"));
+    assert!(cli_readme.contains("public-docs/tzap-benchmark-guide.md"));
     assert!(gitignore.contains("/docs/"));
     assert!(gitignore.contains("/implementation-docs/"));
     assert!(!gitignore.contains("/public-docs/"));

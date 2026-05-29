@@ -1,9 +1,29 @@
 # tzap
 
-`tzap` is the command-line interface for the tzap v0.41 archive format. It
-creates, lists, verifies, and extracts encrypted archives with authenticated
-metadata, zstd compression, safe extraction defaults, and optional multi-volume
-recovery.
+Fast encrypted archives that can heal.
+
+`tzap` is the archive CLI for people who want backups to be private, fast,
+recoverable, and easy to restore. It packs zstd compression, authenticated
+encryption, safe extraction defaults, multi-volume recovery, and instant
+selected-file restores into one practical command.
+
+Use it for project folders, private datasets, media collections, cold storage,
+cloud object storage, and long-lived backup sets where "just zip it" is not
+enough.
+
+## Why use it
+
+- **Fast archives.** Rust, zstd, and indexed metadata keep large backups moving.
+- **Private archives.** File contents, file names, metadata, and indexes are
+  encrypted.
+- **Self-healing archives.** Recovery data can repair accidental damage within
+  the budget chosen at create time.
+- **Instant targeted restores.** Restore one file from a large archive without
+  unpacking everything else.
+- **Split-volume storage.** Write deterministic volume files for drives, discs,
+  and cloud object storage.
+- **Signed roots.** Ed25519 and X.509 RootAuth workflows are available when
+  archives need origin authentication.
 
 ## Install
 
@@ -22,52 +42,52 @@ cargo install tzap
 
 The CLI requires Rust 1.85 or newer when installing from source.
 
-## Quick Start
+## Quick start: passphrase archive
 
-Create a raw key and archive a directory:
+Create an encrypted archive from a passphrase:
+
+```sh
+export TZAP_PASSPHRASE='correct horse battery staple'
+printf '%s\n' "$TZAP_PASSPHRASE" | \
+  tzap create --password-stdin \
+  -o backup.tzap \
+  ./project
+```
+
+Inspect and verify it:
+
+```sh
+printf '%s\n' "$TZAP_PASSPHRASE" | tzap list --password-stdin backup.tzap
+printf '%s\n' "$TZAP_PASSPHRASE" | tzap verify --password-stdin backup.tzap
+```
+
+Restore everything:
+
+```sh
+printf '%s\n' "$TZAP_PASSPHRASE" | \
+  tzap extract --password-stdin --directory restored backup.tzap
+```
+
+Restore one file:
+
+```sh
+printf '%s\n' "$TZAP_PASSPHRASE" | \
+  tzap extract --password-stdin --stdout backup.tzap project/readme.txt
+```
+
+## Quick start: key file archive
 
 ```sh
 tzap keygen --output project.key
 tzap create --keyfile project.key -o project.tzap ./project
-```
-
-Inspect and verify the archive:
-
-```sh
-tzap list --keyfile project.key project.tzap
 tzap verify --keyfile project.key project.tzap
+tzap list --keyfile project.key project.tzap
+tzap extract --keyfile project.key -C restored project.tzap
 ```
 
-Create a signed v41 RootAuth archive:
+## Recoverable multi-volume archive
 
-```sh
-tzap signing-keygen --secret-output root.signing.hex --public-output root.public.hex
-tzap create --keyfile project.key --signing-key root.signing.hex -o signed.tzap ./project
-tzap verify --keyfile project.key --trusted-public-key root.public.hex signed.tzap
-tzap verify --public-no-key --trusted-public-key root.public.hex signed.tzap
-tzap create --keyfile project.key --signing-cert signer.pem --signing-private-key signer.key -o signed-x509.tzap ./project
-tzap verify --keyfile project.key --trusted-ca-cert root-ca.pem signed-x509.tzap
-tzap verify --public-no-key --trusted-ca-cert root-ca.pem signed-x509.tzap
-```
-
-The CLI composes `tzap-core` with `tzap-plugin-signing` for Ed25519 and X.509
-RootAuth signing. Library users can choose `tzap-core` for archive workflows or
-compose it with `tzap-plugin-signing` for signed RootAuth workflows.
-
-Extract files safely into a destination directory:
-
-```sh
-tzap extract --keyfile project.key --directory restored project.tzap
-```
-
-Passphrase mode is available for scripted workflows:
-
-```sh
-printf '%s\n' "$TZAP_PASSPHRASE" | \
-  tzap create --password-stdin -o secrets.tzap ./secrets
-```
-
-## Multi-Volume Recovery
+Create three volumes that can survive one missing volume:
 
 ```sh
 tzap create \
@@ -76,20 +96,52 @@ tzap create \
   --volume-loss-tolerance 1 \
   -o project.tzap \
   ./project
-
-tzap verify --keyfile project.key project.vol000.tzap
 ```
 
-## Safety
+This writes:
 
-`tzap extract` applies safe path validation and overwrite protection;
-`--overwrite` enables explicit replacement. Keep passphrases and raw keyfiles
-separate from archive data; raw-key archives require the original 32-byte key.
+```text
+project.vol000.tzap
+project.vol001.tzap
+project.vol002.tzap
+```
 
-## More Information
+Verify or restore from any discovered volume:
+
+```sh
+tzap verify --keyfile project.key project.vol000.tzap
+tzap extract --keyfile project.key --directory restored project.vol001.tzap
+```
+
+## Signed RootAuth workflow
+
+```sh
+tzap signing-keygen --secret-output root.signing.hex --public-output root.public.hex
+tzap create --keyfile project.key --signing-key root.signing.hex -o signed.tzap ./project
+tzap verify --keyfile project.key --trusted-public-key root.public.hex signed.tzap
+tzap verify --public-no-key --trusted-public-key root.public.hex signed.tzap
+```
+
+X.509 RootAuth signing is available with `--signing-cert` and
+`--signing-private-key`.
+
+## Safety defaults
+
+`tzap extract` validates archive paths and does not overwrite existing files
+unless `--overwrite` is supplied. Keep passphrases and key files separate from
+archive data; raw-key archives require the original 32-byte key.
+
+## Trust material
+
+- Security model: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-security-model.md>
+- Recovery matrix: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-recovery-matrix.md>
+- Benchmark guide: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-benchmark-guide.md>
+- CLI reference: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-cli-reference.md>
+- Operational boundaries: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-operational-boundaries.md>
+
+## More information
 
 - Repository: <https://github.com/frankmanzhu/tzap>
-- CLI reference: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-cli-reference.md>
 - Format specification: <https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv41.md>
 - Library crate: <https://crates.io/crates/tzap-core>
 - Signing plugin crate: <https://crates.io/crates/tzap-plugin-signing>
