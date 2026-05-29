@@ -258,7 +258,7 @@ data blocks
 all blocks (data + parity)
   │ stripe across V volumes: volume = block_index mod V
   ▼
-archive.tzap.001 … archive.tzap.V
+archive.vol000.tzap … archive.volNNN.tzap
 ```
 
 ### 6.1 In-envelope padding (suffix-marker scheme)

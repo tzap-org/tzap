@@ -44,10 +44,9 @@ fn master_key_from_hex(hex: &str) -> Vec<u8> {
 }
 
 fn numbered_volume_path(output_base: &Path, index: usize) -> PathBuf {
-    output_base.with_file_name(format!(
-        "{}.{index:03}",
-        output_base.file_name().unwrap().to_string_lossy()
-    ))
+    let file_name = output_base.file_name().unwrap().to_string_lossy();
+    let base = file_name.strip_suffix(".tzap").unwrap_or(&file_name);
+    output_base.with_file_name(format!("{base}.vol{index:03}.tzap"))
 }
 
 fn tar_stream(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -2289,8 +2288,8 @@ fn cli_commands_read_real_file_named_dash_with_explicit_relative_path() {
 fn cli_open_commands_reject_multi_volume_bootstrap_before_archive_reads() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
-    let primary = temp.path().join("missing-primary.tzap.000");
-    let extra = temp.path().join("missing-primary.tzap.001");
+    let primary = temp.path().join("missing-primary.vol000.tzap");
+    let extra = temp.path().join("missing-primary.vol001.tzap");
     let bootstrap = temp.path().join("missing-primary.tzap.bootstrap");
     let output = temp.path().join("out");
     fs::write(&keyfile, KEY_HEX).unwrap();
@@ -2366,8 +2365,8 @@ fn cli_open_commands_reject_multi_volume_bootstrap_before_archive_reads() {
 fn cli_verify_json_reports_multi_volume_bootstrap_boundary_before_archive_reads() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
-    let primary = temp.path().join("missing-primary.tzap.000");
-    let extra = temp.path().join("missing-primary.tzap.001");
+    let primary = temp.path().join("missing-primary.vol000.tzap");
+    let extra = temp.path().join("missing-primary.vol001.tzap");
     let bootstrap = temp.path().join("missing-primary.tzap.bootstrap");
     fs::write(&keyfile, KEY_HEX).unwrap();
 
@@ -3790,8 +3789,8 @@ fn cli_create_and_verify_multi_volume_archive() {
     let keyfile = temp.path().join("key.hex");
     let input = temp.path().join("striped.txt");
     let output_base = temp.path().join("striped.tzap");
-    let volume_0 = temp.path().join("striped.tzap.000");
-    let volume_1 = temp.path().join("striped.tzap.001");
+    let volume_0 = numbered_volume_path(&output_base, 0);
+    let volume_1 = numbered_volume_path(&output_base, 1);
 
     fs::write(&keyfile, KEY_HEX).unwrap();
     fs::write(&input, b"multi-volume payload\n").unwrap();
@@ -3843,6 +3842,89 @@ fn cli_create_and_verify_multi_volume_archive() {
         .assert()
         .success()
         .stdout(predicate::str::contains("striped.txt\n"));
+}
+
+#[test]
+fn cli_verify_autodiscovers_sibling_volumes_from_middle_volume() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("middle-anchor.txt");
+    let output_base = temp.path().join("middle-anchor.tzap");
+    let volume_1 = numbered_volume_path(&output_base, 1);
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"autodiscovery payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volumes",
+            "3",
+            "--volume-loss-tolerance",
+            "1",
+            "-o",
+            output_base.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            volume_1.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK (3 volume(s), 1 file(s))"));
+}
+
+#[test]
+fn cli_verify_autodiscovery_recovers_when_vol000_is_damaged() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("damaged-anchor.txt");
+    let output_base = temp.path().join("damaged-anchor.tzap");
+    let volume_0 = numbered_volume_path(&output_base, 0);
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"recover from damaged volume zero\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--volumes",
+            "2",
+            "--volume-loss-tolerance",
+            "1",
+            "-o",
+            output_base.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    fs::write(&volume_0, b"not a valid tzap volume\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            volume_0.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK (2 volume(s), 1 file(s))"));
 }
 
 #[test]
@@ -3923,18 +4005,9 @@ fn cli_verify_missing_recoverable_volume_is_recovered_with_tolerance() {
     let keyfile = temp.path().join("key.hex");
     let input = temp.path().join("striped.txt");
     let output_base = temp.path().join("recoverable.tzap");
-    let volume_0 = output_base.with_file_name(format!(
-        "{}.000",
-        output_base.file_name().unwrap().to_string_lossy()
-    ));
-    let volume_1 = output_base.with_file_name(format!(
-        "{}.001",
-        output_base.file_name().unwrap().to_string_lossy()
-    ));
-    let volume_2 = output_base.with_file_name(format!(
-        "{}.002",
-        output_base.file_name().unwrap().to_string_lossy()
-    ));
+    let volume_0 = numbered_volume_path(&output_base, 0);
+    let volume_1 = numbered_volume_path(&output_base, 1);
+    let volume_2 = numbered_volume_path(&output_base, 2);
 
     fs::write(&keyfile, KEY_HEX).unwrap();
     fs::write(&input, b"recoverable payload\n").unwrap();
@@ -3975,14 +4048,8 @@ fn cli_verify_missing_unrecoverable_volume_reports_missing_volume() {
     let keyfile = temp.path().join("key.hex");
     let input = temp.path().join("striped.txt");
     let output_base = temp.path().join("unrecoverable.tzap");
-    let volume_0 = output_base.with_file_name(format!(
-        "{}.000",
-        output_base.file_name().unwrap().to_string_lossy()
-    ));
-    let volume_1 = output_base.with_file_name(format!(
-        "{}.001",
-        output_base.file_name().unwrap().to_string_lossy()
-    ));
+    let volume_0 = numbered_volume_path(&output_base, 0);
+    let volume_1 = numbered_volume_path(&output_base, 1);
 
     fs::write(&keyfile, KEY_HEX).unwrap();
     fs::write(&input, b"unrecoverable payload\n").unwrap();
@@ -4554,14 +4621,8 @@ fn cli_create_rejects_existing_multi_volume_outputs_without_force() {
     let keyfile = temp.path().join("key.hex");
     let input = temp.path().join("striped.txt");
     let output = temp.path().join("striped.tzap");
-    let output_volume_0 = output.with_file_name(format!(
-        "{}.000",
-        output.file_name().unwrap().to_string_lossy()
-    ));
-    let output_volume_1 = output.with_file_name(format!(
-        "{}.001",
-        output.file_name().unwrap().to_string_lossy()
-    ));
+    let output_volume_0 = numbered_volume_path(&output, 0);
+    let output_volume_1 = numbered_volume_path(&output, 1);
 
     fs::write(&keyfile, KEY_HEX).unwrap();
     fs::write(&input, b"multi-volume payload\n").unwrap();
@@ -4620,10 +4681,7 @@ fn cli_create_rejects_volume_size_output_collisions_for_dotted_base() {
     let keyfile = temp.path().join("key.hex");
     let input = temp.path().join("sized.bin");
     let output = temp.path().join("sized.tzap");
-    let collision = output.with_file_name(format!(
-        "{}.000",
-        output.file_name().unwrap().to_string_lossy()
-    ));
+    let collision = numbered_volume_path(&output, 0);
     let mut data = Vec::with_capacity(64 * 1024);
     for i in 0..(64 * 1024) {
         data.push((i % 251) as u8);
@@ -4977,7 +5035,7 @@ fn cli_create_with_volume_size_splits_archive_by_target_size() {
 
     let mut volumes = Vec::new();
     for index in 0.. {
-        let volume = temp.path().join(format!("sized.tzap.{index:03}"));
+        let volume = numbered_volume_path(&output_base, index);
         if !volume.exists() {
             break;
         }
@@ -6454,14 +6512,8 @@ fn cli_extract_multi_volume_archive() {
     let input = temp.path().join("hello.txt");
     let output_base = temp.path().join("multi.tzap");
     let output = temp.path().join("out");
-    let v0 = output_base.with_file_name(format!(
-        "{}.000",
-        output_base.file_name().unwrap().to_string_lossy()
-    ));
-    let v1 = output_base.with_file_name(format!(
-        "{}.001",
-        output_base.file_name().unwrap().to_string_lossy()
-    ));
+    let v0 = numbered_volume_path(&output_base, 0);
+    let v1 = numbered_volume_path(&output_base, 1);
     fs::write(&keyfile, KEY_HEX).unwrap();
     fs::write(&input, b"multi-volume payload\n").unwrap();
 
@@ -6537,18 +6589,9 @@ fn cli_extract_recovers_when_one_volume_is_missing_but_tolerance_allows_it() {
         .assert()
         .success();
 
-    let v0 = output_base.with_file_name(format!(
-        "{}.000",
-        output_base.file_name().unwrap().to_string_lossy()
-    ));
-    let v1 = output_base.with_file_name(format!(
-        "{}.001",
-        output_base.file_name().unwrap().to_string_lossy()
-    ));
-    let v2 = output_base.with_file_name(format!(
-        "{}.002",
-        output_base.file_name().unwrap().to_string_lossy()
-    ));
+    let v0 = numbered_volume_path(&output_base, 0);
+    let v1 = numbered_volume_path(&output_base, 1);
+    let v2 = numbered_volume_path(&output_base, 2);
 
     fs::remove_file(&v1).unwrap();
 
@@ -7070,14 +7113,8 @@ fn cli_extract_missing_volume_tolerates_recovery_when_loss_tolerance_allows() {
     let input = temp.path().join("hello.txt");
     let output_base = temp.path().join("recoverable.tzap");
     let output = temp.path().join("out");
-    let v0 = output_base.with_file_name(format!(
-        "{}.000",
-        output_base.file_name().unwrap().to_string_lossy()
-    ));
-    let v1 = output_base.with_file_name(format!(
-        "{}.001",
-        output_base.file_name().unwrap().to_string_lossy()
-    ));
+    let v0 = numbered_volume_path(&output_base, 0);
+    let v1 = numbered_volume_path(&output_base, 1);
     fs::write(&keyfile, KEY_HEX).unwrap();
     fs::write(&input, b"recovery check\n").unwrap();
 
@@ -7122,14 +7159,8 @@ fn cli_extract_missing_volume_without_tolerance_is_reported_as_corruption() {
     let input = temp.path().join("hello.txt");
     let output_base = temp.path().join("unrecoverable.tzap");
     let output = temp.path().join("out");
-    let v0 = output_base.with_file_name(format!(
-        "{}.000",
-        output_base.file_name().unwrap().to_string_lossy()
-    ));
-    let v1 = output_base.with_file_name(format!(
-        "{}.001",
-        output_base.file_name().unwrap().to_string_lossy()
-    ));
+    let v0 = numbered_volume_path(&output_base, 0);
+    let v1 = numbered_volume_path(&output_base, 1);
     fs::write(&keyfile, KEY_HEX).unwrap();
     fs::write(&input, vec![0x42u8; 1_000_000]).unwrap();
 

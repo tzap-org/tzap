@@ -68,7 +68,7 @@ type CliRootAuthAuthenticator<'a> =
 #[command(version)]
 #[command(about = "Create, list, verify, and extract v41 archives")]
 #[command(
-    long_about = "Create, list, verify, and extract v41 archives.\n\nUsage is centered on an explicit key source per command: either `--keyfile` for raw-key archives, `--password` for interactive prompt, `--password-stdin` for scripted passphrase input, or `--insecure-zero-key` for explicit no-secret convenience archives. The `verify --public-no-key` mode verifies signed public RootAuth commitments without the archive key.\n\nSize suffixes accepted by size flags:\n  0-9 (bytes), K/KB/KiB, M/MB/MiB, G/GB/GiB.\n\nMulti-volume output naming for this CLI:\n  - one volume: --output writes exactly that path\n  - multiple volumes: --output writes --output.000, --output.001, ...\n\nExit codes:\n  2  usage / argument error\n  3  I/O failure (missing file, permission denied, etc.)\n  10 wrong key\n  11 archive corruption or integrity mismatch\n  12 unsupported archive revision / format version\n  13 unsafe extraction attempt\n  14 missing required bootstrap metadata\n  16 unsupported feature in this CLI/core version\n  1  generic failure\n\nSubcommands:\n  create   Build a new archive\n  extract  Extract files from an archive\n  list     List archive contents\n  verify   Validate archive integrity\n  keygen   Generate a random raw keyfile\n  signing-keygen Generate an Ed25519 RootAuth signing keypair"
+    long_about = "Create, list, verify, and extract v41 archives.\n\nUsage is centered on an explicit key source per command: either `--keyfile` for raw-key archives, `--password` for interactive prompt, `--password-stdin` for scripted passphrase input, or `--insecure-zero-key` for explicit no-secret convenience archives. The `verify --public-no-key` mode verifies signed public RootAuth commitments without the archive key.\n\nSize suffixes accepted by size flags:\n  0-9 (bytes), K/KB/KiB, M/MB/MiB, G/GB/GiB.\n\nMulti-volume output naming for this CLI:\n  - one volume: --output writes exactly that path\n  - multiple volumes: --output backup.tzap writes backup.vol000.tzap, backup.vol001.tzap, ...\n\nExit codes:\n  2  usage / argument error\n  3  I/O failure (missing file, permission denied, etc.)\n  10 wrong key\n  11 archive corruption or integrity mismatch\n  12 unsupported archive revision / format version\n  13 unsafe extraction attempt\n  14 missing required bootstrap metadata\n  16 unsupported feature in this CLI/core version\n  1  generic failure\n\nSubcommands:\n  create   Build a new archive\n  extract  Extract files from an archive\n  list     List archive contents\n  verify   Validate archive integrity\n  keygen   Generate a random raw keyfile\n  signing-keygen Generate an Ed25519 RootAuth signing keypair"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -86,7 +86,7 @@ struct Cli {
 enum Command {
     #[command(
         about = "Create a new archive",
-        long_about = "Create a new archive from files and directories.\n\nThe command writes one output path for single-volume archives, or a base path plus `.000`, `.001`, ... suffixes for multi-volume archives.",
+        long_about = "Create a new archive from files and directories.\n\nThe command writes one output path for single-volume archives, or `.vol000.tzap`, `.vol001.tzap`, ... files for multi-volume archives.",
         after_help = "Examples:\n  tzap create --keyfile key.hex -o backup.tzap file.txt\n  tzap create --password -o backup.tzap file.txt\n  tzap create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8192 -o backup.tzap file.txt\n  tar cf - ./dir | tzap create --tar-stdin --keyfile key.hex -o backup.tzap -\n  tzap create --keyfile key.hex --signing-key root.signing.hex -o backup.tzap file.txt\n  tzap create --keyfile key.hex --signing-cert signer.pem --signing-private-key signer.key -o backup.tzap file.txt\n  tzap create --keyfile key.hex -o backup.tzap --volumes 3 dir/\n  tzap create --keyfile key.hex --volume-size 64M --volume-loss-tolerance 1 -o backup.tzap dir/\n  tzap create --keyfile key.hex --bootstrap-out backup.tzap.bootstrap file.txt",
         group(
             ArgGroup::new("create-key-source")
@@ -335,7 +335,7 @@ enum Command {
     Extract {
         #[arg(
             value_name = "ARCHIVE",
-            help = "Primary archive input. Use additional --volume for extra volumes."
+            help = "Archive input. A .volNNN.tzap path discovers sibling volumes unless --volume is used."
         )]
         archive: String,
 
@@ -410,7 +410,11 @@ enum Command {
         )]
         bootstrap: Option<String>,
 
-        #[arg(long = "volume", value_name = "FILE", help = "Additional volume path.")]
+        #[arg(
+            long = "volume",
+            value_name = "FILE",
+            help = "Explicit additional volume path."
+        )]
         volumes: Vec<String>,
     },
     #[command(
@@ -424,7 +428,10 @@ enum Command {
         )
     )]
     List {
-        #[arg(value_name = "ARCHIVE", help = "Archive to inspect.")]
+        #[arg(
+            value_name = "ARCHIVE",
+            help = "Archive to inspect. A .volNNN.tzap path discovers sibling volumes unless --volume is used."
+        )]
         archive: String,
 
         #[arg(
@@ -467,7 +474,11 @@ enum Command {
         )]
         bootstrap: Option<String>,
 
-        #[arg(long = "volume", value_name = "FILE", help = "Additional volume path.")]
+        #[arg(
+            long = "volume",
+            value_name = "FILE",
+            help = "Explicit additional volume path."
+        )]
         volumes: Vec<String>,
 
         #[arg(
@@ -487,13 +498,13 @@ enum Command {
     #[command(
         about = "Verify archive integrity",
         long_about = "Verify archive signatures and checksum integrity. No payload changes are made.\n\nBy default verify is key-holding and requires --keyfile, --password, --password-stdin, or --insecure-zero-key. With --public-no-key, verify uses the v41 public RootAuth profile and does not require the archive key.",
-        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --public-no-key --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --keyfile key.hex backup.tzap backup.tzap.001\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives, the first positional argument is the primary archive.\nAdditional positionals are optional extra volumes."
+        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --public-no-key --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --keyfile key.hex backup.vol000.tzap backup.vol001.tzap\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives named `.volNNN.tzap`, passing any one volume discovers matching siblings in the same directory. Additional positionals are explicit extra volumes."
     )]
     Verify {
         #[arg(
             required = true,
             value_name = "ARCHIVE",
-            help = "Primary archive followed by optional additional volumes."
+            help = "Archive path. A .volNNN.tzap path discovers sibling volumes unless extra archive paths are supplied."
         )]
         archives: Vec<String>,
 
@@ -1150,16 +1161,16 @@ fn run(cli: Cli) -> Result<()> {
                 )?;
                 return Ok(());
             }
-            let volume_files = open_volume_inputs(&archive, &volumes)?;
-            let master_key = load_open_key(
+            let selection = resolve_archive_input_paths(&archive, &volumes, bootstrap.is_none())?;
+            let master_key = load_open_key_from_paths(
                 keyfile.as_deref(),
                 password_stdin,
                 password,
                 insecure_zero_key,
-                &archive,
+                &selection.paths,
             )?;
             let opened =
-                open_inputs_maybe_bootstrap(volume_files, &master_key, bootstrap.as_deref())
+                open_selection_maybe_bootstrap(&selection, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {archive}"))?;
             let (requested_entries, missing_paths) =
                 resolve_extract_index_entries(&opened, &paths)?;
@@ -1326,16 +1337,16 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 return Ok(());
             }
-            let volume_files = open_volume_inputs(&archive, &volumes)?;
-            let master_key = load_open_key(
+            let selection = resolve_archive_input_paths(&archive, &volumes, bootstrap.is_none())?;
+            let master_key = load_open_key_from_paths(
                 keyfile.as_deref(),
                 password_stdin,
                 password,
                 insecure_zero_key,
-                &archive,
+                &selection.paths,
             )?;
             let opened =
-                open_inputs_maybe_bootstrap(volume_files, &master_key, bootstrap.as_deref())
+                open_selection_maybe_bootstrap(&selection, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {archive}"))?;
             if json || long {
                 let entries = opened.list_files()?;
@@ -1491,7 +1502,7 @@ fn run(cli: Cli) -> Result<()> {
                         "{}",
                         serde_json::to_string(&json!({
                             "ok": true,
-                            "archives": archive_paths,
+                            "archives": &archive_paths,
                             "verification_mode": "key-holding-non-seekable-stream",
                             "volume_count": report.total_volumes,
                             "file_count": report.file_count,
@@ -1542,21 +1553,23 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 return Err(err);
             }
-            let volume_files = match open_volume_inputs(first, &archives[1..]) {
-                Ok(volume_files) => volume_files,
-                Err(err) => {
-                    if json {
-                        emit_verify_json_error(&archive_paths, None, None, &err)?;
+            let selection =
+                match resolve_archive_input_paths(first, &archives[1..], bootstrap.is_none()) {
+                    Ok(selection) => selection,
+                    Err(err) => {
+                        if json {
+                            emit_verify_json_error(&archive_paths, None, None, &err)?;
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
-                }
-            };
-            let master_key = match load_open_key(
+                };
+            let archive_paths = selection.paths.clone();
+            let master_key = match load_open_key_from_paths(
                 keyfile.as_deref(),
                 password_stdin,
                 password,
                 insecure_zero_key,
-                first,
+                &selection.paths,
             ) {
                 Ok(master_key) => master_key,
                 Err(err) => {
@@ -1567,7 +1580,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
             };
             let opened =
-                match open_inputs_maybe_bootstrap(volume_files, &master_key, bootstrap.as_deref())
+                match open_selection_maybe_bootstrap(&selection, &master_key, bootstrap.as_deref())
                     .with_context(|| format!("failed to open archive {first}"))
                 {
                     Ok(opened) => opened,
@@ -1612,7 +1625,7 @@ fn run(cli: Cli) -> Result<()> {
                     if json {
                         let mut payload = json!({
                             "ok": true,
-                            "archives": archive_paths,
+                            "archives": &archive_paths,
                             "verification_mode": "key-holding",
                             "volume_count": volume_count,
                             "file_count": file_count,
@@ -2030,15 +2043,11 @@ fn write_archive_outputs(output: &str, volumes: &[Vec<u8>]) -> Result<()> {
     if volumes.is_empty() {
         bail!("writer returned no volumes");
     }
-    if volumes.len() == 1 {
-        fs::write(output, &volumes[0])
-            .with_context(|| format!("failed to write archive {output}"))?;
-        return Ok(());
-    }
+    let output_paths = create_output_paths(output, volumes.len());
     for (index, volume) in volumes.iter().enumerate() {
-        let path = format!("{output}.{index:03}");
-        fs::write(&path, volume)
-            .with_context(|| format!("failed to write archive volume {path}"))?;
+        let path = &output_paths[index];
+        fs::write(path, volume)
+            .with_context(|| format!("failed to write archive volume {}", path.display()))?;
     }
     Ok(())
 }
@@ -2464,10 +2473,7 @@ fn check_output_path_collisions_for_volume_size_output(output: &str) -> Result<(
     check_output_path_free("archive output", Path::new(output))?;
     let output_path = Path::new(output);
     let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
-    let base = output_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("output path has invalid UTF-8: {output}"))?;
+    let base = multi_volume_base_name(output)?;
     let entries = match fs::read_dir(parent) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -2480,25 +2486,26 @@ fn check_output_path_collisions_for_volume_size_output(output: &str) -> Result<(
     for entry in entries.filter_map(|entry| entry.ok()) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if looks_like_numbered_volume(&name, base) {
-            bail!("output path collision: {output}.* already exists; use --force to overwrite");
+        if looks_like_tzap_volume(&name, &base) {
+            bail!(
+                "output path collision: {base}.volNNN.tzap already exists; use --force to overwrite"
+            );
         }
     }
     Ok(())
 }
 
-fn looks_like_numbered_volume(path_name: &str, base: &str) -> bool {
-    let Some(suffix) = path_name.strip_prefix(base) else {
+fn looks_like_tzap_volume(path_name: &str, base: &str) -> bool {
+    let Some(rest) = path_name.strip_prefix(base) else {
         return false;
     };
-    if !suffix.starts_with('.') {
+    let Some(digits) = rest
+        .strip_prefix(".vol")
+        .and_then(|rest| rest.strip_suffix(".tzap"))
+    else {
         return false;
-    }
-    let suffix = &suffix[1..];
-    if suffix.len() != 3 {
-        return false;
-    }
-    suffix.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn check_archive_paths_free_for_write(paths: &[PathBuf]) -> Result<()> {
@@ -2587,9 +2594,30 @@ fn create_output_paths(output: &str, volume_count: usize) -> Vec<PathBuf> {
         vec![PathBuf::from(output)]
     } else {
         (0..volume_count)
-            .map(|index| PathBuf::from(format!("{output}.{index:03}")))
+            .map(|index| create_volume_output_path(output, index))
             .collect()
     }
+}
+
+fn create_volume_output_path(output: &str, index: usize) -> PathBuf {
+    let output_path = Path::new(output);
+    let base = multi_volume_base_name(output).unwrap_or_else(|_| output.to_owned());
+    let file_name = format!("{base}.vol{index:03}.tzap");
+    match output_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(file_name),
+        _ => PathBuf::from(file_name),
+    }
+}
+
+fn multi_volume_base_name(output: &str) -> Result<String> {
+    let file_name = Path::new(output)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("output path has invalid UTF-8: {output}"))?;
+    Ok(file_name
+        .strip_suffix(".tzap")
+        .unwrap_or(file_name)
+        .to_owned())
 }
 
 fn create_dry_run_output_paths(
@@ -2604,9 +2632,11 @@ fn create_dry_run_output_paths(
             .collect();
     }
     if has_volume_size {
+        let first = create_volume_output_path(output, 0);
+        let second = create_volume_output_path(output, 1);
         return vec![
             format!("{output} (if one volume is emitted)"),
-            format!("{output}.000, {output}.001, ... (if split)"),
+            format!("{}, {}, ... (if split)", first.display(), second.display()),
         ];
     }
     vec![output.to_owned()]
@@ -2690,24 +2720,113 @@ fn root_auth_authenticator_value(
     }
 }
 
-fn read_volume_inputs(primary: &str, additional: &[String]) -> Result<Vec<Vec<u8>>> {
+#[derive(Debug, Clone)]
+struct ArchiveInputSelection {
+    paths: Vec<String>,
+    autodiscovered: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VolumePathPattern {
+    base: String,
+    volume_index: u32,
+}
+
+fn resolve_archive_input_paths(
+    primary: &str,
+    additional: &[String],
+    allow_autodiscovery: bool,
+) -> Result<ArchiveInputSelection> {
     let mut paths = Vec::with_capacity(additional.len() + 1);
     paths.push(primary.to_owned());
     paths.extend(additional.iter().cloned());
+    if !allow_autodiscovery || !additional.is_empty() || primary == "-" {
+        return Ok(ArchiveInputSelection {
+            paths,
+            autodiscovered: false,
+        });
+    }
+
+    let Some(pattern) = parse_volume_path_pattern(Path::new(primary)) else {
+        return Ok(ArchiveInputSelection {
+            paths,
+            autodiscovered: false,
+        });
+    };
+    let discovered = discover_volume_siblings(Path::new(primary), &pattern)?;
+    if discovered.is_empty() {
+        return Ok(ArchiveInputSelection {
+            paths,
+            autodiscovered: false,
+        });
+    }
+    Ok(ArchiveInputSelection {
+        paths: discovered,
+        autodiscovered: true,
+    })
+}
+
+fn read_volume_inputs_from_paths(paths: &[String]) -> Result<Vec<Vec<u8>>> {
     paths
-        .into_iter()
-        .map(|path| fs::read(&path).with_context(|| format!("failed to read archive {path}")))
+        .iter()
+        .map(|path| fs::read(path).with_context(|| format!("failed to read archive {path}")))
         .collect()
 }
 
-fn open_volume_inputs(primary: &str, additional: &[String]) -> Result<Vec<File>> {
-    let mut paths = Vec::with_capacity(additional.len() + 1);
-    paths.push(primary.to_owned());
-    paths.extend(additional.iter().cloned());
+fn open_volume_inputs_from_paths(paths: &[String]) -> Result<Vec<File>> {
     paths
-        .into_iter()
-        .map(|path| File::open(&path).with_context(|| format!("failed to read archive {path}")))
+        .iter()
+        .map(|path| File::open(path).with_context(|| format!("failed to read archive {path}")))
         .collect()
+}
+
+fn parse_volume_path_pattern(path: &Path) -> Option<VolumePathPattern> {
+    let file_name = path.file_name()?.to_str()?;
+    parse_volume_file_name(file_name)
+}
+
+fn parse_volume_file_name(file_name: &str) -> Option<VolumePathPattern> {
+    let stem = file_name.strip_suffix(".tzap")?;
+    let (base, digits) = stem.rsplit_once(".vol")?;
+    if base.is_empty() || digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(VolumePathPattern {
+        base: base.to_owned(),
+        volume_index: digits.parse().ok()?,
+    })
+}
+
+fn discover_volume_siblings(primary: &Path, pattern: &VolumePathPattern) -> Result<Vec<String>> {
+    let parent = primary.parent().unwrap_or_else(|| Path::new("."));
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to inspect archive directory {}", parent.display())
+            })
+        }
+    };
+    let mut discovered = Vec::new();
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(candidate) = parse_volume_file_name(file_name) else {
+            continue;
+        };
+        if candidate.base != pattern.base {
+            continue;
+        }
+        discovered.push((candidate.volume_index, entry.path()));
+    }
+    discovered.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    Ok(discovered
+        .into_iter()
+        .map(|(_, path)| path.to_string_lossy().into_owned())
+        .collect())
 }
 
 fn reject_multi_volume_bootstrap(volume_count: usize, bootstrap: Option<&str>) -> Result<()> {
@@ -2840,6 +2959,75 @@ fn open_inputs_maybe_bootstrap(
     }
 }
 
+fn open_selection_maybe_bootstrap(
+    selection: &ArchiveInputSelection,
+    master_key: &MasterKey,
+    bootstrap: Option<&str>,
+) -> Result<OpenedArchive> {
+    let volume_files = open_volume_inputs_from_paths(&selection.paths)?;
+    match open_inputs_maybe_bootstrap(volume_files, master_key, bootstrap) {
+        Ok(opened) => Ok(opened),
+        Err(err)
+            if selection.autodiscovered && bootstrap.is_none() && selection.paths.len() > 1 =>
+        {
+            let usable_paths =
+                filter_usable_autodiscovered_volume_paths(&selection.paths, master_key)
+                    .with_context(|| "failed to filter autodiscovered archive volumes")?;
+            if usable_paths == selection.paths {
+                return Err(err);
+            }
+            let volume_files = open_volume_inputs_from_paths(&usable_paths)?;
+            open_inputs_maybe_bootstrap(volume_files, master_key, bootstrap).map_err(Into::into)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn filter_usable_autodiscovered_volume_paths(
+    paths: &[String],
+    master_key: &MasterKey,
+) -> Result<Vec<String>> {
+    let mut usable = Vec::new();
+    let mut first_error = None;
+    for path in paths {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error =
+                        Some(anyhow!(err).context(format!("failed to read archive {path}")));
+                }
+                continue;
+            }
+        };
+        match open_seekable_archive(file, master_key) {
+            Ok(_) => usable.push(path.clone()),
+            Err(err) if is_single_volume_candidate_usable_error(&err) => usable.push(path.clone()),
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error =
+                        Some(anyhow!(err).context(format!("failed to open archive {path}")));
+                }
+            }
+        }
+    }
+    if usable.is_empty() {
+        return Err(
+            first_error.unwrap_or_else(|| anyhow!("no autodiscovered archive volumes found"))
+        );
+    }
+    Ok(usable)
+}
+
+fn is_single_volume_candidate_usable_error(err: &FormatError) -> bool {
+    matches!(err, FormatError::FecTooFewAvailableShards)
+        || matches!(
+            err,
+            FormatError::InvalidArchive(message)
+                if *message == "missing volume count exceeds volume_loss_tolerance"
+        )
+}
+
 fn validate_verify_key_holding_key_source(
     keyfile: Option<&str>,
     password_stdin: bool,
@@ -2887,11 +3075,21 @@ fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()>
         .archive_paths
         .first()
         .ok_or(UsageError("at least one archive volume is required"))?;
-    let volume_bytes = match read_volume_inputs(first, &request.archive_paths[1..]) {
-        Ok(volume_bytes) => volume_bytes,
+    let selection = match resolve_archive_input_paths(first, &request.archive_paths[1..], true) {
+        Ok(selection) => selection,
         Err(err) => {
             if request.json {
                 emit_verify_json_error(request.archive_paths, None, None, &err)?;
+            }
+            return Err(err);
+        }
+    };
+    let archive_paths = selection.paths;
+    let volume_bytes = match read_volume_inputs_from_paths(&archive_paths) {
+        Ok(volume_bytes) => volume_bytes,
+        Err(err) => {
+            if request.json {
+                emit_verify_json_error(&archive_paths, None, None, &err)?;
             }
             return Err(err);
         }
@@ -2955,7 +3153,7 @@ fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()>
             Ok(verification) => verification,
             Err(err) => {
                 if request.json {
-                    emit_verify_json_error(request.archive_paths, None, None, &err)?;
+                    emit_verify_json_error(&archive_paths, None, None, &err)?;
                 }
                 return Err(err);
             }
@@ -2977,9 +3175,9 @@ fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()>
             "{}",
             serde_json::to_string(&json!({
                 "ok": true,
-                "archives": request.archive_paths,
+                "archives": &archive_paths,
                 "verification_mode": "public-no-key",
-                "volume_count": request.archive_paths.len(),
+                "volume_count": archive_paths.len(),
                 "root_auth": public_no_key_root_auth_json(&root_auth),
                 "public_diagnostics": public_no_key_diagnostic_labels_for_root_auth(&root_auth),
             }))
@@ -2992,7 +3190,7 @@ fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()>
         &format!(
             "{}: OK public no-key ({} volume(s), {} data block(s))",
             first,
-            request.archive_paths.len(),
+            archive_paths.len(),
             public_no_key_total_data_block_count(&root_auth)
         ),
     )?;
@@ -3580,21 +3778,21 @@ fn load_create_key(
     })
 }
 
-fn load_open_key(
+fn load_open_key_from_paths(
     keyfile: Option<&str>,
     password_stdin: bool,
     password: bool,
     insecure_zero_key: bool,
-    first_volume_path: &str,
+    volume_paths: &[String],
 ) -> Result<MasterKey> {
     if password_stdin {
         let passphrase = read_passphrase_stdin()?;
-        let kdf_params = read_kdf_params_from_volume_path(first_volume_path)?;
+        let kdf_params = read_kdf_params_from_any_volume_path(volume_paths)?;
         return derive_key_from_passphrase(&kdf_params, &passphrase);
     }
     if password {
         let passphrase = read_passphrase_interactive_open()?;
-        let kdf_params = read_kdf_params_from_volume_path(first_volume_path)?;
+        let kdf_params = read_kdf_params_from_any_volume_path(volume_paths)?;
         return derive_key_from_passphrase(&kdf_params, &passphrase);
     }
     if insecure_zero_key {
@@ -3791,6 +3989,22 @@ fn read_kdf_params_from_volume_path(path: &str) -> Result<KdfParams> {
     file.read_exact(&mut crypto_header_bytes)
         .with_context(|| format!("failed to read CryptoHeader from {path}"))?;
     read_kdf_params_from_headers(&header_bytes, &crypto_header_bytes)
+}
+
+fn read_kdf_params_from_any_volume_path(paths: &[String]) -> Result<KdfParams> {
+    let mut first_error = None;
+    for path in paths {
+        match read_kdf_params_from_volume_path(path) {
+            Ok(params) => return Ok(params),
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+    Err(first_error.unwrap_or_else(|| anyhow!("at least one archive volume is required")))
+        .context("failed to read KDF parameters from any archive volume")
 }
 
 fn read_kdf_params_from_headers(

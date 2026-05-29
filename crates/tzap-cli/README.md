@@ -77,7 +77,7 @@ tzap create \
   -o project.tzap \
   ./project
 
-tzap verify --keyfile project.key project.tzap.000 project.tzap.001 project.tzap.002
+tzap verify --keyfile project.key project.vol000.tzap
 ```
 
 ## Safety

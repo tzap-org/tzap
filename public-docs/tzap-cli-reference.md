@@ -219,14 +219,19 @@ Validate archive integrity and recovery profile:
 tzap verify --keyfile project.key project.tzap
 tzap verify --insecure-zero-key --trusted-public-key root.public.hex public.tzap
 cat project.tzap | tzap verify --keyfile project.key -
-tzap verify --keyfile project.key project.tzap project.tzap.001
+tzap verify --keyfile project.key project.vol000.tzap
 printf '%s\n' "$TZAP_PASSPHRASE" | tzap verify --password-stdin project.tzap
 
-tzap verify --json --keyfile project.key backup.tzap.000 backup.tzap.001 backup.tzap.002
+tzap verify --json --keyfile project.key backup.vol001.tzap
 tzap verify --keyfile project.key --trusted-public-key root.public.hex backup.tzap
 tzap verify --keyfile project.key --trusted-ca-cert root-ca.pem backup.tzap
 tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap
 ```
+
+For multi-volume archives named `backup.vol000.tzap`,
+`backup.vol001.tzap`, and so on, passing any one volume discovers matching
+siblings in the same directory. Additional positional archive paths are treated
+as the explicit input set.
 
 Useful flags:
 

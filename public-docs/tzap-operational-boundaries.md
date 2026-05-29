@@ -90,8 +90,8 @@ Do not combine `--bootstrap` with a multi-volume open input set:
 tzap list \
   --keyfile project.key \
   --bootstrap archive.tzap.bootstrap \
-  archive.tzap.000 \
-  --volume archive.tzap.001
+  archive.vol000.tzap \
+  --volume archive.vol001.tzap
 # exit 16: unsupported-feature
 ```
 
@@ -538,9 +538,14 @@ tzap create \
   -o project.tzap \
   ./project
 
-tzap verify --keyfile project.key project.tzap.000 project.tzap.002
+tzap verify --keyfile project.key project.vol000.tzap project.vol002.tzap
 # success when the missing volume is within the configured tolerance
 ```
+
+When the archive files use the CLI volume naming pattern, such as
+`project.vol000.tzap`, passing any one volume discovers matching siblings in the
+same directory. Use explicit additional archive paths when the volume files live
+outside that directory or when you intentionally want a partial input set.
 
 Example without enough recovery budget:
 
@@ -556,7 +561,7 @@ tzap create \
 tzap extract \
   --keyfile project.key \
   --directory restored \
-  project.tzap.001 \
+  project.vol001.tzap \
   project/file.txt
 # exit 11: corrupt-archive, with a missing-volume diagnostic
 ```

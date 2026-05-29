@@ -199,15 +199,15 @@ tzap verify --public-no-key --trusted-ca-cert root-ca.pem signed-x509.tzap
 
 ```sh
 tzap create --keyfile project.key --volumes 3 --volume-loss-tolerance 1 -o project.tzap ./project
-tzap verify --keyfile project.key project.tzap.000 project.tzap.001 project.tzap.002
-tzap extract --keyfile project.key project.tzap.000 --volume project.tzap.002 --directory restored project
+tzap verify --keyfile project.key project.vol000.tzap
+tzap extract --keyfile project.key project.vol001.tzap --directory restored project
 ```
 
 If one volume is missing and tolerance allows, verification and extraction still work:
 
 ```sh
-tzap verify --keyfile project.key project.tzap.000 project.tzap.002
-tzap extract --keyfile project.key --volume project.tzap.002 project.tzap.000 --directory restored project
+tzap verify --keyfile project.key project.vol002.tzap
+tzap extract --keyfile project.key project.vol002.tzap --directory restored project
 ```
 
 ## Safety notes
@@ -274,10 +274,10 @@ tzap create \
 This writes:
 
 ```text
-backup.tzap.000
-backup.tzap.001
-backup.tzap.002
-backup.tzap.003
+backup.vol000.tzap
+backup.vol001.tzap
+backup.vol002.tzap
+backup.vol003.tzap
 ```
 
 Tune the self-healing budget:
@@ -307,19 +307,16 @@ Verify the volume set:
 ```sh
 tzap verify \
   --keyfile tzap.key \
-  backup.tzap.000 backup.tzap.001 backup.tzap.002 backup.tzap.003
+  backup.vol000.tzap
 ```
 
-Extract with additional volumes:
+Extract from any discovered volume:
 
 ```sh
 tzap extract \
   --keyfile tzap.key \
-  --volume backup.tzap.001 \
-  --volume backup.tzap.002 \
-  --volume backup.tzap.003 \
   -C restored \
-  backup.tzap.000
+  backup.vol001.tzap
 ```
 
 ## Bootstrap sidecars

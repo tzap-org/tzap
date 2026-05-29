@@ -296,8 +296,8 @@ fn readme_multivolume_recovery_example_executes() {
         .assert()
         .success();
 
-    let volume_0 = temp.path().join("project.tzap.000");
-    let volume_1 = temp.path().join("project.tzap.001");
+    let volume_0 = temp.path().join("project.vol000.tzap");
+    let volume_1 = temp.path().join("project.vol001.tzap");
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -306,7 +306,6 @@ fn readme_multivolume_recovery_example_executes() {
             "--keyfile",
             keyfile.to_str().unwrap(),
             volume_0.to_str().unwrap(),
-            volume_1.to_str().unwrap(),
         ])
         .assert()
         .success()
