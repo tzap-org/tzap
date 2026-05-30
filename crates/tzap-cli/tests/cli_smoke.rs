@@ -411,6 +411,7 @@ fn cli_create_help_includes_examples_and_flags() {
     assert!(stdout.contains("--envelope-size <SIZE>"));
     assert!(stdout.contains("--block-size <SIZE>"));
     assert!(stdout.contains("--jobs <N>"));
+    assert!(stdout.contains("--timings"));
     assert!(stdout.contains("--force"));
     assert!(stdout.contains("--dry-run"));
     assert!(stdout.contains("tar cf -"));
@@ -629,6 +630,37 @@ fn cli_create_rejects_password_source_conflicts() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn cli_create_timings_prints_breakdown() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let output = temp.path().join("sample.tzap");
+    let input = temp.path().join("hello.txt");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"hello from tzap\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--timings",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("create timings:")
+                .and(predicate::str::contains("writer timings:"))
+                .and(predicate::str::contains("plan payload:"))
+                .and(predicate::str::contains("emit payload:")),
+        );
 }
 
 #[test]

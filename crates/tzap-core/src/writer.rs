@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -212,6 +213,26 @@ pub struct WrittenArchiveSummary {
     pub bootstrap_sidecar_bytes: u64,
     pub archive_uuid: [u8; 16],
     pub session_id: [u8; 16],
+    pub timings: WriterTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriterTimings {
+    pub total: Duration,
+    pub plan_payload: Duration,
+    pub plan_metadata: Duration,
+    pub emit_payload: Duration,
+    pub emit_metadata: Duration,
+}
+
+impl WriterTimings {
+    fn add_assign(&mut self, other: Self) {
+        self.total += other.total;
+        self.plan_payload += other.plan_payload;
+        self.plan_metadata += other.plan_metadata;
+        self.emit_payload += other.emit_payload;
+        self.emit_metadata += other.emit_metadata;
+    }
 }
 
 /// In-memory sink used by the compatibility writer APIs.
@@ -256,6 +277,7 @@ pub struct WrittenArchive {
     pub bootstrap_sidecar: Vec<u8>,
     pub archive_uuid: [u8; 16],
     pub session_id: [u8; 16],
+    pub timings: WriterTimings,
 }
 
 #[derive(Debug, Clone)]
@@ -707,6 +729,7 @@ fn write_archive_inner(
         bootstrap_sidecar: sink.bootstrap_sidecar,
         archive_uuid: summary.archive_uuid,
         session_id: summary.session_id,
+        timings: summary.timings,
     })
 }
 
@@ -734,6 +757,7 @@ where
     S: RegularFileSource,
     O: ArchiveWriteSink,
 {
+    let total_started = Instant::now();
     validate_dictionary_inputs(files.is_empty(), dictionary)?;
     if let Some(root_auth) = root_auth {
         validate_root_auth_writer_config(root_auth)?;
@@ -750,10 +774,11 @@ where
     let session_id = requested_options
         .session_id
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
+    let mut accumulated_timings = WriterTimings::default();
 
     loop {
         let planned_options = plan_writer_options(requested_options)?;
-        let plan = build_writer_plan(
+        let timed_plan = build_writer_plan(
             files,
             master_key,
             planned_options,
@@ -763,6 +788,8 @@ where
             session_id,
             root_auth,
         )?;
+        accumulated_timings.add_assign(timed_plan.timings);
+        let plan = timed_plan.plan;
         if let Some(target_volume_size) = planned_options.target_volume_size {
             let required = required_stripe_width_for_plan(&plan, master_key, target_volume_size)?;
             if required > planned_options.stripe_width {
@@ -770,7 +797,7 @@ where
                 continue;
             }
         }
-        return emit_writer_plan(
+        let mut summary = emit_writer_plan(
             files,
             master_key,
             dictionary,
@@ -778,7 +805,10 @@ where
             authenticator.take(),
             plan,
             sink,
-        );
+        )?;
+        summary.timings.add_assign(accumulated_timings);
+        summary.timings.total = total_started.elapsed();
+        return Ok(summary);
     }
 }
 
@@ -807,6 +837,11 @@ fn validate_dictionary_inputs(
 }
 
 #[allow(clippy::too_many_arguments)]
+struct TimedWriterPlan {
+    plan: WriterPlan,
+    timings: WriterTimings,
+}
+
 fn build_writer_plan<S: RegularFileSource>(
     files: &[S],
     master_key: &MasterKey,
@@ -816,10 +851,13 @@ fn build_writer_plan<S: RegularFileSource>(
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
     root_auth: Option<RootAuthWriterConfig<'_>>,
-) -> Result<WriterPlan, ArchiveWriteError> {
+) -> Result<TimedWriterPlan, ArchiveWriteError> {
     let mut next_block_index = 0u64;
+    let payload_started = Instant::now();
     let payload = plan_payload_stream(files, options, dictionary, &mut next_block_index)?;
-    build_writer_plan_from_payload(
+    let plan_payload = payload_started.elapsed();
+    let metadata_started = Instant::now();
+    let plan = build_writer_plan_from_payload(
         payload,
         next_block_index,
         master_key,
@@ -829,7 +867,15 @@ fn build_writer_plan<S: RegularFileSource>(
         archive_uuid,
         session_id,
         root_auth,
-    )
+    )?;
+    Ok(TimedWriterPlan {
+        plan,
+        timings: WriterTimings {
+            plan_payload,
+            plan_metadata: metadata_started.elapsed(),
+            ..WriterTimings::default()
+        },
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1157,6 +1203,7 @@ where
     O: ArchiveWriteSink,
     F: FnOnce(&mut StreamingArchiveWriter<'_, O>) -> Result<(), ArchiveWriteError>,
 {
+    let total_started = Instant::now();
     validate_single_pass_writer_options(options)?;
     if let Some(root_auth) = root_auth {
         validate_root_auth_writer_config(root_auth)?;
@@ -1200,8 +1247,13 @@ where
         },
         emission_state,
     };
+    let emit_payload_started = Instant::now();
     drive_members(&mut writer)?;
-    writer.finish(master_key, kdf_params, root_auth, authenticator)
+    let emit_payload = emit_payload_started.elapsed();
+    let mut summary = writer.finish(master_key, kdf_params, root_auth, authenticator)?;
+    summary.timings.emit_payload += emit_payload;
+    summary.timings.total = total_started.elapsed();
+    Ok(summary)
 }
 
 fn validate_single_pass_writer_options(options: WriterOptions) -> Result<(), FormatError> {
@@ -1818,6 +1870,7 @@ where
         plan.session_id,
     )?;
 
+    let emit_payload_started = Instant::now();
     emit_payload_stream(
         files,
         dictionary,
@@ -1829,8 +1882,12 @@ where
         &mut state.record_counts,
         &mut state.data_leaf_hashes,
     )?;
+    let emit_payload = emit_payload_started.elapsed();
 
-    emit_writer_plan_suffix(&subkeys, root_auth, authenticator, plan, sink, state)
+    let mut summary =
+        emit_writer_plan_suffix(&subkeys, root_auth, authenticator, plan, sink, state)?;
+    summary.timings.emit_payload += emit_payload;
+    Ok(summary)
 }
 
 fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
@@ -1841,6 +1898,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
     sink: &mut O,
     mut state: WriterEmissionState,
 ) -> Result<WrittenArchiveSummary, ArchiveWriteError> {
+    let emit_metadata_started = Instant::now();
     let volume_count = plan.options.stripe_width as usize;
 
     for planned in &plan.index_shard_objects {
@@ -2117,6 +2175,10 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
         bootstrap_sidecar_bytes,
         archive_uuid: plan.archive_uuid,
         session_id: plan.session_id,
+        timings: WriterTimings {
+            emit_metadata: emit_metadata_started.elapsed(),
+            ..WriterTimings::default()
+        },
     })
 }
 

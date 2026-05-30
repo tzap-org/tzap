@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
@@ -32,6 +32,7 @@ use tzap_core::{
     NonSeekableReaderOptions, OpenedArchive, PublicNoKeyVerification, ReaderOptions, RegularFile,
     RootAuthSigningRequest, RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions,
     StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind, WriterOptions,
+    WriterTimings,
 };
 use tzap_plugin_signing::ed25519_raw::{
     self, Ed25519RootAuthOutcome, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
@@ -315,6 +316,12 @@ enum Command {
             help = "Worker jobs for reader/writer CPU work (default: logical CPU count)."
         )]
         jobs: Option<usize>,
+
+        #[arg(
+            long = "timings",
+            help = "Print create-stage timing breakdown to stderr."
+        )]
+        timings: bool,
 
         #[arg(
             long = "dry-run",
@@ -724,8 +731,10 @@ fn run(cli: Cli) -> Result<()> {
             envelope_size,
             block_size,
             jobs,
+            timings,
             paths,
         } => {
+            let create_total_started = Instant::now();
             let jobs = resolve_jobs(jobs)?;
             let resolved_volume_loss_tolerance = resolve_create_volume_loss_tolerance(
                 volume_loss_tolerance,
@@ -842,7 +851,8 @@ fn run(cli: Cli) -> Result<()> {
                     .as_ref()
                     .map(CreateRootAuthProfile::root_auth_writer_config)
                     .transpose()?;
-                let (bootstrap_sidecar, summary_text) = match stdin_mode {
+                let core_writer_started = Instant::now();
+                let (bootstrap_sidecar, summary_text, writer_timings) = match stdin_mode {
                     CreateStdinMode::Tar => {
                         let (summary, bootstrap_sidecar) = write_tar_stdin_archive_output(
                             &output,
@@ -860,7 +870,7 @@ fn run(cli: Cli) -> Result<()> {
                             resolved_volume_loss_tolerance,
                             bit_rot_buffer_pct
                         );
-                        (bootstrap_sidecar, summary_text)
+                        (bootstrap_sidecar, summary_text, summary.archive.timings)
                     }
                     CreateStdinMode::RawKnownSize => {
                         let stdin_size =
@@ -883,7 +893,7 @@ fn run(cli: Cli) -> Result<()> {
                             resolved_volume_loss_tolerance,
                             bit_rot_buffer_pct
                         );
-                        (bootstrap_sidecar, summary_text)
+                        (bootstrap_sidecar, summary_text, summary.archive.timings)
                     }
                     CreateStdinMode::RawSpool => {
                         let stdin = io::stdin();
@@ -913,10 +923,12 @@ fn run(cli: Cli) -> Result<()> {
                             resolved_volume_loss_tolerance,
                             bit_rot_buffer_pct
                         );
-                        (bootstrap_sidecar, summary_text)
+                        (bootstrap_sidecar, summary_text, summary.archive.timings)
                     }
                     CreateStdinMode::RawUnknownSize => unreachable!("rejected before key loading"),
                 };
+                let core_writer = core_writer_started.elapsed();
+                let write_outputs_started = Instant::now();
                 if let Some(path) = bootstrap_out.as_deref() {
                     if bootstrap_sidecar.is_empty() {
                         return Err(FormatError::WriterUnsupported(
@@ -926,6 +938,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                     write_bootstrap_output(path, &bootstrap_sidecar, force)?;
                 }
+                let write_outputs = write_outputs_started.elapsed();
                 emit_success_summary(quiet, &summary_text)?;
                 if let Some(profile) = root_auth_profile.as_ref() {
                     emit_success_summary(
@@ -936,9 +949,21 @@ fn run(cli: Cli) -> Result<()> {
                 if let Some(path) = bootstrap_out.as_ref() {
                     emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
                 }
+                if timings {
+                    emit_create_timing_report(
+                        Duration::default(),
+                        Duration::default(),
+                        core_writer,
+                        write_outputs,
+                        create_total_started.elapsed(),
+                        writer_timings,
+                    )?;
+                }
                 return Ok(());
             }
+            let scan_inputs_started = Instant::now();
             let input_specs = collect_input_specs(&paths)?;
+            let scan_inputs = scan_inputs_started.elapsed();
             let bootstrap_output = bootstrap_out.clone();
 
             if dry_run {
@@ -984,7 +1009,9 @@ fn run(cli: Cli) -> Result<()> {
                 argon2_m_cost_kib,
                 argon2_parallelism,
             )?;
+            let read_inputs_started = Instant::now();
             let inputs = collect_inputs_from_specs(&input_specs)?;
+            let read_inputs = read_inputs_started.elapsed();
             let regular_files = inputs
                 .iter()
                 .map(|file| RegularFile {
@@ -1010,6 +1037,7 @@ fn run(cli: Cli) -> Result<()> {
                 .as_ref()
                 .map(CreateRootAuthProfile::root_auth_writer_config)
                 .transpose()?;
+            let core_writer_started = Instant::now();
             let archive = match (
                 &dictionary_bytes,
                 &key.kdf_params,
@@ -1078,6 +1106,7 @@ fn run(cli: Cli) -> Result<()> {
                 (_, _, Some(_), None) => unreachable!("root auth requires signing profile"),
             }
             .context("failed to create archive")?;
+            let core_writer = core_writer_started.elapsed();
 
             let output_paths = create_output_paths(&output, archive.volumes.len());
             if !force {
@@ -1089,6 +1118,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
 
+            let write_outputs_started = Instant::now();
             write_archive_outputs(&output, &archive.volumes)?;
             if let Some(path) = bootstrap_out {
                 if archive.bootstrap_sidecar.is_empty() {
@@ -1100,6 +1130,7 @@ fn run(cli: Cli) -> Result<()> {
                 fs::write(&path, &archive.bootstrap_sidecar)
                     .with_context(|| format!("failed to write bootstrap sidecar {path}"))?;
             }
+            let write_outputs = write_outputs_started.elapsed();
             let summary = format!(
                 "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
                 regular_files.len(),
@@ -1115,6 +1146,16 @@ fn run(cli: Cli) -> Result<()> {
             }
             if let Some(path) = bootstrap_output {
                 emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
+            }
+            if timings {
+                emit_create_timing_report(
+                    scan_inputs,
+                    read_inputs,
+                    core_writer,
+                    write_outputs,
+                    create_total_started.elapsed(),
+                    archive.timings,
+                )?;
             }
             Ok(())
         }
@@ -1769,6 +1810,36 @@ fn emit_success_summary(quiet: bool, message: &str) -> io::Result<()> {
     }
     eprintln!("{message}");
     Ok(())
+}
+
+fn emit_create_timing_report(
+    scan_inputs: Duration,
+    read_inputs: Duration,
+    core_writer: Duration,
+    write_outputs: Duration,
+    total: Duration,
+    writer: WriterTimings,
+) -> io::Result<()> {
+    let accounted = scan_inputs + read_inputs + core_writer + write_outputs;
+    let other_cli = total.saturating_sub(accounted);
+    eprintln!("create timings:");
+    eprintln!("  scan inputs: {}", format_duration(scan_inputs));
+    eprintln!("  read inputs: {}", format_duration(read_inputs));
+    eprintln!("  core writer: {}", format_duration(core_writer));
+    eprintln!("  write outputs: {}", format_duration(write_outputs));
+    eprintln!("  other CLI: {}", format_duration(other_cli));
+    eprintln!("  total: {}", format_duration(total));
+    eprintln!("writer timings:");
+    eprintln!("  plan payload: {}", format_duration(writer.plan_payload));
+    eprintln!("  plan metadata: {}", format_duration(writer.plan_metadata));
+    eprintln!("  emit payload: {}", format_duration(writer.emit_payload));
+    eprintln!("  emit metadata: {}", format_duration(writer.emit_metadata));
+    eprintln!("  total: {}", format_duration(writer.total));
+    Ok(())
+}
+
+fn format_duration(duration: Duration) -> String {
+    format!("{:.3}s", duration.as_secs_f64())
 }
 
 fn emit_success_stdout(quiet: bool, message: &str) -> io::Result<()> {

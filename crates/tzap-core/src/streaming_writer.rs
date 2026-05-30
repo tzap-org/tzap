@@ -81,6 +81,7 @@ pub fn write_tar_stream_archive<R: Read>(
         bootstrap_sidecar: sink.bootstrap_sidecar,
         archive_uuid: summary.archive.archive_uuid,
         session_id: summary.archive.session_id,
+        timings: summary.archive.timings,
     })
 }
 

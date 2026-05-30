@@ -55,5 +55,5 @@ pub use writer::{
     write_archive_with_dictionary_kdf_and_root_auth, write_archive_with_kdf,
     write_archive_with_root_auth, write_archive_with_root_auth_and_kdf, write_empty_archive,
     ArchiveWriteSink, MemoryArchiveSink, RegularFile, RegularFileSource, RootAuthSigningRequest,
-    RootAuthWriterConfig, WriterOptions, WrittenArchiveSummary,
+    RootAuthWriterConfig, WriterOptions, WriterTimings, WrittenArchiveSummary,
 };

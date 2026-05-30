@@ -87,6 +87,7 @@ Useful flags:
 - `--compression-level`, `--chunk-size`, `--envelope-size`, `--block-size`
 - `--jobs`: worker count for reader/writer CPU work; defaults to the logical CPU
   count reported by the operating system
+- `--timings`: print a create-stage timing breakdown for performance diagnosis
 - `--dry-run`: print planned actions without writing bytes
 - `--force`: allow overwrite of outputs and bootstrap
 
