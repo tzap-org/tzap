@@ -1687,9 +1687,15 @@ fn prepare_destination(
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&current).map_err(|_| {
-                    FormatError::FilesystemExtractionFailed("failed to create parent directory")
-                })?;
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) => {
+                        return Err(FormatError::FilesystemExtractionFailed(
+                            "failed to create parent directory",
+                        ));
+                    }
+                }
                 let metadata = fs::symlink_metadata(&current).map_err(|_| {
                     FormatError::FilesystemExtractionFailed(
                         "failed to inspect created parent directory",

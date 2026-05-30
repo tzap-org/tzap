@@ -167,6 +167,9 @@ The standard profile defaults to 64 files in every data set and targets 1 MB,
 20 MB, 1 GB, and 20 GB total input sizes. Pinning `--file-count` and
 `--dataset-sizes` in the public command keeps "number of files" from becoming a
 hidden benchmark variable while giving normal readers sizes they understand.
+The normal create/extract rows use `tzap create` defaults, including the
+input-size-based payload layout. The damaged-payload recovery proof below keeps
+explicit block/chunk/envelope flags so the corruption site is deterministic.
 Thirty normal workflow runs is the default for this profile when `--runs` is
 omitted. One recovery proof run is the default when `--recovery-runs` is
 omitted.

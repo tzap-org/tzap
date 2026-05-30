@@ -164,8 +164,8 @@ impl<'a> RegularFile<'a> {
 
 /// Re-openable source for one regular file written into an archive.
 ///
-/// The streaming writer performs a planning pass and an emission pass, so
-/// implementations must return a fresh reader from each `open` call.
+/// The writer may replan when options such as target volume sizing need another
+/// pass, so implementations must return a fresh reader from each `open` call.
 pub trait RegularFileSource {
     fn archive_path(&self) -> &str;
     fn file_data_size(&self) -> u64;
@@ -691,6 +691,88 @@ where
         master_key,
         options,
         dictionary,
+        kdf_params,
+        root_auth,
+        authenticator,
+        sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_archive_sources_to_sink_single_pass<S, O>(
+    files: &[S],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    kdf_params: &KdfParams,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    sink: &mut O,
+) -> Result<WrittenArchiveSummary, ArchiveWriteError>
+where
+    S: RegularFileSource,
+    O: ArchiveWriteSink,
+{
+    write_single_pass_archive_to_sink(
+        master_key,
+        options,
+        kdf_params,
+        root_auth,
+        authenticator,
+        sink,
+        |writer| {
+            for file in files {
+                let archive_path =
+                    normalize_lookup_file_path(file.archive_path(), options.max_path_length)?;
+                let mut reader = file.open()?;
+                writer.write_regular_member_from_reader(
+                    StreamingRegularMember {
+                        archive_path,
+                        file_data_size: file.file_data_size(),
+                        mode: file.mode(),
+                        mtime: file.mtime(),
+                    },
+                    reader.as_mut(),
+                )?;
+            }
+            Ok(())
+        },
+    )
+}
+
+#[doc(hidden)]
+pub fn write_archive_sources_to_sink_unordered_probe<S, O>(
+    files: &[S],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    kdf_params: &KdfParams,
+    sink: &mut O,
+) -> Result<WrittenArchiveSummary, ArchiveWriteError>
+where
+    S: RegularFileSource,
+    O: ArchiveWriteSink,
+{
+    write_unordered_probe_archive_to_sink(files, master_key, options, kdf_params, sink)
+}
+
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn write_archive_sources_to_sink_ordered_parallel_probe<S, O>(
+    files: &[S],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    kdf_params: &KdfParams,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    sink: &mut O,
+) -> Result<WrittenArchiveSummary, ArchiveWriteError>
+where
+    S: RegularFileSource,
+    O: ArchiveWriteSink,
+{
+    write_ordered_parallel_archive_to_sink(
+        files,
+        master_key,
+        options,
         kdf_params,
         root_auth,
         authenticator,
@@ -1254,6 +1336,1063 @@ where
     summary.timings.emit_payload += emit_payload;
     summary.timings.total = total_started.elapsed();
     Ok(summary)
+}
+
+struct UnorderedProbeJob {
+    envelope_index: u64,
+    plaintext: Vec<u8>,
+}
+
+struct UnorderedProbeResult {
+    records: Vec<BlockRecord>,
+}
+
+struct OrderedFrameJob {
+    frame_index: u64,
+    member_index: usize,
+    member_start: u64,
+    member_offset: u64,
+    member_group_size: u64,
+    plaintext: Vec<u8>,
+}
+
+struct OrderedFrameResult {
+    frame_index: u64,
+    member_index: usize,
+    member_start: u64,
+    member_offset: u64,
+    member_group_size: u64,
+    decompressed_size: usize,
+    frame: Vec<u8>,
+}
+
+struct OrderedEnvelopeJob {
+    envelope_index: u64,
+    plaintext: Vec<u8>,
+    extent: ObjectExtent,
+}
+
+struct OrderedEnvelopeResult {
+    envelope_index: u64,
+    records: Vec<BlockRecord>,
+}
+
+struct OrderedParallelState {
+    tar_members: Vec<TarMember>,
+    frames: Vec<PayloadFrame>,
+    payload_objects: Vec<PayloadObject>,
+    payload_block_count: u64,
+    tar_total_size: u64,
+    hasher: Sha256,
+    next_frame_job_index: u64,
+    next_frame_result_index: u64,
+    next_frame_metadata_index: u64,
+    frame_buffer: std::collections::BTreeMap<u64, OrderedFrameResult>,
+    envelope: PayloadEnvelopeBuilder,
+    next_payload_block_index: u64,
+    next_envelope_result_index: u64,
+    envelope_buffer: std::collections::BTreeMap<u64, OrderedEnvelopeResult>,
+}
+
+impl OrderedParallelState {
+    fn new(file_count: usize) -> Self {
+        Self {
+            tar_members: Vec::with_capacity(file_count),
+            frames: Vec::new(),
+            payload_objects: Vec::new(),
+            payload_block_count: 0,
+            tar_total_size: 0,
+            hasher: Sha256::new(),
+            next_frame_job_index: 0,
+            next_frame_result_index: 0,
+            next_frame_metadata_index: 0,
+            frame_buffer: std::collections::BTreeMap::new(),
+            envelope: PayloadEnvelopeBuilder {
+                envelope_index: 0,
+                plaintext: Vec::new(),
+            },
+            next_payload_block_index: 0,
+            next_envelope_result_index: 0,
+            envelope_buffer: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+fn write_unordered_probe_archive_to_sink<S, O>(
+    files: &[S],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    kdf_params: &KdfParams,
+    sink: &mut O,
+) -> Result<WrittenArchiveSummary, ArchiveWriteError>
+where
+    S: RegularFileSource,
+    O: ArchiveWriteSink,
+{
+    let total_started = Instant::now();
+    validate_single_pass_writer_options(options)?;
+    let options = plan_single_pass_writer_options(options)?;
+    let archive_uuid = options
+        .archive_uuid
+        .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
+    let session_id = options
+        .session_id
+        .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
+    let subkeys = Subkeys::derive(master_key, &archive_uuid, &session_id)?;
+    let crypto_header = build_crypto_header(
+        options,
+        false,
+        &subkeys,
+        &archive_uuid,
+        &session_id,
+        kdf_params,
+    )?;
+    let mut state =
+        begin_writer_emission_state(sink, options, &crypto_header, archive_uuid, session_id)?;
+    let worker_count = options.jobs.max(1);
+    let job_buffer = worker_count.saturating_mul(2).max(1);
+    let batch_target = (options.envelope_target_size as usize)
+        .saturating_mul(4)
+        .max(options.chunk_size as usize);
+    let emit_payload_started = Instant::now();
+    let subkeys = std::sync::Arc::new(subkeys);
+    let next_block_index = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut jobs_sent = 0usize;
+    let mut results_received = 0usize;
+
+    std::thread::scope(|scope| -> Result<(), ArchiveWriteError> {
+        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<UnorderedProbeJob>(job_buffer);
+        let (result_tx, result_rx) =
+            std::sync::mpsc::channel::<Result<UnorderedProbeResult, ArchiveWriteError>>();
+        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+
+        let handles = (0..worker_count)
+            .map(|_| {
+                let job_rx = std::sync::Arc::clone(&job_rx);
+                let result_tx = result_tx.clone();
+                let subkeys = std::sync::Arc::clone(&subkeys);
+                let next_block_index = std::sync::Arc::clone(&next_block_index);
+                scope.spawn(move || loop {
+                    let job = {
+                        let receiver = job_rx.lock().expect("unordered probe receiver poisoned");
+                        receiver.recv()
+                    };
+                    let Ok(job) = job else {
+                        break;
+                    };
+                    let is_error = match build_unordered_probe_result(
+                        job,
+                        &subkeys,
+                        &next_block_index,
+                        options,
+                        archive_uuid,
+                        session_id,
+                    ) {
+                        Ok(result) => result_tx.send(Ok(result)).is_err(),
+                        Err(error) => {
+                            let _ = result_tx.send(Err(error));
+                            true
+                        }
+                    };
+                    if is_error {
+                        break;
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(result_tx);
+
+        let mut envelope_index = 0u64;
+        let mut batch = Vec::with_capacity(batch_target);
+        for file in files {
+            let path = normalize_lookup_file_path(file.archive_path(), options.max_path_length)?;
+            let prefix = build_regular_file_member_prefix(
+                &path,
+                file.file_data_size(),
+                file.mode(),
+                file.mtime(),
+            )?;
+            let member_group_size = checked_u64_add(
+                prefix.len() as u64,
+                checked_u64_add(
+                    file.file_data_size(),
+                    padding_to_512_u64(file.file_data_size()),
+                    "tar member",
+                )?,
+                "tar member",
+            )?;
+            let mut reader =
+                StreamingMemberReader::new(file.open()?, prefix, file.file_data_size());
+            let mut member_offset = 0u64;
+            while member_offset < member_group_size {
+                let remaining = member_group_size - member_offset;
+                let available = batch_target.saturating_sub(batch.len()).max(1);
+                let read_len = remaining.min(available as u64);
+                let mut chunk = vec![0u8; to_usize_writer(read_len, "payload probe batch")?];
+                reader
+                    .read_exact(&mut chunk)
+                    .map_err(ArchiveWriteError::Io)?;
+                batch.extend_from_slice(&chunk);
+                member_offset = checked_u64_add(member_offset, read_len, "payload probe batch")?;
+                if batch.len() >= batch_target {
+                    send_unordered_probe_job(
+                        &job_tx,
+                        &result_rx,
+                        &mut jobs_sent,
+                        &mut results_received,
+                        &mut envelope_index,
+                        &mut batch,
+                        batch_target,
+                        sink,
+                        options,
+                        &mut state.bytes_written,
+                        &mut state.record_counts,
+                    )?;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            send_unordered_probe_job(
+                &job_tx,
+                &result_rx,
+                &mut jobs_sent,
+                &mut results_received,
+                &mut envelope_index,
+                &mut batch,
+                batch_target,
+                sink,
+                options,
+                &mut state.bytes_written,
+                &mut state.record_counts,
+            )?;
+        }
+        drop(job_tx);
+
+        while results_received < jobs_sent {
+            let result = result_rx
+                .recv()
+                .map_err(|_| FormatError::WriterInvariant("unordered probe worker stopped"))??;
+            emit_unordered_probe_result(
+                result,
+                sink,
+                options,
+                &mut state.bytes_written,
+                &mut state.record_counts,
+            )?;
+            results_received += 1;
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| FormatError::WriterInvariant("unordered probe worker panicked"))?;
+        }
+        Ok(())
+    })?;
+
+    state.next_block_index = next_block_index.load(std::sync::atomic::Ordering::SeqCst);
+    Ok(WrittenArchiveSummary {
+        volume_count: options.stripe_width as usize,
+        archive_bytes: state.bytes_written.iter().sum(),
+        bootstrap_sidecar_bytes: 0,
+        archive_uuid,
+        session_id,
+        timings: WriterTimings {
+            emit_payload: emit_payload_started.elapsed(),
+            total: total_started.elapsed(),
+            ..WriterTimings::default()
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_ordered_parallel_archive_to_sink<S, O>(
+    files: &[S],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    kdf_params: &KdfParams,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    sink: &mut O,
+) -> Result<WrittenArchiveSummary, ArchiveWriteError>
+where
+    S: RegularFileSource,
+    O: ArchiveWriteSink,
+{
+    let total_started = Instant::now();
+    validate_single_pass_writer_options(options)?;
+    if let Some(root_auth) = root_auth {
+        validate_root_auth_writer_config(root_auth)?;
+    }
+    let options = plan_single_pass_writer_options(options)?;
+    let archive_uuid = options
+        .archive_uuid
+        .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
+    let session_id = options
+        .session_id
+        .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
+    let subkeys = Subkeys::derive(master_key, &archive_uuid, &session_id)?;
+    let crypto_header = build_crypto_header(
+        options,
+        false,
+        &subkeys,
+        &archive_uuid,
+        &session_id,
+        kdf_params,
+    )?;
+    let mut emission_state =
+        begin_writer_emission_state(sink, options, &crypto_header, archive_uuid, session_id)?;
+
+    let emit_payload_started = Instant::now();
+    let mut ordered = OrderedParallelState::new(files.len());
+    let worker_count = options.jobs.max(1);
+    let frame_job_buffer = worker_count.saturating_mul(4).max(1);
+    let envelope_job_buffer = worker_count.saturating_mul(2).max(1);
+    let subkeys_for_workers = std::sync::Arc::new(subkeys.clone());
+
+    std::thread::scope(|scope| -> Result<(), ArchiveWriteError> {
+        let (frame_job_tx, frame_job_rx) =
+            std::sync::mpsc::sync_channel::<OrderedFrameJob>(frame_job_buffer);
+        let (frame_result_tx, frame_result_rx) =
+            std::sync::mpsc::channel::<Result<OrderedFrameResult, ArchiveWriteError>>();
+        let frame_job_rx = std::sync::Arc::new(std::sync::Mutex::new(frame_job_rx));
+
+        let (envelope_job_tx, envelope_job_rx) =
+            std::sync::mpsc::sync_channel::<OrderedEnvelopeJob>(envelope_job_buffer);
+        let (envelope_result_tx, envelope_result_rx) =
+            std::sync::mpsc::channel::<Result<OrderedEnvelopeResult, ArchiveWriteError>>();
+        let envelope_job_rx = std::sync::Arc::new(std::sync::Mutex::new(envelope_job_rx));
+
+        let frame_handles = (0..worker_count)
+            .map(|_| {
+                let frame_job_rx = std::sync::Arc::clone(&frame_job_rx);
+                let frame_result_tx = frame_result_tx.clone();
+                scope.spawn(move || loop {
+                    let job = {
+                        let receiver = frame_job_rx
+                            .lock()
+                            .expect("ordered frame receiver poisoned");
+                        receiver.recv()
+                    };
+                    let Ok(job) = job else {
+                        break;
+                    };
+                    let is_error = match build_ordered_frame_result(job, options) {
+                        Ok(result) => frame_result_tx.send(Ok(result)).is_err(),
+                        Err(error) => {
+                            let _ = frame_result_tx.send(Err(error));
+                            true
+                        }
+                    };
+                    if is_error {
+                        break;
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(frame_result_tx);
+
+        let envelope_handles = (0..worker_count)
+            .map(|_| {
+                let envelope_job_rx = std::sync::Arc::clone(&envelope_job_rx);
+                let envelope_result_tx = envelope_result_tx.clone();
+                let subkeys = std::sync::Arc::clone(&subkeys_for_workers);
+                scope.spawn(move || loop {
+                    let job = {
+                        let receiver = envelope_job_rx
+                            .lock()
+                            .expect("ordered envelope receiver poisoned");
+                        receiver.recv()
+                    };
+                    let Ok(job) = job else {
+                        break;
+                    };
+                    let is_error = match build_ordered_envelope_result(
+                        job,
+                        &subkeys,
+                        options,
+                        archive_uuid,
+                        session_id,
+                    ) {
+                        Ok(result) => envelope_result_tx.send(Ok(result)).is_err(),
+                        Err(error) => {
+                            let _ = envelope_result_tx.send(Err(error));
+                            true
+                        }
+                    };
+                    if is_error {
+                        break;
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(envelope_result_tx);
+
+        for (member_index, file) in files.iter().enumerate() {
+            let path = normalize_lookup_file_path(file.archive_path(), options.max_path_length)?;
+            let prefix = build_regular_file_member_prefix(
+                &path,
+                file.file_data_size(),
+                file.mode(),
+                file.mtime(),
+            )?;
+            let member_start = ordered.tar_total_size;
+            let member_group_size = checked_u64_add(
+                prefix.len() as u64,
+                checked_u64_add(
+                    file.file_data_size(),
+                    padding_to_512_u64(file.file_data_size()),
+                    "tar member",
+                )?,
+                "tar member",
+            )?;
+            ordered.tar_members.push(TarMember {
+                path,
+                tar_member_group_start: member_start,
+                tar_member_group_size: member_group_size,
+                file_data_size: file.file_data_size(),
+                mode: file.mode(),
+                mtime: file.mtime(),
+            });
+            let mut reader =
+                StreamingMemberReader::new(file.open()?, prefix, file.file_data_size());
+            let mut member_offset = 0u64;
+            while member_offset < member_group_size {
+                let remaining = member_group_size - member_offset;
+                let read_len = remaining.min(options.chunk_size as u64);
+                let mut plaintext = vec![0u8; to_usize_writer(read_len, "payload chunk")?];
+                reader
+                    .read_exact(&mut plaintext)
+                    .map_err(ArchiveWriteError::Io)?;
+                ordered.hasher.update(&plaintext);
+                let frame_index = ordered.next_frame_job_index;
+                ordered.next_frame_job_index =
+                    checked_u64_add(ordered.next_frame_job_index, 1, "PayloadFrame.frame_index")?;
+                send_ordered_frame_job(
+                    OrderedFrameJob {
+                        frame_index,
+                        member_index,
+                        member_start,
+                        member_offset,
+                        member_group_size,
+                        plaintext,
+                    },
+                    &frame_job_tx,
+                    &frame_result_rx,
+                    &envelope_job_tx,
+                    &envelope_result_rx,
+                    &mut ordered,
+                    sink,
+                    options,
+                    &mut emission_state,
+                )?;
+                member_offset = checked_u64_add(member_offset, read_len, "payload chunk")?;
+                ordered.tar_total_size =
+                    checked_u64_add(ordered.tar_total_size, read_len, "tar stream")?;
+            }
+        }
+        drop(frame_job_tx);
+
+        while ordered.next_frame_result_index < ordered.next_frame_job_index {
+            receive_ordered_frame_result(
+                &frame_result_rx,
+                &envelope_job_tx,
+                &envelope_result_rx,
+                &mut ordered,
+                sink,
+                options,
+                &mut emission_state,
+                true,
+            )?;
+        }
+        flush_ordered_parallel_envelope(
+            &envelope_job_tx,
+            &envelope_result_rx,
+            &mut ordered,
+            sink,
+            options,
+            &mut emission_state,
+        )?;
+        drop(envelope_job_tx);
+        while ordered.next_envelope_result_index < ordered.envelope.envelope_index {
+            receive_ordered_envelope_result(
+                &envelope_result_rx,
+                &mut ordered,
+                sink,
+                options,
+                &mut emission_state,
+                true,
+            )?;
+        }
+
+        for handle in frame_handles {
+            handle
+                .join()
+                .map_err(|_| FormatError::WriterInvariant("ordered frame worker panicked"))?;
+        }
+        for handle in envelope_handles {
+            handle
+                .join()
+                .map_err(|_| FormatError::WriterInvariant("ordered envelope worker panicked"))?;
+        }
+        Ok(())
+    })?;
+    let emit_payload = emit_payload_started.elapsed();
+
+    emission_state.next_block_index = ordered.next_payload_block_index;
+    let digest = ordered.hasher.finalize();
+    let mut content_sha256 = [0u8; 32];
+    content_sha256.copy_from_slice(&digest);
+    let payload = PayloadPlanning {
+        tar_members: ordered.tar_members,
+        frames: ordered.frames,
+        payload_objects: ordered.payload_objects,
+        payload_block_count: ordered.payload_block_count,
+        tar_total_size: ordered.tar_total_size,
+        content_sha256,
+    };
+    let plan = build_writer_plan_from_payload(
+        payload,
+        emission_state.next_block_index,
+        master_key,
+        options,
+        None,
+        kdf_params,
+        archive_uuid,
+        session_id,
+        root_auth,
+    )?;
+    if plan.options != options || plan.crypto_header != crypto_header {
+        return Err(FormatError::WriterUnsupported(
+            "ordered parallel metadata exceeded the predeclared header class",
+        )
+        .into());
+    }
+    let mut summary = emit_writer_plan_suffix(
+        &subkeys,
+        root_auth,
+        authenticator,
+        plan,
+        sink,
+        emission_state,
+    )?;
+    summary.timings.emit_payload += emit_payload;
+    summary.timings.total = total_started.elapsed();
+    Ok(summary)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_ordered_frame_job<O: ArchiveWriteSink>(
+    mut job: OrderedFrameJob,
+    frame_job_tx: &std::sync::mpsc::SyncSender<OrderedFrameJob>,
+    frame_result_rx: &std::sync::mpsc::Receiver<Result<OrderedFrameResult, ArchiveWriteError>>,
+    envelope_job_tx: &std::sync::mpsc::SyncSender<OrderedEnvelopeJob>,
+    envelope_result_rx: &std::sync::mpsc::Receiver<
+        Result<OrderedEnvelopeResult, ArchiveWriteError>,
+    >,
+    ordered: &mut OrderedParallelState,
+    sink: &mut O,
+    options: WriterOptions,
+    emission_state: &mut WriterEmissionState,
+) -> Result<(), ArchiveWriteError> {
+    loop {
+        match frame_job_tx.try_send(job) {
+            Ok(()) => {
+                drain_ordered_frame_results(
+                    frame_result_rx,
+                    envelope_job_tx,
+                    envelope_result_rx,
+                    ordered,
+                    sink,
+                    options,
+                    emission_state,
+                )?;
+                return Ok(());
+            }
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                job = returned;
+                receive_ordered_frame_result(
+                    frame_result_rx,
+                    envelope_job_tx,
+                    envelope_result_rx,
+                    ordered,
+                    sink,
+                    options,
+                    emission_state,
+                    true,
+                )?;
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return Err(FormatError::WriterInvariant("ordered frame worker stopped").into());
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_ordered_frame_results<O: ArchiveWriteSink>(
+    frame_result_rx: &std::sync::mpsc::Receiver<Result<OrderedFrameResult, ArchiveWriteError>>,
+    envelope_job_tx: &std::sync::mpsc::SyncSender<OrderedEnvelopeJob>,
+    envelope_result_rx: &std::sync::mpsc::Receiver<
+        Result<OrderedEnvelopeResult, ArchiveWriteError>,
+    >,
+    ordered: &mut OrderedParallelState,
+    sink: &mut O,
+    options: WriterOptions,
+    emission_state: &mut WriterEmissionState,
+) -> Result<(), ArchiveWriteError> {
+    while receive_ordered_frame_result(
+        frame_result_rx,
+        envelope_job_tx,
+        envelope_result_rx,
+        ordered,
+        sink,
+        options,
+        emission_state,
+        false,
+    )? {}
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receive_ordered_frame_result<O: ArchiveWriteSink>(
+    frame_result_rx: &std::sync::mpsc::Receiver<Result<OrderedFrameResult, ArchiveWriteError>>,
+    envelope_job_tx: &std::sync::mpsc::SyncSender<OrderedEnvelopeJob>,
+    envelope_result_rx: &std::sync::mpsc::Receiver<
+        Result<OrderedEnvelopeResult, ArchiveWriteError>,
+    >,
+    ordered: &mut OrderedParallelState,
+    sink: &mut O,
+    options: WriterOptions,
+    emission_state: &mut WriterEmissionState,
+    wait: bool,
+) -> Result<bool, ArchiveWriteError> {
+    let result = if wait {
+        match frame_result_rx.recv() {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(FormatError::WriterInvariant("ordered frame worker stopped").into())
+            }
+        }
+    } else {
+        match frame_result_rx.try_recv() {
+            Ok(result) => result?,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(false),
+        }
+    };
+    ordered.frame_buffer.insert(result.frame_index, result);
+    while let Some(result) = ordered
+        .frame_buffer
+        .remove(&ordered.next_frame_result_index)
+    {
+        append_ordered_frame_result(
+            result,
+            envelope_job_tx,
+            envelope_result_rx,
+            ordered,
+            sink,
+            options,
+            emission_state,
+        )?;
+        ordered.next_frame_result_index = checked_u64_add(
+            ordered.next_frame_result_index,
+            1,
+            "PayloadFrame.frame_index",
+        )?;
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_ordered_frame_result<O: ArchiveWriteSink>(
+    result: OrderedFrameResult,
+    envelope_job_tx: &std::sync::mpsc::SyncSender<OrderedEnvelopeJob>,
+    envelope_result_rx: &std::sync::mpsc::Receiver<
+        Result<OrderedEnvelopeResult, ArchiveWriteError>,
+    >,
+    ordered: &mut OrderedParallelState,
+    sink: &mut O,
+    options: WriterOptions,
+    emission_state: &mut WriterEmissionState,
+) -> Result<(), ArchiveWriteError> {
+    let next_len = checked_usize_add(
+        ordered.envelope.plaintext.len(),
+        result.frame.len(),
+        "payload",
+    )?;
+    if !ordered.envelope.plaintext.is_empty()
+        && (next_len > options.envelope_target_size as usize
+            || !payload_object_can_fit(next_len, options)?)
+    {
+        flush_ordered_parallel_envelope(
+            envelope_job_tx,
+            envelope_result_rx,
+            ordered,
+            sink,
+            options,
+            emission_state,
+        )?;
+    }
+    if ordered.envelope.plaintext.is_empty()
+        && !payload_object_can_fit(result.frame.len(), options)?
+    {
+        return Err(
+            FormatError::WriterUnsupported("payload frame exceeds envelope object limits").into(),
+        );
+    }
+    let offset = u32_len(
+        ordered.envelope.plaintext.len(),
+        "FrameEntry.offset_in_envelope",
+    )?;
+    ordered.envelope.plaintext.extend_from_slice(&result.frame);
+    let mut flags = 0u32;
+    if result.member_offset == 0 {
+        flags |= 0x0000_0001;
+    }
+    if checked_u64_add(
+        result.member_offset,
+        result.decompressed_size as u64,
+        "payload chunk",
+    )? == result.member_group_size
+    {
+        flags |= 0x0000_0002;
+    }
+    ordered.frames.push(PayloadFrame {
+        frame_index: ordered.next_frame_metadata_index,
+        envelope_index: ordered.envelope.envelope_index,
+        member_index: result.member_index,
+        offset_in_envelope: offset,
+        compressed_size: u32_len(result.frame.len(), "FrameEntry.compressed_size")?,
+        decompressed_size: u32_len(result.decompressed_size, "FrameEntry.decompressed_size")?,
+        flags,
+        tar_stream_offset: checked_u64_add(
+            result.member_start,
+            result.member_offset,
+            "PayloadFrame.tar_stream_offset",
+        )?,
+    });
+    ordered.next_frame_metadata_index = checked_u64_add(
+        ordered.next_frame_metadata_index,
+        1,
+        "PayloadFrame.frame_index",
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_ordered_parallel_envelope<O: ArchiveWriteSink>(
+    envelope_job_tx: &std::sync::mpsc::SyncSender<OrderedEnvelopeJob>,
+    envelope_result_rx: &std::sync::mpsc::Receiver<
+        Result<OrderedEnvelopeResult, ArchiveWriteError>,
+    >,
+    ordered: &mut OrderedParallelState,
+    sink: &mut O,
+    options: WriterOptions,
+    emission_state: &mut WriterEmissionState,
+) -> Result<(), ArchiveWriteError> {
+    if ordered.envelope.plaintext.is_empty() {
+        return Ok(());
+    }
+    let plaintext_size = u32_len(
+        ordered.envelope.plaintext.len(),
+        "EnvelopeEntry.plaintext_size",
+    )?;
+    let object_plan = plan_encrypted_object(
+        ordered.envelope.plaintext.len(),
+        options.fec_data_shards,
+        options.fec_parity_shards,
+        options,
+    )?;
+    let extent = ObjectExtent::new(ordered.next_payload_block_index, object_plan)?;
+    ordered.next_payload_block_index = extent.next_block_index()?;
+    ordered.payload_block_count = checked_u64_add(
+        ordered.payload_block_count,
+        extent.data_block_count as u64,
+        "payload",
+    )?;
+    ordered.payload_objects.push(PayloadObject {
+        envelope_index: ordered.envelope.envelope_index,
+        plaintext_size,
+        object: extent,
+    });
+    let mut job = OrderedEnvelopeJob {
+        envelope_index: ordered.envelope.envelope_index,
+        plaintext: std::mem::take(&mut ordered.envelope.plaintext),
+        extent,
+    };
+    ordered.envelope.envelope_index =
+        checked_u64_add(ordered.envelope.envelope_index, 1, "EnvelopeEntry")?;
+    loop {
+        match envelope_job_tx.try_send(job) {
+            Ok(()) => {
+                drain_ordered_envelope_results(
+                    envelope_result_rx,
+                    ordered,
+                    sink,
+                    options,
+                    emission_state,
+                )?;
+                return Ok(());
+            }
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                job = returned;
+                receive_ordered_envelope_result(
+                    envelope_result_rx,
+                    ordered,
+                    sink,
+                    options,
+                    emission_state,
+                    true,
+                )?;
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return Err(FormatError::WriterInvariant("ordered envelope worker stopped").into());
+            }
+        }
+    }
+}
+
+fn drain_ordered_envelope_results<O: ArchiveWriteSink>(
+    envelope_result_rx: &std::sync::mpsc::Receiver<
+        Result<OrderedEnvelopeResult, ArchiveWriteError>,
+    >,
+    ordered: &mut OrderedParallelState,
+    sink: &mut O,
+    options: WriterOptions,
+    emission_state: &mut WriterEmissionState,
+) -> Result<(), ArchiveWriteError> {
+    while receive_ordered_envelope_result(
+        envelope_result_rx,
+        ordered,
+        sink,
+        options,
+        emission_state,
+        false,
+    )? {}
+    Ok(())
+}
+
+fn receive_ordered_envelope_result<O: ArchiveWriteSink>(
+    envelope_result_rx: &std::sync::mpsc::Receiver<
+        Result<OrderedEnvelopeResult, ArchiveWriteError>,
+    >,
+    ordered: &mut OrderedParallelState,
+    sink: &mut O,
+    options: WriterOptions,
+    emission_state: &mut WriterEmissionState,
+    wait: bool,
+) -> Result<bool, ArchiveWriteError> {
+    let result = if wait {
+        match envelope_result_rx.recv() {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(FormatError::WriterInvariant("ordered envelope worker stopped").into());
+            }
+        }
+    } else {
+        match envelope_result_rx.try_recv() {
+            Ok(result) => result?,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(false),
+        }
+    };
+    ordered
+        .envelope_buffer
+        .insert(result.envelope_index, result);
+    while let Some(result) = ordered
+        .envelope_buffer
+        .remove(&ordered.next_envelope_result_index)
+    {
+        emit_ordered_envelope_result(result, sink, options, emission_state)?;
+        ordered.next_envelope_result_index =
+            checked_u64_add(ordered.next_envelope_result_index, 1, "EnvelopeEntry")?;
+    }
+    Ok(true)
+}
+
+fn build_ordered_frame_result(
+    job: OrderedFrameJob,
+    options: WriterOptions,
+) -> Result<OrderedFrameResult, ArchiveWriteError> {
+    let frame = compress_zstd_frame_with_jobs(&job.plaintext, options.zstd_level, 1)?;
+    Ok(OrderedFrameResult {
+        frame_index: job.frame_index,
+        member_index: job.member_index,
+        member_start: job.member_start,
+        member_offset: job.member_offset,
+        member_group_size: job.member_group_size,
+        decompressed_size: job.plaintext.len(),
+        frame,
+    })
+}
+
+fn build_ordered_envelope_result(
+    job: OrderedEnvelopeJob,
+    subkeys: &Subkeys,
+    options: WriterOptions,
+    archive_uuid: [u8; 16],
+    session_id: [u8; 16],
+) -> Result<OrderedEnvelopeResult, ArchiveWriteError> {
+    let mut local_next_block_index = job.extent.first_block_index;
+    let object = encrypt_object(
+        &job.plaintext,
+        ObjectEncryptionContext {
+            key: &subkeys.enc_key,
+            nonce_seed: &subkeys.nonce_seed,
+            domain: b"envelope",
+            counter: job.envelope_index,
+            data_kind: BlockKind::PayloadData,
+            parity_kind: BlockKind::PayloadParity,
+            data_shard_max: options.fec_data_shards,
+            class_parity_shard_max: options.fec_parity_shards,
+            archive_uuid: &archive_uuid,
+            session_id: &session_id,
+        },
+        &mut local_next_block_index,
+        options,
+    )?;
+    validate_planned_extent(&object, job.extent)?;
+    Ok(OrderedEnvelopeResult {
+        envelope_index: job.envelope_index,
+        records: object.records,
+    })
+}
+
+fn emit_ordered_envelope_result<O: ArchiveWriteSink>(
+    result: OrderedEnvelopeResult,
+    sink: &mut O,
+    options: WriterOptions,
+    emission_state: &mut WriterEmissionState,
+) -> Result<(), ArchiveWriteError> {
+    for record in &result.records {
+        emit_block_record(
+            sink,
+            options,
+            &mut emission_state.bytes_written,
+            &mut emission_state.record_counts,
+            &mut emission_state.data_leaf_hashes,
+            record,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_unordered_probe_job<O: ArchiveWriteSink>(
+    job_tx: &std::sync::mpsc::SyncSender<UnorderedProbeJob>,
+    result_rx: &std::sync::mpsc::Receiver<Result<UnorderedProbeResult, ArchiveWriteError>>,
+    jobs_sent: &mut usize,
+    results_received: &mut usize,
+    envelope_index: &mut u64,
+    batch: &mut Vec<u8>,
+    batch_target: usize,
+    sink: &mut O,
+    options: WriterOptions,
+    bytes_written: &mut [u64],
+    record_counts: &mut [u64],
+) -> Result<(), ArchiveWriteError> {
+    let plaintext = std::mem::replace(batch, Vec::with_capacity(batch_target));
+    job_tx
+        .send(UnorderedProbeJob {
+            envelope_index: *envelope_index,
+            plaintext,
+        })
+        .map_err(|_| FormatError::WriterInvariant("unordered probe worker stopped"))?;
+    *envelope_index = checked_u64_add(*envelope_index, 1, "EnvelopeEntry")?;
+    *jobs_sent = jobs_sent
+        .checked_add(1)
+        .ok_or(FormatError::WriterInvariant(
+            "unordered probe job count overflow",
+        ))?;
+    while let Ok(result) = result_rx.try_recv() {
+        emit_unordered_probe_result(result?, sink, options, bytes_written, record_counts)?;
+        *results_received = results_received
+            .checked_add(1)
+            .ok_or(FormatError::WriterInvariant(
+                "unordered probe result count overflow",
+            ))?;
+    }
+    Ok(())
+}
+
+fn build_unordered_probe_result(
+    job: UnorderedProbeJob,
+    subkeys: &Subkeys,
+    next_block_index: &std::sync::atomic::AtomicU64,
+    options: WriterOptions,
+    archive_uuid: [u8; 16],
+    session_id: [u8; 16],
+) -> Result<UnorderedProbeResult, ArchiveWriteError> {
+    let mut envelope_plaintext = Vec::with_capacity(job.plaintext.len() / 2);
+    for chunk in job.plaintext.chunks(options.chunk_size as usize) {
+        let frame = compress_zstd_frame_with_jobs(chunk, options.zstd_level, 1)?;
+        envelope_plaintext.extend_from_slice(&frame);
+    }
+    if !payload_object_can_fit(envelope_plaintext.len(), options)? {
+        return Err(FormatError::WriterUnsupported(
+            "unordered probe payload batch exceeds envelope object limits",
+        )
+        .into());
+    }
+    let object_plan = plan_encrypted_object(
+        envelope_plaintext.len(),
+        options.fec_data_shards,
+        options.fec_parity_shards,
+        options,
+    )?;
+    let block_count = u64::from(object_plan.data_block_count)
+        .checked_add(u64::from(object_plan.parity_block_count))
+        .ok_or(FormatError::WriterInvariant(
+            "unordered probe block count overflow",
+        ))?;
+    let first_block_index =
+        next_block_index.fetch_add(block_count, std::sync::atomic::Ordering::SeqCst);
+    let extent = ObjectExtent::new(first_block_index, object_plan)?;
+    let mut local_next_block_index = first_block_index;
+    let object = encrypt_object(
+        &envelope_plaintext,
+        ObjectEncryptionContext {
+            key: &subkeys.enc_key,
+            nonce_seed: &subkeys.nonce_seed,
+            domain: b"envelope",
+            counter: job.envelope_index,
+            data_kind: BlockKind::PayloadData,
+            parity_kind: BlockKind::PayloadParity,
+            data_shard_max: options.fec_data_shards,
+            class_parity_shard_max: options.fec_parity_shards,
+            archive_uuid: &archive_uuid,
+            session_id: &session_id,
+        },
+        &mut local_next_block_index,
+        options,
+    )?;
+    validate_planned_extent(&object, extent)?;
+    Ok(UnorderedProbeResult {
+        records: object.records,
+    })
+}
+
+fn emit_unordered_probe_result<O: ArchiveWriteSink>(
+    result: UnorderedProbeResult,
+    sink: &mut O,
+    options: WriterOptions,
+    bytes_written: &mut [u64],
+    record_counts: &mut [u64],
+) -> Result<(), ArchiveWriteError> {
+    for record in &result.records {
+        let volume_index = (record.block_index % options.stripe_width as u64) as usize;
+        let record_bytes = record.to_bytes();
+        sink.write_volume(volume_index, &record_bytes)?;
+        bytes_written[volume_index] = checked_u64_add(
+            bytes_written[volume_index],
+            record_bytes.len() as u64,
+            "BlockRecord",
+        )?;
+        record_counts[volume_index] =
+            checked_u64_add(record_counts[volume_index], 1, "BlockRecord count")?;
+    }
+    Ok(())
 }
 
 fn validate_single_pass_writer_options(options: WriterOptions) -> Result<(), FormatError> {
@@ -5601,11 +6740,10 @@ mod tests {
         .unwrap();
         let mut sink = TrackingArchiveSink::default();
 
-        let summary = write_archive_sources_to_sink(
+        let summary = write_archive_sources_to_sink_single_pass(
             &[file],
             &master_key,
             options,
-            None,
             &KdfParams::Raw,
             None,
             None,
@@ -5614,8 +6752,8 @@ mod tests {
         .unwrap();
 
         let stats = stats.borrow();
-        assert_eq!(stats.open_count, 2);
-        assert_eq!(stats.total_read, file_size as u64 * 2);
+        assert_eq!(stats.open_count, 1);
+        assert_eq!(stats.total_read, file_size as u64);
         assert!(stats.max_read_request <= options.chunk_size as usize);
         assert_eq!(summary.volume_count, 1);
         assert_eq!(summary.archive_bytes, sink.volume_bytes.iter().sum());

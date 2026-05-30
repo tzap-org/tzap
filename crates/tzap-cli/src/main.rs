@@ -22,17 +22,19 @@ use tzap_core::{
     list_non_seekable_stream, list_non_seekable_stream_with_bootstrap_sidecar,
     open_seekable_archive, open_seekable_archive_with_bootstrap_sidecar_options,
     public_no_key_verify_volumes_with_options, verify_non_seekable_stream_with_bootstrap_sidecar,
-    verify_non_seekable_stream_with_options, write_archive, write_archive_with_dictionary,
-    write_archive_with_dictionary_and_kdf, write_archive_with_dictionary_and_root_auth,
-    write_archive_with_dictionary_kdf_and_root_auth, write_archive_with_kdf,
-    write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
+    verify_non_seekable_stream_with_options, write_archive,
+    write_archive_sources_to_sink_ordered_parallel_probe,
+    write_archive_sources_to_sink_single_pass, write_archive_sources_to_sink_unordered_probe,
+    write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
+    write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
+    write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
     write_tar_stream_archive_to_sink_with_kdf_and_root_auth, ArchiveContentVerification,
-    ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfParams, MasterKey, MetadataDiagnostic,
-    NonSeekableReaderOptions, OpenedArchive, PublicNoKeyVerification, ReaderOptions, RegularFile,
-    RootAuthSigningRequest, RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions,
-    StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind, WriterOptions,
-    WriterTimings,
+    ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfParams, MasterKey, MemoryArchiveSink,
+    MetadataDiagnostic, NonSeekableReaderOptions, OpenedArchive, PublicNoKeyVerification,
+    ReaderOptions, RegularFile, RegularFileSource, RootAuthSigningRequest, RootAuthVerification,
+    RootAuthWriterConfig, SafeExtractionOptions, StreamingRawWriterSummary,
+    StreamingTarWriterSummary, TarEntryKind, WriterOptions, WriterTimings, WrittenArchiveSummary,
 };
 use tzap_plugin_signing::ed25519_raw::{
     self, Ed25519RootAuthOutcome, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
@@ -60,6 +62,7 @@ const DEFAULT_ARGON2_M_COST_KIB: u32 = 262_144;
 const DEFAULT_ARGON2_PARALLELISM: u32 = 4;
 const DEFAULT_ARGON2_SALT_LEN: usize = 16;
 const INSECURE_ZERO_KEY: [u8; 32] = [0; 32];
+const LARGE_CREATE_LAYOUT_THRESHOLD: u64 = 100 * 1024 * 1024 * 1024;
 
 type CliRootAuthAuthenticator<'a> =
     dyn FnMut(&RootAuthSigningRequest) -> std::result::Result<Vec<u8>, FormatError> + 'a;
@@ -289,26 +292,23 @@ enum Command {
         #[arg(
             long = "chunk-size",
             value_name = "SIZE",
-            default_value = "256K",
-            help = "Compression chunk size."
+            help = "Compression chunk size (default: auto by input size)."
         )]
-        chunk_size: String,
+        chunk_size: Option<String>,
 
         #[arg(
             long = "envelope-size",
             value_name = "SIZE",
-            default_value = "1M",
-            help = "Archive envelope size."
+            help = "Archive envelope size (default: auto by input size)."
         )]
-        envelope_size: String,
+        envelope_size: Option<String>,
 
         #[arg(
             long = "block-size",
             value_name = "SIZE",
-            default_value = "64K",
-            help = "Block size for archive payload layout."
+            help = "Block size for archive payload layout (default: auto by input size)."
         )]
-        block_size: String,
+        block_size: Option<String>,
 
         #[arg(
             long = "jobs",
@@ -742,22 +742,22 @@ fn run(cli: Cli) -> Result<()> {
                 volume_size.as_deref(),
                 tar_stdin || raw_stdin || spool_stdin,
             );
-            let options = WriterOptions {
-                stripe_width: volumes.unwrap_or(1),
-                target_volume_size: volume_size
-                    .as_deref()
-                    .map(|value| {
-                        parse_size(value).with_context(|| format!("invalid volume-size: {value}"))
-                    })
-                    .transpose()?,
-                volume_loss_tolerance: resolved_volume_loss_tolerance,
-                bit_rot_buffer_pct,
-                zstd_level: compression_level,
-                jobs,
-                chunk_size: parse_size_u32(&chunk_size, "chunk-size")?,
-                envelope_target_size: parse_size_u32(&envelope_size, "envelope-size")?,
-                block_size: parse_size_u32(&block_size, "block-size")?,
-                ..WriterOptions::default()
+            let layout_overrides = CreateLayoutOverrides {
+                chunk_size: chunk_size.as_deref(),
+                envelope_size: envelope_size.as_deref(),
+                block_size: block_size.as_deref(),
+            };
+            let build_writer_options = |total_input_size: Option<u64>| -> Result<WriterOptions> {
+                create_writer_options(CreateWriterOptionsArgs {
+                    volumes,
+                    volume_size: volume_size.as_deref(),
+                    volume_loss_tolerance: resolved_volume_loss_tolerance,
+                    bit_rot_buffer_pct,
+                    compression_level,
+                    jobs,
+                    layout_overrides,
+                    total_input_size,
+                })
             };
             if bootstrap_out.is_some() && (volumes.unwrap_or(1) > 1 || volume_size.is_some()) {
                 return Err(FormatError::WriterUnsupported(
@@ -788,8 +788,19 @@ fn run(cli: Cli) -> Result<()> {
                 bootstrap_out.as_deref(),
                 force,
             )?;
-            validate_create_writer_options(&options)?;
             if let Some(stdin_mode) = stdin_mode {
+                if dry_run {
+                    let dry_run_input_size = match stdin_mode {
+                        CreateStdinMode::RawKnownSize => Some(parse_size(
+                            stdin_size.as_deref().expect("validated stdin-size"),
+                        )?),
+                        CreateStdinMode::Tar
+                        | CreateStdinMode::RawSpool
+                        | CreateStdinMode::RawUnknownSize => None,
+                    };
+                    let options = build_writer_options(dry_run_input_size)?;
+                    validate_create_writer_options(&options)?;
+                }
                 if dry_run {
                     eprintln!("create dry-run summary:");
                     eprintln!("  files: streaming stdin");
@@ -854,6 +865,8 @@ fn run(cli: Cli) -> Result<()> {
                 let core_writer_started = Instant::now();
                 let (bootstrap_sidecar, summary_text, writer_timings) = match stdin_mode {
                     CreateStdinMode::Tar => {
+                        let options = build_writer_options(None)?;
+                        validate_create_writer_options(&options)?;
                         let (summary, bootstrap_sidecar) = write_tar_stdin_archive_output(
                             &output,
                             &key,
@@ -875,6 +888,8 @@ fn run(cli: Cli) -> Result<()> {
                     CreateStdinMode::RawKnownSize => {
                         let stdin_size =
                             parse_size(stdin_size.as_deref().expect("validated stdin-size"))?;
+                        let options = build_writer_options(Some(stdin_size))?;
+                        validate_create_writer_options(&options)?;
                         let (summary, bootstrap_sidecar) = write_raw_stdin_archive_output(
                             &output,
                             io::stdin().lock(),
@@ -905,6 +920,8 @@ fn run(cli: Cli) -> Result<()> {
                         )?;
                         let known_size_source = spool.known_size_source();
                         let spool_reader = spool.reopen()?;
+                        let options = build_writer_options(Some(known_size_source.size()))?;
+                        validate_create_writer_options(&options)?;
                         let (summary, bootstrap_sidecar) = write_raw_stdin_archive_output(
                             &output,
                             spool_reader,
@@ -965,14 +982,14 @@ fn run(cli: Cli) -> Result<()> {
             let input_specs = collect_input_specs(&paths)?;
             let scan_inputs = scan_inputs_started.elapsed();
             let bootstrap_output = bootstrap_out.clone();
+            let input_bytes = input_specs_total_size(&input_specs)?;
+            let options = build_writer_options(Some(input_bytes))?;
+            validate_create_writer_options(&options)?;
 
             if dry_run {
                 eprintln!("create dry-run summary:");
                 eprintln!("  files: {}", input_specs.len());
-                eprintln!(
-                    "  input bytes: {}",
-                    input_specs.iter().map(|entry| entry.size).sum::<u64>()
-                );
+                eprintln!("  input bytes: {}", input_bytes);
                 eprintln!(
                     "  key mode: {}",
                     create_key_mode_label(
@@ -1009,18 +1026,6 @@ fn run(cli: Cli) -> Result<()> {
                 argon2_m_cost_kib,
                 argon2_parallelism,
             )?;
-            let read_inputs_started = Instant::now();
-            let inputs = collect_inputs_from_specs(&input_specs)?;
-            let read_inputs = read_inputs_started.elapsed();
-            let regular_files = inputs
-                .iter()
-                .map(|file| RegularFile {
-                    path: file.archive_path.as_str(),
-                    contents: &file.contents,
-                    mode: file.mode,
-                    mtime: file.mtime,
-                })
-                .collect::<Vec<_>>();
             let dictionary_bytes = dictionary
                 .as_deref()
                 .map(|path| {
@@ -1037,6 +1042,181 @@ fn run(cli: Cli) -> Result<()> {
                 .as_ref()
                 .map(CreateRootAuthProfile::root_auth_writer_config)
                 .transpose()?;
+
+            let unordered_probe = matches!(
+                std::env::var("TZAP_UNORDERED_CREATE_PROBE").as_deref(),
+                Ok("1")
+            );
+            let ordered_probe = matches!(
+                std::env::var("TZAP_ORDERED_CREATE_PROBE").as_deref(),
+                Ok("1")
+            );
+            if ordered_probe {
+                if dictionary_bytes.is_some()
+                    || options.target_volume_size.is_some()
+                    || options.volume_loss_tolerance != 0
+                {
+                    return Err(FormatError::WriterUnsupported(
+                        "ordered create probe only supports simple file archives",
+                    )
+                    .into());
+                }
+                let core_writer_started = Instant::now();
+                let (archive, sink) = write_file_inputs_ordered_probe_to_memory(
+                    &input_specs,
+                    &key,
+                    options,
+                    root_auth,
+                    root_auth_profile.as_ref(),
+                )
+                .context("failed to create ordered probe archive")?;
+                let core_writer = core_writer_started.elapsed();
+
+                let write_outputs_started = Instant::now();
+                write_archive_outputs(&output, &sink.volumes)?;
+                if let Some(path) = bootstrap_out.as_deref() {
+                    if sink.bootstrap_sidecar.is_empty() {
+                        return Err(FormatError::WriterUnsupported(
+                            "bootstrap output is unavailable for this archive shape",
+                        )
+                        .into());
+                    }
+                    write_bootstrap_output(path, &sink.bootstrap_sidecar, force)?;
+                }
+                let write_outputs = write_outputs_started.elapsed();
+                let summary = format!(
+                    "created ordered probe for {} file(s), {} bytes in, {} archive bytes, {} volume(s)",
+                    input_specs.len(),
+                    input_bytes,
+                    archive.archive_bytes,
+                    archive.volume_count,
+                );
+                emit_success_summary(quiet, &summary)?;
+                if timings {
+                    emit_create_timing_report(
+                        scan_inputs,
+                        Duration::default(),
+                        core_writer,
+                        write_outputs,
+                        create_total_started.elapsed(),
+                        archive.timings,
+                    )?;
+                }
+                return Ok(());
+            }
+            if unordered_probe {
+                if dictionary_bytes.is_some()
+                    || root_auth.is_some()
+                    || options.target_volume_size.is_some()
+                    || options.volume_loss_tolerance != 0
+                    || bootstrap_out.is_some()
+                {
+                    return Err(FormatError::WriterUnsupported(
+                        "unordered create probe only supports simple unsigned file archives",
+                    )
+                    .into());
+                }
+                let core_writer_started = Instant::now();
+                let archive =
+                    write_file_inputs_unordered_probe_output(&output, &input_specs, &key, options)
+                        .context("failed to create unordered probe archive")?;
+                let core_writer = core_writer_started.elapsed();
+                let summary = format!(
+                    "created unordered probe for {} file(s), {} bytes in, {} invalid archive bytes, {} volume(s)",
+                    input_specs.len(),
+                    input_bytes,
+                    archive.archive_bytes,
+                    archive.volume_count,
+                );
+                emit_success_summary(quiet, &summary)?;
+                emit_success_summary(
+                    quiet,
+                    "  warning: TZAP_UNORDERED_CREATE_PROBE output is intentionally invalid",
+                )?;
+                if timings {
+                    emit_create_timing_report(
+                        scan_inputs,
+                        Duration::default(),
+                        core_writer,
+                        Duration::default(),
+                        create_total_started.elapsed(),
+                        archive.timings,
+                    )?;
+                }
+                return Ok(());
+            }
+
+            if dictionary_bytes.is_none()
+                && options.target_volume_size.is_none()
+                && options.volume_loss_tolerance == 0
+            {
+                let core_writer_started = Instant::now();
+                let (archive, sink) = write_file_inputs_archive_to_memory(
+                    &input_specs,
+                    &key,
+                    options,
+                    root_auth,
+                    root_auth_profile.as_ref(),
+                )
+                .context("failed to create archive")?;
+                let core_writer = core_writer_started.elapsed();
+
+                let write_outputs_started = Instant::now();
+                write_archive_outputs(&output, &sink.volumes)?;
+                if let Some(path) = bootstrap_out.as_deref() {
+                    if sink.bootstrap_sidecar.is_empty() {
+                        return Err(FormatError::WriterUnsupported(
+                            "bootstrap output is unavailable for this archive shape",
+                        )
+                        .into());
+                    }
+                    write_bootstrap_output(path, &sink.bootstrap_sidecar, force)?;
+                }
+                let write_outputs = write_outputs_started.elapsed();
+                let summary = format!(
+                    "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
+                    input_specs.len(),
+                    input_bytes,
+                    archive.archive_bytes,
+                    archive.volume_count,
+                    resolved_volume_loss_tolerance,
+                    bit_rot_buffer_pct
+                );
+                emit_success_summary(quiet, &summary)?;
+                if let Some(profile) = root_auth_profile.as_ref() {
+                    emit_success_summary(
+                        quiet,
+                        &format!("  root auth: {} signed", profile.label()),
+                    )?;
+                }
+                if let Some(path) = bootstrap_output {
+                    emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
+                }
+                if timings {
+                    emit_create_timing_report(
+                        scan_inputs,
+                        Duration::default(),
+                        core_writer,
+                        write_outputs,
+                        create_total_started.elapsed(),
+                        archive.timings,
+                    )?;
+                }
+                return Ok(());
+            }
+
+            let read_inputs_started = Instant::now();
+            let inputs = collect_inputs_from_specs(&input_specs)?;
+            let read_inputs = read_inputs_started.elapsed();
+            let regular_files = inputs
+                .iter()
+                .map(|file| RegularFile {
+                    path: file.archive_path.as_str(),
+                    contents: &file.contents,
+                    mode: file.mode,
+                    mtime: file.mtime,
+                })
+                .collect::<Vec<_>>();
             let core_writer_started = Instant::now();
             let archive = match (
                 &dictionary_bytes,
@@ -1134,7 +1314,7 @@ fn run(cli: Cli) -> Result<()> {
             let summary = format!(
                 "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
                 regular_files.len(),
-                input_specs.iter().map(|entry| entry.size).sum::<u64>(),
+                input_bytes,
                 archive.volumes.iter().map(|volume| volume.len() as u64).sum::<u64>(),
                 archive.volumes.len(),
                 resolved_volume_loss_tolerance,
@@ -1295,11 +1475,14 @@ fn run(cli: Cli) -> Result<()> {
             let options = SafeExtractionOptions {
                 overwrite_existing: overwrite,
             };
-            for entry in requested_entries {
-                let path = entry.path;
-                let diagnostics = opened
-                    .extract_file_to(&path, &root, options)?
-                    .ok_or_else(|| anyhow!("path not found in archive: {path}"))?;
+            let diagnostics = extract_entries_to_dir_parallel(
+                &opened,
+                requested_entries,
+                &root,
+                options,
+                reader_options.jobs,
+            )?;
+            for (path, diagnostics) in diagnostics {
                 extracted_count = extracted_count
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("extracted path count overflow"))?;
@@ -1850,6 +2033,86 @@ fn emit_success_stdout(quiet: bool, message: &str) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CreateLayoutOverrides<'a> {
+    chunk_size: Option<&'a str>,
+    envelope_size: Option<&'a str>,
+    block_size: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CreateLayout {
+    block_size: u32,
+    chunk_size: u32,
+    envelope_target_size: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CreateWriterOptionsArgs<'a> {
+    volumes: Option<u32>,
+    volume_size: Option<&'a str>,
+    volume_loss_tolerance: u8,
+    bit_rot_buffer_pct: u8,
+    compression_level: i32,
+    jobs: usize,
+    layout_overrides: CreateLayoutOverrides<'a>,
+    total_input_size: Option<u64>,
+}
+
+fn create_writer_options(args: CreateWriterOptionsArgs<'_>) -> Result<WriterOptions> {
+    let layout = resolve_create_layout(args.layout_overrides, args.total_input_size)?;
+    Ok(WriterOptions {
+        stripe_width: args.volumes.unwrap_or(1),
+        target_volume_size: args
+            .volume_size
+            .map(|value| parse_size(value).with_context(|| format!("invalid volume-size: {value}")))
+            .transpose()?,
+        volume_loss_tolerance: args.volume_loss_tolerance,
+        bit_rot_buffer_pct: args.bit_rot_buffer_pct,
+        zstd_level: args.compression_level,
+        jobs: args.jobs,
+        chunk_size: layout.chunk_size,
+        envelope_target_size: layout.envelope_target_size,
+        block_size: layout.block_size,
+        ..WriterOptions::default()
+    })
+}
+
+fn resolve_create_layout(
+    overrides: CreateLayoutOverrides<'_>,
+    total_input_size: Option<u64>,
+) -> Result<CreateLayout> {
+    let mut layout = default_create_layout(total_input_size);
+    if let Some(value) = overrides.block_size {
+        layout.block_size = parse_size_u32(value, "block-size")?;
+    }
+    if let Some(value) = overrides.envelope_size {
+        layout.envelope_target_size = parse_size_u32(value, "envelope-size")?;
+    }
+    if let Some(value) = overrides.chunk_size {
+        layout.chunk_size = parse_size_u32(value, "chunk-size")?;
+        if overrides.envelope_size.is_none() && layout.chunk_size > layout.envelope_target_size {
+            layout.envelope_target_size = layout.chunk_size;
+        }
+    }
+    Ok(layout)
+}
+
+fn default_create_layout(total_input_size: Option<u64>) -> CreateLayout {
+    match total_input_size {
+        Some(size) if size <= LARGE_CREATE_LAYOUT_THRESHOLD => CreateLayout {
+            block_size: 64 * 1024,
+            chunk_size: 256 * 1024,
+            envelope_target_size: 1024 * 1024,
+        },
+        Some(_) | None => CreateLayout {
+            block_size: 1024 * 1024,
+            chunk_size: 32 * 1024 * 1024,
+            envelope_target_size: 64 * 1024 * 1024,
+        },
+    }
+}
+
 fn default_jobs() -> usize {
     std::thread::available_parallelism()
         .map(|jobs| jobs.get())
@@ -1981,6 +2244,30 @@ struct InputSpec {
     size: u64,
 }
 
+impl RegularFileSource for InputSpec {
+    fn archive_path(&self) -> &str {
+        &self.archive_path
+    }
+
+    fn file_data_size(&self) -> u64 {
+        self.size
+    }
+
+    fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    fn mtime(&self) -> u64 {
+        self.mtime
+    }
+
+    fn open(&self) -> std::result::Result<Box<dyn Read + '_>, ArchiveWriteError> {
+        File::open(&self.source)
+            .map(|file| Box::new(file) as Box<dyn Read + '_>)
+            .map_err(ArchiveWriteError::Io)
+    }
+}
+
 #[derive(Debug)]
 struct CreateKey {
     master_key: MasterKey,
@@ -2083,6 +2370,13 @@ fn collect_input_specs(paths: &[String]) -> Result<Vec<InputSpec>> {
     Ok(out)
 }
 
+fn input_specs_total_size(specs: &[InputSpec]) -> Result<u64> {
+    specs.iter().try_fold(0u64, |sum, entry| {
+        sum.checked_add(entry.size)
+            .ok_or_else(|| anyhow!("input byte count overflow"))
+    })
+}
+
 fn collect_input_files(specs: &[InputSpec]) -> Result<Vec<InputFile>> {
     let mut out = Vec::new();
     for spec in specs {
@@ -2159,6 +2453,61 @@ fn resolve_extract_index_entries(
     Ok((resolved, missing))
 }
 
+fn extract_entries_to_dir_parallel(
+    opened: &OpenedArchive,
+    entries: Vec<ArchiveIndexEntry>,
+    root: &Path,
+    options: SafeExtractionOptions,
+    jobs: usize,
+) -> Result<Vec<(String, Vec<MetadataDiagnostic>)>> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    if jobs <= 1 || entries.len() <= 1 {
+        return entries
+            .into_iter()
+            .map(|entry| {
+                let path = entry.path;
+                let diagnostics = opened
+                    .extract_file_to(&path, root, options)?
+                    .ok_or_else(|| anyhow!("path not found in archive: {path}"))?;
+                Ok((path, diagnostics))
+            })
+            .collect();
+    }
+
+    let worker_count = jobs.min(entries.len());
+    let chunk_size = entries.len().div_ceil(worker_count);
+    std::thread::scope(|scope| {
+        let handles = entries
+            .chunks(chunk_size)
+            .map(|chunk| {
+                let chunk = chunk.to_vec();
+                scope.spawn(move || {
+                    chunk
+                        .into_iter()
+                        .map(|entry| {
+                            let path = entry.path;
+                            let diagnostics = opened
+                                .extract_file_to(&path, root, options)?
+                                .ok_or_else(|| anyhow!("path not found in archive: {path}"))?;
+                            Ok((path, diagnostics))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut out = Vec::new();
+        for handle in handles {
+            let mut chunk = handle
+                .join()
+                .map_err(|_| anyhow!("extract worker panicked"))??;
+            out.append(&mut chunk);
+        }
+        Ok(out)
+    })
+}
+
 fn archive_path_to_string(path: &Path) -> Result<String> {
     let mut parts = Vec::new();
     for component in path.components() {
@@ -2204,6 +2553,51 @@ fn write_archive_outputs(output: &str, volumes: &[Vec<u8>]) -> Result<()> {
 struct PathBackedArchiveSink<'a> {
     temps: &'a mut [tempfile::NamedTempFile],
     bootstrap_sidecar: Vec<u8>,
+}
+
+struct DirectArchiveSink {
+    files: Vec<File>,
+    bootstrap_sidecar: Vec<u8>,
+}
+
+impl ArchiveWriteSink for DirectArchiveSink {
+    fn begin_archive(&mut self, volume_count: usize) -> std::result::Result<(), ArchiveWriteError> {
+        if volume_count != self.files.len() {
+            return Err(FormatError::WriterInvariant(
+                "direct file sink volume count does not match output paths",
+            )
+            .into());
+        }
+        for file in &mut self.files {
+            file.set_len(0).map_err(ArchiveWriteError::Io)?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(ArchiveWriteError::Io)?;
+        }
+        self.bootstrap_sidecar.clear();
+        Ok(())
+    }
+
+    fn write_volume(
+        &mut self,
+        volume_index: usize,
+        bytes: &[u8],
+    ) -> std::result::Result<(), ArchiveWriteError> {
+        let file = self
+            .files
+            .get_mut(volume_index)
+            .ok_or(FormatError::WriterInvariant(
+                "direct file sink volume index is out of bounds",
+            ))?;
+        file.write_all(bytes).map_err(ArchiveWriteError::Io)
+    }
+
+    fn write_bootstrap_sidecar(
+        &mut self,
+        bytes: &[u8],
+    ) -> std::result::Result<(), ArchiveWriteError> {
+        self.bootstrap_sidecar.extend_from_slice(bytes);
+        Ok(())
+    }
 }
 
 impl ArchiveWriteSink for PathBackedArchiveSink<'_> {
@@ -2330,6 +2724,122 @@ fn write_raw_stdin_archive_output<R: Read>(
         None,
         None,
     )
+}
+
+fn write_file_inputs_archive_to_memory(
+    input_specs: &[InputSpec],
+    key: &CreateKey,
+    options: WriterOptions,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    root_auth_profile: Option<&CreateRootAuthProfile>,
+) -> Result<(WrittenArchiveSummary, MemoryArchiveSink)> {
+    if let (Some(profile), Some(root_auth)) = (root_auth_profile, root_auth) {
+        let mut authenticator =
+            |request: &RootAuthSigningRequest| root_auth_authenticator_value(profile, request);
+        return write_file_inputs_archive_to_memory_with_authenticator(
+            input_specs,
+            key,
+            options,
+            Some(root_auth),
+            Some(&mut authenticator),
+        );
+    }
+    write_file_inputs_archive_to_memory_with_authenticator(input_specs, key, options, None, None)
+}
+
+fn write_file_inputs_archive_to_memory_with_authenticator(
+    input_specs: &[InputSpec],
+    key: &CreateKey,
+    options: WriterOptions,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut CliRootAuthAuthenticator<'_>>,
+) -> Result<(WrittenArchiveSummary, MemoryArchiveSink)> {
+    let mut sink = MemoryArchiveSink::default();
+    let summary = write_archive_sources_to_sink_single_pass(
+        input_specs,
+        &key.master_key,
+        options,
+        &key.kdf_params,
+        root_auth,
+        authenticator,
+        &mut sink,
+    )?;
+    Ok((summary, sink))
+}
+
+fn write_file_inputs_ordered_probe_to_memory(
+    input_specs: &[InputSpec],
+    key: &CreateKey,
+    options: WriterOptions,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    root_auth_profile: Option<&CreateRootAuthProfile>,
+) -> Result<(WrittenArchiveSummary, MemoryArchiveSink)> {
+    if let (Some(profile), Some(root_auth)) = (root_auth_profile, root_auth) {
+        let mut authenticator =
+            |request: &RootAuthSigningRequest| root_auth_authenticator_value(profile, request);
+        return write_file_inputs_ordered_probe_to_memory_with_authenticator(
+            input_specs,
+            key,
+            options,
+            Some(root_auth),
+            Some(&mut authenticator),
+        );
+    }
+    write_file_inputs_ordered_probe_to_memory_with_authenticator(
+        input_specs,
+        key,
+        options,
+        None,
+        None,
+    )
+}
+
+fn write_file_inputs_ordered_probe_to_memory_with_authenticator(
+    input_specs: &[InputSpec],
+    key: &CreateKey,
+    options: WriterOptions,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut CliRootAuthAuthenticator<'_>>,
+) -> Result<(WrittenArchiveSummary, MemoryArchiveSink)> {
+    let mut sink = MemoryArchiveSink::default();
+    let summary = write_archive_sources_to_sink_ordered_parallel_probe(
+        input_specs,
+        &key.master_key,
+        options,
+        &key.kdf_params,
+        root_auth,
+        authenticator,
+        &mut sink,
+    )?;
+    Ok((summary, sink))
+}
+
+fn write_file_inputs_unordered_probe_output(
+    output: &str,
+    input_specs: &[InputSpec],
+    key: &CreateKey,
+    options: WriterOptions,
+) -> Result<WrittenArchiveSummary> {
+    let output_paths = create_output_paths(output, options.stripe_width as usize);
+    let files = output_paths
+        .iter()
+        .map(|path| {
+            File::create(path)
+                .with_context(|| format!("failed to create probe output {}", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut sink = DirectArchiveSink {
+        files,
+        bootstrap_sidecar: Vec::new(),
+    };
+    write_archive_sources_to_sink_unordered_probe(
+        input_specs,
+        &key.master_key,
+        options,
+        &key.kdf_params,
+        &mut sink,
+    )
+    .map_err(Into::into)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4516,6 +5026,47 @@ mod tests {
         } else {
             512 - remainder
         }
+    }
+
+    #[test]
+    fn create_layout_defaults_scale_by_input_size() {
+        assert_eq!(
+            default_create_layout(Some(LARGE_CREATE_LAYOUT_THRESHOLD)),
+            CreateLayout {
+                block_size: 64 * 1024,
+                chunk_size: 256 * 1024,
+                envelope_target_size: 1024 * 1024,
+            }
+        );
+        assert_eq!(
+            default_create_layout(Some(LARGE_CREATE_LAYOUT_THRESHOLD + 1)),
+            CreateLayout {
+                block_size: 1024 * 1024,
+                chunk_size: 32 * 1024 * 1024,
+                envelope_target_size: 64 * 1024 * 1024,
+            }
+        );
+        assert_eq!(
+            default_create_layout(None),
+            default_create_layout(Some(LARGE_CREATE_LAYOUT_THRESHOLD + 1))
+        );
+    }
+
+    #[test]
+    fn create_layout_chunk_override_grows_implicit_envelope() {
+        let layout = resolve_create_layout(
+            CreateLayoutOverrides {
+                chunk_size: Some("4M"),
+                envelope_size: None,
+                block_size: None,
+            },
+            Some(1024),
+        )
+        .unwrap();
+
+        assert_eq!(layout.chunk_size, 4 * 1024 * 1024);
+        assert_eq!(layout.envelope_target_size, 4 * 1024 * 1024);
+        assert_eq!(layout.block_size, 64 * 1024);
     }
 
     #[test]

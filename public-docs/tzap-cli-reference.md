@@ -84,7 +84,10 @@ Useful flags:
 - `--stdin-name`: archive member path for `--raw-stdin`
 - `--stdin-size`: known byte size for single-pass raw stdin
 - `--spool-stdin`: explicit plaintext spool mode for unknown-size raw stdin
-- `--compression-level`, `--chunk-size`, `--envelope-size`, `--block-size`
+- `--compression-level`, `--chunk-size`, `--envelope-size`, `--block-size`.
+  When sizing flags are omitted, `create` chooses the payload layout from the
+  input size: compact settings through 100 GiB and the large-data layout for
+  larger or unknown-size stdin input.
 - `--jobs`: worker count for reader/writer CPU work; defaults to the logical CPU
   count reported by the operating system
 - `--timings`: print a create-stage timing breakdown for performance diagnosis
