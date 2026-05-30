@@ -4,7 +4,9 @@ use std::io::{Cursor, Read};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::compression::{compress_zstd_frame, compress_zstd_frame_with_dictionary};
+use crate::compression::{
+    compress_zstd_frame_with_dictionary_and_jobs, compress_zstd_frame_with_jobs,
+};
 use crate::crypto::{
     aead_encrypt, build_aad, compute_hmac, derive_nonce, HmacDomain, KdfParams, MasterKey, Subkeys,
 };
@@ -61,6 +63,12 @@ const MAX_HASH_PREFIX_RUN_FILES: usize = 50_000;
 const DEFAULT_DIRECTORY_HINT_ENTRIES_PER_SHARD: usize = 10_000;
 const CMRA_SHARD_SIZE: usize = 512;
 
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|jobs| jobs.get())
+        .unwrap_or(1)
+}
+
 fn should_emit_directory_hints(file_count: usize) -> bool {
     file_count > DIRECTORY_HINT_REQUIRED_FILE_COUNT
 }
@@ -74,6 +82,7 @@ pub struct WriterOptions {
     pub volume_loss_tolerance: u8,
     pub bit_rot_buffer_pct: u8,
     pub zstd_level: i32,
+    pub jobs: usize,
     pub aead_algo: AeadAlgo,
     pub fec_data_shards: u16,
     pub fec_parity_shards: u16,
@@ -98,6 +107,7 @@ impl Default for WriterOptions {
             volume_loss_tolerance: DEFAULT_VOLUME_LOSS_TOLERANCE,
             bit_rot_buffer_pct: DEFAULT_BIT_ROT_BUFFER_PCT,
             zstd_level: 3,
+            jobs: default_jobs(),
             aead_algo: AeadAlgo::AesGcmSiv256,
             fec_data_shards: DEFAULT_FEC_DATA_SHARDS,
             fec_parity_shards: DEFAULT_FEC_PARITY_SHARDS,
@@ -852,7 +862,8 @@ fn build_writer_plan_from_payload(
     let mut shard_entries = Vec::with_capacity(planned_index_shards.len());
     let mut index_shard_objects = Vec::with_capacity(planned_index_shards.len());
     for planned in planned_index_shards {
-        let compressed = compress_zstd_frame(&planned.plaintext, options.zstd_level)?;
+        let compressed =
+            compress_zstd_frame_with_jobs(&planned.plaintext, options.zstd_level, options.jobs)?;
         let object_plan = plan_encrypted_object(
             compressed.len(),
             options.index_fec_data_shards,
@@ -880,7 +891,9 @@ fn build_writer_plan_from_payload(
     }
 
     let compressed_dictionary = dictionary
-        .map(|dictionary| compress_zstd_frame(dictionary, options.zstd_level))
+        .map(|dictionary| {
+            compress_zstd_frame_with_jobs(dictionary, options.zstd_level, options.jobs)
+        })
         .transpose()?;
     let dictionary_decompressed_size = dictionary
         .map(|dictionary| u32_len(dictionary.len(), "dictionary"))
@@ -913,7 +926,8 @@ fn build_writer_plan_from_payload(
     let mut directory_hint_objects = Vec::with_capacity(planned_directory_hint_shards.len());
     let mut planned_next_block_index = next_after_dictionary;
     for planned in planned_directory_hint_shards {
-        let compressed = compress_zstd_frame(&planned.plaintext, options.zstd_level)?;
+        let compressed =
+            compress_zstd_frame_with_jobs(&planned.plaintext, options.zstd_level, options.jobs)?;
         let object_plan = plan_encrypted_object(
             compressed.len(),
             options.index_fec_data_shards,
@@ -952,7 +966,8 @@ fn build_writer_plan_from_payload(
         directory_hint_entries: &directory_hint_entries,
         dictionary_extent,
     });
-    let compressed_index_root = compress_zstd_frame(&index_root_plaintext, options.zstd_level)?;
+    let compressed_index_root =
+        compress_zstd_frame_with_jobs(&index_root_plaintext, options.zstd_level, options.jobs)?;
     let metadata_class = plan_index_root_metadata_class(
         options,
         compressed_index_root.len(),
@@ -1057,9 +1072,14 @@ fn plan_payload_stream<S: RegularFileSource>(
             let frame = loop {
                 let candidate = &chunk[..chunk_len];
                 let frame = if let Some(dictionary) = dictionary {
-                    compress_zstd_frame_with_dictionary(candidate, options.zstd_level, dictionary)?
+                    compress_zstd_frame_with_dictionary_and_jobs(
+                        candidate,
+                        options.zstd_level,
+                        dictionary,
+                        options.jobs,
+                    )?
                 } else {
-                    compress_zstd_frame(candidate, options.zstd_level)?
+                    compress_zstd_frame_with_jobs(candidate, options.zstd_level, options.jobs)?
                 };
                 if payload_object_can_fit(frame.len(), options)? {
                     break frame;
@@ -1323,7 +1343,11 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
             let mut chunk_len = chunk.len();
             let frame = loop {
                 let candidate = &chunk[..chunk_len];
-                let frame = compress_zstd_frame(candidate, self.options.zstd_level)?;
+                let frame = compress_zstd_frame_with_jobs(
+                    candidate,
+                    self.options.zstd_level,
+                    self.options.jobs,
+                )?;
                 if payload_object_can_fit(frame.len(), self.options)? {
                     break frame;
                 }
@@ -2245,13 +2269,18 @@ where
             let frame = loop {
                 let candidate = &chunk[..chunk_len];
                 let frame = if let Some(dictionary) = dictionary {
-                    compress_zstd_frame_with_dictionary(
+                    compress_zstd_frame_with_dictionary_and_jobs(
                         candidate,
                         plan.options.zstd_level,
                         dictionary,
+                        plan.options.jobs,
                     )?
                 } else {
-                    compress_zstd_frame(candidate, plan.options.zstd_level)?
+                    compress_zstd_frame_with_jobs(
+                        candidate,
+                        plan.options.zstd_level,
+                        plan.options.jobs,
+                    )?
                 };
                 if payload_object_can_fit(frame.len(), plan.options)? {
                     break frame;
@@ -2441,6 +2470,9 @@ pub fn write_empty_archive(master_key: &MasterKey) -> Result<WrittenArchive, For
 }
 
 fn plan_writer_options(mut options: WriterOptions) -> Result<WriterOptions, FormatError> {
+    if options.jobs == 0 {
+        return Err(FormatError::WriterUnsupported("jobs must be at least 1"));
+    }
     if options.block_size < MIN_BLOCK_SIZE || options.block_size % 2 != 0 {
         return Err(FormatError::WriterUnsupported(
             "writer requires an even block size of at least 4096",
@@ -2697,9 +2729,14 @@ fn build_payload_envelopes(
                 let end = checked_usize_add(member_offset, chunk_len, "payload chunk")?;
                 let chunk = &member_bytes[member_offset..end];
                 let frame = if let Some(dictionary) = dictionary {
-                    compress_zstd_frame_with_dictionary(chunk, options.zstd_level, dictionary)?
+                    compress_zstd_frame_with_dictionary_and_jobs(
+                        chunk,
+                        options.zstd_level,
+                        dictionary,
+                        options.jobs,
+                    )?
                 } else {
-                    compress_zstd_frame(chunk, options.zstd_level)?
+                    compress_zstd_frame_with_jobs(chunk, options.zstd_level, options.jobs)?
                 };
                 if payload_object_can_fit(frame.len(), options)? {
                     break frame;
@@ -2852,7 +2889,8 @@ fn append_index_shards_for_rows(
     let shard_index =
         u64::try_from(planned.len()).map_err(|_| FormatError::WriterUnsupported("shard_index"))?;
     let candidate = build_index_shard_plaintext(shard_index, &rows, frames, payloads, options)?;
-    let compressed = compress_zstd_frame(&candidate.plaintext, options.zstd_level)?;
+    let compressed =
+        compress_zstd_frame_with_jobs(&candidate.plaintext, options.zstd_level, options.jobs)?;
     if index_object_can_fit(compressed.len(), options)? {
         planned.push(candidate);
         return Ok(());
@@ -3079,7 +3117,8 @@ fn append_directory_hint_shards_for_rows(
     let hint_shard_index = u64::try_from(planned.len())
         .map_err(|_| FormatError::WriterUnsupported("hint_shard_index"))?;
     let candidate = build_directory_hint_plaintext(hint_shard_index, &rows)?;
-    let compressed = compress_zstd_frame(&candidate.plaintext, options.zstd_level)?;
+    let compressed =
+        compress_zstd_frame_with_jobs(&candidate.plaintext, options.zstd_level, options.jobs)?;
     if index_object_can_fit(compressed.len(), options)? {
         planned.push(candidate);
         return Ok(());
@@ -4697,6 +4736,22 @@ mod tests {
             MIN_INDEX_ROOT_FEC_DATA_SHARDS
         );
         assert_eq!(options.bit_rot_buffer_pct, 5);
+        assert_eq!(options.jobs, default_jobs());
+        assert!(options.jobs >= 1);
+    }
+
+    #[test]
+    fn writer_options_reject_zero_jobs() {
+        let err = plan_writer_options(WriterOptions {
+            jobs: 0,
+            ..WriterOptions::default()
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            FormatError::WriterUnsupported("jobs must be at least 1")
+        );
     }
 
     #[test]

@@ -92,6 +92,7 @@ fn public_reference_file_exists_and_covers_commands() {
     assert!(reference.contains("--trusted-ca-cert"));
     assert!(reference.contains("--public-no-key"));
     assert!(reference.contains("--volume"));
+    assert!(reference.contains("--jobs"));
     assert!(reference.contains("--dry-run"));
     assert!(reference.contains("JSON output"));
     assert!(reference.contains("For selected-file workflows, use a file-backed archive path"));

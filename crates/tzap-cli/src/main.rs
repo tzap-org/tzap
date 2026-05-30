@@ -20,16 +20,16 @@ use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
 use tzap_core::{
     extract_non_seekable_stream_to_dir, extract_non_seekable_stream_to_dir_with_bootstrap_sidecar,
     list_non_seekable_stream, list_non_seekable_stream_with_bootstrap_sidecar,
-    open_seekable_archive, open_seekable_archive_volumes,
-    open_seekable_archive_with_bootstrap_sidecar, public_no_key_verify_volumes_with,
-    verify_non_seekable_stream_with_bootstrap_sidecar, verify_non_seekable_stream_with_options,
-    write_archive, write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
-    write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
-    write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
+    open_seekable_archive, open_seekable_archive_with_bootstrap_sidecar_options,
+    public_no_key_verify_volumes_with_options, verify_non_seekable_stream_with_bootstrap_sidecar,
+    verify_non_seekable_stream_with_options, write_archive, write_archive_with_dictionary,
+    write_archive_with_dictionary_and_kdf, write_archive_with_dictionary_and_root_auth,
+    write_archive_with_dictionary_kdf_and_root_auth, write_archive_with_kdf,
+    write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
     write_tar_stream_archive_to_sink_with_kdf_and_root_auth, ArchiveContentVerification,
     ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfParams, MasterKey, MetadataDiagnostic,
-    NonSeekableReaderOptions, OpenedArchive, PublicNoKeyVerification, RegularFile,
+    NonSeekableReaderOptions, OpenedArchive, PublicNoKeyVerification, ReaderOptions, RegularFile,
     RootAuthSigningRequest, RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions,
     StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind, WriterOptions,
 };
@@ -310,6 +310,13 @@ enum Command {
         block_size: String,
 
         #[arg(
+            long = "jobs",
+            value_name = "N",
+            help = "Worker jobs for reader/writer CPU work (default: logical CPU count)."
+        )]
+        jobs: Option<usize>,
+
+        #[arg(
             long = "dry-run",
             help = "Print a create plan and file summary without writing archive bytes."
         )]
@@ -416,6 +423,13 @@ enum Command {
             help = "Explicit additional volume path."
         )]
         volumes: Vec<String>,
+
+        #[arg(
+            long = "jobs",
+            value_name = "N",
+            help = "Worker jobs for reader CPU work (default: logical CPU count)."
+        )]
+        jobs: Option<usize>,
     },
     #[command(
         about = "List archive contents",
@@ -494,6 +508,13 @@ enum Command {
             help = "Emit stable machine-readable JSON output."
         )]
         json: bool,
+
+        #[arg(
+            long = "jobs",
+            value_name = "N",
+            help = "Worker jobs for reader CPU work (default: logical CPU count)."
+        )]
+        jobs: Option<usize>,
     },
     #[command(
         about = "Verify archive integrity",
@@ -580,6 +601,13 @@ enum Command {
             help = "Emit stable machine-readable JSON output."
         )]
         json: bool,
+
+        #[arg(
+            long = "jobs",
+            value_name = "N",
+            help = "Worker jobs for reader CPU work (default: logical CPU count)."
+        )]
+        jobs: Option<usize>,
     },
     #[command(
         about = "Generate a random raw key",
@@ -695,8 +723,10 @@ fn run(cli: Cli) -> Result<()> {
             chunk_size,
             envelope_size,
             block_size,
+            jobs,
             paths,
         } => {
+            let jobs = resolve_jobs(jobs)?;
             let resolved_volume_loss_tolerance = resolve_create_volume_loss_tolerance(
                 volume_loss_tolerance,
                 volumes,
@@ -714,6 +744,7 @@ fn run(cli: Cli) -> Result<()> {
                 volume_loss_tolerance: resolved_volume_loss_tolerance,
                 bit_rot_buffer_pct,
                 zstd_level: compression_level,
+                jobs,
                 chunk_size: parse_size_u32(&chunk_size, "chunk-size")?,
                 envelope_target_size: parse_size_u32(&envelope_size, "envelope-size")?,
                 block_size: parse_size_u32(&block_size, "block-size")?,
@@ -1100,7 +1131,9 @@ fn run(cli: Cli) -> Result<()> {
             insecure_zero_key,
             bootstrap,
             volumes,
+            jobs,
         } => {
+            let reader_options = reader_options(resolve_jobs(jobs)?);
             reject_multi_volume_bootstrap(1 + volumes.len(), bootstrap.as_deref())?;
             reject_stdout_extract_shape(stdout, paths.len())?;
             if archive == "-" {
@@ -1137,7 +1170,7 @@ fn run(cli: Cli) -> Result<()> {
                         bootstrap_bytes,
                         &master_key,
                         Path::new(&directory),
-                        NonSeekableReaderOptions::default(),
+                        non_seekable_reader_options(reader_options),
                         options,
                     )
                 } else {
@@ -1145,7 +1178,7 @@ fn run(cli: Cli) -> Result<()> {
                         stdin.lock(),
                         &master_key,
                         Path::new(&directory),
-                        NonSeekableReaderOptions::default(),
+                        non_seekable_reader_options(reader_options),
                         options,
                     )
                 }
@@ -1169,9 +1202,13 @@ fn run(cli: Cli) -> Result<()> {
                 insecure_zero_key,
                 &selection.paths,
             )?;
-            let opened =
-                open_selection_maybe_bootstrap(&selection, &master_key, bootstrap.as_deref())
-                    .with_context(|| format!("failed to open archive {archive}"))?;
+            let opened = open_selection_maybe_bootstrap(
+                &selection,
+                &master_key,
+                bootstrap.as_deref(),
+                reader_options,
+            )
+            .with_context(|| format!("failed to open archive {archive}"))?;
             let (requested_entries, missing_paths) =
                 resolve_extract_index_entries(&opened, &paths)?;
             if !missing_paths.is_empty() {
@@ -1249,7 +1286,9 @@ fn run(cli: Cli) -> Result<()> {
             volumes,
             long,
             json,
+            jobs,
         } => {
+            let reader_options = reader_options(resolve_jobs(jobs)?);
             reject_multi_volume_bootstrap(1 + volumes.len(), bootstrap.as_deref())?;
             if archive == "-" {
                 reject_archive_stdin_list_options(
@@ -1272,13 +1311,13 @@ fn run(cli: Cli) -> Result<()> {
                         stdin.lock(),
                         bootstrap_bytes,
                         &master_key,
-                        NonSeekableReaderOptions::default(),
+                        non_seekable_reader_options(reader_options),
                     )
                 } else {
                     list_non_seekable_stream(
                         stdin.lock(),
                         &master_key,
-                        NonSeekableReaderOptions::default(),
+                        non_seekable_reader_options(reader_options),
                     )
                 }
                 .context("failed to list non-seekable archive stream")?;
@@ -1345,9 +1384,13 @@ fn run(cli: Cli) -> Result<()> {
                 insecure_zero_key,
                 &selection.paths,
             )?;
-            let opened =
-                open_selection_maybe_bootstrap(&selection, &master_key, bootstrap.as_deref())
-                    .with_context(|| format!("failed to open archive {archive}"))?;
+            let opened = open_selection_maybe_bootstrap(
+                &selection,
+                &master_key,
+                bootstrap.as_deref(),
+                reader_options,
+            )
+            .with_context(|| format!("failed to open archive {archive}"))?;
             if json || long {
                 let entries = opened.list_files()?;
                 emit_entry_metadata_diagnostics(quiet, &entries)?;
@@ -1410,7 +1453,9 @@ fn run(cli: Cli) -> Result<()> {
             public_no_key,
             bootstrap,
             json,
+            jobs,
         } => {
+            let reader_options = reader_options(resolve_jobs(jobs)?);
             let first = archives
                 .first()
                 .ok_or_else(|| anyhow!("at least one archive volume is required"))?;
@@ -1478,13 +1523,13 @@ fn run(cli: Cli) -> Result<()> {
                         stdin.lock(),
                         bootstrap_bytes,
                         &master_key,
-                        NonSeekableReaderOptions::default(),
+                        non_seekable_reader_options(reader_options),
                     )
                 } else {
                     verify_non_seekable_stream_with_options(
                         stdin.lock(),
                         &master_key,
-                        NonSeekableReaderOptions::default(),
+                        non_seekable_reader_options(reader_options),
                     )
                 }
                 .context("failed to verify non-seekable archive stream");
@@ -1532,6 +1577,7 @@ fn run(cli: Cli) -> Result<()> {
                     keyfile: keyfile.as_deref(),
                     insecure_zero_key,
                     bootstrap: bootstrap.as_deref(),
+                    reader_options,
                     quiet,
                     json,
                 });
@@ -1579,18 +1625,22 @@ fn run(cli: Cli) -> Result<()> {
                     return Err(err);
                 }
             };
-            let opened =
-                match open_selection_maybe_bootstrap(&selection, &master_key, bootstrap.as_deref())
-                    .with_context(|| format!("failed to open archive {first}"))
-                {
-                    Ok(opened) => opened,
-                    Err(err) => {
-                        if json {
-                            emit_verify_json_error(&archive_paths, None, None, &err)?;
-                        }
-                        return Err(err);
+            let opened = match open_selection_maybe_bootstrap(
+                &selection,
+                &master_key,
+                bootstrap.as_deref(),
+                reader_options,
+            )
+            .with_context(|| format!("failed to open archive {first}"))
+            {
+                Ok(opened) => opened,
+                Err(err) => {
+                    if json {
+                        emit_verify_json_error(&archive_paths, None, None, &err)?;
                     }
-                };
+                    return Err(err);
+                }
+            };
             let result = opened
                 .verify_content()
                 .with_context(|| format!("failed to verify archive {first}"));
@@ -1727,6 +1777,34 @@ fn emit_success_stdout(quiet: bool, message: &str) -> io::Result<()> {
     }
     println!("{message}");
     Ok(())
+}
+
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|jobs| jobs.get())
+        .unwrap_or(1)
+}
+
+fn resolve_jobs(jobs: Option<usize>) -> Result<usize> {
+    let jobs = jobs.unwrap_or_else(default_jobs);
+    if jobs == 0 {
+        return Err(UsageError("--jobs must be at least 1").into());
+    }
+    Ok(jobs)
+}
+
+fn reader_options(jobs: usize) -> ReaderOptions {
+    ReaderOptions {
+        jobs,
+        ..ReaderOptions::default()
+    }
+}
+
+fn non_seekable_reader_options(reader: ReaderOptions) -> NonSeekableReaderOptions {
+    NonSeekableReaderOptions {
+        reader,
+        ..NonSeekableReaderOptions::default()
+    }
 }
 
 fn metadata_diagnostic_line(path: &str, diagnostic: &MetadataDiagnostic) -> String {
@@ -2940,10 +3018,16 @@ fn open_inputs_maybe_bootstrap(
     volume_files: Vec<File>,
     master_key: &MasterKey,
     bootstrap: Option<&str>,
+    options: ReaderOptions,
 ) -> Result<OpenedArchive> {
     if volume_files.len() > 1 {
         reject_multi_volume_bootstrap(volume_files.len(), bootstrap)?;
-        return open_seekable_archive_volumes(volume_files, master_key).map_err(Into::into);
+        return OpenedArchive::open_seekable_volumes_with_options(
+            volume_files,
+            master_key,
+            options,
+        )
+        .map_err(Into::into);
     }
     let volume_file = volume_files
         .into_iter()
@@ -2952,10 +3036,16 @@ fn open_inputs_maybe_bootstrap(
     if let Some(path) = bootstrap {
         let sidecar =
             fs::read(path).with_context(|| format!("failed to read bootstrap sidecar {path}"))?;
-        open_seekable_archive_with_bootstrap_sidecar(volume_file, &sidecar, master_key)
-            .map_err(Into::into)
+        open_seekable_archive_with_bootstrap_sidecar_options(
+            volume_file,
+            &sidecar,
+            master_key,
+            options,
+        )
+        .map_err(Into::into)
     } else {
-        open_seekable_archive(volume_file, master_key).map_err(Into::into)
+        OpenedArchive::open_seekable_volumes_with_options(vec![volume_file], master_key, options)
+            .map_err(Into::into)
     }
 }
 
@@ -2963,9 +3053,10 @@ fn open_selection_maybe_bootstrap(
     selection: &ArchiveInputSelection,
     master_key: &MasterKey,
     bootstrap: Option<&str>,
+    options: ReaderOptions,
 ) -> Result<OpenedArchive> {
     let volume_files = open_volume_inputs_from_paths(&selection.paths)?;
-    match open_inputs_maybe_bootstrap(volume_files, master_key, bootstrap) {
+    match open_inputs_maybe_bootstrap(volume_files, master_key, bootstrap, options) {
         Ok(opened) => Ok(opened),
         Err(err)
             if selection.autodiscovered && bootstrap.is_none() && selection.paths.len() > 1 =>
@@ -2977,7 +3068,8 @@ fn open_selection_maybe_bootstrap(
                 return Err(err);
             }
             let volume_files = open_volume_inputs_from_paths(&usable_paths)?;
-            open_inputs_maybe_bootstrap(volume_files, master_key, bootstrap).map_err(Into::into)
+            open_inputs_maybe_bootstrap(volume_files, master_key, bootstrap, options)
+                .map_err(Into::into)
         }
         Err(err) => Err(err),
     }
@@ -3057,6 +3149,7 @@ struct PublicNoKeyVerifyRequest<'a> {
     keyfile: Option<&'a str>,
     insecure_zero_key: bool,
     bootstrap: Option<&'a str>,
+    reader_options: ReaderOptions,
     quiet: bool,
     json: bool,
 }
@@ -3097,8 +3190,9 @@ fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()>
     let borrowed = volume_bytes.iter().map(Vec::as_slice).collect::<Vec<_>>();
     let mut x509_report = None;
     let mut x509_error = None;
-    let verification =
-        match public_no_key_verify_volumes_with(&borrowed, |footer, archive_root| match &trust {
+    let verification = match public_no_key_verify_volumes_with_options(
+        &borrowed,
+        |footer, archive_root| match &trust {
             PublicNoKeyTrust::Ed25519 { public_key } => {
                 if footer.authenticator_id != ED25519_AUTHENTICATOR_ID {
                     return Err(FormatError::ReaderUnsupported(
@@ -3140,24 +3234,26 @@ fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()>
                     }
                 }
             }
-        })
-        .map_err(|err| {
-            if let Some(detail) = x509_error.take() {
-                anyhow!("{err}: {detail}")
-            } else {
-                anyhow!(err)
+        },
+        request.reader_options,
+    )
+    .map_err(|err| {
+        if let Some(detail) = x509_error.take() {
+            anyhow!("{err}: {detail}")
+        } else {
+            anyhow!(err)
+        }
+    })
+    .with_context(|| format!("failed to verify public RootAuth for {first}"))
+    {
+        Ok(verification) => verification,
+        Err(err) => {
+            if request.json {
+                emit_verify_json_error(&archive_paths, None, None, &err)?;
             }
-        })
-        .with_context(|| format!("failed to verify public RootAuth for {first}"))
-        {
-            Ok(verification) => verification,
-            Err(err) => {
-                if request.json {
-                    emit_verify_json_error(&archive_paths, None, None, &err)?;
-                }
-                return Err(err);
-            }
-        };
+            return Err(err);
+        }
+    };
     let root_auth = match trust {
         PublicNoKeyTrust::Ed25519 { .. } => VerifiedPublicNoKeyRootAuth::Ed25519(verification),
         PublicNoKeyTrust::X509 { .. } => {

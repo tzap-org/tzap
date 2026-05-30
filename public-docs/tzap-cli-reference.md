@@ -85,6 +85,8 @@ Useful flags:
 - `--stdin-size`: known byte size for single-pass raw stdin
 - `--spool-stdin`: explicit plaintext spool mode for unknown-size raw stdin
 - `--compression-level`, `--chunk-size`, `--envelope-size`, `--block-size`
+- `--jobs`: worker count for reader/writer CPU work; defaults to the logical CPU
+  count reported by the operating system
 - `--dry-run`: print planned actions without writing bytes
 - `--force`: allow overwrite of outputs and bootstrap
 
@@ -154,6 +156,8 @@ Useful flags:
 - `--insecure-zero-key`: open an explicit no-secret convenience archive
 - `--bootstrap`: bootstrap sidecar path
 - `--volume`: additional multi-volume input paths
+- `--jobs`: worker count for reader CPU work; defaults to the logical CPU count
+  reported by the operating system
 
 Notes:
 
@@ -204,6 +208,8 @@ Useful flags:
 - `--insecure-zero-key`: open an explicit no-secret convenience archive
 - `--bootstrap`: bootstrap sidecar path
 - `--volume`: additional multi-volume input paths
+- `--jobs`: worker count for reader CPU work; defaults to the logical CPU count
+  reported by the operating system
 
 Notes:
 
@@ -258,6 +264,8 @@ Useful flags:
 - `--public-no-key`: verify public v41 RootAuth commitments without the archive key
 - `--insecure-zero-key`: verify an explicit no-secret convenience archive
 - `--bootstrap`: bootstrap sidecar path
+- `--jobs`: worker count for reader CPU work; defaults to the logical CPU count
+  reported by the operating system
 
 Notes:
 

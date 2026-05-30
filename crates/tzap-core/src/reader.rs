@@ -1,7 +1,8 @@
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::sync::Arc;
+use std::thread;
 
 use sha2::{Digest, Sha256};
 
@@ -52,6 +53,12 @@ const DEFAULT_MAX_TRAILING_GARBAGE_SCAN: usize = 1024 * 1024;
 const DEFAULT_MAX_TOTAL_EXTRACTION_SIZE: u64 = 100 * 1024 * 1024 * 1024;
 const DIRECTORY_HINT_REQUIRED_FILE_COUNT: u64 = 100_000;
 
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|jobs| jobs.get())
+        .unwrap_or(1)
+}
+
 pub trait ArchiveReadAt: Send + Sync + 'static {
     fn len(&self) -> Result<u64, FormatError>;
     fn is_empty(&self) -> Result<bool, FormatError> {
@@ -68,14 +75,55 @@ impl ArchiveReadAt for File {
     }
 
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
-        let mut file = self
-            .try_clone()
-            .map_err(|_| FormatError::InvalidArchive("archive read clone failed"))?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|_| FormatError::InvalidArchive("archive read seek failed"))?;
-        file.read_exact(buf)
-            .map_err(|_| FormatError::InvalidArchive("archive read failed"))
+        file_read_exact_at(self, offset, buf)
     }
+}
+
+#[cfg(unix)]
+fn file_read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> Result<(), FormatError> {
+    use std::os::unix::fs::FileExt;
+
+    while !buf.is_empty() {
+        let read = file
+            .read_at(buf, offset)
+            .map_err(|_| FormatError::InvalidArchive("archive read failed"))?;
+        if read == 0 {
+            return Err(FormatError::InvalidArchive("archive read failed"));
+        }
+        offset = checked_u64_add(offset, read as u64, "archive read offset overflow")?;
+        let rest = std::mem::take(&mut buf).split_at_mut(read).1;
+        buf = rest;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn file_read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> Result<(), FormatError> {
+    use std::os::windows::fs::FileExt;
+
+    while !buf.is_empty() {
+        let read = file
+            .seek_read(buf, offset)
+            .map_err(|_| FormatError::InvalidArchive("archive read failed"))?;
+        if read == 0 {
+            return Err(FormatError::InvalidArchive("archive read failed"));
+        }
+        offset = checked_u64_add(offset, read as u64, "archive read offset overflow")?;
+        let rest = std::mem::take(&mut buf).split_at_mut(read).1;
+        buf = rest;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+    let mut file = file
+        .try_clone()
+        .map_err(|_| FormatError::InvalidArchive("archive read clone failed"))?;
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
+        .map_err(|_| FormatError::InvalidArchive("archive read seek failed"))?;
+    file.read_exact(buf)
+        .map_err(|_| FormatError::InvalidArchive("archive read failed"))
 }
 
 impl ArchiveReadAt for Vec<u8> {
@@ -112,6 +160,7 @@ pub struct ReaderOptions {
     pub max_trailing_garbage_scan: usize,
     pub max_verify_tar_size: usize,
     pub max_total_extraction_size: u64,
+    pub jobs: usize,
 }
 
 impl Default for ReaderOptions {
@@ -120,8 +169,16 @@ impl Default for ReaderOptions {
             max_trailing_garbage_scan: DEFAULT_MAX_TRAILING_GARBAGE_SCAN,
             max_verify_tar_size: DEFAULT_MAX_VERIFY_TAR_SIZE,
             max_total_extraction_size: DEFAULT_MAX_TOTAL_EXTRACTION_SIZE,
+            jobs: default_jobs(),
         }
     }
+}
+
+pub(crate) fn validate_reader_options(options: ReaderOptions) -> Result<(), FormatError> {
+    if options.jobs == 0 {
+        return Err(FormatError::ReaderUnsupported("jobs must be at least 1"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -498,10 +555,24 @@ pub fn open_seekable_archive_with_bootstrap_sidecar<R: ArchiveReadAt>(
     bootstrap_sidecar: &[u8],
     master_key: &MasterKey,
 ) -> Result<OpenedArchive, FormatError> {
+    open_seekable_archive_with_bootstrap_sidecar_options(
+        reader,
+        bootstrap_sidecar,
+        master_key,
+        ReaderOptions::default(),
+    )
+}
+
+pub fn open_seekable_archive_with_bootstrap_sidecar_options<R: ArchiveReadAt>(
+    reader: R,
+    bootstrap_sidecar: &[u8],
+    master_key: &MasterKey,
+    options: ReaderOptions,
+) -> Result<OpenedArchive, FormatError> {
     OpenedArchive::open_seekable_volumes_with_options_for_mode(
         vec![Arc::new(reader) as Arc<dyn ArchiveReadAt>],
         master_key,
-        ReaderOptions::default(),
+        options,
         Some(bootstrap_sidecar),
     )
 }
@@ -597,6 +668,7 @@ impl OpenedArchive {
         master_key: &MasterKey,
         options: ReaderOptions,
     ) -> Result<Self, FormatError> {
+        validate_reader_options(options)?;
         if volumes.is_empty() {
             return Err(FormatError::InvalidArchive("no volumes supplied"));
         }
@@ -782,6 +854,7 @@ impl OpenedArchive {
         options: ReaderOptions,
         bootstrap_sidecar: Option<&[u8]>,
     ) -> Result<Self, FormatError> {
+        validate_reader_options(options)?;
         if readers.is_empty() {
             return Err(FormatError::InvalidArchive("no volumes supplied"));
         }
@@ -1829,11 +1902,9 @@ impl OpenedArchive {
     }
 
     fn load_all_index_shards(&self) -> Result<Vec<IndexShard>, FormatError> {
-        self.index_root
-            .shards
-            .iter()
-            .map(|entry| self.load_index_shard(entry))
-            .collect()
+        parallel_map_ref(&self.index_root.shards, self.options.jobs, |entry| {
+            self.load_index_shard(entry)
+        })
     }
 
     fn load_index_shard(&self, entry: &ShardEntry) -> Result<IndexShard, FormatError> {
@@ -1852,11 +1923,11 @@ impl OpenedArchive {
     }
 
     fn load_all_directory_hint_tables(&self) -> Result<Vec<DirectoryHintTable>, FormatError> {
-        self.index_root
-            .directory_hint_shards
-            .iter()
-            .map(|entry| self.load_directory_hint_table(entry))
-            .collect()
+        parallel_map_ref(
+            &self.index_root.directory_hint_shards,
+            self.options.jobs,
+            |entry| self.load_directory_hint_table(entry),
+        )
     }
 
     fn load_directory_hint_table(
@@ -2271,9 +2342,10 @@ impl OpenedArchive {
         &self,
         rows: &[FecLayoutObjectRow],
     ) -> Result<Vec<DataBlockMerkleLeaf>, FormatError> {
-        let mut leaves = Vec::new();
         let block_provider = self.block_provider();
-        for row in rows.iter().filter(|row| row.present) {
+        let present_rows = rows.iter().filter(|row| row.present).collect::<Vec<_>>();
+        let chunks = parallel_map_ref(&present_rows, self.options.jobs, |row| {
+            let row = **row;
             let (data_kind, parity_kind, data_max, parity_max) = match row.object_class {
                 1 => (
                     BlockKind::IndexRootData,
@@ -2326,6 +2398,7 @@ impl OpenedArchive {
                 data_max,
                 parity_max,
             )?;
+            let mut leaves = Vec::new();
             for (offset, payload) in repaired.into_iter().enumerate() {
                 leaves.push(DataBlockMerkleLeaf {
                     block_index: checked_u64_add(
@@ -2342,6 +2415,11 @@ impl OpenedArchive {
                     payload,
                 });
             }
+            Ok(leaves)
+        })?;
+        let mut leaves = Vec::new();
+        for mut chunk in chunks {
+            leaves.append(&mut chunk);
         }
         leaves.sort_by_key(|leaf| leaf.block_index);
         Ok(leaves)
@@ -2863,7 +2941,7 @@ struct ParsedPublicNoKeyVolume {
     blocks: BTreeMap<u64, BlockRecord>,
 }
 
-fn public_no_key_verify_volumes_with_options<F>(
+pub fn public_no_key_verify_volumes_with_options<F>(
     volumes: &[&[u8]],
     mut verifier: F,
     options: ReaderOptions,
@@ -2871,6 +2949,7 @@ fn public_no_key_verify_volumes_with_options<F>(
 where
     F: FnMut(&RootAuthFooterV1, &[u8; 32]) -> Result<bool, FormatError>,
 {
+    validate_reader_options(options)?;
     if volumes.is_empty() {
         return Err(FormatError::InvalidArchive("no volumes supplied"));
     }
@@ -5768,6 +5847,7 @@ fn sequential_extract_tar_stream_with_options(
     master_key: &MasterKey,
     options: ReaderOptions,
 ) -> Result<Vec<u8>, FormatError> {
+    validate_reader_options(options)?;
     if bytes.len() < VOLUME_HEADER_LEN {
         return Err(FormatError::InvalidLength {
             structure: "archive",
@@ -6904,6 +6984,33 @@ fn read_at_vec(
     Ok(out)
 }
 
+fn parallel_map_ref<T, U, F>(items: &[T], jobs: usize, f: F) -> Result<Vec<U>, FormatError>
+where
+    T: Sync,
+    U: Send,
+    F: Fn(&T) -> Result<U, FormatError> + Sync,
+{
+    if jobs <= 1 || items.len() <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let worker_count = jobs.min(items.len());
+    let chunk_size = items.len().div_ceil(worker_count);
+    let mut out = Vec::with_capacity(items.len());
+    thread::scope(|scope| {
+        let handles = items
+            .chunks(chunk_size)
+            .map(|chunk| scope.spawn(|| chunk.iter().map(&f).collect::<Result<Vec<_>, _>>()))
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let mut chunk = handle
+                .join()
+                .map_err(|_| FormatError::InvalidArchive("reader worker panicked"))??;
+            out.append(&mut chunk);
+        }
+        Ok(out)
+    })
+}
+
 fn checked_add(lhs: usize, rhs: usize, structure: &'static str) -> Result<usize, FormatError> {
     lhs.checked_add(rhs)
         .ok_or(FormatError::InvalidArchive(structure))
@@ -6947,6 +7054,32 @@ mod tests {
 
     fn master_key() -> MasterKey {
         MasterKey::from_raw_key(&[0x42; 32]).unwrap()
+    }
+
+    #[test]
+    fn reader_defaults_use_available_parallelism_jobs() {
+        let options = ReaderOptions::default();
+
+        assert_eq!(options.jobs, default_jobs());
+        assert!(options.jobs >= 1);
+    }
+
+    #[test]
+    fn reader_options_reject_zero_jobs() {
+        let err = OpenedArchive::open_with_options(
+            &[],
+            &master_key(),
+            ReaderOptions {
+                jobs: 0,
+                ..ReaderOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            FormatError::ReaderUnsupported("jobs must be at least 1")
+        );
     }
 
     const TEST_ROOT_AUTH_ID: u16 = 0xe001;

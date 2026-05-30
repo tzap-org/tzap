@@ -3,7 +3,28 @@ use crate::format::FormatError;
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
 pub fn compress_zstd_frame(plaintext: &[u8], level: i32) -> Result<Vec<u8>, FormatError> {
-    zstd::bulk::compress(plaintext, level).map_err(|_| FormatError::ZstdCompressionFailure)
+    compress_zstd_frame_with_jobs(plaintext, level, 1)
+}
+
+pub fn compress_zstd_frame_with_jobs(
+    plaintext: &[u8],
+    level: i32,
+    jobs: usize,
+) -> Result<Vec<u8>, FormatError> {
+    if jobs <= 1 {
+        return zstd::bulk::compress(plaintext, level)
+            .map_err(|_| FormatError::ZstdCompressionFailure);
+    }
+    let jobs = u32::try_from(jobs)
+        .map_err(|_| FormatError::WriterUnsupported("jobs exceeds zstd worker limit"))?;
+    let mut compressor =
+        zstd::bulk::Compressor::new(level).map_err(|_| FormatError::ZstdCompressionFailure)?;
+    compressor
+        .set_parameter(zstd_safe::CParameter::NbWorkers(jobs))
+        .map_err(|_| FormatError::ZstdCompressionFailure)?;
+    compressor
+        .compress(plaintext)
+        .map_err(|_| FormatError::ZstdCompressionFailure)
 }
 
 pub fn compress_zstd_frame_with_dictionary(
@@ -11,8 +32,26 @@ pub fn compress_zstd_frame_with_dictionary(
     level: i32,
     dictionary: &[u8],
 ) -> Result<Vec<u8>, FormatError> {
-    zstd::bulk::Compressor::with_dictionary(level, dictionary)
-        .and_then(|mut compressor| compressor.compress(plaintext))
+    compress_zstd_frame_with_dictionary_and_jobs(plaintext, level, dictionary, 1)
+}
+
+pub fn compress_zstd_frame_with_dictionary_and_jobs(
+    plaintext: &[u8],
+    level: i32,
+    dictionary: &[u8],
+    jobs: usize,
+) -> Result<Vec<u8>, FormatError> {
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(level, dictionary)
+        .map_err(|_| FormatError::ZstdCompressionFailure)?;
+    if jobs > 1 {
+        let jobs = u32::try_from(jobs)
+            .map_err(|_| FormatError::WriterUnsupported("jobs exceeds zstd worker limit"))?;
+        compressor
+            .set_parameter(zstd_safe::CParameter::NbWorkers(jobs))
+            .map_err(|_| FormatError::ZstdCompressionFailure)?;
+    }
+    compressor
+        .compress(plaintext)
         .map_err(|_| FormatError::ZstdCompressionFailure)
 }
 

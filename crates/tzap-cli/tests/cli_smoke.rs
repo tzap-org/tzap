@@ -319,6 +319,57 @@ fn cli_help_does_not_advertise_archive_stdin_or_create_stdout() {
 }
 
 #[test]
+fn cli_jobs_must_be_at_least_one() {
+    let temp = tempdir().unwrap();
+    let archive = temp.path().join("sample.tzap");
+    let output = temp.path().join("out.tzap");
+    let input = temp.path().join("input.txt");
+    let directory = temp.path().join("extract");
+
+    for args in [
+        vec![
+            "create",
+            "--insecure-zero-key",
+            "--jobs",
+            "0",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ],
+        vec![
+            "extract",
+            "--insecure-zero-key",
+            "--jobs",
+            "0",
+            "--directory",
+            directory.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ],
+        vec![
+            "list",
+            "--insecure-zero-key",
+            "--jobs",
+            "0",
+            archive.to_str().unwrap(),
+        ],
+        vec![
+            "verify",
+            "--insecure-zero-key",
+            "--jobs",
+            "0",
+            archive.to_str().unwrap(),
+        ],
+    ] {
+        Command::cargo_bin("tzap")
+            .unwrap()
+            .args(args)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("--jobs must be at least 1"));
+    }
+}
+
+#[test]
 fn cli_create_help_includes_examples_and_flags() {
     let output = Command::cargo_bin("tzap")
         .unwrap()
@@ -359,6 +410,7 @@ fn cli_create_help_includes_examples_and_flags() {
     assert!(stdout.contains("--chunk-size <SIZE>"));
     assert!(stdout.contains("--envelope-size <SIZE>"));
     assert!(stdout.contains("--block-size <SIZE>"));
+    assert!(stdout.contains("--jobs <N>"));
     assert!(stdout.contains("--force"));
     assert!(stdout.contains("--dry-run"));
     assert!(stdout.contains("tar cf -"));
@@ -386,6 +438,7 @@ fn cli_extract_help_includes_examples_and_flags() {
     assert!(stdout.contains("--password"));
     assert!(stdout.contains("--bootstrap"));
     assert!(stdout.contains("--volume"));
+    assert!(stdout.contains("--jobs <N>"));
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
     assert!(stdout.contains("--insecure-zero-key"));
@@ -413,6 +466,7 @@ fn cli_list_help_includes_examples_and_flags() {
     assert!(stdout.contains("--volume"));
     assert!(stdout.contains("--long"));
     assert!(stdout.contains("--json"));
+    assert!(stdout.contains("--jobs <N>"));
 }
 
 #[test]
@@ -439,6 +493,7 @@ fn cli_verify_help_includes_examples_and_flags() {
     assert!(stdout.contains("--public-no-key"));
     assert!(stdout.contains("--bootstrap"));
     assert!(stdout.contains("--json"));
+    assert!(stdout.contains("--jobs <N>"));
     assert!(stdout.contains("--quiet"));
     assert!(stdout.contains("For multi-volume archives"));
 }
@@ -944,6 +999,8 @@ fn cli_create_tar_stdin_round_trips_list_verify_and_extract() {
         .args([
             "create",
             "--tar-stdin",
+            "--jobs",
+            "2",
             "--keyfile",
             keyfile.to_str().unwrap(),
             "-o",
@@ -962,6 +1019,8 @@ fn cli_create_tar_stdin_round_trips_list_verify_and_extract() {
         .unwrap()
         .args([
             "verify",
+            "--jobs",
+            "2",
             "--keyfile",
             keyfile.to_str().unwrap(),
             output.to_str().unwrap(),
@@ -972,6 +1031,8 @@ fn cli_create_tar_stdin_round_trips_list_verify_and_extract() {
         .unwrap()
         .args([
             "list",
+            "--jobs",
+            "2",
             "--keyfile",
             keyfile.to_str().unwrap(),
             output.to_str().unwrap(),
@@ -984,6 +1045,8 @@ fn cli_create_tar_stdin_round_trips_list_verify_and_extract() {
         .unwrap()
         .args([
             "extract",
+            "--jobs",
+            "2",
             "--keyfile",
             keyfile.to_str().unwrap(),
             "-C",

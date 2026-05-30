@@ -18,9 +18,9 @@ use crate::reader::{
     block_record_error_is_recoverable_erasure, expected_stream_block_index,
     manifest_bootstrap_fields_match, observed_archive_size, parse_non_seekable_bootstrap_material,
     parse_terminal_material_read_at, required_object_parity, total_extraction_size_cap,
-    v41_terminal_tail_cap, validate_crypto_class_parity_exactness, ArchiveEntry, ArchiveReadAt,
-    KeyHoldingTerminalContext, NonSeekableBootstrapMaterial, OpenedArchive, ReaderOptions,
-    StreamedArchiveOpenParts,
+    v41_terminal_tail_cap, validate_crypto_class_parity_exactness, validate_reader_options,
+    ArchiveEntry, ArchiveReadAt, KeyHoldingTerminalContext, NonSeekableBootstrapMaterial,
+    OpenedArchive, ReaderOptions, StreamedArchiveOpenParts,
 };
 use crate::tar_model::{
     NoopTarStreamObserver, SafeExtractionOptions, TarStreamFilesystemRestoreObserver,
@@ -331,6 +331,7 @@ where
     R: Read,
     O: TarStreamObserver,
 {
+    validate_reader_options(options.reader)?;
     let mut volume_header_bytes = [0u8; VOLUME_HEADER_LEN];
     read_exact_stream(&mut reader, &mut volume_header_bytes, "VolumeHeader")?;
     let volume_header = VolumeHeader::parse(&volume_header_bytes)?;
