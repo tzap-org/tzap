@@ -6,9 +6,9 @@ use crate::metadata::{
     normalize_lookup_file_path, validate_directory_path_bytes, validate_file_path_bytes,
 };
 use crate::writer::{
-    write_single_pass_archive_to_sink, ArchiveWriteSink, MemoryArchiveSink, RootAuthAuthenticator,
-    RootAuthWriterConfig, StreamingRegularMember, WriterOptions, WrittenArchive,
-    WrittenArchiveSummary,
+    write_ordered_parallel_stream_archive_to_sink, ArchiveWriteSink, MemoryArchiveSink,
+    RootAuthAuthenticator, RootAuthWriterConfig, StreamingRegularMember, WriterOptions,
+    WrittenArchive, WrittenArchiveSummary,
 };
 
 const TAR_BLOCK_LEN: usize = 512;
@@ -124,7 +124,7 @@ where
 {
     validate_streaming_create_writer_options(options)?;
     let archive_path = normalize_lookup_file_path(archive_path, options.max_path_length)?;
-    let archive = write_single_pass_archive_to_sink(
+    let archive = write_ordered_parallel_stream_archive_to_sink(
         master_key,
         options,
         kdf_params,
@@ -177,7 +177,7 @@ where
 {
     validate_streaming_create_writer_options(options)?;
     let mut input_summary = None;
-    let archive = write_single_pass_archive_to_sink(
+    let archive = write_ordered_parallel_stream_archive_to_sink(
         master_key,
         options,
         kdf_params,

@@ -23,11 +23,10 @@ use tzap_core::{
     open_seekable_archive, open_seekable_archive_with_bootstrap_sidecar_options,
     public_no_key_verify_volumes_with_options, verify_non_seekable_stream_with_bootstrap_sidecar,
     verify_non_seekable_stream_with_options, write_archive,
-    write_archive_sources_to_sink_ordered_parallel_probe,
-    write_archive_sources_to_sink_single_pass, write_archive_sources_to_sink_unordered_probe,
-    write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
-    write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
-    write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
+    write_archive_sources_to_sink_ordered_parallel, write_archive_with_dictionary,
+    write_archive_with_dictionary_and_kdf, write_archive_with_dictionary_and_root_auth,
+    write_archive_with_dictionary_kdf_and_root_auth, write_archive_with_kdf,
+    write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
     write_tar_stream_archive_to_sink_with_kdf_and_root_auth, ArchiveContentVerification,
     ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfParams, MasterKey, MemoryArchiveSink,
@@ -1043,115 +1042,12 @@ fn run(cli: Cli) -> Result<()> {
                 .map(CreateRootAuthProfile::root_auth_writer_config)
                 .transpose()?;
 
-            let unordered_probe = matches!(
-                std::env::var("TZAP_UNORDERED_CREATE_PROBE").as_deref(),
-                Ok("1")
-            );
-            let ordered_probe = matches!(
-                std::env::var("TZAP_ORDERED_CREATE_PROBE").as_deref(),
-                Ok("1")
-            );
-            if ordered_probe {
-                if dictionary_bytes.is_some()
-                    || options.target_volume_size.is_some()
-                    || options.volume_loss_tolerance != 0
-                {
-                    return Err(FormatError::WriterUnsupported(
-                        "ordered create probe only supports simple file archives",
-                    )
-                    .into());
-                }
-                let core_writer_started = Instant::now();
-                let (archive, sink) = write_file_inputs_ordered_probe_to_memory(
-                    &input_specs,
-                    &key,
-                    options,
-                    root_auth,
-                    root_auth_profile.as_ref(),
-                )
-                .context("failed to create ordered probe archive")?;
-                let core_writer = core_writer_started.elapsed();
-
-                let write_outputs_started = Instant::now();
-                write_archive_outputs(&output, &sink.volumes)?;
-                if let Some(path) = bootstrap_out.as_deref() {
-                    if sink.bootstrap_sidecar.is_empty() {
-                        return Err(FormatError::WriterUnsupported(
-                            "bootstrap output is unavailable for this archive shape",
-                        )
-                        .into());
-                    }
-                    write_bootstrap_output(path, &sink.bootstrap_sidecar, force)?;
-                }
-                let write_outputs = write_outputs_started.elapsed();
-                let summary = format!(
-                    "created ordered probe for {} file(s), {} bytes in, {} archive bytes, {} volume(s)",
-                    input_specs.len(),
-                    input_bytes,
-                    archive.archive_bytes,
-                    archive.volume_count,
-                );
-                emit_success_summary(quiet, &summary)?;
-                if timings {
-                    emit_create_timing_report(
-                        scan_inputs,
-                        Duration::default(),
-                        core_writer,
-                        write_outputs,
-                        create_total_started.elapsed(),
-                        archive.timings,
-                    )?;
-                }
-                return Ok(());
-            }
-            if unordered_probe {
-                if dictionary_bytes.is_some()
-                    || root_auth.is_some()
-                    || options.target_volume_size.is_some()
-                    || options.volume_loss_tolerance != 0
-                    || bootstrap_out.is_some()
-                {
-                    return Err(FormatError::WriterUnsupported(
-                        "unordered create probe only supports simple unsigned file archives",
-                    )
-                    .into());
-                }
-                let core_writer_started = Instant::now();
-                let archive =
-                    write_file_inputs_unordered_probe_output(&output, &input_specs, &key, options)
-                        .context("failed to create unordered probe archive")?;
-                let core_writer = core_writer_started.elapsed();
-                let summary = format!(
-                    "created unordered probe for {} file(s), {} bytes in, {} invalid archive bytes, {} volume(s)",
-                    input_specs.len(),
-                    input_bytes,
-                    archive.archive_bytes,
-                    archive.volume_count,
-                );
-                emit_success_summary(quiet, &summary)?;
-                emit_success_summary(
-                    quiet,
-                    "  warning: TZAP_UNORDERED_CREATE_PROBE output is intentionally invalid",
-                )?;
-                if timings {
-                    emit_create_timing_report(
-                        scan_inputs,
-                        Duration::default(),
-                        core_writer,
-                        Duration::default(),
-                        create_total_started.elapsed(),
-                        archive.timings,
-                    )?;
-                }
-                return Ok(());
-            }
-
             if dictionary_bytes.is_none()
                 && options.target_volume_size.is_none()
                 && options.volume_loss_tolerance == 0
             {
                 let core_writer_started = Instant::now();
-                let (archive, sink) = write_file_inputs_archive_to_memory(
+                let (archive, sink) = write_file_inputs_ordered_parallel_to_memory(
                     &input_specs,
                     &key,
                     options,
@@ -2555,51 +2451,6 @@ struct PathBackedArchiveSink<'a> {
     bootstrap_sidecar: Vec<u8>,
 }
 
-struct DirectArchiveSink {
-    files: Vec<File>,
-    bootstrap_sidecar: Vec<u8>,
-}
-
-impl ArchiveWriteSink for DirectArchiveSink {
-    fn begin_archive(&mut self, volume_count: usize) -> std::result::Result<(), ArchiveWriteError> {
-        if volume_count != self.files.len() {
-            return Err(FormatError::WriterInvariant(
-                "direct file sink volume count does not match output paths",
-            )
-            .into());
-        }
-        for file in &mut self.files {
-            file.set_len(0).map_err(ArchiveWriteError::Io)?;
-            file.seek(SeekFrom::Start(0))
-                .map_err(ArchiveWriteError::Io)?;
-        }
-        self.bootstrap_sidecar.clear();
-        Ok(())
-    }
-
-    fn write_volume(
-        &mut self,
-        volume_index: usize,
-        bytes: &[u8],
-    ) -> std::result::Result<(), ArchiveWriteError> {
-        let file = self
-            .files
-            .get_mut(volume_index)
-            .ok_or(FormatError::WriterInvariant(
-                "direct file sink volume index is out of bounds",
-            ))?;
-        file.write_all(bytes).map_err(ArchiveWriteError::Io)
-    }
-
-    fn write_bootstrap_sidecar(
-        &mut self,
-        bytes: &[u8],
-    ) -> std::result::Result<(), ArchiveWriteError> {
-        self.bootstrap_sidecar.extend_from_slice(bytes);
-        Ok(())
-    }
-}
-
 impl ArchiveWriteSink for PathBackedArchiveSink<'_> {
     fn begin_archive(&mut self, volume_count: usize) -> std::result::Result<(), ArchiveWriteError> {
         if volume_count != self.temps.len() {
@@ -2726,7 +2577,7 @@ fn write_raw_stdin_archive_output<R: Read>(
     )
 }
 
-fn write_file_inputs_archive_to_memory(
+fn write_file_inputs_ordered_parallel_to_memory(
     input_specs: &[InputSpec],
     key: &CreateKey,
     options: WriterOptions,
@@ -2736,7 +2587,7 @@ fn write_file_inputs_archive_to_memory(
     if let (Some(profile), Some(root_auth)) = (root_auth_profile, root_auth) {
         let mut authenticator =
             |request: &RootAuthSigningRequest| root_auth_authenticator_value(profile, request);
-        return write_file_inputs_archive_to_memory_with_authenticator(
+        return write_file_inputs_ordered_parallel_to_memory_with_authenticator(
             input_specs,
             key,
             options,
@@ -2744,48 +2595,7 @@ fn write_file_inputs_archive_to_memory(
             Some(&mut authenticator),
         );
     }
-    write_file_inputs_archive_to_memory_with_authenticator(input_specs, key, options, None, None)
-}
-
-fn write_file_inputs_archive_to_memory_with_authenticator(
-    input_specs: &[InputSpec],
-    key: &CreateKey,
-    options: WriterOptions,
-    root_auth: Option<RootAuthWriterConfig<'_>>,
-    authenticator: Option<&mut CliRootAuthAuthenticator<'_>>,
-) -> Result<(WrittenArchiveSummary, MemoryArchiveSink)> {
-    let mut sink = MemoryArchiveSink::default();
-    let summary = write_archive_sources_to_sink_single_pass(
-        input_specs,
-        &key.master_key,
-        options,
-        &key.kdf_params,
-        root_auth,
-        authenticator,
-        &mut sink,
-    )?;
-    Ok((summary, sink))
-}
-
-fn write_file_inputs_ordered_probe_to_memory(
-    input_specs: &[InputSpec],
-    key: &CreateKey,
-    options: WriterOptions,
-    root_auth: Option<RootAuthWriterConfig<'_>>,
-    root_auth_profile: Option<&CreateRootAuthProfile>,
-) -> Result<(WrittenArchiveSummary, MemoryArchiveSink)> {
-    if let (Some(profile), Some(root_auth)) = (root_auth_profile, root_auth) {
-        let mut authenticator =
-            |request: &RootAuthSigningRequest| root_auth_authenticator_value(profile, request);
-        return write_file_inputs_ordered_probe_to_memory_with_authenticator(
-            input_specs,
-            key,
-            options,
-            Some(root_auth),
-            Some(&mut authenticator),
-        );
-    }
-    write_file_inputs_ordered_probe_to_memory_with_authenticator(
+    write_file_inputs_ordered_parallel_to_memory_with_authenticator(
         input_specs,
         key,
         options,
@@ -2794,7 +2604,7 @@ fn write_file_inputs_ordered_probe_to_memory(
     )
 }
 
-fn write_file_inputs_ordered_probe_to_memory_with_authenticator(
+fn write_file_inputs_ordered_parallel_to_memory_with_authenticator(
     input_specs: &[InputSpec],
     key: &CreateKey,
     options: WriterOptions,
@@ -2802,7 +2612,7 @@ fn write_file_inputs_ordered_probe_to_memory_with_authenticator(
     authenticator: Option<&mut CliRootAuthAuthenticator<'_>>,
 ) -> Result<(WrittenArchiveSummary, MemoryArchiveSink)> {
     let mut sink = MemoryArchiveSink::default();
-    let summary = write_archive_sources_to_sink_ordered_parallel_probe(
+    let summary = write_archive_sources_to_sink_ordered_parallel(
         input_specs,
         &key.master_key,
         options,
@@ -2812,34 +2622,6 @@ fn write_file_inputs_ordered_probe_to_memory_with_authenticator(
         &mut sink,
     )?;
     Ok((summary, sink))
-}
-
-fn write_file_inputs_unordered_probe_output(
-    output: &str,
-    input_specs: &[InputSpec],
-    key: &CreateKey,
-    options: WriterOptions,
-) -> Result<WrittenArchiveSummary> {
-    let output_paths = create_output_paths(output, options.stripe_width as usize);
-    let files = output_paths
-        .iter()
-        .map(|path| {
-            File::create(path)
-                .with_context(|| format!("failed to create probe output {}", path.display()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut sink = DirectArchiveSink {
-        files,
-        bootstrap_sidecar: Vec::new(),
-    };
-    write_archive_sources_to_sink_unordered_probe(
-        input_specs,
-        &key.master_key,
-        options,
-        &key.kdf_params,
-        &mut sink,
-    )
-    .map_err(Into::into)
 }
 
 #[allow(clippy::too_many_arguments)]
