@@ -18,7 +18,7 @@ In scope:
 - the exact bytes written into `RootAuthFooterV1.authenticator_value`;
 - certificate-chain verification with caller-supplied trusted roots and/or
   OpenSSL default trust roots;
-- API and CLI outcome wording for key-holding and public no-key verification
+- API and CLI outcome wording for full RootAuth and public no-key verification
   modes.
 
 Not in scope:
@@ -98,7 +98,7 @@ byte string:
 struct X509ChainAuthenticatorV1 {
     magic:                     [u8; 4],  // b"TZXC"
     version:                   u16,      // 1
-    sig_scheme:                u16,      // 1 = OpenSSL EVP SHA-256 signature
+    sig_scheme:                u16,      // see §5.3
     signed_at_unix_seconds:    i64,      // signer-claimed Unix timestamp
     chain_digest:              [u8; 32],
     signature_length:          u32,
@@ -118,8 +118,8 @@ All integer fields are little-endian. The fixed header is exactly 60 bytes.
 `signature` stores the first `signature_length` bytes as the actual signature.
 The remaining `signature_capacity - signature_length` bytes MUST be zero.
 `signature_capacity` lets writers reserve the maximum signature size for the
-selected OpenSSL key type while supporting variable-length encodings such as
-ECDSA.
+selected explicit signature scheme while supporting variable-length encodings
+such as ECDSA.
 
 `authenticator_value_length` MUST equal:
 
@@ -172,27 +172,36 @@ SIGNING_INPUT = SHA-512(
 `LE64(signed_at_unix_seconds)` is the two's-complement little-endian encoding of
 the signed 64-bit timestamp.
 
-The OpenSSL signature input is the 64-byte `SIGNING_INPUT` value. For
-`sig_scheme = 1`, implementations use OpenSSL EVP signing and verification with
-`MessageDigest::sha256()` and the leaf certificate public-key algorithm.
+The signature input is the 64-byte `SIGNING_INPUT` value. The selected
+`sig_scheme` in §5.3 signs and verifies that value as the message. The SHA-256
+named by each scheme hashes exactly those 64 bytes; implementations MUST NOT
+pre-hash them with an extra, profile-specific digest or sign raw archive bytes.
 
 The profile MUST NOT sign raw archive bytes, raw footer bytes, or a stored
 `archive_root` that core has not recomputed and equality-checked.
 
 ## 5.3 Signature Algorithm Profile
 
-`sig_scheme = 1` means "OpenSSL EVP signature with SHA-256 over
-`SIGNING_INPUT`." The exact public-key signature algorithm is determined by the
-leaf certificate public key and private key, subject to OpenSSL support.
+`sig_scheme` is an explicit on-wire algorithm identifier. Implementations MUST
+NOT infer an alternate signature algorithm from OpenSSL defaults, key type
+metadata, certificate signatureAlgorithm fields, or provider configuration.
+
+| `sig_scheme` | Name | Required verification behavior |
+|---:|---|---|
+| 1 | `rsa-pkcs1-sha256` | RSASSA-PKCS1-v1_5 signature over SHA-256(`SIGNING_INPUT`) using a leaf RSA public key whose SubjectPublicKeyInfo algorithm is unconstrained `rsaEncryption`. The encoded signature length MUST equal the RSA modulus length in bytes. Readers MUST reject RSASSA-PSS-constrained public keys for this scheme. |
+| 2 | `ecdsa-sha256-der` | ECDSA signature over SHA-256(`SIGNING_INPUT`) using a leaf named-curve EC public key. Signature bytes are DER `Ecdsa-Sig-Value` (`SEQUENCE { r INTEGER, s INTEGER }`) and MUST be a single complete DER value. `r` and `s` MUST be positive, minimally encoded DER integers in the range `1..n-1`, where `n` is the curve order, and `s` MUST be low-S (`s <= n/2`). Readers MUST reject explicit-parameter EC keys, unknown curve orders, high-S signatures, and otherwise non-canonical DER. |
+| 3 | `rsa-pss-sha256` | RSASSA-PSS signature over SHA-256(`SIGNING_INPUT`) using a leaf RSA public key, MGF1-SHA-256, salt length exactly 32 bytes, trailer field `0xBC`. The encoded signature length MUST equal the RSA modulus length in bytes. If the SubjectPublicKeyInfo algorithm is RSASSA-PSS and carries parameters, those parameters MUST exactly match this row; unconstrained `rsaEncryption` keys are also valid. |
+
+Writers MUST set a scheme compatible with the leaf public key and signing
+private key. Readers MUST reject a scheme/key mismatch, a signature whose length,
+encoding, key algorithm, or algorithm parameters violate the selected row, or an
+RSA-PSS signature verified with any salt length, MGF digest, or trailer field
+other than the values above. Writers MUST emit canonical low-S ECDSA signatures;
+readers MUST NOT accept a high-S alternate encoding of the same ECDSA signature.
 
 Writers MUST reject Ed25519 and Ed448 private keys for this profile. Readers
-MUST reject authenticators whose leaf public key cannot be used with OpenSSL EVP
-SHA-256 verification.
-
-Writers SHOULD use certificates and keys whose OpenSSL EVP SHA-256 behavior is
-stable and broadly interoperable, such as RSA or ECDSA. This profile does not
-assign separate on-wire `sig_scheme` values for RSA-PKCS1, RSA-PSS, ECDSA, or
-other OpenSSL key classes.
+MUST reject authenticators whose leaf public key cannot be used with one of the
+registered schemes above.
 
 ## 6. Verification Inputs
 
@@ -206,7 +215,10 @@ Core passes the profile:
 - exact `signer_identity_bytes`;
 - exact `authenticator_value`;
 - caller-supplied trusted root certificates, as DER;
-- whether OpenSSL default trust roots may be used.
+- whether OpenSSL default trust roots may be used;
+- the chain-validation time policy and validation time. The default v1 policy is
+  `verifier_current_time`, using the verifier's current clock at the time of
+  verification.
 
 The profile MUST NOT read archive files, parse archive metadata, perform FEC,
 decrypt objects, or decide public observation windows.
@@ -218,7 +230,8 @@ Readers MUST reject this authenticator value unless:
 - length is at least 60 bytes;
 - `magic = "TZXC"`;
 - `version = 1`;
-- `sig_scheme = 1`;
+- `sig_scheme` is one of `1`, `2`, or `3` as defined in §5.3;
+- `signature_length > 0`;
 - `signature_length <= signature_capacity`;
 - the byte string contains exactly `signature_capacity` signature bytes after
   the fixed header;
@@ -233,11 +246,16 @@ After parsing, readers MUST:
 
 1. Build `SIGNING_INPUT` from the recomputed core `archive_root`, not from an
    untrusted stored value.
-2. Verify the RootAuth signature with the leaf certificate public key.
+2. Verify the RootAuth signature with the leaf certificate public key and the
+   exact `sig_scheme` parameters from §5.3.
 3. Build an X.509 store from caller-supplied trusted roots and, only when
    explicitly requested, OpenSSL default trust roots.
 4. Add embedded chain certificates as untrusted intermediates.
-5. Verify the certificate path at `signed_at_unix_seconds`.
+5. Verify the certificate path at the selected chain-validation time. The
+   default v1 profile uses verifier current time. `signed_at_unix_seconds` MUST
+   NOT be used as the chain-validation time for a successful v1 result unless a
+   separate trusted timestamp profile or explicit deployment policy supplies
+   independent evidence that binds the archive signature to that time.
 
 RootAuth verification MUST fail if either signature verification or certificate
 path verification fails.
@@ -245,22 +263,39 @@ path verification fails.
 ## 8. Trust and Time Policy
 
 `signed_at_unix_seconds` is signer-claimed metadata. It is authenticated by the
-RootAuth signature, and it is used as the X.509 path-validation time, but it is
-not a trusted timestamp.
+RootAuth signature, but it is not a trusted timestamp and MUST NOT by itself
+select the X.509 path-validation time for `RootAuthContentVerified` or
+`PublicDataBlockCommitmentVerified`. The default path-validation time basis for
+this v1 profile is `verifier_current_time`.
 
 Successful verification means:
 
 - the recomputed v43 `archive_root` matched the stored footer commitment;
 - the leaf certificate public key verified the X.509 RootAuth signature;
-- the leaf certificate chained to an accepted trust root at the signer-claimed
-  time.
+- the leaf certificate chained to an accepted trust root at the selected
+  chain-validation time.
 
 Successful verification MUST NOT be described as proof that the signature was
-created at that time unless a separate trusted timestamp profile is used.
+created at `signed_at_unix_seconds`, as proof of freshness, or as proof of
+revocation status unless a separate trusted timestamp/revocation profile or
+deployment policy supplies those checks. A v1 success under the default policy
+does mean that the certificate path was valid according to the accepted trust
+roots at the verifier's selected validation time.
 
 This v1 profile does not perform revocation checking. Implementations MUST NOT
 claim CRL, OCSP, or freshness validation for this profile unless a future
 profile or deployment policy performs those checks separately.
+
+CLI, JSON, and API reports MUST label the time policy explicitly:
+`x509_time_policy = verifier_current_time` by default,
+`chain_time_basis = verifier_current_time`, the exact
+`chain_validation_time_unix_seconds`, the signer-claimed
+`signed_at_unix_seconds`, `trusted_timestamp = false`, and
+`revocation_checked = false`, unless a future profile or explicit deployment
+policy adds different evidence and labels it separately. Implementations MAY
+report whether the chain would also validate at `signed_at_unix_seconds`, but
+that diagnostic MUST NOT be used to upgrade a failed default-policy verification
+into a successful v1 RootAuth outcome.
 
 This v1 profile does not define a mandatory EKU or leaf KeyUsage policy beyond
 the certificate path validation performed by OpenSSL. Deployments that require a
@@ -279,23 +314,27 @@ enum X509RootAuthOutcome {
 }
 ```
 
-`RootAuthContentVerified` is available only when core has completed key-holding
-v43 full-archive content verification and root-auth recomputation.
+`RootAuthContentVerified` is available only when core has completed full v43
+RootAuth verification: archive-wide content verification and root-auth
+recomputation. In an encryption mode this requires the archive key; in
+unencrypted mode it does not require any archive key or password.
 
 `PublicDataBlockCommitmentVerified` is available only when core has completed
 the v43 public no-key observation path. It proves only that a certificate chain
 accepted by the caller's trust policy signed a commitment to the observed
 data-block set (ciphertext blocks in an encryption mode; plaintext blocks in
 unencrypted mode) and opaque component digests. In an encryption mode it does
-not prove plaintext, file list, IndexRoot, HMAC-authenticated metadata, physical
-completeness, or recovery margin; in unencrypted mode the data blocks are
-plaintext, so the commitment covers the plaintext data directly, but it still
-does not prove the file list/IndexRoot contents, physical completeness, or
-recovery margin.
+not prove plaintext recovery, decoded file/content authenticity, file list,
+IndexRoot, encrypted-mode authenticated metadata, physical completeness, or
+recovery margin; in unencrypted mode the commitment covers the observed
+plaintext data BlockRecord payloads directly, but it still does not prove
+decoded file/content authenticity, file-list/IndexRoot contents, physical
+completeness, or recovery margin.
 
 `UntrustedChain` means the RootAuth signature may be structurally well-formed,
-but no accepted trust anchor validated the certificate path. It MUST NOT be
-described as origin authenticity or public commitment verification.
+but no accepted trust anchor validated the certificate path at the selected
+chain-validation time. It MUST NOT be described as origin authenticity or public
+commitment verification.
 
 `UnsupportedIdentity` means `signer_identity_type` is not `2` for this profile
 or the selected RootAuth authenticator is not `0x0003`.
@@ -305,14 +344,23 @@ or the selected RootAuth authenticator is not `0x0003`.
 Successful verification SHOULD expose:
 
 - `signed_at_unix_seconds`;
+- `signature_scheme`;
+- `chain_validation_time_unix_seconds`;
 - `subject`;
 - `issuer`;
 - `serial_number_hex`;
 - leaf certificate SHA-256 fingerprint;
 - verified chain subjects in OpenSSL chain order;
-- trust anchor subject when available.
+- trust anchor subject when available;
+- `x509_time_policy = verifier_current_time` by default;
+- `chain_time_basis = verifier_current_time`;
+- `trusted_timestamp = false`;
+- `revocation_checked = false`.
 
-CLI and JSON output MUST label the timestamp source as `signer_claimed`.
+CLI and JSON output MUST label `signed_at_unix_seconds` as `signer_claimed` and
+MUST label the chain-validation time separately. They MUST NOT label a
+v1-profile success as fresh, TSA-backed, or revocation-checked unless those
+claims come from an explicitly separate policy or future profile field.
 
 ## 11. Evaluation Order
 
@@ -325,8 +373,8 @@ CLI and JSON output MUST label the timestamp source as `signer_claimed`.
 6. The profile builds `SIGNING_INPUT`.
 7. The profile verifies the signature with the leaf certificate public key.
 8. The profile verifies the certificate path with caller-approved trust roots at
-   `signed_at_unix_seconds`.
-9. If verification succeeds and core is in key-holding full verification mode,
+   the selected chain-validation time.
+9. If verification succeeds and core is in full RootAuth verification mode,
    return `RootAuthContentVerified`.
 10. If verification succeeds and core is in public no-key mode, return
     `PublicDataBlockCommitmentVerified`.
@@ -336,13 +384,27 @@ CLI and JSON output MUST label the timestamp source as `signer_claimed`.
 For archive creation, the CLI profile maps:
 
 - `--signing-cert FILE` to `signer_identity_bytes`;
-- `--signing-private-key FILE` to the private key used for `sig_scheme = 1`;
-- `--signing-chain FILE` to one or more embedded untrusted chain certificates.
+- `--signing-private-key FILE` to the private key used for the selected
+  `sig_scheme`;
+- `--signing-chain FILE` to one or more embedded untrusted chain certificates;
+- `--x509-signature-scheme {rsa-pkcs1-sha256,ecdsa-sha256-der,rsa-pss-sha256}`
+  to the on-wire `sig_scheme`.
+
+If `--x509-signature-scheme` is omitted, writers MUST choose
+`rsa-pkcs1-sha256` for unconstrained RSA keys and `ecdsa-sha256-der` for
+named-curve EC keys. Writers MUST use `rsa-pss-sha256` only when explicitly
+requested; a constrained RSASSA-PSS key without an explicit compatible scheme is
+rejected.
 
 For verification, the CLI profile maps:
 
 - `--trusted-ca-cert FILE` to caller-supplied trusted roots;
 - `--trusted-system-roots` to OpenSSL default trust roots.
+
+Unless a future CLI flag or deployment policy explicitly supplies a validation
+time with separate evidence, CLI verification uses verifier current time for
+X.509 path validation. The CLI MUST NOT use `signed_at_unix_seconds` as the
+chain-validation time merely because it is present in the signed authenticator.
 
 Verification MUST reject a request that mixes Ed25519 trust options with X.509
 trust options in the same RootAuth verification operation.
@@ -361,19 +423,34 @@ Partial operations may report root auth as deferred or unavailable.
 
 ## 14. Required Test Vectors
 
-1. `RootAuthContentVerified`: matching trusted root, valid key-holding v43 full
-   verification, valid chain at `signed_at_unix_seconds`.
+1. `RootAuthContentVerified`: matching trusted root, valid full v43 RootAuth
+   verification, valid chain at the selected chain-validation time. Cover both
+   an encrypted archive with an archive key and an unencrypted archive with no
+   password/key material.
 2. `PublicDataBlockCommitmentVerified`: matching trusted root, no archive key,
    complete public data-block observation set. Cover both an encrypted archive
    (ciphertext blocks) and an unencrypted archive (`aead_algo = None`, plaintext
    blocks).
 3. `UntrustedChain`: valid signature and embedded chain, wrong trusted root.
 4. `Invalid`: flipped `archive_root`, wrong signing domain, wrong certificate
-   public key, malformed signature value, non-zero signature padding, malformed
-   certificate DER, chain digest mismatch, trailing authenticator bytes.
+   public key, unsupported or mismatched `sig_scheme`, RSA-PSS parameter
+   mismatch, malformed ECDSA DER signature value, non-zero signature padding,
+   malformed certificate DER, chain digest mismatch, trailing authenticator
+   bytes.
 5. `UnsupportedIdentity`: unknown `signer_identity_type` with otherwise valid
    core footer wire checks.
 6. Missing trust policy: no caller-supplied trusted roots and no explicit system
    roots request.
 7. Stored footer `archive_root` differs from core recomputation: core rejects
    before profile success is possible.
+8. Signature schemes: valid RSA-PKCS1-SHA256 (`sig_scheme = 1`), valid
+   ECDSA-SHA256-DER (`sig_scheme = 2`), valid RSA-PSS-SHA256 with salt length 32
+   (`sig_scheme = 3`), and rejection when any of those signatures is verified
+   under another scheme.
+9. Time labelling: under the default `verifier_current_time` policy, a chain
+   that validates at `signed_at_unix_seconds` but is expired at current
+   verification time MUST fail as `UntrustedChain`, while still reporting
+   `signed_at_unix_seconds` as signer-claimed metadata. Such a case may succeed
+   only when an explicit future profile or deployment policy selects a different
+   chain-validation time with separate evidence, and the report MUST label that
+   non-default time basis separately.

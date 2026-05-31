@@ -15,14 +15,14 @@ In scope:
 - the exact bytes written into `RootAuthFooterV1.authenticator_value`;
 - `authenticator_id = 0x0002`;
 - the strict Ed25519 verification profile;
-- API outcome wording for key-holding and public no-key verification modes.
+- API outcome wording for full RootAuth and public no-key verification modes.
 
 Not in scope:
 
 - `archive_root` construction;
 - `RootAuthFooterV1` layout and footer CRC;
 - CMRA and locator recovery;
-- key-holding versus public no-key source-authority rules;
+- full RootAuth versus public no-key source-authority rules;
 - CLI key-management UX, X.509, timestamping, trust stores, revocation, or
   certificate policy.
 
@@ -156,18 +156,21 @@ enum Ed25519RootAuthOutcome {
 }
 ```
 
-`RootAuthContentVerified` is available only when core has completed key-holding
-v43 full-archive content verification and root-auth recomputation.
+`RootAuthContentVerified` is available only when core has completed full v43
+RootAuth verification: archive-wide content verification and root-auth
+recomputation. In an encryption mode this requires the archive key; in
+unencrypted mode it does not require any archive key or password.
 
 `PublicDataBlockCommitmentVerified` is available only when core has completed
 the v43 public no-key observation path. It proves only that a trusted key signed
 a commitment to the observed data-block set (ciphertext blocks in an encryption
 mode; plaintext blocks in unencrypted mode) and opaque component digests. In an
-encryption mode it does not prove plaintext, file list, IndexRoot,
-HMAC-authenticated metadata, physical completeness, or recovery margin; in
-unencrypted mode the data blocks are plaintext, so the commitment covers the
-plaintext data directly, but it still does not prove the file list/IndexRoot
-contents, physical completeness, or recovery margin.
+encryption mode it does not prove plaintext recovery, decoded file/content
+authenticity, file list, IndexRoot, encrypted-mode authenticated metadata,
+physical completeness, or recovery margin; in unencrypted mode the commitment
+covers the observed plaintext data BlockRecord payloads directly, but it still
+does not prove decoded file/content authenticity, file-list/IndexRoot contents,
+physical completeness, or recovery margin.
 
 `SelfSignedConsistent` means the signature validates against an embedded key
 but no caller trust anchor matched. It MUST NOT be described as origin
@@ -184,7 +187,7 @@ authenticity.
 4. The profile builds `SIGNING_INPUT`.
 5. The profile verifies the Ed25519 signature using the strict profile.
 6. If verification fails, return `Invalid`.
-7. If verification succeeds with caller trust and core is in key-holding full
+7. If verification succeeds with caller trust and core is in full RootAuth
    verification mode, return `RootAuthContentVerified`.
 8. If verification succeeds with caller trust and core is in public no-key
    mode, return `PublicDataBlockCommitmentVerified`.
@@ -201,8 +204,9 @@ Partial operations may report root auth as deferred or unavailable.
 
 ## 10. Required Test Vectors
 
-1. `RootAuthContentVerified`: matching caller key, valid key-holding v43 full
-   verification.
+1. `RootAuthContentVerified`: matching caller key, valid full v43 RootAuth
+   verification. Cover both an encrypted archive with an archive key and an
+   unencrypted archive with no password/key material.
 2. `PublicDataBlockCommitmentVerified`: matching caller key, no archive key,
    complete public data-block observation set. Cover both an encrypted archive
    (ciphertext blocks) and an unencrypted archive (`aead_algo = None`, plaintext

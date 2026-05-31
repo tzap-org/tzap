@@ -16,8 +16,9 @@
 ## Changelog from v0.41 / v0.42
 
 v0.41 and v0.42 were never released. v0.43 consolidates them into a single
-standalone specification and makes **encryption optional** (a password is no
-longer required), while keeping a single consistent format-revision number.
+standalone specification and makes **encryption/password optional** while keeping
+a single consistent format-revision number. Signing/root authentication is also
+optional and independent of encryption/password.
 v0.43 is not wire-compatible with v0.41/v0.42 drafts: writers set
 `VolumeHeader.volume_format_rev = 43`, and earlier-draft readers reject v0.43
 archives.
@@ -42,6 +43,8 @@ archives.
 5. **Tamper-evidence via optional root authentication.** Root authentication is
    independent of the protection mode and unchanged in construction; a signed
    unencrypted archive is tamper-evident and verifiable without any key (§30).
+   Unsigned unencrypted archives remain valid, but they provide only
+   corruption checks, not cryptographic authentication or tamper-evidence.
 6. **Unified versioning.** The format-revision number is `43` everywhere it
    appears: `volume_format_rev = 43`, all format/root-auth hash domains end in
    `-v43`, and `root_auth_spec_id = "tzap-root-auth-v0.43"`. The symmetric
@@ -97,9 +100,9 @@ locator`.
    unsigned archive as cryptographically authenticated. In both modes, archive
    truncation or missing terminal material is detected
    before a clean extraction is reported. Non-seekable sequential readers
-   that emit live output before terminal authentication MUST treat that
+   that emit live output before terminal verification MUST treat that
    output as provisional; default filesystem extractors MUST NOT commit
-   filesystem-visible results as clean until terminal authentication
+   filesystem-visible results as clean until terminal verification
    succeeds.
 3. **Critical metadata recovery.** VolumeHeader, CryptoHeader,
    ManifestFooter, optional RootAuthFooterV1, VolumeTrailer, and the layout
@@ -150,18 +153,18 @@ detection; replay attacks; loss of CryptoHeader or ManifestFooter copies;
 mid-stream writer crashes.
 
 Active modification is in scope for integrity detection and plaintext
-non-release for any object that fails AEAD/HMAC authentication, not for
+non-release for any object that fails mode-specific integrity validation, not for
 guaranteed repair. The unkeyed per-block CRC identifies accidental
 corruption and missing/erased shards for FEC, but an active attacker who
 can rewrite a BlockRecord and recompute its CRC can still cause object
-AEAD failure and deny availability even when parity would have repaired
-an accidental error at the same location. Whole-archive truncation in
-non-seekable sequential mode is detected at terminal authentication;
+integrity failure and deny availability even when parity would have repaired an
+accidental error at the same location. Whole-archive truncation in
+non-seekable sequential mode is detected at terminal verification;
 any live output emitted before that point is provisional and must not be
 reported or committed as a clean extraction until terminal recovery and
-authentication succeed, including locator/CMRA recovery as applicable,
-ManifestFooter and VolumeTrailer HMACs, and requested RootAuthFooterV1
-verification when present.
+verification succeed, including locator/CMRA recovery as applicable,
+ManifestFooter and VolumeTrailer mode-specific integrity checks, and requested
+RootAuthFooterV1 verification when present.
 
 **Out of scope:** host side channels; quantum adversaries beyond AES-256
 Grover resistance; chosen-plaintext attacks against the compression layer
@@ -239,6 +242,23 @@ replaced by unkeyed digests at the same offset and size (§9, §11, §12); and
 per-block `record_crc32c` (§10) provides corruption detection. A password is
 therefore optional: confidentiality is opt-in via a passphrase or keyfile (§13),
 and tamper-evidence is opt-in via root authentication (§30).
+
+Encryption/password and signing/root authentication are independent optional
+features. A conforming v0.43 archive may be any of these four combinations:
+
+| Encryption/password | Root authentication | Valid? | Security claim |
+|---|---|---:|---|
+| off | off | yes | plaintext archive with CRC/unkeyed-digest corruption checks only; readers MUST NOT report cryptographic authentication or tamper-evidence |
+| on | off | yes | confidential archive with keyed HMAC/AEAD integrity for holders of the archive key |
+| off | on | yes | public plaintext archive with signature-backed tamper-evidence and no archive key requirement |
+| on | on | yes | confidential archive with keyed HMAC/AEAD integrity plus signature-backed archive-root verification |
+
+Throughout this document, **mode-specific integrity verification** means the
+keyed HMAC/AEAD checks in an encryption mode, or the unkeyed header/footer
+digest checks, per-block CRC32C checks, block-continuity checks, and plaintext
+object validation in unencrypted mode. The unkeyed checks are corruption and
+binding checks only; root authentication is the only cryptographic
+tamper-evidence mechanism for unencrypted archives.
 
 Readers MUST enforce these cross-field consistency rules from the CryptoHeader
 fixed fields before any object processing:
@@ -322,12 +342,12 @@ zstd frames f₁, f₂, …, fₙ
 envelopes E_j
   │ in-envelope pad (SUFFIX-MARKER SCHEME, §6.1)
   │ envelope_total_size = next multiple of BLOCK_SIZE such that
-  │   |E_j| + pad_len + AEAD_TAG_LEN = envelope_total_size
+  │   |E_j| + pad_len + OBJECT_TAG_LEN = envelope_total_size
   ▼
 padded plaintexts
-  │ AEAD-encrypt
+  │ AEAD-encrypt in an encryption mode; otherwise store as-is
   ▼
-encrypted envelopes EE_j
+stored envelope objects
   │ split into BLOCK_SIZE-sized blocks
   ▼
 data blocks
@@ -414,7 +434,7 @@ Edge cases:
   a byte-form `pad_len = 255`.
 - The exact-fit extra block is still subject to every u32 and FEC object
   limit. Writers MUST split or shrink the envelope before
-  `packed_frames.len() + AEAD_TAG_LEN + BLOCK_SIZE` would exceed
+  `packed_frames.len() + OBJECT_TAG_LEN + BLOCK_SIZE` would exceed
   `u32::MAX`, the selected object-class data-shard cap, or the
   ReedSolomonGF16 total-shard cap.
 - Because `BLOCK_SIZE ≥ 4096`, an exact-fit envelope that adds a full
@@ -518,7 +538,7 @@ within each sink: no seek-back or overwrite is required.
 For a fully non-reopenable single sink (for example a pipe or a tape stream),
 conforming v0.43 writers MUST use `stripe_width = 1`,
 `volume_loss_tolerance = 0`, and either `has_dictionary = 0` or a bootstrap
-sidecar containing authenticated encrypted IndexRoot and dictionary-object
+sidecar containing mode-specifically verified IndexRoot and dictionary-object
 copies (§12.2, §17.3). A live reader cannot decompress dictionary-compressed
 payload frames until that sidecar is available.
 
@@ -566,9 +586,9 @@ VolumeHeader is now fully write-once: no field requires backfill at
 archive close.
 
 `header_crc32c` is an unkeyed corruption detector only. Readers MUST NOT
-treat VolumeHeader identity fields or offsets as authenticated until they
-are matched against authenticated CryptoHeader, VolumeTrailer, and
-ManifestFooter fields after HMAC verification (§17.1). Readers MUST
+treat VolumeHeader identity fields or offsets as trusted until they
+are matched against mode-specifically verified CryptoHeader, VolumeTrailer, and
+ManifestFooter fields (§17.1). Readers MUST
 verify `magic = b"TZAP"` and range-check `crypto_header_length` against
 the actual volume or stream bounds and reader caps before allocating or
 reading the CryptoHeader. Writers MUST set `crypto_header_offset =
@@ -578,7 +598,7 @@ VolumeHeader and CryptoHeader. Writers MUST set `stripe_width ≥ 1` and
 MUST set `volume_index < stripe_width`; readers MUST reject a
 VolumeHeader whose `stripe_width = 0` or whose
 `volume_index >= stripe_width`.
-Before CryptoHeader HMAC verification succeeds, readers MUST treat the
+Before CryptoHeader integrity verification succeeds, readers MUST treat the
 length, `archive_uuid`, and `session_id` as untrusted input used only to
 locate and verify a bounded candidate CryptoHeader at the canonical
 offset.
@@ -663,36 +683,38 @@ HMAC-equivalent authenticated state for an unencrypted archive; cryptographic
 tamper-evidence in unencrypted mode comes only from optional root authentication
 (§30). The distinct `tzap-*-v43` domains ensure an unkeyed digest can never be
 confused with or substituted for a `tzap-v1-*` HMAC. All structural/identity
-cross-checks that follow HMAC verification in encryption mode (UUID/session/
-volume_index agreement, magic, reserved-zero) are performed identically after
-digest verification.
+cross-checks that follow keyed HMAC verification in encryption mode
+(UUID/session/volume_index agreement, magic, reserved-zero) are performed
+identically after digest verification in unencrypted mode.
 
 Readers MUST reject a CryptoHeader
 whose length is smaller than the fixed header, the selected KdfParams
-payload, the required Extension TLV terminator, and the HMAC. At
+payload, the required Extension TLV terminator, and the trailing 32-byte
+integrity field. At
 minimum, a candidate header must contain
 `sizeof(CryptoHeaderFixed) + 2 + 6 + 32` bytes: the fixed header, the
 shortest raw KdfParams payload, a terminator TLV (`tag = 0`, `length =
-0`), and `header_hmac`. This minimum lets the KdfParams `algo_tag` be
-read safely and leaves room for the mandatory terminator before the HMAC.
+0`), and the trailing integrity field. This minimum lets the KdfParams
+`algo_tag` be read safely and leaves room for the mandatory terminator before
+the integrity field.
 After `kdf_algo` is known, readers MUST prove the complete KdfParams
 payload indicated by §13.1 fits before `length - 32`, and only then
-perform a structural Extension TLV scan. This pre-HMAC scan treats
+perform a structural Extension TLV scan. This pre-integrity scan treats
 Extension bytes as untrusted and may validate only framing:
 1. Every TLV header must fit before `length - 32`.
 2. Every Extension payload length must be `≤ 256`, even for unknown tags.
 3. `tag = 0` is valid only as the terminator with `length = 0`.
 4. The terminator TLV must be present and must end exactly at
-   `length - 32`, immediately before `header_hmac`.
+   `length - 32`, immediately before the trailing integrity field.
 Readers MUST reject a CryptoHeader whose TLV list does not satisfy those
 framing rules, or whose reserved bytes are non-zero.
 Except for the explicitly limited public no-key profile in §30.11.1, readers
 MUST NOT make semantic decisions from Extension tags or values until after
-CryptoHeader HMAC verification succeeds. Public no-key use of TLVs is only a
+CryptoHeader integrity verification succeeds. Public no-key use of TLVs is only a
 bounded candidate rejection or unavailable-result rule; it is not
 CryptoHeader authentication and MUST NOT be reported as authenticated
 metadata.
-After HMAC verification, readers interpret each non-terminator extension
+After CryptoHeader integrity verification, readers interpret each non-terminator extension
 by defining `ext_tag = tag & 0x7FFF` and
 `is_critical = (tag & 0x8000) != 0`. The high bit is the critical bit and
 is masked from `ext_tag` when validating known tags. Readers MUST:
@@ -717,11 +739,11 @@ stripe_width`, `bit_rot_buffer_pct > 100`, or any class data-shard
 maximum (`fec_data_shards`, `index_fec_data_shards`, or
 `index_root_fec_data_shards`) equal to zero.
 
-Binding the VolumeHeader UUID/session into the CryptoHeader HMAC makes a
-mismatched header pair fail immediately after KDF/HMAC verification,
-before any object AEAD attempt. The VolumeHeader is still not trusted as
-a security boundary; the same identity fields are later checked against
-the authenticated VolumeTrailer and ManifestFooter.
+Binding the VolumeHeader UUID/session into the CryptoHeader integrity field
+makes a mismatched header pair fail immediately after CryptoHeader integrity
+verification, before any object processing. The VolumeHeader is still not
+trusted as a security boundary; the same identity fields are later checked
+against the mode-specifically verified VolumeTrailer and ManifestFooter.
 
 `chunk_size` records the writer's target maximum uncompressed zstd-frame
 payload for large tar member groups (§6.2). Writers MUST set
@@ -1081,16 +1103,16 @@ physical_file_size        = CMRA_offset + CMRA_length + 256
 ```
 
 Readers MUST verify these equations with checked 64-bit-or-wider arithmetic
-after CMRA recovery and trailer HMAC verification.
+after CMRA recovery and trailer integrity verification.
 
 ### 12.1 Reader diagnostic logic
 
 | Trailer state | Diagnosis |
 |---|---|
-| CMRA recovered, trailer HMAC valid, authoritative ManifestFooter, matching identity, `bytes_written`, `block_count`, terminal adjacency, and locator boundary | Clean close |
+| CMRA recovered, trailer integrity valid, authoritative ManifestFooter, matching identity, `bytes_written`, `block_count`, terminal adjacency, and locator boundary | Clean close |
 | CMRA unrecoverable but another volume or explicit trusted source can bootstrap the requested operation | Degraded bootstrap availability |
-| Trailer present in CMRA but invalid HMAC | Tampered or wrong key |
-| Trailer HMAC valid but identity, pointer, adjacency, or locator boundary mismatches | Mixed, spliced, or malformed volume |
+| Trailer present in CMRA but invalid integrity field | Tampered, corrupt, or wrong key |
+| Trailer integrity valid but identity, pointer, adjacency, or locator boundary mismatches | Mixed, spliced, or malformed volume |
 | Final locator corrupt but mirror locator opens the archive | Clean with locator-repair diagnostic |
 | Both locators corrupt but bounded locatorless CMRA scan succeeds | Clean with critical-recovery scan diagnostic |
 | No valid locator or bounded CMRA candidate | Writer crashed, truncated, or garbage beyond recovery cap |
@@ -1103,17 +1125,20 @@ may additionally emit a bootstrap sidecar file (`<base>.tzap.bootstrap`) or a
 separate sidecar stream/file descriptor. The sidecar may contain:
 
 - a sidecar ManifestFooter instance containing the shared bootstrap fields and
-  its own HMAC;
+  its own mode-specific integrity field;
 - BlockRecord copies for the encrypted IndexRoot data/parity blocks (§12.3);
 - for dictionary archives, BlockRecord copies for the encrypted dictionary
   object.
 
 Sidecar bytes are not trusted merely because they are adjacent to the archive.
-Readers MUST verify the same HMAC/AEAD authentication that would be verified
+Readers MUST verify the same mode-specific integrity checks that would be verified
 when reading the bytes from a volume before using sidecar BlockRecords to
-locate, repair, decrypt, or decompress any object. A dictionary archive uses the
-sidecar's authenticated encrypted IndexRoot copy to locate the dictionary object
-and the sidecar's authenticated encrypted dictionary copy to recover dictionary
+locate, repair, decrypt, or decompress any object: the keyed HMAC/AEAD checks
+in an encryption mode, or per-block CRC32C plus the unkeyed §9 digests
+(`sidecar_digest`, `manifest_digest`) and plaintext object reads in unencrypted
+mode (`aead_algo = None`). A dictionary archive uses the
+sidecar's mode-specifically verified IndexRoot copy to locate the dictionary object
+and the sidecar's mode-specifically verified dictionary copy to recover dictionary
 bytes before payload decompression. If a reader starts from a live non-seekable
 stream before the sidecar is complete, it MUST either buffer encrypted payload
 bytes until the dictionary is recovered or reject with "dictionary bootstrap
@@ -1184,15 +1209,15 @@ offset if they are non-zero.
 
 When a ManifestFooter is placed in a bootstrap sidecar, it is a sidecar
 ManifestFooter instance. It MAY be byte-identical to the volume-0
-per-volume ManifestFooter when every serialized field and HMAC input is
+per-volume ManifestFooter when every serialized field and integrity input is
 identical. Writers MUST NOT copy a nonzero-volume ManifestFooter and
-then mutate `volume_index` after HMAC. Writers MUST serialize the
+then mutate `volume_index` after integrity computation. Writers MUST serialize the
 sidecar ManifestFooter instance with
 `ManifestFooter.volume_index = 0` and `is_authoritative = 1`, then
-compute that instance's `manifest_hmac` over those sidecar bytes. The
+compute that instance's mode-specific integrity field over those sidecar bytes. The
 zero volume index is informational for sidecar bootstrapping because the
 sidecar is not itself a volume. Readers MUST verify the sidecar
-ManifestFooter HMAC and `archive_uuid`/`session_id`, MUST reject a v0.43
+ManifestFooter integrity field and `archive_uuid`/`session_id`, MUST reject a v0.43
 bootstrap sidecar whose sidecar ManifestFooter has `volume_index != 0`
 or `is_authoritative != 1`, and MUST NOT require that zero value to
 match the currently opened VolumeHeader. Seekable per-volume
@@ -1243,8 +1268,8 @@ and 2 MUST all be set and all three declared byte ranges MUST be present.
 `index_root_records_length` MUST be an integer multiple of
 `sizeof(BlockRecord)`, and every copied BlockRecord MUST have kind 2
 (`index-root-data`) or kind 3 (`index-root-parity`). The copied
-BlockRecord payload bytes are the same authenticated encrypted/parity
-bytes that would be read from the volume set.
+BlockRecord payload bytes are the same mode-specifically verified stored
+data/parity bytes that would be read from the volume set.
 After obtaining an authenticated ManifestFooter from the sidecar or
 another source, readers MUST verify that the IndexRoot record section
 contains exactly the BlockRecords in the
@@ -1270,13 +1295,13 @@ index_root_fec_data_shards + index_root_fec_parity_shards`, and
 `dictionary_records_length / sizeof(BlockRecord) ≤
 index_root_fec_data_shards + index_root_fec_parity_shards`. Readers MUST
 also enforce the bootstrap sidecar file-size cap in §13.3. These caps are
-checked in addition to the packed cursor rule and HMAC/AEAD
-authentication.
+checked in addition to the packed cursor rule and mode-specific integrity
+verification.
 
 The sidecar header CRC is only an unkeyed corruption check over the raw
-received header bytes. Readers MAY compute it before KDF/HMAC work to
+received header bytes. Readers MAY compute it before KDF/integrity work to
 reject obvious corruption early, even though the covered bytes include
-the as-received `sidecar_hmac` field. `sidecar_hmac` verification is
+the as-received `sidecar_hmac` field. Sidecar integrity-field verification is
 mandatory before trusting flags, offsets, or lengths. In unencrypted mode
 `sidecar_hmac` is instead the unkeyed `sidecar_digest = SHA-256(b"tzap-sidecar-v43"
 || archive_uuid || session_id || all sidecar bytes before this field)` per §9;
@@ -1285,9 +1310,11 @@ unencrypted mode comes from the plaintext ManifestFooter digest plus root
 authentication when present, not from a keyed HMAC. The CRC covers the
 `sidecar_hmac` bytes because it covers the first 124 header bytes; this
 is intentional and does not make the CRC an authentication mechanism.
-Authority for copied archive objects still comes from the ManifestFooter
-HMAC plus AEAD verification of IndexRoot and any copied dictionary
-object.
+Authority for copied archive objects still comes from mode-specific
+ManifestFooter integrity plus object validation: HMAC plus AEAD verification of
+IndexRoot and any copied dictionary object in an encryption mode, or
+ManifestFooter digest, per-block CRC32C, suffix-padding/zstd exactness, and
+optional root authentication in unencrypted mode.
 Readers MUST verify that the sidecar `archive_uuid` and `session_id`
 match the VolumeHeader/CryptoHeader pair before using any sidecar bytes.
 Readers implementing this draft MUST reject `version != 1`.
@@ -1523,7 +1550,7 @@ For this cap, "observed archive byte size" means the sum of file sizes
 for all supplied volume files that have passed identity checks when the
 input set is seekable. For non-seekable or partial/recovery inputs, it
 means the cumulative bytes consumed from supplied archive streams that
-have passed their available CRC/HMAC/AEAD checks, plus authenticated
+have passed their available CRC and mode-specific integrity checks, plus authenticated
 sidecar bytes if a sidecar is used. Readers MAY choose a lower local cap
 or require all volumes before extracting, but MUST NOT use the size of a
 single opened volume as the whole multi-volume archive size when more
@@ -1595,11 +1622,11 @@ randomness is required after `session_id` is generated.
 
 ```rust
 fn encrypt_envelope(j: u64, packed_frames: &[u8]) -> Vec<u8> {
-    let tag_len = AEAD_TAG_LEN;
+    let object_tag_len = OBJECT_TAG_LEN; // AEAD_TAG_LEN in encryption mode, 0 otherwise.
     let mut total_blocks = max(1,
-        (packed_frames.len() + tag_len + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        (packed_frames.len() + object_tag_len + BLOCK_SIZE - 1) / BLOCK_SIZE);
     let mut envelope_total = total_blocks * BLOCK_SIZE;
-    let mut pad_len = envelope_total - packed_frames.len() - tag_len;
+    let mut pad_len = envelope_total - packed_frames.len() - object_tag_len;
     if pad_len == 0 {
         total_blocks += 1;
         envelope_total = total_blocks * BLOCK_SIZE;
@@ -1607,10 +1634,13 @@ fn encrypt_envelope(j: u64, packed_frames: &[u8]) -> Vec<u8> {
     }
     // pad_len is now always ≥ 1.
 
-    let mut plaintext = Vec::with_capacity(envelope_total - tag_len);
+    let mut plaintext = Vec::with_capacity(envelope_total - object_tag_len);
     plaintext.extend_from_slice(packed_frames);
     append_suffix_padding(&mut plaintext, pad_len);   // §6.1
 
+    if aead_algo == None {
+        return plaintext;
+    }
     let nonce = derive_nonce(
         &nonce_seed, b"envelope", &archive_uuid, &session_id, j, AEAD_NONCE_LEN);
     aead_encrypt(
@@ -1618,20 +1648,20 @@ fn encrypt_envelope(j: u64, packed_frames: &[u8]) -> Vec<u8> {
 }
 ```
 
-The value returned by this construction is an encrypted object whose
-bytes are the §5 combined `ciphertext || tag` serialization and whose
-length is recorded in `EnvelopeEntry.encrypted_size` as u32. Writers MUST
-perform the arithmetic above with checked integer operations and MUST
-split the envelope before the exact-fit extra block, AEAD tag, or
-`data_block_count * block_size` product would exceed `u32::MAX` or the
-selected FEC object limits. Truncating or wrapping `encrypted_size` is
-non-conforming.
+The value returned by this construction is the stored envelope object:
+`ciphertext || tag` in an encryption mode, or padded plaintext in unencrypted
+mode. Its length is recorded in `EnvelopeEntry.encrypted_size` as u32. Writers
+MUST perform the arithmetic above with checked integer operations and MUST split
+the envelope before the exact-fit extra block, `OBJECT_TAG_LEN`, or
+`data_block_count * block_size` product would exceed `u32::MAX` or the selected
+FEC object limits. Truncating or wrapping `encrypted_size` is non-conforming.
 
 ### 14.3 Index encryption
 
 ```rust
 fn encrypt_index_root(plaintext: &[u8]) -> Vec<u8> {
-    let padded = suffix_pad_for_aead(plaintext, AEAD_TAG_LEN, BLOCK_SIZE);
+    let padded = suffix_pad_for_aead(plaintext, OBJECT_TAG_LEN, BLOCK_SIZE);
+    if aead_algo == None { return padded; }
     let counter = 0; // IndexRoot is a singleton within the archive.
     let nonce = derive_nonce(
         &index_nonce_seed, b"idxroot", &archive_uuid, &session_id, counter, AEAD_NONCE_LEN);
@@ -1641,7 +1671,8 @@ fn encrypt_index_root(plaintext: &[u8]) -> Vec<u8> {
 }
 
 fn encrypt_index_shard(s: u64, plaintext: &[u8]) -> Vec<u8> {
-    let padded = suffix_pad_for_aead(plaintext, AEAD_TAG_LEN, BLOCK_SIZE);
+    let padded = suffix_pad_for_aead(plaintext, OBJECT_TAG_LEN, BLOCK_SIZE);
+    if aead_algo == None { return padded; }
     let nonce = derive_nonce(
         &index_nonce_seed, b"idxshard", &archive_uuid, &session_id, s, AEAD_NONCE_LEN);
     aead_encrypt(
@@ -1650,7 +1681,8 @@ fn encrypt_index_shard(s: u64, plaintext: &[u8]) -> Vec<u8> {
 }
 
 fn encrypt_dictionary(plaintext: &[u8]) -> Vec<u8> {
-    let padded = suffix_pad_for_aead(plaintext, AEAD_TAG_LEN, BLOCK_SIZE);
+    let padded = suffix_pad_for_aead(plaintext, OBJECT_TAG_LEN, BLOCK_SIZE);
+    if aead_algo == None { return padded; }
     let counter = 0; // one dictionary object per archive.
     let nonce = derive_nonce(
         &index_nonce_seed, b"dict", &archive_uuid, &session_id, counter, AEAD_NONCE_LEN);
@@ -1660,7 +1692,8 @@ fn encrypt_dictionary(plaintext: &[u8]) -> Vec<u8> {
 }
 
 fn encrypt_directory_hint_shard(h: u64, plaintext: &[u8]) -> Vec<u8> {
-    let padded = suffix_pad_for_aead(plaintext, AEAD_TAG_LEN, BLOCK_SIZE);
+    let padded = suffix_pad_for_aead(plaintext, OBJECT_TAG_LEN, BLOCK_SIZE);
+    if aead_algo == None { return padded; }
     let nonce = derive_nonce(
         &index_nonce_seed, b"dirhint", &archive_uuid, &session_id, h, AEAD_NONCE_LEN);
     aead_encrypt(
@@ -1671,10 +1704,12 @@ fn encrypt_directory_hint_shard(h: u64, plaintext: &[u8]) -> Vec<u8> {
 
 The same suffix-marker padding scheme is used for index encryption.
 `suffix_pad_for_aead` is the §6.1 construction with the exact-fit extra
-block rule from §14.2; it MUST NOT produce `pad_len = 0`. Readers trim
-ciphertext to the recorded `encrypted_size`, AEAD-decrypt, and then strip
-suffix padding with the §6.1 algorithm before zstd-decompressing any
-IndexRoot, IndexShard, dictionary, or directory-hint object.
+block rule from §14.2, using `OBJECT_TAG_LEN`; it MUST NOT produce
+`pad_len = 0`. Readers trim stored object bytes to the recorded
+`encrypted_size`, AEAD-decrypt in an encryption mode or read the bytes directly
+in unencrypted mode, and then strip suffix padding with the §6.1 algorithm
+before zstd-decompressing any IndexRoot, IndexShard, dictionary, or
+directory-hint object.
 
 Each metadata object compressed payload (IndexRoot, IndexShard, dictionary
 object, and DirectoryHintTable) MUST be exactly one complete non-skippable
@@ -2874,7 +2909,7 @@ are: `ustar-baseline`, `pax-posix-2001`, `gnu-longname`,
 specific local profile names, but they SHOULD map them to these baseline
 identifiers when reporting unsupported metadata.
 
-The encrypted tzap tar stream contains only path-specific tar member
+The tzap tar stream contains only path-specific tar member
 groups. Writers MUST NOT emit global PAX headers, global GNU state, or
 any other non-path-specific tar metadata record whose semantics affect
 later unrelated entries. Readers MUST reject such records during
@@ -3023,21 +3058,33 @@ MUST still pass the no-follow ancestry checks above.
         `bit_rot_buffer_pct > 100`, zero data-shard class maxima, `chunk_size =
         0`, `envelope_target_size = 0`, `chunk_size > envelope_target_size`,
         `block_size < 4096`, odd `block_size`, or any header parameter above its
-        active reader-side cap in v0.43. Parse KdfParams only after `kdf_algo` is
-        known and supported; prompt for passphrase or load keyfile.
+        active reader-side cap in v0.43. Determine the protection mode from
+        `aead_algo` and enforce the §5.1 cross-field rules (aead_algo = None iff
+        kdf_algo = None). Parse KdfParams only after `kdf_algo` is
+        known and supported; in an encryption mode prompt for passphrase or load
+        keyfile, in unencrypted mode there is no key input.
         Structurally scan Extension TLVs for bounded headers, `length <= 256`,
         valid terminator encoding, and no bytes between the terminator and
-        `header_hmac`.
-     i. Run KDF -> master_key. Derive `mac_key` using the archive UUID and
-        session ID from the recovered `VolumeHeader` (§13.2). Verify
+        the trailing 32-byte integrity field.
+     i. Encryption mode (`aead_algo != None`): run KDF -> master_key, derive
+        `mac_key` using the archive UUID and
+        session ID from the recovered `VolumeHeader` (§13.2), and verify
         `CryptoHeader.header_hmac`, including the VolumeHeader UUID/session
         binding (§9). On failure: try another recovered volume candidate if one
         is available. If all fail under the same key: abort "wrong key or all
-        CryptoHeader copies corrupt." After HMAC succeeds, interpret Extension
-        semantics. Reject forbidden tags `0x0004` and `0x0006`, duplicate known
-        tags, malformed known extension values, and unknown critical extensions.
-        Ignore unknown non-critical extensions.
-     j. Verify `VolumeTrailer.trailer_hmac`, `ManifestFooter.manifest_hmac`, and
+        CryptoHeader copies corrupt."
+        Unencrypted mode (`aead_algo = None`): run no KDF and derive no subkeys;
+        recompute the unkeyed `header_digest` (§9) over the same byte range and
+        verify it equals the trailing 32-byte field. On failure: try another
+        recovered candidate; if all fail: abort "all CryptoHeader copies
+        corrupt." There is no "wrong key" outcome in unencrypted mode.
+        After the header integrity check succeeds (either mode), interpret
+        Extension semantics. Reject forbidden tags `0x0004` and `0x0006`,
+        duplicate known tags, malformed known extension values, and unknown
+        critical extensions. Ignore unknown non-critical extensions.
+     j. Verify the `VolumeTrailer` and `ManifestFooter` integrity fields
+        (`trailer_hmac`/`manifest_hmac` in an encryption mode; the unkeyed
+        `trailer_digest`/`manifest_digest` of §11/§12 in unencrypted mode), and
         all identity, offset, length, block-count, and adjacency checks. Verify
         that unrepaired critical byte ranges read directly from canonical
         physical offsets equal those physical bytes. If CMRA repair supplies a
@@ -3059,7 +3106,7 @@ MUST still pass the no-follow ancestry checks above.
         the replicated global input rules in §30.9.0.1.
 3. If the input is non-seekable:
      a. Read `VolumeHeader` at offset 0; verify CRC. Reject if `magic != b"TZAP"`,
-        `format_version != 1`, `volume_format_rev != 41`,
+        `format_version != 1`, `volume_format_rev != 43`,
         `VolumeHeader.stripe_width = 0`, `VolumeHeader.volume_index >=
         VolumeHeader.stripe_width`, or `crypto_header_offset !=
         sizeof(VolumeHeader)`.
@@ -3074,16 +3121,26 @@ MUST still pass the no-follow ancestry checks above.
         supplies the root-auth state named in §30.13.
      d. Otherwise enter sequential extraction mode (§17.3). Random access,
         listing, and directory-prefix extraction are unavailable.
-4. Derive `enc_key`, `nonce_seed`, `index_root_key`, `index_shard_key`,
-   `dictionary_key`, `dir_hint_key`, and `index_nonce_seed`.
+4. Encryption mode: derive `enc_key`, `nonce_seed`, `index_root_key`,
+   `index_shard_key`, `dictionary_key`, `dir_hint_key`, and `index_nonce_seed`.
+   Unencrypted mode (`aead_algo = None`): skip this step; no subkeys exist and
+   objects are read as plaintext.
 5. If `has_dictionary = 1` in the authenticated CryptoHeader: defer loading until
    step 11.
 ```
 
-FEC repairs candidate bytes. HMAC, AEAD, and optional root auth decide whether
-candidate bytes are trustworthy.
+FEC repairs candidate bytes. In an encryption mode, HMAC, AEAD, and optional
+root auth decide whether candidate bytes are trustworthy; in unencrypted mode,
+per-block CRC32C, the unkeyed header/footer digests (§9), structural
+block-continuity, and optional root auth decide trust.
 
 ### 17.2 Random extract
+
+In unencrypted mode (`aead_algo = None`, `OBJECT_TAG_LEN = 0`), every
+"AEAD-decrypt with `<key>`" step below is replaced by reading the trimmed object
+bytes as plaintext directly, with no decryption and no key; all
+trim-to-`encrypted_size`, suffix-depad, and zstd-decompress steps are otherwise
+identical. The steps are written for the encryption mode for brevity.
 
 ```
 9. Read IndexRoot data and parity blocks using
@@ -3189,7 +3246,7 @@ per-envelope `parity_block_count ≥ 1`.
 
 Sequential output is provisional until terminal verification succeeds:
 locator/CMRA recovery when applicable, ManifestFooter and VolumeTrailer
-HMAC/source-authority checks, RootAuthFooterV1 wire validation when
+mode-specific integrity/source-authority checks, RootAuthFooterV1 wire validation when
 present, and any requested external authenticator/root-auth verification.
 A reader that writes to a filesystem in default conforming mode MUST
 stage output in a temporary/quarantine location, or otherwise make it
@@ -3197,7 +3254,7 @@ non-final, until the terminal material has verified. It MUST NOT replace
 existing files, report success, or present the result as a clean
 extraction before that point. A live stdout or library streaming API MAY
 deliver bytes after each payload
-envelope AEAD verifies, but it MUST document and signal that those bytes
+envelope's mode-specific integrity verifies, but it MUST document and signal that those bytes
 are provisional until terminal verification succeeds; an explicit
 best-effort/unsafe mode is required to keep or treat them as final after
 terminal verification fails.
@@ -3226,7 +3283,7 @@ envelope-counter event or as an abort condition. If a kind-0 or kind-1
 payload BlockRecord appears after a metadata BlockRecord has been
 observed, the stream is malformed.
 `next_envelope_index` starts at 0 and increments exactly once after each
-complete payload envelope authenticates. Payload-parity BlockRecords do
+complete payload envelope validates. Payload-parity BlockRecords do
 not increment this counter. Metadata objects (kinds 2 through 9) use
 their own AEAD domains/counters and do not affect the payload envelope
 counter.
@@ -3272,8 +3329,8 @@ At EOF the terminal bytes MUST parse as:
 ManifestFooter | RootAuthFooterV1? | VolumeTrailer | CMRA | LocatorMirror | Locator
 ```
 
-The reader then applies CMRA recovery and the same HMAC/source-authority checks
-as seekable open (§17.1 and §30.5.1). The ManifestFooter, optional
+The reader then applies CMRA recovery and the same mode-specific
+integrity/source-authority checks as seekable open (§17.1 and §30.5.1). The ManifestFooter, optional
 RootAuthFooterV1, and VolumeTrailer MUST cross-check matching UUID/session/volume
 identity, `manifest_footer_offset`, `manifest_footer_length =
 sizeof(ManifestFooter)`, root-auth pointer fields when present, `bytes_written`
@@ -3294,7 +3351,7 @@ Root auth is available in non-seekable sequential mode only when the reader has
 retained the per-block leaf state, metadata objects, object extents, and FEC
 state required by §30.13. Otherwise root auth is unavailable for that operation;
 an operation that requires root auth MUST fail rather than silently downgrade to
-ordinary HMAC/AEAD verification.
+ordinary mode-specific integrity verification.
 
 Only after authenticated terminal material has verified may readers that
 feed the decoded stream to a strict tar consumer append two synthetic
@@ -3305,8 +3362,8 @@ For non-seekable single-volume input, this is the required fallback when
 no bootstrap sidecar is available and `has_dictionary = 0`. If
 `has_dictionary = 1`, the reader needs authenticated dictionary material
 before decompressing payload frames. Without a bootstrap sidecar that
-provides an authenticated encrypted IndexRoot copy that locates the
-dictionary object and an authenticated encrypted dictionary-object copy
+provides a mode-specifically verified IndexRoot copy that locates the
+dictionary object and a mode-specifically verified dictionary-object copy
 that supplies the dictionary bytes, the reader MUST reject with
 "dictionary bootstrap required." If the payload stream is already flowing
 before the sidecar is available, the reader MUST buffer encrypted
@@ -3326,11 +3383,11 @@ pipe mode: the core tzap format does not define a multiplexed
 multi-volume pipe container, concatenation delimiter, or volume-stream
 wrapper. A reader presented with a pure concatenation of striped volumes
 without external framing MUST reject because volume identity, concurrent
-ordering, and terminal authentication are not reconstructable from that
+ordering, and terminal verification are not reconstructable from that
 pipe alone. Any tool that concatenates, delimits, or multiplexes volumes
 is outside this archive wire format and must present the original
 BlockRecord `volume_index`/`block_index` semantics and each volume's
-authenticated v43 terminal sequence to the reader.
+verified v43 terminal sequence to the reader.
 
 ### 17.4 Recovery mode
 
@@ -3438,14 +3495,15 @@ sharded rather than placed in IndexRoot.
 
 `record_crc32c` on data and parity BlockRecords is an unkeyed bit-rot
 detector, not a cryptographic authenticator. Undetected corruption in a
-parity block can cause repair to fail or produce candidate ciphertext
-that later fails AEAD verification, but readers MUST NOT release
-plaintext from any repaired object until that object's AEAD tag verifies.
+parity block can cause repair to fail or produce candidate object bytes
+that later fail mode-specific object validation, but readers MUST NOT release
+plaintext from any repaired object until that object's mode-specific validation
+succeeds.
 An active attacker who can modify a BlockRecord can also recompute its
 CRC32C, causing the reader to treat a poisoned shard as apparently
 intact rather than as an erasure. In that case FEC repair is not
 guaranteed to recover availability; the affected object is expected to
-fail AEAD/HMAC verification before plaintext release. tzap's FEC is an
+fail mode-specific integrity verification before plaintext release. tzap's FEC is an
 availability feature for loss and accidental corruption, not a
 cryptographic tamper locator.
 
@@ -3536,8 +3594,9 @@ bits set.
    streaming writer with unknown final metadata size MAY choose the
    maximum acceptable class values upfront and accept the parameter
    overhead, or reject/spool until it can choose bounded values. It MUST
-   NOT raise these CryptoHeader fields after the header HMAC is emitted.
-6. Build CryptoHeader; compute HMAC.
+   NOT raise these CryptoHeader fields after the trailing CryptoHeader
+   integrity field is emitted.
+6. Build CryptoHeader; compute its mode-specific trailing integrity field.
 7. Open V sinks (file handles, S3 multipart streams, etc.).
 8. For each sink: write VolumeHeader, then CryptoHeader bytes.
    (Both are now fully write-once. No fields to backfill.)
@@ -3547,7 +3606,7 @@ bits set.
      - record exactly one FileEntry as a decompressed frame extent whose
        normalized path and `file_data_size` match the main tar entry.
    Do not emit the POSIX two-zero-block end-of-archive marker into the
-   encrypted tzap tar stream.
+   tzap tar stream.
 10. Compress tar bytes into independent zstd frames. Prefer one frame per
    tar member group; split very large groups into ordered frame ranges
    whose uncompressed frame payloads target chunk_size. Record
@@ -3555,19 +3614,24 @@ bits set.
 11. Pack complete frames into envelopes. A frame MUST NOT be split across
     envelopes. Assign envelope_index sequentially from 0 in closure
     order. When closing an envelope:
-     - suffix-pad and AEAD-encrypt it;
-     - if the exact-fit padding rule or AEAD tag would make
+     - suffix-pad it, then AEAD-encrypt it in an encryption mode, or leave it as
+       padded plaintext in unencrypted mode (`OBJECT_TAG_LEN = 0`, no AEAD);
+     - if the exact-fit padding rule or the `OBJECT_TAG_LEN` tag would make
        `encrypted_size`, `data_block_count`, or the FEC object exceed
        u32/class limits, split the envelope earlier and retry;
-     - split encrypted bytes into data blocks; `data_block_count` is the
-       number of ciphertext blocks including the AEAD tag and suffix
+     - split the object bytes into data blocks; `data_block_count` is the
+       number of blocks including any AEAD tag and the suffix
        padding;
      - compute object-local parity blocks;
      - write data+parity blocks through the stripe mapper;
      - record EnvelopeEntry with data/parity counts and frame range;
      - record FrameEntry.envelope_index and offset_in_envelope in memory.
 12. Build index (compute SHA-256(normalized path) for every FileEntry,
-    sort by hash):
+    sort by hash). In unencrypted mode (`aead_algo = None`), every
+    "AEAD-encrypt with `<key>`" sub-step below is replaced by writing the
+    padded plaintext object directly (`OBJECT_TAG_LEN = 0`, no nonce/AAD/tag);
+    the zstd-compress, FEC-encode, and block-write steps are otherwise
+    identical. The sub-steps are written for the encryption mode for brevity:
      a. Partition into shards of ~10,000 files each (default)
         while applying the bounded hash-prefix run rule (§15.4).
     b. For each shard: serialize FileEntry records plus the local
@@ -3599,8 +3663,8 @@ bits set.
     and exact `authenticator_value_length`; compute the resulting footer length
     before building trailers.
 15. For each sink, build this volume's ManifestFooter copy by setting
-    `volume_index` to the sink's zero-based volume index and computing
-    `manifest_hmac` over that copy.
+    `volume_index` to the sink's zero-based volume index and computing the
+    mode-specific `manifest_hmac`/`manifest_digest` over that copy.
 16. For each sink, build the v43 VolumeTrailer with:
      - `block_count = blocks written to this sink`;
      - `bytes_written = sink's current cursor after ManifestFooter and optional
@@ -3608,8 +3672,8 @@ bits set.
      - `manifest_footer_offset = position where ManifestFooter will be written`;
      - `manifest_footer_length = sizeof(ManifestFooter)`;
      - root-auth pointer fields set consistently with §12 and §30.7;
-     - `trailer_hmac = HMAC` using the §12 domain-separated trailer input over
-       the first 96 trailer bytes.
+     - `trailer_hmac`/`trailer_digest` using the §12 domain-separated trailer
+       input over the first 96 trailer bytes.
 17. If root auth is enabled, compute `critical_metadata_digest`, `index_digest`,
     `fec_layout_digest`, `data_block_merkle_root`, `signer_identity_digest`, and
     `archive_root`; obtain exactly `authenticator_value_length` authenticator
@@ -3624,11 +3688,21 @@ bits set.
     required.
 21. If emitting a bootstrap sidecar, build its ManifestFooter instance from the
     same shared authoritative bootstrap fields, set `volume_index = 0` and
-    `is_authoritative = 1`, and compute `manifest_hmac` over that sidecar
+    `is_authoritative = 1`, and compute the mode-specific integrity field over that sidecar
     instance. This instance may be byte-identical to the volume-0 ManifestFooter
     when all fields match, but do not byte-copy a nonzero-volume footer and mutate
-    `volume_index` after HMAC.
+    `volume_index` after integrity computation.
 ```
+
+The steps above are written for an encryption mode. In **unencrypted mode**
+(`aead_algo = None`, §5.1) the writer makes exactly these substitutions and no
+others: it sets `kdf_algo = None` and runs no KDF/subkey schedule; every
+"AEAD-encrypt with `<key>`" step becomes writing the padded plaintext object
+directly (`OBJECT_TAG_LEN = 0`, no nonce/AAD/tag); and every per-volume/footer
+HMAC computation (`manifest_hmac`, `trailer_hmac`, `header_hmac`) becomes the
+corresponding unkeyed SHA-256 digest of §9 (`manifest_digest`, `trailer_digest`,
+`header_digest`) over the same byte ranges. All block framing, CRC32C, FEC, CMRA,
+locator, and optional root-auth steps are unchanged.
 
 ### 19.2 Cloud / S3 compatibility
 
@@ -3654,7 +3728,7 @@ volume forward-only: VolumeHeader, CryptoHeader, payload/index blocks,
 ManifestFooter, optional RootAuthFooterV1, VolumeTrailer, CMRA, locator mirror,
 and locator. If the writer uses a payload zstd
 dictionary (`has_dictionary = 1`), it MUST also emit a bootstrap sidecar
-containing authenticated encrypted IndexRoot and dictionary-object copies
+containing mode-specifically verified IndexRoot and dictionary-object copies
 (§12.2), otherwise non-seekable sequential extraction would be
 impossible.
 Because CryptoHeader is authenticated before payload metadata exists,
@@ -3726,21 +3800,21 @@ compression, and per-sink writes are all independent.
 | Failure | Detection | Recovery |
 |---|---|---|
 | Bit-rot in block payload | record_crc32c | FEC repair |
-| Active block tamper with recomputed CRC | AEAD/HMAC failure | Detected before plaintext release; FEC availability is not guaranteed |
+| Active block tamper with recomputed CRC | Mode-specific object integrity failure | Detected before plaintext release; FEC availability is not guaranteed |
 | Any single volume lost (default mode) | block_index gap | FEC (if parity sized correctly) |
-| CryptoHeader corrupt in 1 volume | CMRA repairs before HMAC, or HMAC fails | Repair from same-volume CMRA; otherwise use another volume's copy |
-| ManifestFooter corrupt in 1 volume | CMRA repairs before HMAC, or HMAC fails | Repair from same-volume CMRA; otherwise use another volume's copy |
-| All ManifestFooter copies corrupt/missing | HMAC/trailer lookup fails | Use trusted bootstrap sidecar or sequential recovery |
-| VolumeTrailer corrupt | CMRA repairs before HMAC, or HMAC fails | Repair from same-volume CMRA; otherwise try another volume |
+| CryptoHeader corrupt in 1 volume | CMRA repairs before integrity verification, or integrity verification fails | Repair from same-volume CMRA; otherwise use another volume's copy |
+| ManifestFooter corrupt in 1 volume | CMRA repairs before integrity verification, or integrity verification fails | Repair from same-volume CMRA; otherwise use another volume's copy |
+| All ManifestFooter copies corrupt/missing | ManifestFooter/trailer lookup fails | Use trusted bootstrap sidecar or sequential recovery |
+| VolumeTrailer corrupt | CMRA repairs before integrity verification, or integrity verification fails | Repair from same-volume CMRA; otherwise try another volume |
 | Locator corrupt or trailing garbage after locators | Final/mirror locator fails; bounded critical-recovery scan finds valid CMRA/locator candidate | Use greatest unambiguous candidate within `max_critical_recovery_scan` with diagnostic |
 | V=1 streaming volume lost | Volume file missing | Unrecoverable unless another copy exists |
-| Mid-stream writer crash | VolumeTrailer absent or HMAC fails | Reader reports clearly |
-| Sequential output before terminal verification | Terminal material not yet verified: locator/CMRA recovery, ManifestFooter and VolumeTrailer HMAC/source-authority checks, RootAuthFooterV1 wire validation when present, and requested external root-auth verification | Output is provisional; default filesystem extractors stage/quarantine and commit only after terminal verification succeeds |
+| Mid-stream writer crash | VolumeTrailer absent or integrity verification fails | Reader reports clearly |
+| Sequential output before terminal verification | Terminal material not yet verified: locator/CMRA recovery, ManifestFooter and VolumeTrailer mode-specific integrity/source-authority checks, RootAuthFooterV1 wire validation when present, and requested external root-auth verification | Output is provisional; default filesystem extractors stage/quarantine and commit only after terminal verification succeeds |
 | Streaming writer cannot fit final IndexRoot | Writer detects FEC/u32 class-limit overflow at close | Reject finalization; avoid by pre-scan, spool, or conservative maxima |
 | Adversarial volume splice | session_id mismatch | Detected; rejected |
 | IndexRoot block extent known but unrecoverable | High parity usually saves it | If exhausted, recovery mode |
 | Index Shard S unrecoverable | Shard FEC exhausted | Files in shard S lose random-access; sequential extract still works |
-| CMRA shard corruption within parity budget | CMRA CRC/FEC repair succeeds | Recovered critical bytes still require HMAC/AEAD/root-auth checks |
+| CMRA shard corruption within parity budget | CMRA CRC/FEC repair succeeds | Recovered critical bytes still require mode-specific integrity and root-auth checks |
 | CMRA decoder envelopes all corrupt | No valid CMRA header, locator, or trusted external decoder tuple | Critical recovery unavailable for that volume |
 | Root-auth footer unknown selector | Wire validation passes but no verifier supports selector | Root auth unavailable, not malformed footer |
 | Public no-key missing data BlockRecord | Public observation set incomplete | Public no-key verification fails or returns explicit incomplete result |
@@ -3760,27 +3834,29 @@ compression, and per-sink writes are all independent.
 - Per-envelope padding masks exact packed-frame length within the chosen
   block-size granularity; it does not hide total archive size or object
   count from an observer who can see all volume bytes.
-- All plaintext-deriving bytes are authenticated by AEAD and/or HMAC.
-- Non-seekable sequential readers may expose per-envelope-authenticated
-  bytes before whole-archive terminal authentication only as provisional
+- All plaintext-deriving bytes in an encryption mode are authenticated by AEAD
+  and/or HMAC; unencrypted-mode plaintext bytes are corruption-checked unless
+  root authentication is enabled.
+- Non-seekable sequential readers may expose per-envelope-verified
+  bytes before whole-archive terminal verification only as provisional
   output. Default filesystem extractors preserve the truncation
   non-release guarantee by staging or quarantining writes until terminal
   verification succeeds: locator/CMRA recovery when applicable,
-  ManifestFooter and VolumeTrailer HMAC/source-authority checks,
+  ManifestFooter and VolumeTrailer mode-specific integrity/source-authority checks,
   RootAuthFooterV1 wire validation when present, and any requested
   external authenticator/root-auth verification.
 - VolumeHeader, BlockRecord, CMRA, locator, and RootAuthFooterV1 CRC32C fields
   are corruption detectors, not authentication. Readers only trust archive
-  identity and repaired object bytes after authenticated header/trailer/footer
-  checks, AEAD/HMAC verification, and optional root-auth verification succeed.
+  identity and repaired object bytes after mode-specific header/trailer/footer
+  checks, object verification, and optional root-auth verification succeed.
 - CMRA repairs availability failures only. CMRA bytes, locator bytes, and parity
-  payloads are not part of `archive_root`; key-holding root-auth verification
+  payloads are not part of `archive_root`; full RootAuth verification
   signs global authenticated metadata, FEC layout rows, and data BlockRecord
   payloads as defined in §30.9.
 - Because BlockRecord CRC32C is unkeyed, an active attacker can modify a
   data or parity shard and recompute the CRC so the reader does not mark
-  that shard as an erasure. This can force the enclosing AEAD/HMAC object
-  to fail authentication even when enough original parity would have
+  that shard as an erasure. This can force the enclosing object to fail
+  mode-specific integrity validation even when enough original parity would have
   repaired an accidentally corrupted shard. This is an availability
   denial, not a plaintext integrity bypass: readers MUST NOT release
   plaintext until object authentication succeeds.
@@ -3894,8 +3970,9 @@ The minimum value 16 is only a floor for small archives, not a
 recommendation for large file sets; writers must choose a value large
 enough before CryptoHeader emission.
 The value is "dynamic" only before CryptoHeader serialization. Once the
-CryptoHeader HMAC has been emitted, `index_root_fec_data_shards` and
-`index_root_fec_parity_shards` are fixed archive parameters.
+trailing CryptoHeader integrity field has been emitted,
+`index_root_fec_data_shards` and `index_root_fec_parity_shards` are fixed
+archive parameters.
 
 `max_hash_prefix_run_files` is a writer-side planning default: it is the
 maximum number of files with the same 8-byte path-hash prefix that the
@@ -4055,14 +4132,14 @@ referenced by each case.
 
 High-priority v0.43 critical-recovery and root-auth regression cases:
 
-1. Corrupt one byte of `VolumeHeader.volume_index`; CMRA repairs it and HMAC
-   cross-checks pass.
+1. Corrupt one byte of `VolumeHeader.volume_index`; CMRA repairs it and
+   mode-specific integrity cross-checks pass.
 2. Corrupt one byte of `CryptoHeader`; CMRA repairs it before
    `CryptoHeader.header_hmac` verification.
 3. Corrupt one byte of `ManifestFooter.index_root_first_block`; CMRA repairs it
-   and ManifestFooter HMAC passes.
+   and ManifestFooter integrity verification passes.
 4. Corrupt one byte of `VolumeTrailer.manifest_footer_offset`; CMRA repairs it
-   and trailer HMAC passes.
+   and trailer integrity verification passes.
 5. Corrupt final locator only; mirror locator still opens the archive.
 6. Corrupt both locators but leave a valid locatorless `TZCR` candidate within
    `max_critical_recovery_scan`; recovery succeeds with a diagnostic. Repeat
@@ -4072,7 +4149,7 @@ High-priority v0.43 critical-recovery and root-auth regression cases:
 8. Corrupt CMRA shards beyond `parity_shard_count`; reader fails clearly or
    uses an explicitly requested authenticated fallback.
 9. Modify CMRA bytes and recompute unkeyed CRCs; HMAC/root-auth checks reject.
-10. Lose one configured-tolerated volume; key-holding root-auth verification
+10. Lose one configured-tolerated volume; full RootAuth verification
     still succeeds after reconstructing data BlockRecords.
 11. Lose one volume and attempt full physical-instance verification; diagnostic
     mode reports that physical-instance verification is unavailable.
@@ -4086,8 +4163,8 @@ High-priority v0.43 critical-recovery and root-auth regression cases:
 15. Mutate v43 `VolumeTrailer.bytes_written` to physical EOF minus 128; readers
     reject because it does not equal the trailer offset.
 16. Pipe a v43 single-volume archive through sequential extraction; output is
-    committed only after terminal tail, CMRA, HMACs, and optional root auth
-    verify.
+    committed only after terminal tail, CMRA, mode-specific integrity checks, and
+    optional root auth verify.
 17. Use max-size CryptoHeader and max-size RootAuthFooterV1; `cmra_worst_case_cap`
     accepts valid input and rejects overflow.
 18. Recompute `header_crc32c`, `shard_crc32c`, `locator_crc32c`,
@@ -4111,11 +4188,12 @@ High-priority v0.43 critical-recovery and root-auth regression cases:
 25. Change only the trailing `image_crc32c` byte and recompute shard CRCs;
     `image_sha256` rejects because it covers the complete serialized image.
 26. Mutate `max_path_length`, KDF parameter bytes, `expected_volume_size`, or
-    an Extension TLV before `header_hmac`; key-holding root-auth verification
-    produces a different `critical_metadata_digest`.
+    an Extension TLV before the trailing CryptoHeader integrity field; full
+    RootAuth verification produces a different `critical_metadata_digest`.
 27. Mutate `ManifestFooter.is_authoritative`, `_reserved_a`, `_reserved_b`, or
-    a global IndexRoot field before `manifest_hmac`; key-holding root-auth
-    verification rejects or produces a different `critical_metadata_digest`.
+    a global IndexRoot field before the trailing ManifestFooter integrity field;
+    full RootAuth verification rejects or produces a different
+    `critical_metadata_digest`.
 28. Public no-key verifier sees duplicate, missing, gapped, incongruent, or
     CRC-invalid BlockRecords in a candidate public input set; it fails or
     returns an explicitly incomplete public result.
@@ -4145,7 +4223,7 @@ High-priority v0.43 critical-recovery and root-auth regression cases:
 35. Mutate each stored `RootAuthFooterV1` commitment field, including
     component digests, `total_data_block_count`, `data_block_merkle_root`,
     `signer_identity_digest`, and `archive_root`, then recompute only
-    `footer_crc32c`; key-holding root-auth verification rejects before or during
+    `footer_crc32c`; full RootAuth verification rejects before or during
     authenticator verification.
 36. Build a locator-based CMRA candidate whose `TZCL.cmra_offset`,
     `TZCL.cmra_length`, `TZCL.body_bytes_before_cmra`,
@@ -4157,7 +4235,7 @@ High-priority v0.43 critical-recovery and root-auth regression cases:
     `index_digest`, and `fec_layout_digest` from `RootAuthFooterV1` as opaque
     commitments, while still requiring the observed data-block root,
     signer-identity digest, and `archive_root` to match recomputed values.
-38. Lose one configured-tolerated volume and verify key-holding root auth
+38. Lose one configured-tolerated volume and verify full RootAuth
     succeeds after reconstructing every required signed data leaf, while public
     no-key verification over the same incomplete physical input reports an
     incomplete public candidate set.
@@ -4178,22 +4256,23 @@ High-priority v0.43 critical-recovery and root-auth regression cases:
     `manifest_footer_length`, `root_auth_footer_offset`,
     `root_auth_footer_length`, `volume_trailer_offset`, `layout_flags`,
     `volume_index`, and `stripe_width`, while preserving the image CRC and
-    region digests; key-holding readers reject before using the image field
-    when it disagrees with HMAC-verified terminal authority.
+    region digests; full-verification readers reject before using the image field
+    when it disagrees with mode-specifically verified terminal authority.
 42. Public no-key verification with damaged final and mirror locators scans to
-    two public candidates that cannot be HMAC-verified. Verify that it applies
+    two public candidates whose terminal integrity fields are not verified.
+    Verify that it applies
     the public candidate acceptance and ordering-anchor rules, accepts the
     greatest unambiguous authenticator-verified public candidate, and rejects
     same-anchor candidates that differ in CMRA range, footer bytes, observed
     data root, or archive root.
-43. Provide two accepted present volumes with HMAC-valid but non-identical
-    `CryptoHeader` pre-HMAC bytes; key-holding root-auth verification rejects
+43. Provide two accepted present volumes with integrity-valid but non-identical
+    `CryptoHeader` pre-HMAC bytes; full RootAuth verification rejects
     with `replicated_crypto_header_mismatch` before selecting a bootstrap copy.
     Repeat with one volume wholly absent within authenticated volume-loss
     tolerance and verify content root auth can still succeed while reporting
     `replicated_global_copy_unchecked_due_to_volume_loss`.
 44. Provide two accepted present closed root-auth volumes with individually
-    valid but byte-different `RootAuthFooterV1` copies; key-holding root-auth
+    valid but byte-different `RootAuthFooterV1` copies; full RootAuth
     rejects with `replicated_root_auth_footer_mismatch`. Public no-key
     verification over byte-different valid footer copies rejects or returns
     `public_root_auth_footer_ambiguous`.
@@ -4205,11 +4284,12 @@ High-priority v0.43 critical-recovery and root-auth regression cases:
     are ignored while locator hints remain mandatory equality checks.
 46. Run public no-key verification on an intact archive without a key and verify
     that `RootAuthFooterV1` wire validation succeeds without requiring
-    `CryptoHeader`, `ManifestFooter`, or `VolumeTrailer` HMACs, while the
+    `CryptoHeader`, `ManifestFooter`, or `VolumeTrailer` integrity fields to
+    verify, while the
     §30.5.1.1 public identity and equality checks still decide whether the public
     candidate set is acceptable.
-47. Perform a narrow key-holding operation that validates only the requested
-    file's ordinary HMAC/AEAD path and not the full IndexRoot, all IndexShards,
+47. Perform a narrow operation that validates only the requested file's ordinary
+    mode-specific integrity path and not the full IndexRoot, all IndexShards,
     FEC layout rows, and every signed data-kind BlockRecord. The operation may
     report the ordinary checks, but it MUST report root auth as deferred or
     unavailable and MUST NOT report `root_auth_content_verified`.
@@ -4221,9 +4301,10 @@ High-priority v0.43 critical-recovery and root-auth regression cases:
 49. Run public no-key verification on a candidate whose CMRA image, region
     CRC/SHA-256 values, public `VolumeHeader`, public `CryptoHeader`, recovered
     `RootAuthFooterV1`, and observed BlockRecord window satisfy every public
-    column rule in §30.5.1.1, but whose `ManifestFooter` and `VolumeTrailer` HMACs
-    cannot be checked because no key is available. Public no-key verification
-    proceeds without requiring HMACs and reports the required unauthenticated
+    column rule in §30.5.1.1, but whose `ManifestFooter` and `VolumeTrailer`
+    integrity fields are not part of the public no-key acceptance path. Public
+    no-key verification proceeds without requiring terminal integrity fields and
+    reports the required unauthenticated
     metadata diagnostics. Mutate any public column equality and verify public
     no-key verification fails or returns explicitly incomplete.
 50. Mutate exactly one of `RootAuthFooterV1.footer_length`,
@@ -4351,8 +4432,8 @@ Additional v0.43 boundary regression cases:
   each individual count fits its u16 class maximum and the u32 size product
   fits.
 - **Volume format revision freshness**: create archives with
-  `volume_format_rev` below, equal to, and above 41; verify v0.43-only
-  readers accept only 41 and reject older or newer revisions.
+  `volume_format_rev` below, equal to, and above 43; verify v0.43-only
+  readers accept only 43 and reject older or newer revisions.
 - **Unsafe parity conformance boundary**: attempt to emit a conforming archive
   with `--unsafe-parity` causing any serialized class parity maximum or
   per-object `parity_block_count` to differ from the §27 computation. Verify
@@ -4448,7 +4529,7 @@ Previously required regression cases retained from earlier drafts:
   operation.
 - **Magic-field validation**: mutate each fixed magic field independently
   (`TZAP`, `TZCH`, `TZBK`, `TZMF`, `TZVT`, `TZBS`, `TZIR`, `TZIS`, and
-  `TZDH`) while preserving any applicable CRC/HMAC/AEAD envelope for the
+  `TZDH`) while preserving any applicable CRC or mode-specific integrity envelope for the
   malformed bytes where possible; verify readers reject before trusting
   the containing structure.
 - **CryptoHeader canonical offset**: set `crypto_header_offset` to values
@@ -4482,24 +4563,27 @@ Previously required regression cases retained from earlier drafts:
   or each FEC class-total maximum above configured reader caps; verify
   readers reject before object planning or FEC repair. Mutate
   `expected_volume_size` and verify readers treat it as advisory only.
-- **CryptoHeader Extension TLVs**: with a valid HMAC, inject an unknown
+- **CryptoHeader Extension TLVs**: with a valid mode-specific integrity field, inject an unknown
   non-critical extension tag `0x0009` with valid length and payload;
   verify v0.43 readers ignore it and continue parsing. Repeat with the
   same unknown extension as critical `0x8009`; verify readers reject with
-  a hard error after CryptoHeader HMAC verification. Also mutate `tag = 0`
+  a hard error after CryptoHeader integrity verification. Also mutate `tag = 0`
   with non-zero length, an extension length above 256 bytes, bytes between
-  the terminator and HMAC, duplicate known tags, forbidden tag `0x0004`,
+  the terminator and trailing integrity field, duplicate known tags, forbidden tag `0x0004`,
   and forbidden tag `0x0006`; verify readers reject each case.
 - **CryptoHeader identity binding**: combine a VolumeHeader from one
   archive with a CryptoHeader from another archive under the same raw key
-  and verify CryptoHeader HMAC fails because UUID/session are bound.
+  and verify encrypted-mode CryptoHeader HMAC fails because UUID/session are bound.
 - **Per-volume ManifestFooter copies**: create a multi-volume archive and
-  verify each footer HMAC authenticates with that volume's own
-  `volume_index` while all shared IndexRoot/bootstrap fields are equal.
-- **HMAC domain vectors**: fixed `mac_key`, UUID/session, and serialized
+  verify each footer's mode-specific integrity field is computed with that
+  volume's own `volume_index` while all shared IndexRoot/bootstrap fields are
+  equal.
+- **Integrity domain vectors**: fixed `mac_key`, UUID/session, and serialized
   CryptoHeader, ManifestFooter, VolumeTrailer, and BootstrapSidecarHeader
-  bytes. Verify all HMACs use their `tzap-v1-*` domain strings and raw
-  byte concatenation exactly.
+  bytes for an encrypted archive. Verify all HMACs use their `tzap-v1-*`
+  domain strings and raw byte concatenation exactly. Repeat with an
+  unencrypted archive and verify the corresponding unkeyed digest domains and
+  byte ranges from §9.
 - **Unsafe paths**: include absolute paths, `..` components, empty
   components, NUL-containing names, and host-native separator escape
   forms such as backslash-as-directory-separator; verify conformant
@@ -4716,10 +4800,10 @@ Previously required regression cases retained from earlier drafts:
   maximum.
 - **Parity-block corruption**: corrupt parity BlockRecord payloads and
   CRCs independently. Verify CRC-detected corruption is treated as an
-  erasure and any unrepaired or incorrectly repaired ciphertext still
-  fails AEAD before plaintext release. Also tamper with a data
+  erasure and any unrepaired or incorrectly repaired object bytes still
+  fail mode-specific validation before plaintext release. Also tamper with a data
   BlockRecord and recompute its unkeyed CRC; verify the reader does not
-  mis-release plaintext and reports AEAD/HMAC failure rather than
+  mis-release plaintext and reports mode-specific integrity failure rather than
   claiming FEC availability.
 - **Large tar member group**: one regular file larger than
   `envelope_target_size`; verify FileEntry.frame_count > 1 and random
@@ -4827,7 +4911,7 @@ Previously required regression cases retained from earlier drafts:
   spooling instead of silently buffering unbounded data. Present a
   striped multi-volume archive as one unframed concatenated pipe and
   verify the reader rejects unless an external wrapper supplies original
-  volume identity, block ordering, and terminal authentication.
+  volume identity, block ordering, and terminal verification.
 - **Streaming IndexRoot FEC preselection**: feed a true streaming writer
   an unknown-size input. Verify it either selects conservative
   `index_root_fec_*` maxima before CryptoHeader HMAC, pre-scans/spools,
@@ -4870,18 +4954,20 @@ Previously required regression cases retained from earlier drafts:
   place a payload BlockRecord after a metadata BlockRecord and verify
   sequential extraction rejects it as out-of-order.
 - **Bootstrap sidecar**: dictionary archive with a bootstrap sidecar;
-  verify `TZBS` header CRC, sidecar HMAC, UUID/session binding,
-  ManifestFooter HMAC, IndexRoot AEAD, and dictionary-object AEAD are
-  checked; verify IndexRoot and dictionary objects decrypt from sidecar
-  BlockRecord copies and the dictionary is available before payload
+  verify `TZBS` header CRC, sidecar integrity field, UUID/session binding,
+  ManifestFooter integrity field, IndexRoot validation, and dictionary-object
+  validation are checked; verify IndexRoot and dictionary objects are recovered
+  from sidecar BlockRecord copies and the dictionary is available before payload
   frame decompression. Verify the sidecar ManifestFooter uses
-  `volume_index = 0`, has a valid HMAC computed over that sidecar
+  `volume_index = 0`, has a valid integrity field computed over that sidecar
   instance, and can bootstrap while the opened VolumeHeader has another
-  `volume_index`; mutate that value to non-zero after HMAC and verify
-  rejection. Set sidecar `is_authoritative = 0` with a recomputed HMAC
+  `volume_index`; mutate that value to non-zero after integrity computation and
+  verify rejection. Set sidecar `is_authoritative = 0` with a recomputed
+  integrity field
   and verify rejection. Verify that byte-copying a per-volume
-  ManifestFooter and then changing `volume_index` to zero fails HMAC
-  unless the HMAC is recomputed for the sidecar instance. Verify sparse
+  ManifestFooter and then changing `volume_index` to zero fails integrity
+  verification unless the integrity field is recomputed for the sidecar
+  instance. Verify sparse
   flag combinations follow the §12.3 cursor and authority rules: a
   sidecar with IndexRoot records but no ManifestFooter is usable only
   when an authenticated ManifestFooter is already available from another
@@ -4910,16 +4996,16 @@ Previously required regression cases retained from earlier drafts:
 - **ManifestFooter pointer bounds**: mutate `manifest_footer_offset` and
   `manifest_footer_length` in VolumeTrailer to point outside the volume,
   before valid data, or to the wrong length; verify readers reject before
-  seeking, allocating, or attempting ManifestFooter HMAC. Mutate
+  seeking, allocating, or attempting ManifestFooter integrity verification. Mutate
   authenticated `VolumeTrailer.block_count` so it no longer matches the
   BlockRecord byte region between CryptoHeader and ManifestFooter; verify
-  readers reject after trailer HMAC verification and before object use.
+  readers reject after trailer integrity verification and before object use.
   Insert bytes between ManifestFooter and VolumeTrailer while keeping
-  HMACs internally valid; verify readers reject because the ManifestFooter
+  integrity fields internally valid; verify readers reject because the ManifestFooter
   no longer ends exactly at the selected trailer offset.
 - **Trailer byte count and critical-recovery scan**: mutate authenticated
   `VolumeTrailer.bytes_written` so it no longer equals the recovered trailer
-  offset; verify seekable readers reject after CMRA recovery and trailer HMAC
+  offset; verify seekable readers reject after CMRA recovery and trailer integrity
   verification. Damage both locator copies but leave a valid locatorless CMRA
   candidate within `max_critical_recovery_scan`; verify bounded recovery accepts
   only the greatest unambiguous candidate, warns, and rejects candidates beyond
@@ -5017,7 +5103,7 @@ A conformant writer:
    §12.3 bootstrap sidecar if `has_dictionary = 1`.
 13. Emits PAX/GNU tar extension records when claiming metadata beyond
    ustar baseline, and does not emit POSIX end-of-archive zero blocks
-   into the encrypted tzap tar stream. Emits only path-specific tar
+   into the tzap tar stream. Emits only path-specific tar
    metadata records inside the member group for the main entry they
    modify; never emits global PAX headers, global GNU state, or other
    non-path-specific tar metadata records that affect later unrelated
@@ -5137,9 +5223,10 @@ A conformant writer:
     stripe_width)` and consecutive records in that volume spaced exactly
     by `stripe_width`; never emits duplicate global block indices and
     never emits duplicate volume indexes in the same volume set.
-33. Emits `IndexShardHeader.version = 1` and uses domain-separated HMAC
-    inputs for CryptoHeader, ManifestFooter, VolumeTrailer, and
-    BootstrapSidecarHeader.
+33. Emits `IndexShardHeader.version = 1` and uses the domain-separated
+    integrity inputs for CryptoHeader, ManifestFooter, VolumeTrailer, and
+    BootstrapSidecarHeader (HMAC in an encryption mode, unkeyed digest in
+    unencrypted mode).
 34. Sets all IndexRoot dictionary fields to zero whenever
     `has_dictionary = 0`; when `has_dictionary = 1`, emits a non-empty
     dictionary object with non-zero `dictionary_first_block`,
@@ -5149,9 +5236,9 @@ A conformant writer:
    extension bytes, unclaimed gaps, or trailing bytes. If a
    ManifestFooter is present in a sidecar, freshly serializes that
    sidecar ManifestFooter with `volume_index = 0` and
-   `is_authoritative = 1`, and computes its `manifest_hmac` over the
-   sidecar bytes; does not mutate a per-volume ManifestFooter after
-   HMAC. Emits non-seekable bootstrap sidecars with ManifestFooter and
+   `is_authoritative = 1`, and computes its mode-specific ManifestFooter
+   integrity field over the sidecar bytes; does not mutate a per-volume
+   ManifestFooter after computing that field. Emits non-seekable bootstrap sidecars with ManifestFooter and
    IndexRoot BlockRecord sections present, and includes dictionary
    BlockRecord sections whenever `has_dictionary = 1`.
 36. Emits zero offsets for absent counted tables and no non-zero
@@ -5163,7 +5250,8 @@ A conformant writer:
     POSIX end-of-archive marker. Assigns non-overlapping global
     block-index ranges to all distinct encrypted objects.
 38. Chooses `index_root_fec_data_shards` and
-    `index_root_fec_parity_shards` before emitting the CryptoHeader HMAC;
+    `index_root_fec_parity_shards` before emitting the trailing CryptoHeader
+    integrity field;
     unknown-size streaming writers either choose conservative maxima,
     pre-scan/spool, or reject rather than depending on a later header
     change.
@@ -5230,15 +5318,16 @@ A conformant reader:
 14. Enforces all resource caps from §13.3, including bootstrap sidecar
     size, directory-hint shard count, directory-hint entry count, and
     total extraction size.
-15. Structurally validates CryptoHeader Extension TLVs before KDF/HMAC
+15. Structurally validates CryptoHeader Extension TLVs before KDF/integrity
    using only bounded framing rules; after CryptoHeader HMAC succeeds,
    rejects forbidden extension tags `0x0004` and `0x0006`, duplicate
    known tags, malformed known extension values, and unknown critical
    extension tags, while ignoring unknown non-critical extensions.
-16. Validates §12.3 sidecar HMAC, UUID/session binding,
-    known flag bits, zero reserved bytes, ManifestFooter HMAC, IndexRoot AEAD, and
-    dictionary-object AEAD when present before trusting bootstrap sidecar
-    bytes. It MAY use sidecar CRC as an early corruption check. For a
+16. Validates §12.3 sidecar integrity field, UUID/session binding,
+    known flag bits, zero reserved bytes, ManifestFooter integrity field,
+    IndexRoot validation, and dictionary-object validation when present before
+    trusting bootstrap sidecar bytes. It MAY use sidecar CRC as an early
+    corruption check. For a
     sidecar ManifestFooter, requires `volume_index = 0` and
     `is_authoritative = 1`, and does not compare that zero volume index
     with the current VolumeHeader. Uses sidecar BlockRecord sections only
@@ -5246,8 +5335,9 @@ A conformant reader:
     authenticated IndexRoot from the sidecar or another source; requires
     ManifestFooter and IndexRoot sections for non-seekable sidecar
     bootstrap.
-17. Derives subkeys with the §13.2 HKDF-SHA-256 schedule and verifies
-    CryptoHeader HMAC with the VolumeHeader UUID/session binding.
+17. Derives subkeys with the §13.2 HKDF-SHA-256 schedule in an encryption mode
+    and verifies the CryptoHeader integrity field with the VolumeHeader
+    UUID/session binding.
 18. Rejects unknown algorithm IDs, `compression_algo != ZstdFramed`,
     `fec_algo != ReedSolomonGF16`, `has_dictionary` values other than 0
     or 1, `volume_loss_tolerance >= stripe_width`,
@@ -5263,7 +5353,7 @@ A conformant reader:
     Argon2id `t_cost = 0`, and
     structurally scans Extension TLVs only for bounded framing, payload
     length caps, valid terminator encoding, and exact terminator
-    placement before the HMAC. It then treats the validated `chunk_size`
+    placement before the trailing integrity field. It then treats the validated `chunk_size`
     and `expected_volume_size` as advisory metadata only; FrameEntry,
     EnvelopeEntry, and authenticated trailer/footer offsets remain
     authoritative.
@@ -5290,7 +5380,7 @@ A conformant reader:
     decode, or trailing non-frame bytes.
     Before reporting clean extraction or appending synthetic tar EOF
     blocks, verifies terminal material: locator/CMRA recovery when
-    applicable, ManifestFooter and VolumeTrailer HMAC/source-authority checks,
+    applicable, ManifestFooter and VolumeTrailer mode-specific integrity/source-authority checks,
     RootAuthFooterV1 wire validation when present, and any requested external
     authenticator/root-auth verification. After an irrecoverable envelope,
     non-authoritative terminal footer, or terminal-verification failure, does
@@ -5410,7 +5500,7 @@ Additional v43 writer requirements:
     Locator`, and never requires seek-back.
 40. Emits a default-interoperable conforming CMRA for every closed volume, with
     parity at least the §30.6 minimum and no greater than the default §30.6
-    effective pre-HMAC parity cap unless the output is explicitly marked as
+    effective pre-integrity parity cap unless the output is explicitly marked as
     requiring a raised reader cap or as non-conforming/debug.
 41. When root auth is enabled, emits byte-identical `RootAuthFooterV1` bytes on
     every closed volume and computes `archive_root` from the canonical inputs in
@@ -5425,7 +5515,7 @@ Additional v43 reader requirements:
     windows.
 33. Verifies v43 terminal adjacency and `VolumeTrailer.bytes_written` as the
     trailer offset, not physical EOF minus 128.
-34. Performs key-holding root-auth verification only after the v43 full-archive
+34. Performs full RootAuth verification only after the v43 full-archive
     content-conformance gate and the §30.9.6 recomputation/equality checks pass.
 35. Performs public no-key verification only under §30.11 and reports the narrow
     public result plus required unchecked-scope diagnostics.
@@ -5460,21 +5550,27 @@ unencrypted archive is tamper-evident and verifiable with no archive key, which
 is the recommended way to distribute a public, password-free archive.
 `critical_metadata_digest` folds in `LE16(aead_algo)`, so a signature binds the
 protection mode: a signed encrypted archive cannot be repackaged as unencrypted
-(or vice versa) without invalidating `archive_root`. In unencrypted mode the
-key-holding (full-recomputation) verification path of §30.9.6 requires **no
-archive key** — the reader opens the plaintext objects and recomputes directly,
-after per-block CRC32C, structural block-continuity, and the unkeyed
-header/footer digest checks (§9) replace the HMAC/AEAD metadata validation used
-in encryption mode. `crypto_header_pre_hmac_digest` (§30.9.1) covers the
-CryptoHeader bytes up to the trailing 32-byte field positionally, so it is
-correct whether that field is a `header_hmac` or the unkeyed `header_digest`.
+(or vice versa) without invalidating `archive_root`.
+
+This section uses **full RootAuth verification** for the archive-wide
+recomputation path in §30.9.6. In an encryption mode, full RootAuth verification
+requires the archive key because keyed HMAC/AEAD checks gate metadata and
+plaintext release. In unencrypted mode it requires **no archive key**: the reader
+opens plaintext objects and recomputes directly after per-block CRC32C,
+structural block-continuity, and the unkeyed header/footer digest checks (§9)
+replace the keyed metadata validation used in encryption mode.
+`crypto_header_pre_hmac_digest` (§30.9.1) covers the CryptoHeader bytes up to
+the trailing 32-byte integrity field positionally, so it is correct whether that
+field is a `header_hmac` or the unkeyed `header_digest`.
 
 ### 30.1 Goals
 
 The archive object model defined above already protects objects after the reader
 can locate them:
 BlockRecord CRCs identify accidental shard corruption, object-local FEC repairs
-availability failures, and HMAC/AEAD decides trust before plaintext release.
+availability failures, and keyed HMAC/AEAD decides trust before plaintext release in an
+encryption mode (in unencrypted mode, per-block CRC32C, the unkeyed header/footer
+digests of §9, and optional root authentication decide trust).
 
 The remaining weakness is bootstrap availability. Small critical structures are
 needed before object FEC can help:
@@ -5508,7 +5604,7 @@ tar member groups -> zstd frames -> pack -> pad -> AEAD
 - Do not replace HMAC or AEAD with FEC.
 - Do not sign raw volume-file bytes.
 - Do not define Ed25519, X.509, timestamping, or a signing plugin.
-- Do not make public no-key verification equivalent to key-holding
+- Do not make public no-key verification equivalent to full RootAuth
   verification.
 - Do not require seek-back in the writer.
 
@@ -5528,7 +5624,7 @@ CRC/FEC bytes, or root-auth bytes unless all applicable rules below pass:
   `TZCS`, `TZCL`, or `TZRA`;
 - every per-structure `version` field equals `1`;
 - every embedded `format_version` field equals `1`;
-- every embedded `volume_format_rev` field equals `41`;
+- every embedded `volume_format_rev` field equals `43`;
 - every `_reserved`, reserved integer field, reserved byte range, and unknown
   flag bit is zero;
 - every enum-like field is one of the values assigned by this v43 section, except
@@ -5596,8 +5692,9 @@ root_auth_flags:             u32,  // bit 0: RootAuthFooterV1 present
 _reserved_v38:               u32,  // MUST be zero
 ```
 
-The trailer HMAC coverage includes these bytes because `trailer_hmac` covers
-the first 96 trailer bytes.
+The trailer integrity coverage includes these bytes because `trailer_hmac` in an
+encryption mode, or `trailer_digest` in unencrypted mode, covers the first 96
+trailer bytes.
 
 If root auth is enabled for a completed archive, every closed v43 volume MUST
 set `root_auth_flags` bit 0, MUST set non-zero `root_auth_footer_offset` and
@@ -5643,7 +5740,7 @@ physical_file_size        = CMRA_offset + CMRA_length
 ```
 
 Readers MUST verify these equations with checked 64-bit-or-wider arithmetic
-after CMRA recovery and trailer HMAC verification.
+after CMRA recovery and trailer integrity verification.
 
 ### 30.5 Critical Metadata Recovery Area
 
@@ -5777,8 +5874,8 @@ any type-4 region with a zero offset or zero length. For every region, `bytes`
 MUST equal the recovered trusted byte string for that canonical range. Writers
 populate each region with the exact critical byte string at archive close.
 Readers validate recovered region bytes through `image_crc32c`, region digests,
-and the §30.5.1.1 HMAC/source-authority checks; repaired region bytes need not
-equal corrupt or unavailable physical bytes.
+and the §30.5.1.1 source-authority checks; repaired region bytes need not equal
+corrupt or unavailable physical bytes.
 
 Readers MUST reject a recovered `CriticalMetadataImageV1` unless
 `magic = b"TZMI"`, `version = 1`, `volume_format_rev = 43`,
@@ -5819,12 +5916,13 @@ input selection, object repair, or a public no-key observation window, the
 reader MUST enforce the applicable source-authority checks below with checked
 64-bit-or-wider arithmetic.
 
-For key-holding verification, the key-holding column means HMAC-verified v43
-terminal authority after `CryptoHeader.header_hmac`,
-`VolumeTrailer.trailer_hmac`, and `ManifestFooter.manifest_hmac` have all
-verified. Public no-key verification has no `mac_key`; the public no-key column
-below is the complete §30.5.1.1 public subset. Public no-key verification MUST NOT
-import any key-holding-only HMAC requirement, and MUST report that
+For full RootAuth verification, the full-verification column means
+mode-specific v43 terminal authority after `CryptoHeader`, `VolumeTrailer`, and
+`ManifestFooter` integrity have all verified: HMACs in an encryption mode, or the
+unkeyed §9/§11/§12 digests in unencrypted mode. Public no-key verification has no
+`mac_key`; the public no-key column below is the complete §30.5.1.1 public
+subset. Public no-key verification MUST NOT import any full-verification-only
+HMAC, digest, or object-validation requirement, and MUST report that
 `ManifestFooter` and `VolumeTrailer` authority was not authenticated. Before a
 public no-key reader uses any `CryptoHeader` field named in this table or in
 §30.11, the public `VolumeHeader`/`CryptoHeader` pair MUST satisfy the public-safe
@@ -5832,24 +5930,24 @@ structural profile in §30.11.1. Before it uses any structurally parsed
 `VolumeTrailer` root-auth pointer field, the recovered trailer bytes MUST
 satisfy the public-safe `VolumeTrailer` profile in §30.11.
 
-| `CriticalMetadataImageV1` field | Key-holding source authority and required equality before use | Public no-key required structural checks before use |
+| `CriticalMetadataImageV1` field | Full-verification source authority and required equality before use | Public no-key required structural checks before use |
 |---|---|---|
 | `magic`, `version`, `volume_format_rev`, `layout_flags`, `_reserved`, `serialized_region_count`, every `SerializedRegion.region_type`, and every `SerializedRegion._reserved` | The fixed v43 structure rules in §30.2 and §30.5.1. Unknown flags, unknown regions, duplicate regions, non-canonical region order, and non-zero reserved bytes are hard rejection before any layout use. | Same fixed v43 structure rules. These are public corruption and syntax checks only. |
-| `archive_uuid`, `session_id` | MUST equal the identity tuple bound into `CryptoHeader.header_hmac` by `VolumeHeader`, and MUST also equal HMAC-verified `ManifestFooter`, HMAC-verified `VolumeTrailer`, and `RootAuthFooterV1` when present. | MUST equal `RootAuthFooterV1` and the public `VolumeHeader`. This is a signature-input selection rule, not authentication. |
-| `volume_index` | MUST equal HMAC-verified `ManifestFooter.volume_index`, HMAC-verified `VolumeTrailer.volume_index`, and the authenticated `VolumeHeader.volume_index` that supplied the CryptoHeader HMAC identity. | MUST equal the public `VolumeHeader.volume_index` and the public candidate index selected by §30.11. |
-| `stripe_width` | MUST equal authenticated `CryptoHeader.stripe_width`; HMAC-verified `ManifestFooter.total_volumes` and every accepted `VolumeHeader.stripe_width` MUST equal the same value. | MUST equal the structurally parsed public `CryptoHeader.stripe_width` and every public `VolumeHeader.stripe_width` in the accepted candidate set. |
+| `archive_uuid`, `session_id` | MUST equal the identity tuple bound into the mode-specific `CryptoHeader` integrity field by `VolumeHeader`, and MUST also equal mode-specifically verified `ManifestFooter`, mode-specifically verified `VolumeTrailer`, and `RootAuthFooterV1` when present. | MUST equal `RootAuthFooterV1` and the public `VolumeHeader`. This is a signature-input selection rule, not authentication. |
+| `volume_index` | MUST equal mode-specifically verified `ManifestFooter.volume_index`, mode-specifically verified `VolumeTrailer.volume_index`, and the integrity-checked `VolumeHeader.volume_index` that supplied the CryptoHeader identity. | MUST equal the public `VolumeHeader.volume_index` and the public candidate index selected by §30.11. |
+| `stripe_width` | MUST equal integrity-checked `CryptoHeader.stripe_width`; mode-specifically verified `ManifestFooter.total_volumes` and every accepted `VolumeHeader.stripe_width` MUST equal the same value. | MUST equal the structurally parsed public `CryptoHeader.stripe_width` and every public `VolumeHeader.stripe_width` in the accepted candidate set. |
 | `volume_header_offset`, `volume_header_length` | MUST equal `0` and `128`. Region type 1 offset and length MUST equal these fields, and region type 1 bytes MUST validate as a v43 `VolumeHeader` with a valid CRC before layout use. | Same fixed offset, length, region, v43 `VolumeHeader`, and CRC checks. |
 | `crypto_header_offset`, `crypto_header_length` | MUST equal `VolumeHeader.crypto_header_offset` and `VolumeHeader.crypto_header_length`; `crypto_header_offset` MUST be `128`; `crypto_header_length` MUST equal `CryptoHeader.length` and fit the active CryptoHeader cap. Region type 2 offset and length MUST equal these fields. | MUST pass the public-safe `VolumeHeader`/`CryptoHeader` structural profile in §30.11.1, including exact offset, length, and active-cap checks, without requiring `CryptoHeader.header_hmac`. The parsed `CryptoHeader` may provide only public observation values named in §30.11. |
 | `block_records_offset` | MUST equal `crypto_header_offset + crypto_header_length`. It MUST also equal the start of the physically observed BlockRecord region for the selected candidate volume. | MUST equal `crypto_header_offset + crypto_header_length` and the public observation start in §30.11. |
-| `block_count` | MUST equal HMAC-verified `VolumeTrailer.block_count`. | Public no-key verification MUST NOT use this field to define completeness, derive a scan limit, or claim authenticated physical block count. The public BlockRecord-region end comes only from `block_records_offset + block_records_length` after the structural checks in this table and §30.11 pass. |
+| `block_count` | MUST equal mode-specifically verified `VolumeTrailer.block_count`. | Public no-key verification MUST NOT use this field to define completeness, derive a scan limit, or claim authenticated physical block count. The public BlockRecord-region end comes only from `block_records_offset + block_records_length` after the structural checks in this table and §30.11 pass. |
 | `block_records_length` | MUST equal `VolumeTrailer.block_count * (20 + CryptoHeader.block_size)`. The same product defines the authenticated BlockRecord-region length used for root-auth and object reads. | MUST satisfy `block_records_offset + block_records_length == manifest_footer_offset`, and `block_records_length` MUST be a whole number of `20 + block_size` slots using the structurally parsed public `CryptoHeader.block_size`. This does not authenticate terminal `block_count`. |
-| `manifest_footer_offset`, `manifest_footer_length` | `manifest_footer_length` MUST equal HMAC-verified `VolumeTrailer.manifest_footer_length` and `136`. `manifest_footer_offset` MUST equal HMAC-verified `VolumeTrailer.manifest_footer_offset` and `block_records_offset + block_records_length`. Region type 3 offset and length MUST equal these fields. | `manifest_footer_length` MUST equal `136`, `manifest_footer_offset` MUST equal `block_records_offset + block_records_length`, and region type 3 offset and length MUST equal these fields. Public no-key verification MUST NOT treat `ManifestFooter` bytes as authenticated. |
-| `root_auth_footer_offset`, `root_auth_footer_length` | MUST equal the v43 root-auth pointer fields carried in the HMAC-verified `VolumeTrailer`, and MUST equal the footer length binding in §30.7. When root auth is absent, both image fields and all trailer root-auth pointer fields MUST be zero. When root auth is present, both fields MUST be non-zero, `layout_flags` bit 0 and `VolumeTrailer.root_auth_flags` bit 0 MUST both be set, `manifest_footer_offset + 136 == root_auth_footer_offset`, and `root_auth_footer_offset + root_auth_footer_length == volume_trailer_offset`. Region type 4 offset and length MUST equal these fields when present. | Public no-key requires root auth to be present. `layout_flags` bit 0 and the structurally parsed `VolumeTrailer.root_auth_flags` bit 0 MUST both be set; both image fields and the structurally parsed trailer pointer fields MUST be non-zero and equal; `manifest_footer_offset + 136 == root_auth_footer_offset`; `root_auth_footer_offset + root_auth_footer_length == volume_trailer_offset`; region type 4 offset and length MUST equal these fields; and parsed `RootAuthFooterV1.footer_length` MUST equal `root_auth_footer_length` under §30.7. These are structural checks only. |
-| `volume_trailer_offset`, `volume_trailer_length` | `volume_trailer_length` MUST equal `128`. `volume_trailer_offset` MUST equal HMAC-verified `VolumeTrailer.bytes_written`, and MUST equal either `manifest_footer_offset + 136` when root auth is absent or `root_auth_footer_offset + root_auth_footer_length` when root auth is present. Region type 5 offset and length MUST equal these fields. | `volume_trailer_length` MUST equal `128`; region type 5 offset and length MUST equal these fields; and `volume_trailer_offset` MUST equal `root_auth_footer_offset + root_auth_footer_length` for public root-auth candidates. Public no-key verification MUST NOT treat `VolumeTrailer` bytes as authenticated. |
+| `manifest_footer_offset`, `manifest_footer_length` | `manifest_footer_length` MUST equal mode-specifically verified `VolumeTrailer.manifest_footer_length` and `136`. `manifest_footer_offset` MUST equal mode-specifically verified `VolumeTrailer.manifest_footer_offset` and `block_records_offset + block_records_length`. Region type 3 offset and length MUST equal these fields. | `manifest_footer_length` MUST equal `136`, `manifest_footer_offset` MUST equal `block_records_offset + block_records_length`, and region type 3 offset and length MUST equal these fields. Public no-key verification MUST NOT treat `ManifestFooter` bytes as authenticated. |
+| `root_auth_footer_offset`, `root_auth_footer_length` | MUST equal the v43 root-auth pointer fields carried in the mode-specifically verified `VolumeTrailer`, and MUST equal the footer length binding in §30.7. When root auth is absent, both image fields and all trailer root-auth pointer fields MUST be zero. When root auth is present, both fields MUST be non-zero, `layout_flags` bit 0 and `VolumeTrailer.root_auth_flags` bit 0 MUST both be set, `manifest_footer_offset + 136 == root_auth_footer_offset`, and `root_auth_footer_offset + root_auth_footer_length == volume_trailer_offset`. Region type 4 offset and length MUST equal these fields when present. | Public no-key requires root auth to be present. `layout_flags` bit 0 and the structurally parsed `VolumeTrailer.root_auth_flags` bit 0 MUST both be set; both image fields and the structurally parsed trailer pointer fields MUST be non-zero and equal; `manifest_footer_offset + 136 == root_auth_footer_offset`; `root_auth_footer_offset + root_auth_footer_length == volume_trailer_offset`; region type 4 offset and length MUST equal these fields; and parsed `RootAuthFooterV1.footer_length` MUST equal `root_auth_footer_length` under §30.7. These are structural checks only. |
+| `volume_trailer_offset`, `volume_trailer_length` | `volume_trailer_length` MUST equal `128`. `volume_trailer_offset` MUST equal mode-specifically verified `VolumeTrailer.bytes_written`, and MUST equal either `manifest_footer_offset + 136` when root auth is absent or `root_auth_footer_offset + root_auth_footer_length` when root auth is present. Region type 5 offset and length MUST equal these fields. | `volume_trailer_length` MUST equal `128`; region type 5 offset and length MUST equal these fields; and `volume_trailer_offset` MUST equal `root_auth_footer_offset + root_auth_footer_length` for public root-auth candidates. Public no-key verification MUST NOT treat `VolumeTrailer` bytes as authenticated. |
 | `body_bytes_before_cmra` | MUST equal `volume_trailer_offset + 128`. For locator-based candidates it MUST also equal `CriticalRecoveryLocator.cmra_offset`; for locatorless `TZCR` candidates it MUST equal the scanned CMRA offset. | Same arithmetic and locator or locatorless boundary checks, without HMAC. |
 | `*_sha256` digest fields | Each digest MUST equal the SHA-256 of the exact matching serialized region bytes as defined in §30.5.1. These digest fields are corruption checks only and MUST NOT override the authenticated authorities above. | Same digest checks. They are public corruption checks only and do not authenticate the archive. |
 
-If any required equality fails, a key-holding reader MUST reject the candidate
+If any required equality fails, a full-verification reader MUST reject the candidate
 before reading BlockRecords, using root-auth inputs, applying object FEC, or
 reporting root-auth success. A public no-key reader MUST fail or return an
 explicitly incomplete public result before using the disputed field as a
@@ -5983,7 +6081,7 @@ on any duplicated decoder field, they are not a matching locator pair and MUST
 NOT be used as a pair.
 
 Identity hints are deterministic equality checks, not optional acceptance
-authorities. For any CMRA byte range accepted for key-holding verification,
+authorities. For any CMRA byte range accepted for full RootAuth verification,
 public no-key verification, or BlockRecord observation-window selection, every
 CRC-valid `CriticalMetadataRecoveryHeader` and every CRC-valid
 `CriticalRecoveryLocator` that participates in that candidate MUST name the
@@ -5991,7 +6089,7 @@ same `archive_uuid_hint`, `session_id_hint`, and `volume_index_hint`. After the
 image is recovered, those hints MUST equal
 `CriticalMetadataImageV1.archive_uuid`, `session_id`, and `volume_index`.
 After mode-specific source authority is available, the same hints MUST equal
-the authenticated key-holding archive tuple or the public `RootAuthFooterV1`
+the integrity-checked full-verification archive tuple or the public `RootAuthFooterV1`
 and `VolumeHeader` tuple used by §30.11. A header whose CRC failed contributes no
 hint fields; a reader MUST ignore that unusable header slot rather than compare
 its bytes. Readers MAY use hint fields to prioritize candidate work, but MUST
@@ -6043,10 +6141,11 @@ the candidate volume and MUST have `locator_sequence = 0`. Then they try the
 mirror immediately before it, which MUST have `locator_sequence = 1`. If both
 fail, a reader MAY scan backward within the §30.6
 `max_critical_recovery_scan` bound for a `TZCL` or `TZCR` candidate. A scan
-result is only a candidate. Key-holding verification still must pass CMRA
-CRC/FEC, image digest, HMACs, source-authority cross-checks, and optional
-root-auth verification. Public no-key verification uses the separate §30.11
-candidate acceptance rules and does not require HMACs.
+result is only a candidate. Full verification still must pass CMRA CRC/FEC,
+image digest, mode-specific integrity, source-authority cross-checks, and
+optional root-auth verification. Public no-key verification uses the separate
+§30.11 candidate acceptance rules and does not require terminal integrity
+fields.
 
 A scanned `TZCL` candidate is valid only if the 128-byte locator at the scanned
 offset passes the validation rules above and its `cmra_offset` and
@@ -6057,7 +6156,7 @@ sequence `0` second. If a scanned valid locator is not part of a matching pair,
 it is still a candidate, but its ordering anchor is only that locator's end
 offset.
 
-Before any locator-based `TZCL` candidate is accepted for key-holding
+Before any locator-based `TZCL` candidate is accepted for full RootAuth
 verification, public no-key verification, or BlockRecord observation-window
 selection, the locator, derived CMRA length, and recovered image MUST agree on
 the CMRA boundary:
@@ -6143,10 +6242,10 @@ active_trailing_garbage_scan_cap = reader's active
 
 `active_cmra_parity_pct_cap < 100` is a local resource policy, not a v43
 malformation threshold. Full-interoperability readers use an effective
-pre-HMAC parity cap of at least 100 because `bit_rot_buffer_pct` may be any
-authenticated value from 0 through 100 and is not known until after CMRA
-recovery and `CryptoHeader.header_hmac` verification. A reader that refuses
-to allocate, scan, or decode up to this effective bound MAY return a
+pre-integrity parity cap of at least 100 because `bit_rot_buffer_pct` may be any
+mode-specifically integrity-checked value from 0 through 100 and is not known
+until after CMRA recovery and CryptoHeader integrity verification. A reader that
+refuses to allocate, scan, or decode up to this effective bound MAY return a
 resource-limit or unavailable result, but MUST NOT report the archive as
 malformed solely because its CMRA parity exceeds a local cap below 100.
 
@@ -6227,8 +6326,8 @@ worst-case bounded locatorless CMRA. Readers MAY choose a lower local
 `active_trailing_garbage_scan_cap`, including zero, but they MUST NOT scan more
 than `max_critical_recovery_scan` bytes before EOF for v43 critical recovery.
 
-For key-holding recovery, if multiple scanned candidates pass all CMRA, HMAC,
-structural, source-authority, and root-auth checks, the candidate with the
+For full-verification recovery, if multiple scanned candidates pass all CMRA,
+mode-specific integrity, structural, source-authority, and root-auth checks, the candidate with the
 greatest ordering anchor wins. For a matching locator pair, the ordering anchor
 is the end offset of the sequence-0 final locator. For a single valid scanned
 locator, the ordering anchor is that locator's end offset. For a locatorless
@@ -6273,8 +6372,8 @@ If `parity_shard_count` exceeds a reader's local
 above, the reader MAY stop with a resource-limit or unavailable result before
 FEC allocation. It MUST NOT classify that condition as a malformed CMRA.
 
-After CMRA recovery and successful `CryptoHeader.header_hmac` verification,
-readers MUST enforce the writer-conformance lower bound:
+After CMRA recovery and successful CryptoHeader mode-specific integrity
+verification, readers MUST enforce the writer-conformance lower bound:
 
 ```text
 cmra_min_parity_shard_count =
@@ -6289,12 +6388,12 @@ that recovers an otherwise valid volume with fewer parity shards MUST reject it
 as malformed before reporting the archive as a conforming v43 archive.
 For default-interoperable conforming archives, writers MUST also keep
 `parity_shard_count <= max(2, ceil(data_shard_count * 100 / 100))`, matching the
-default §30.6 effective pre-HMAC parity cap. A writer that emits more CMRA parity
+default §30.6 effective pre-integrity parity cap. A writer that emits more CMRA parity
 MUST explicitly label the output as requiring a raised reader CMRA parity cap, or
 as non-conforming/debug output; default readers MAY stop with a resource-limit or
 unavailable result rather than treating that raised-cap output as malformed.
-If `active_cmra_parity_pct_cap < bit_rot_buffer_pct` after HMAC verification,
-the reader MUST either treat the active cap as raised to
+If `active_cmra_parity_pct_cap < bit_rot_buffer_pct` after CryptoHeader integrity
+verification, the reader MUST either treat the active cap as raised to
 `bit_rot_buffer_pct` for this archive or stop with a resource-limit diagnostic
 that says the local CMRA parity cap is below the authenticated archive
 requirement. It MUST NOT reject the archive as malformed solely because the
@@ -6388,10 +6487,10 @@ Length rules:
 - Before any footer use, `RootAuthFooterV1.footer_length` MUST equal
   `CriticalMetadataImageV1.root_auth_footer_length`,
   `SerializedRegion(type 4).length`, and the recovered
-  `VolumeTrailer.root_auth_footer_length`. In key-holding mode, the same
-  `VolumeTrailer.root_auth_footer_length` value MUST be HMAC-verified before it
-  becomes terminal authority. In public no-key mode, this equality is only a
-  structural candidate-selection check.
+  `VolumeTrailer.root_auth_footer_length`. In full RootAuth verification, the
+  same `VolumeTrailer.root_auth_footer_length` value MUST be mode-specifically
+  verified before it becomes terminal authority. In public no-key mode, this
+  equality is only a structural candidate-selection check.
 - When root auth is enabled for a completed v43 archive, every closed volume
   MUST carry a `RootAuthFooterV1`, and those footer bytes MUST be replicated
   byte-identically on every closed volume. A completed archive that carries root
@@ -6420,11 +6519,11 @@ reserved, length, and CRC checks are not substitutes for archive-root
 verification.
 
 Wire validation does not prove that the footer belongs to an authenticated
-archive. Key-holding verification MUST perform the identity, authority,
-replicated-copy, and commitment equality checks in §30.9.0, §30.9.0.1, and §30.9.6
-before reporting root-auth success. Public no-key verification MUST perform the
-public selection and equality checks in §30.11 and MUST NOT require HMAC-verified
-terminal metadata merely to wire-validate the footer.
+archive. Full RootAuth verification MUST perform the identity, authority,
+replicated-copy, and commitment equality checks in §30.9.0, §30.9.0.1, and
+§30.9.6 before reporting root-auth success. Public no-key verification MUST
+perform the public selection and equality checks in §30.11 and MUST NOT require
+mode-specifically verified terminal metadata merely to wire-validate the footer.
 
 #### 30.7.1 RootAuth Descriptor Digest
 
@@ -6469,7 +6568,8 @@ A root-auth writer must know the authenticator output length before computing
 1. Choose `authenticator_id`, signer identity bytes, and exact
    `authenticator_value_length`.
 2. Compute `RootAuthFooterV1` offset and `footer_length`.
-3. Build and HMAC `VolumeTrailer` with root-auth pointer fields.
+3. Build `VolumeTrailer` with root-auth pointer fields and compute its
+   mode-specific integrity field.
 4. Compute `critical_metadata_digest`, `index_digest`, `fec_layout_digest`, and
    `data_block_merkle_root`.
 5. Compute `archive_root`.
@@ -6549,35 +6649,35 @@ bytes do not contain `archive_uuid`, `session_id`,
 `format_version`, `volume_format_rev`, `total_volumes`, or IndexRoot extent
 fields.
 
-| Value or input | Key-holding source | Required key-holding cross-check | Public no-key handling |
+| Value or input | Full-verification source | Required full-verification cross-check | Public no-key handling |
 |---|---|---|---|
-| `archive_uuid`, `session_id` | The authenticated archive identity tuple: `VolumeHeader` supplies the UUID/session bytes to `CryptoHeader.header_hmac`; after that HMAC verifies, HMAC-verified `ManifestFooter` and `VolumeTrailer` fields MUST match. | `RootAuthFooterV1.archive_uuid`, `RootAuthFooterV1.session_id`, `CriticalMetadataImageV1.archive_uuid`, `CriticalMetadataImageV1.session_id`, and every CRC-valid CMRA header or locator identity hint participating in the accepted candidate MUST match the authenticated tuple before root auth succeeds. | Recomputed public `archive_root` uses `RootAuthFooterV1.archive_uuid` and `RootAuthFooterV1.session_id`. Public `VolumeHeader`, recovered image identity fields, and every CRC-valid candidate hint MUST match the footer; `CryptoHeader` is not a source for these fields. |
+| `archive_uuid`, `session_id` | The integrity-checked archive identity tuple: `VolumeHeader` supplies the UUID/session bytes to the CryptoHeader integrity field (`header_hmac` in an encryption mode, `header_digest` in unencrypted mode); after that mode-specific integrity check verifies, mode-specifically verified `ManifestFooter` and `VolumeTrailer` fields MUST match. | `RootAuthFooterV1.archive_uuid`, `RootAuthFooterV1.session_id`, `CriticalMetadataImageV1.archive_uuid`, `CriticalMetadataImageV1.session_id`, and every CRC-valid CMRA header or locator identity hint participating in the accepted candidate MUST match the integrity-checked tuple before root auth succeeds. | Recomputed public `archive_root` uses `RootAuthFooterV1.archive_uuid` and `RootAuthFooterV1.session_id`. Public `VolumeHeader`, recovered image identity fields, and every CRC-valid candidate hint MUST match the footer; `CryptoHeader` is not a source for these fields. |
 | `format_version`, `volume_format_rev` | Fixed v43 constants: `format_version = 1`, `volume_format_rev = 43`. | `VolumeHeader`, `RootAuthFooterV1`, `CriticalMetadataImageV1`, `CriticalRecoveryLocator`, and every new v43 structure with these fields MUST carry the fixed values before use. | Recomputed public `archive_root` uses the validated `RootAuthFooterV1` fixed values. Public `VolumeHeader` and recovered v43 structures MUST carry the same fixed values. |
 | `root_auth_spec_id` | The fixed 24-byte v43 root-auth spec ID after §30.7 wire validation: the 20 ASCII bytes `tzap-root-auth-v0.43` followed by four zero bytes. | The value serialized into `archive_root` MUST equal the wire-validated `RootAuthFooterV1.root_auth_spec_id`; any other byte sequence is a footer wire-validation failure before root-auth commitment checks. | Public no-key uses the same wire-validated `RootAuthFooterV1.root_auth_spec_id` bytes. |
-| `compression_algo`, `aead_algo`, `fec_algo`, `kdf_algo`, `chunk_size`, `envelope_target_size`, `block_size`, FEC class maxima, `volume_loss_tolerance`, `bit_rot_buffer_pct`, `has_dictionary`, `max_path_length`, `expected_volume_size`, KDF parameters, Extension TLVs, and `CryptoHeader` reserved bytes | The same authenticated `crypto_header_pre_hmac_bytes` used for `crypto_header_pre_hmac_digest`, after `CryptoHeader.header_hmac` verifies. | `CryptoHeaderFixed.length` MUST equal `VolumeHeader.crypto_header_length`; `CryptoHeader.stripe_width` MUST equal `VolumeHeader.stripe_width`; every accepted present HMAC-valid `CryptoHeader` copy MUST provide byte-identical pre-HMAC bytes under §30.9.0.1; all §9 structural and semantic `CryptoHeader` checks MUST pass. | Public no-key uses only structurally parsed `CryptoHeader` bytes that passed the public-safe profile in §30.11.1 for public observation values such as `CryptoHeader.length`, `block_size`, `stripe_width`, and algorithm identifiers. This is not HMAC authentication; the signature result is only over the public inputs selected by these rules. |
-| `stripe_width` | Authenticated `CryptoHeader.stripe_width`. | Every authenticated present `VolumeHeader.stripe_width` and every HMAC-verified authoritative `ManifestFooter.total_volumes` used as bootstrap authority MUST equal `CryptoHeader.stripe_width`. Present volume indexes MUST be unique and in range. Key-holding root auth does not require the accepted physical volume count to equal `stripe_width`; missing indexes are permitted only when their count is within authenticated `CryptoHeader.volume_loss_tolerance` and every required signed data leaf and metadata object can be reconstructed and validated by §§30.9.2-30.9.4. | Public no-key uses structurally parsed `CryptoHeader.stripe_width`; every public `VolumeHeader.stripe_width` MUST match it, and the accepted candidate set MUST contain exactly one candidate for every `volume_index` in `0 .. stripe_width - 1`. Missing, duplicate, or out-of-range public candidates make public no-key verification incomplete or failed. |
-| `total_volumes` and IndexRoot extent fields in `critical_metadata_digest` | The same HMAC-verified authoritative `ManifestFooter` bytes used for `manifest_footer_global_pre_hmac_digest`. | `ManifestFooter.is_authoritative = 1`, reserved bytes zero, `ManifestFooter.total_volumes == CryptoHeader.stripe_width`, and all §11 ManifestFooter size/extent checks MUST pass. | Public no-key does not recompute these values. It intentionally copies `RootAuthFooterV1.critical_metadata_digest` as an opaque signer commitment. |
-| `manifest_footer_global_pre_hmac_digest` | Canonicalized pre-HMAC `ManifestFooter` bytes with only `volume_index` replaced by `LE32(0)`. | Every HMAC-verified authoritative `ManifestFooter` used as a bootstrap authority MUST produce the same canonical digest. | Opaque through `RootAuthFooterV1.critical_metadata_digest`; public no-key makes no ManifestFooter authenticity claim. |
+| `compression_algo`, `aead_algo`, `fec_algo`, `kdf_algo`, `chunk_size`, `envelope_target_size`, `block_size`, FEC class maxima, `volume_loss_tolerance`, `bit_rot_buffer_pct`, `has_dictionary`, `max_path_length`, `expected_volume_size`, KDF parameters, Extension TLVs, and `CryptoHeader` reserved bytes | The same integrity-checked `crypto_header_pre_hmac_bytes` used for `crypto_header_pre_hmac_digest`, after the CryptoHeader mode-specific integrity field verifies. | `CryptoHeaderFixed.length` MUST equal `VolumeHeader.crypto_header_length`; `CryptoHeader.stripe_width` MUST equal `VolumeHeader.stripe_width`; every accepted present integrity-valid `CryptoHeader` copy MUST provide byte-identical pre-HMAC bytes under §30.9.0.1; all §9 structural and semantic `CryptoHeader` checks MUST pass. | Public no-key uses only structurally parsed `CryptoHeader` bytes that passed the public-safe profile in §30.11.1 for public observation values such as `CryptoHeader.length`, `block_size`, `stripe_width`, and algorithm identifiers. This is not CryptoHeader authentication; the signature result is only over the public inputs selected by these rules. |
+| `stripe_width` | Integrity-checked `CryptoHeader.stripe_width`. | Every integrity-checked present `VolumeHeader.stripe_width` and every mode-specifically verified authoritative `ManifestFooter.total_volumes` used as bootstrap authority MUST equal `CryptoHeader.stripe_width`. Present volume indexes MUST be unique and in range. Full RootAuth verification does not require the accepted physical volume count to equal `stripe_width`; missing indexes are permitted only when their count is within integrity-checked `CryptoHeader.volume_loss_tolerance` and every required signed data leaf and metadata object can be reconstructed and validated by §§30.9.2-30.9.4. | Public no-key uses structurally parsed `CryptoHeader.stripe_width`; every public `VolumeHeader.stripe_width` MUST match it, and the accepted candidate set MUST contain exactly one candidate for every `volume_index` in `0 .. stripe_width - 1`. Missing, duplicate, or out-of-range public candidates make public no-key verification incomplete or failed. |
+| `total_volumes` and IndexRoot extent fields in `critical_metadata_digest` | The same mode-specifically verified authoritative `ManifestFooter` bytes used for `manifest_footer_global_pre_hmac_digest`. | `ManifestFooter.is_authoritative = 1`, reserved bytes zero, `ManifestFooter.total_volumes == CryptoHeader.stripe_width`, and all §11 ManifestFooter size/extent checks MUST pass. | Public no-key does not recompute these values. It intentionally copies `RootAuthFooterV1.critical_metadata_digest` as an opaque signer commitment. |
+| `manifest_footer_global_pre_hmac_digest` | Canonicalized pre-integrity-field `ManifestFooter` bytes with only `volume_index` replaced by `LE32(0)`. | Every mode-specifically verified authoritative `ManifestFooter` used as a bootstrap authority MUST produce the same canonical digest. | Opaque through `RootAuthFooterV1.critical_metadata_digest`; public no-key makes no ManifestFooter authenticity claim. |
 | `critical_metadata_digest`, `index_digest`, `fec_layout_digest` | Recomputed from the authenticated sources defined in §30.9.1, §30.9.2, and §30.9.3. | Each recomputed digest MUST equal the same-named field stored in `RootAuthFooterV1` before authenticator verification succeeds. | These three fields are intentionally copied from `RootAuthFooterV1` as opaque component commitments. Public no-key MUST NOT claim it has validated the metadata or plaintext behind them. |
-| `total_data_block_count`, `data_block_merkle_root` | Recomputed from the key-holding synthetic data leaves in §30.9.4 after HMAC/AEAD metadata validation and object FEC repair as needed. | The recomputed count and root MUST equal `RootAuthFooterV1.total_data_block_count` and `RootAuthFooterV1.data_block_merkle_root`. | Public no-key counts observed data-kind BlockRecords and recomputes the observed data root from §30.11. The count and root MUST equal the same-named `RootAuthFooterV1` fields. |
+| `total_data_block_count`, `data_block_merkle_root` | Recomputed from the full-verification synthetic data leaves in §30.9.4 after mode-specific metadata validation and object FEC repair as needed. | The recomputed count and root MUST equal `RootAuthFooterV1.total_data_block_count` and `RootAuthFooterV1.data_block_merkle_root`. | Public no-key counts observed data-kind BlockRecords and recomputes the observed data root from §30.11. The count and root MUST equal the same-named `RootAuthFooterV1` fields. |
 | `root_auth_descriptor_digest` | Recomputed from the validated `RootAuthFooterV1` descriptor fields and exact signer identity bytes. | The recomputed descriptor digest is the only descriptor digest that may enter `archive_root`; descriptor fields are also covered by `footer_crc32c` and v43 footer validation. | Public no-key recomputes this digest from the validated footer. |
 | `signer_identity_digest` | Recomputed from exact `signer_identity_bytes` carried by `RootAuthFooterV1`. | The recomputed digest MUST equal `RootAuthFooterV1.signer_identity_digest`. | Public no-key recomputes this digest and requires equality before verifier profile/key selection succeeds. |
 
 #### 30.9.0.1 Replicated Global Input Agreement
 
-Before reporting key-holding root-auth success, a reader MUST canonicalize
+Before reporting full RootAuth success, a reader MUST canonicalize
 globally replicated root-auth inputs across the accepted present volume set.
 An accepted present volume is a supplied volume candidate that the operation
 uses after its applicable v43 structure checks, CMRA recovery, source-authority
-checks, and available HMAC checks have succeeded. A volume index that is wholly
+checks, and available mode-specific integrity checks have succeeded. A volume index that is wholly
 missing, outside the supplied input set, or unrecoverable but tolerated by
 authenticated `CryptoHeader.volume_loss_tolerance` is an absent copy for this
 rule; absent copies cannot be compared and MUST be reported as a volume-loss
 diagnostic rather than treated as root-auth rejection.
 
-For key-holding verification:
+For full RootAuth verification:
 
-1. Every accepted present HMAC-valid `CryptoHeader` copy MUST have the same
+1. Every accepted present integrity-valid `CryptoHeader` copy MUST have the same
    exact `crypto_header_pre_hmac_bytes`, the same
    `crypto_header_pre_hmac_length`, and therefore the same
    `crypto_header_pre_hmac_digest`. A mismatch is
@@ -6610,7 +6710,8 @@ even though object FEC can recover the archive data. Signing every volume's
 header/footer/trailer would regress volume-loss recovery.
 
 Instead, `critical_metadata_digest` covers only global authenticated metadata
-that a key-holding reader can recover from any authenticated bootstrap source.
+that a full-verification reader can recover from any mode-specifically verified
+bootstrap source.
 First compute the exact CryptoHeader byte commitment:
 
 ```text
@@ -6622,11 +6723,12 @@ crypto_header_pre_hmac_digest = SHA-256(
 ```
 
 `crypto_header_pre_hmac_bytes` are the exact `CryptoHeader` bytes from offset 0
-through the byte immediately before `header_hmac`. The length is
+through the byte immediately before the trailing CryptoHeader integrity field
+(`header_hmac` in an encryption mode, `header_digest` in unencrypted mode). The length is
 `CryptoHeader.length - 32`. This byte string includes the fixed CryptoHeader
 fields, KDF parameter bytes, every Extension TLV, the terminator TLV, reserved
 bytes, `max_path_length`, and `expected_volume_size`. It excludes only the
-trailing `header_hmac`.
+trailing 32-byte integrity field.
 
 Next compute the canonical global ManifestFooter byte commitment:
 
@@ -6640,15 +6742,17 @@ manifest_footer_global_pre_hmac_digest = SHA-256(
 
 `MF_PRE_HMAC_LEN` is 104. `manifest_footer_pre_hmac_bytes_with_volume_index_zero`
 are the exact `ManifestFooter` bytes from offset 0 through the byte immediately
-before `manifest_hmac`, except that the four `volume_index` bytes are replaced
-with `LE32(0)`. This byte string includes `ManifestFooter.magic`,
+before the trailing ManifestFooter integrity field (`manifest_hmac` in an
+encryption mode, `manifest_digest` in unencrypted mode), except that the four
+`volume_index` bytes are replaced with `LE32(0)`. This byte string includes `ManifestFooter.magic`,
 `archive_uuid`, `session_id`, `is_authoritative`, `_reserved_a`,
 `total_volumes`, all IndexRoot extent and size fields, and `_reserved_b`.
 It has length 104: the `volume_index` field remains present at its normal
-offset but is zeroed, while the trailing `manifest_hmac` field is excluded.
+offset but is zeroed, while the trailing integrity field is excluded.
 For root-authenticated verification, the source
-`ManifestFooter` MUST be HMAC-verified, MUST have `is_authoritative = 1`, and
-MUST have zero reserved bytes before this digest can be used.
+`ManifestFooter` MUST be mode-specifically verified, MUST have
+`is_authoritative = 1`, and MUST have zero reserved bytes before this digest can
+be used.
 
 Then compute:
 
@@ -6698,11 +6802,11 @@ authenticated CryptoHeader bytes used for `crypto_header_pre_hmac_digest`.
 The canonical ManifestFooter byte commitment makes the root-authenticated
 metadata set cover the completed-archive authority bit and global pre-HMAC
 ManifestFooter reserved bytes without signing the per-volume `volume_index`.
-Readers MUST reject key-holding root-auth verification if a present
-HMAC-verified ManifestFooter used as a bootstrap authority yields a different
+Readers MUST reject full RootAuth verification if a present mode-specifically
+verified ManifestFooter used as a bootstrap authority yields a different
 `manifest_footer_global_pre_hmac_digest` after `volume_index` canonicalization.
 They MUST also reject if the ManifestFooter scalar values serialized above do
-not come from the same HMAC-verified ManifestFooter bytes used for
+not come from the same mode-specifically verified ManifestFooter bytes used for
 `manifest_footer_global_pre_hmac_digest`.
 
 Per-volume fields such as `VolumeHeader.volume_index`,
@@ -6776,8 +6880,9 @@ the corresponding decompressed-size field. For payload-envelope rows,
 `fec_layout_row_count` MUST equal the number of rows serialized by the rules
 above. Empty archives still serialize the class-1 IndexRoot row and the class-2
 dictionary sentinel row; they simply have zero class-3, class-4, and class-5
-rows. Readers recompute this digest only after HMAC/AEAD verification,
-decompression, and all §15 structural validation for the source tables.
+rows. Readers recompute this digest only after mode-specific object integrity
+verification, decompression, and all §15 structural validation for the source
+tables.
 
 #### 30.9.4 data_block_merkle_root
 
@@ -6800,7 +6905,8 @@ kind =
     8 for class-5 directory hint
 
 flags = 1 if i == data_block_count - 1, otherwise 0
-payload = the exact BLOCK_SIZE-byte encrypted data shard for block_index,
+payload = the exact BLOCK_SIZE-byte stored data shard for block_index
+          (ciphertext in an encryption mode, plaintext in unencrypted mode),
           read from an intact BlockRecord or reconstructed by object FEC
 ```
 
@@ -6808,9 +6914,9 @@ If a data BlockRecord is present, readers MUST verify its `block_index`, `kind`,
 and `flags` against these synthetic values before using its payload in the
 tree. If a data BlockRecord is missing due to tolerated volume loss, readers
 MUST synthesize only the framing values above; the payload bytes still MUST come
-from successful object FEC repair and later AEAD/HMAC validation. A repaired
-data shard with no authenticated object extent is not eligible for root-auth
-verification.
+from successful object FEC repair and later mode-specific object validation. A
+repaired data shard with no authenticated object extent is not eligible for
+root-auth verification.
 
 `RootAuthFooterV1.total_data_block_count` MUST equal the total number of
 synthetic data leaves produced by these rules.
@@ -6842,9 +6948,9 @@ signer_identity_digest = SHA-256(
 
 If no `RootAuthFooterV1` exists, this field is 32 zero bytes.
 
-#### 30.9.6 Key-holding RootAuthFooterV1 Verification
+#### 30.9.6 Full RootAuthFooterV1 Verification
 
-Key-holding root-auth verification MUST treat `RootAuthFooterV1` commitment
+Full RootAuth verification MUST treat `RootAuthFooterV1` commitment
 fields as stored expectations, not as substitutes for recomputation.
 
 `root_auth_content_verified` is both a v43 full-archive content-conformance
@@ -6859,9 +6965,11 @@ true:
 1. The archive has passed the v43 full-archive content-conformance operation.
    This operation MUST:
    - bootstrap by §30.12, recover CMRA, parse the v43 terminal sequence, verify
-     `CryptoHeader.header_hmac`, `VolumeTrailer.trailer_hmac`, and
-     `ManifestFooter.manifest_hmac`, and enforce the §30.5.1.1 source-authority
-     checks before using any recovered layout field;
+     the mode-specific integrity fields for `CryptoHeader`, `VolumeTrailer`,
+     and `ManifestFooter` (`header_hmac`/`trailer_hmac`/`manifest_hmac` in an
+     encryption mode; `header_digest`/`trailer_digest`/`manifest_digest` in
+     unencrypted mode), and enforce the §30.5.1.1 source-authority checks before
+     using any recovered layout field;
    - apply the v43 terminal layout instead of the v36 physical EOF rule:
      `ManifestFooter | RootAuthFooterV1? | VolumeTrailer | CMRA |
      LocatorMirror | Locator` is the candidate terminal sequence,
@@ -6874,8 +6982,8 @@ true:
      uniqueness, §27 class and per-object parity equality, reconstructed
      tar-stream coverage and `content_sha256`, FileEntry/tar-member binding,
      and directory-hint map validation when applicable, using the
-     v43-authenticated `CryptoHeader`, `ManifestFooter`, `VolumeTrailer`, and
-     recovered CMRA image as the bootstrap authorities;
+     v43 mode-specifically verified `CryptoHeader`, `ManifestFooter`,
+     `VolumeTrailer`, and recovered CMRA image as the bootstrap authorities;
    - permit a whole-volume input to be absent when its index is within the
      authenticated `CryptoHeader.volume_loss_tolerance` and §18 object-local
      FEC reconstructs every metadata object and signed data leaf needed by the
@@ -6894,12 +7002,12 @@ true:
    referenced IndexShard table, dictionary metadata when present,
    directory-hint metadata when present, all distinct authenticated object
    extents and FEC layout rows, and every signed data-kind BlockRecord,
-   including object FEC repair and AEAD/HMAC validation as applicable.
+   including object FEC repair and mode-specific object validation as applicable.
 
 This requirement is stricter than a narrow random extract, a single-file
 listing, a recomputed `archive_root`, or any other partial operation. Partial
 operations may report ordinary `CryptoHeader`, `ManifestFooter`, `VolumeTrailer`,
-and object AEAD/HMAC results for the bytes they actually validated, and may
+and object integrity results for the bytes they actually validated, and may
 report root auth as deferred or unavailable, but they MUST NOT report
 `root_auth_content_verified`. If the root-auth recomputation and authenticator
 would otherwise pass but the v43 full-archive content-conformance operation
@@ -6907,7 +7015,7 @@ fails or has not run, the reader MUST NOT report
 `root_auth_content_verified`.
 
 After CMRA repair, successful v43 full-archive content conformance, and the
-full root-auth recomputation scope above, a key-holding verifier MUST:
+full root-auth recomputation scope above, a full RootAuth verifier MUST:
 
 1. Enforce the replicated global input agreement rules in §30.9.0.1 before
    selecting any `CryptoHeader` or `RootAuthFooterV1` copy as a root-auth
@@ -6947,7 +7055,7 @@ Therefore:
 - `archive_root` does not include per-volume critical metadata leaves.
 - `archive_root` does not include parity BlockRecord payload bytes.
 - `archive_root` does include global FEC layout and data BlockRecord bytes.
-- A key-holding reader may verify `archive_root` after losing up to the
+- A full-verification reader may verify `archive_root` after losing up to the
   configured volume-loss tolerance if it can reconstruct every required data
   BlockRecord and validate IndexRoot/IndexShard metadata.
 
@@ -6959,11 +7067,11 @@ Verification APIs and CLI output MUST distinguish these results:
   content-conformance operation defined in §30.9.6. This result is available only
   after both gates in §30.9.6 have completed.
 - `root_auth_deferred_full_archive_scan_required`: the requested operation
-  validated only a partial archive view. The reader may report ordinary HMAC/AEAD
-  results for checked metadata and objects, but root auth is deferred or
+  validated only a partial archive view. The reader may report ordinary
+  mode-specific integrity results for checked metadata and objects, but root auth is deferred or
   unavailable until the global recomputation required by §30.9.6 can run.
 - `authenticated_metadata_not_root_signed`: per-volume authenticated metadata
-  was checked by HMAC and CMRA cross-checks but is intentionally outside
+  was checked by mode-specific integrity and CMRA cross-checks but is intentionally outside
   `archive_root`, including `VolumeHeader.volume_index`,
   `ManifestFooter.volume_index`, `VolumeTrailer.volume_index`,
   `VolumeTrailer.bytes_written`, root-auth footer offsets, physical offsets,
@@ -7024,7 +7132,8 @@ A public verifier may:
    `RootAuthFooterV1.archive_root`, then verify the authenticator over exactly
    that matching 32-byte value using an external trusted key/profile.
 
-Public no-key candidate selection MUST NOT depend on HMACs. A public candidate
+Public no-key candidate selection MUST NOT depend on mode-specific terminal
+integrity fields. A public candidate
 is acceptable only when all of the following public checks pass:
 
 1. The candidate is located by the final locator, mirror locator, a bounded
@@ -7049,8 +7158,9 @@ is acceptable only when all of the following public checks pass:
 Among multiple passing public scanned candidates, §30.6 ordering-anchor rules
 apply without HMAC. If no final, mirror, scanned locator, or locatorless header
 candidate passes these public checks, public no-key verification is unavailable
-or incomplete. Implementations MUST NOT silently apply the key-holding scanned
-candidate rule, which requires HMACs, to public no-key mode.
+or incomplete. Implementations MUST NOT silently apply the full-verification
+scanned candidate rule, which requires mode-specific terminal integrity, to
+public no-key mode.
 
 #### Public-safe VolumeTrailer Profile
 
@@ -7059,8 +7169,8 @@ Public no-key verification MUST NOT use `VolumeTrailer.root_auth_flags`,
 `manifest_footer_offset`, `manifest_footer_length`, or `bytes_written` unless
 the exact recovered SerializedRegion type 5 bytes pass every check below. These
 checks are public syntax, bounds, and signature-input selection rules only.
-They do not verify `VolumeTrailer.trailer_hmac` and MUST NOT be reported as
-terminal-metadata authentication.
+They do not verify `VolumeTrailer.trailer_hmac` or `trailer_digest` and MUST NOT
+be reported as terminal-metadata authentication.
 
 For each accepted public candidate volume:
 
@@ -7100,8 +7210,8 @@ Public no-key verification MUST NOT use `CryptoHeader.length`, `block_size`,
 unless the public `VolumeHeader`/`CryptoHeader` copy that supplied those fields
 passes every check below. These checks are public syntax, bounds, and
 signature-input selection rules only. They do not authenticate the
-`CryptoHeader`, do not run a KDF, do not verify `CryptoHeader.header_hmac`, and
-do not apply post-HMAC critical-extension semantics.
+`CryptoHeader`, do not run a KDF, do not verify the trailing CryptoHeader
+integrity field, and do not apply post-integrity critical-extension semantics.
 
 For each accepted public candidate volume:
 
@@ -7118,24 +7228,27 @@ For each accepted public candidate volume:
    `CryptoHeaderFixed.length` byte range MUST be available inside
    SerializedRegion type 2. The length MUST be large enough to contain the
    fixed header, the selected KDF parameter payload, a terminator TLV, and the
-   trailing 32-byte `header_hmac`, and MUST be no larger than the active cap.
+   trailing 32-byte integrity field, and MUST be no larger than the active cap.
 3. `compression_algo`, `aead_algo`, `fec_algo`, and `kdf_algo` MUST be values
    defined by §5. In v43 public no-key mode, `compression_algo` MUST be
    `ZstdFramed` and `fec_algo` MUST be `ReedSolomonGF16`, matching the v43
-   registry requirements. The
+   registry requirements. The §5.1 protection-mode cross-field rule MUST pass:
+   `aead_algo = None` iff `kdf_algo = None`. The
    selected KDF parameter payload MUST fit before `length - 32` and its
    `algo_tag` MUST match `kdf_algo`. For `Raw`, the payload is exactly the
    two-byte raw KDF parameter form with `algo_tag = 0`. For `Argon2id`, the
    fixed prefix and complete salt MUST fit, `algo_tag = 1`, `salt_length` MUST
    be in `8..64`, `t_cost` and `parallelism` MUST be non-zero,
    `m_cost_kib >= 8 * parallelism`, and all KDF scalar values MUST fit active
-   reader caps. A public verifier checks this framing and these scalar bounds
-   without deriving any key.
+   reader caps. For `None`, the payload is exactly the two-byte unencrypted-mode
+   KDF parameter form with `algo_tag = 2`; no key material, salt, or subkeys
+   exist. A public verifier checks this framing and these scalar bounds without
+   deriving any key.
 4. `CryptoHeader` reserved bytes MUST be zero. The Extension TLV list MUST
-   satisfy the §9 pre-HMAC structural scan: every TLV header fits before
+   satisfy the §9 pre-integrity structural scan: every TLV header fits before
    `length - 32`, every payload length is `<= 256`, `tag = 0` appears only as
    the terminator with `length = 0`, the terminator is present, and it ends
-   exactly at `length - 32` immediately before `header_hmac`.
+   exactly at `length - 32` immediately before the trailing integrity field.
 
    Public no-key verification MUST then apply the subset of §9 extension
    acceptance rules that can be decided from bounded public TLV framing before
@@ -7143,13 +7256,15 @@ For each accepted public candidate volume:
    selection, or `archive_root` recomputation. If the TLV list contains an
    unknown critical extension, a forbidden extension tag, a duplicate known
    extension tag, or a known extension payload whose malformed value can be
-   determined without `CryptoHeader.header_hmac`, public no-key verification
+   determined without CryptoHeader integrity verification, public no-key verification
    MUST fail or return `public_crypto_header_extension_unavailable`. This
    outcome is not `public_data_block_commitment_verified` and MUST NOT be
    described as successful v43 public verification. Unknown non-critical
    extensions that pass bounded TLV framing MAY be ignored for public no-key
-   verification, matching key-holding behavior after HMAC succeeds.
-5. The pre-HMAC scalar checks that do not require HMAC MUST pass:
+   verification, matching full-verification behavior after mode-specific
+   integrity succeeds.
+5. The pre-integrity scalar checks that do not require the trailing integrity
+   field to verify MUST pass:
    `has_dictionary` is 0 or 1, `volume_loss_tolerance < stripe_width`,
    `bit_rot_buffer_pct <= 100`, all class data-shard maxima are non-zero,
    `chunk_size != 0`, `envelope_target_size != 0`,
@@ -7281,10 +7396,10 @@ public_data_block_leaf_payload =
 The public verifier MUST NOT decrypt IndexRoot, synthesize object extents,
 repair missing data with object FEC, infer absent leaves, or use parity
 BlockRecords in this root. For a conforming intact archive this public leaf set
-is byte-identical to the key-holding §30.9.4 data leaf set because later
-HMAC/AEAD metadata validation proves the observed `kind` and `flags` match the
-authenticated object extents. Public no-key verification itself does not prove
-that stronger claim.
+is byte-identical to the full-verification §30.9.4 data leaf set because later
+mode-specific metadata validation proves the observed `kind` and `flags` match
+the authenticated object extents. Public no-key verification itself does not
+prove that stronger claim.
 
 Public verification APIs and CLI output MUST report the unchecked physical
 scope separately from the signature result:
@@ -7295,35 +7410,43 @@ scope separately from the signature result:
   component digests. In unencrypted mode this commitment therefore covers the
   plaintext data blocks directly.
 - `public_physical_completeness_unverified`: public verification did not
-  authenticate per-volume terminal `block_count`, physical EOF, trailer HMACs,
-  or final physical offsets.
+  authenticate per-volume terminal `block_count`, physical EOF, trailer
+  integrity fields, or final physical offsets.
 - `public_recovery_margin_unchecked`: public verification did not authenticate
   parity BlockRecord presence, parity payload integrity, CMRA recovery strength,
   or object-FEC repair margin.
 
 These diagnostics MUST accompany every successful public no-key result unless a
-separate key-holding or full physical-instance diagnostic mode has actually run
+separate full RootAuth or full physical-instance diagnostic mode has actually run
 and reported its own result.
 
 The only conforming public outcome is:
 
 ```text
-Trusted key signed a commitment to this observed CRC-valid public encrypted
-data-block set and to opaque component digests. Plaintext, IndexRoot,
-HMAC-authenticated metadata, physical completeness, and recovery margin were
-not inspected.
+Trusted key signed a commitment to this observed CRC-valid public data-block set
+(ciphertext in an encryption mode, plaintext in unencrypted mode) and to opaque
+component digests. Plaintext recovery for encrypted archives, decoded
+file/content authenticity, IndexRoot, mode-specifically authenticated metadata,
+physical completeness, and recovery margin were not inspected.
 ```
+
+For unencrypted archives, public no-key verification may claim only a signer
+commitment to the observed CRC-valid plaintext data BlockRecord payloads. It
+MUST NOT claim those bytes form the authentic decoded file list, tar stream,
+IndexRoot, metadata graph, complete physical archive, or recovery set.
 
 Public verification MUST fail, or return an explicitly incomplete result, when
 data blocks are missing or CRC-failed. Public verifiers MUST NOT claim:
 
-- plaintext authenticity;
+- plaintext recovery for encrypted archives;
+- decoded file/content plaintext authenticity;
 - file-list authenticity;
 - IndexRoot authenticity;
-- HMAC-authenticated metadata validity;
+- mode-specifically authenticated metadata validity;
 - FEC recovery of missing data.
 
-Key-holding verification is required for those claims.
+Full RootAuth verification is required for decoded file/content, metadata,
+physical-completeness, and recovery claims.
 
 ### 30.12 Reader Bootstrap Order
 
@@ -7339,13 +7462,17 @@ Seekable v43 open order:
 5. Validate image CRC, image SHA-256, region digests, offsets, and lengths.
 6. Parse recovered `VolumeHeader`, `CryptoHeader`, `ManifestFooter`, optional
    `RootAuthFooterV1`, and `VolumeTrailer`.
-7. Treat recovered bytes as untrusted until:
+7. Treat recovered bytes as untrusted until (encryption-mode chain shown; in
+   unencrypted mode the keyed steps are replaced by their §9 unkeyed-digest
+   equivalents):
    - `VolumeHeader.header_crc32c` verifies;
    - `CryptoHeader` framing is bounded;
-   - the key/passphrase derives `mac_key`;
-   - `CryptoHeader.header_hmac` verifies;
-   - `VolumeTrailer.trailer_hmac` verifies;
-   - `ManifestFooter.manifest_hmac` verifies;
+   - encryption mode: the key/passphrase derives `mac_key` and
+     `CryptoHeader.header_hmac` verifies; unencrypted mode (`aead_algo = None`):
+     no key is derived and the unkeyed `header_digest` (§9) verifies;
+   - `VolumeTrailer` and `ManifestFooter` integrity verify
+     (`trailer_hmac`/`manifest_hmac` in an encryption mode; the unkeyed
+     `trailer_digest`/`manifest_digest` of §11/§12 in unencrypted mode);
    - all identity, offset, length, block-count, and adjacency checks pass.
 8. Use recovered metadata to locate BlockRecords and IndexRoot.
 9. If root auth is present and requested, run the v43 full-archive
@@ -7396,16 +7523,17 @@ ManifestFooter | RootAuthFooterV1? | VolumeTrailer | CMRA | LocatorMirror | Loca
 If the terminal tail exceeds `terminal_tail_cap` before EOF, the reader MUST
 abort without committing provisional output.
 
-For non-seekable sequential extraction, key-holding root auth is available only
+For non-seekable sequential extraction, full RootAuth verification is available only
 when the reader has enough retained state to run the same §30.9.6 recomputation a
 seekable reader would run. That retained state MUST include:
 
 1. Per-block leaf state for every signed data-kind BlockRecord needed by §30.9.4,
    including metadata BlockRecords as well as payload BlockRecords. The state
    MUST include `block_index`, `kind`, `flags`, and either the exact
-   BLOCK_SIZE-byte encrypted data payload or a domain-separated leaf hash that
-   is sufficient to recompute `data_block_merkle_root` after authenticated
-   object extents are known.
+   BLOCK_SIZE-byte stored data payload (ciphertext in an encryption mode,
+   plaintext in unencrypted mode) or a domain-separated leaf hash that is
+   sufficient to recompute `data_block_merkle_root` after authenticated object
+   extents are known.
 2. Buffered or reconstructed metadata objects needed to compute `index_digest`
    and `fec_layout_digest`, including IndexRoot plaintext, IndexShard tables,
    dictionary metadata when present, directory-hint metadata when present, and
@@ -7420,10 +7548,11 @@ non-seekable operation requires an explicit external trusted API source that
 defines and supplies the missing `RootAuthFooterV1`, IndexRoot, metadata
 objects, object extents, and data-leaf commitments. That external source is not
 part of the on-disk v43 archive format and does not change the v43 terminal
-layout, CMRA, locator, HMAC, AEAD, footer, or `archive_root` verification
+layout, CMRA, locator, mode-specific integrity, footer, or `archive_root` verification
 semantics defined here. Without retained state or such an external trusted
 source, root auth is unavailable; an operation that requires root auth MUST
-fail rather than silently downgrade to ordinary HMAC/AEAD verification.
+fail rather than silently downgrade to ordinary mode-specific integrity
+verification.
 
 For dictionary-compressed non-seekable streams, the §12.2 sidecar requirement
 still applies: the reader needs authenticated IndexRoot and dictionary object
@@ -7452,10 +7581,11 @@ that non-seekable operation.
 2. Write `VolumeHeader`, `CryptoHeader`, and BlockRecords in §19 order.
 3. Maintain `data_block_merkle_root` state for data BlockRecords if root auth
    is enabled.
-4. Build and HMAC `ManifestFooter`.
+4. Build `ManifestFooter` and compute its mode-specific integrity field.
 5. If root auth is enabled, choose root-auth descriptor fields and exact
    authenticator output length.
-6. Build and HMAC `VolumeTrailer` with v43 root-auth pointer fields.
+6. Build `VolumeTrailer` with v43 root-auth pointer fields and compute its
+   mode-specific integrity field.
 7. Compute `critical_metadata_digest`, `index_digest`, `fec_layout_digest`,
    `data_block_merkle_root`, `signer_identity_digest`, and `archive_root`.
 8. If root auth is enabled, obtain authenticator bytes over `archive_root` and
@@ -7497,10 +7627,11 @@ No step requires rewriting bytes already emitted to a volume.
 
 ## 32. Glossary
 
-- **Block** — fixed-`BLOCK_SIZE` ciphertext/parity; FEC unit.
-- **Envelope** — packed group of zstd frames; AEAD unit.
+- **Block** — fixed-`BLOCK_SIZE` stored data/parity unit; data is ciphertext in
+  an encryption mode and plaintext in unencrypted mode.
+- **Envelope** — packed group of zstd frames; object-validation unit.
 - **Frame** — one zstd frame; compression unit.
-- **FEC object** — one encrypted object repaired with its own data/parity
+- **FEC object** — one stored object repaired with its own data/parity
   block extent: payload envelope, index shard, or IndexRoot. IndexRoot
   still needs ManifestFooter or bootstrap sidecar metadata to locate that
   extent.
