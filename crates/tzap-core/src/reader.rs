@@ -6,14 +6,11 @@ use std::thread;
 
 use sha2::{Digest, Sha256};
 
-use crate::compression::{
-    decompress_exact_zstd_frame, decompress_exact_zstd_frame_with_dictionary,
-    validate_exact_zstd_frame,
-};
+use crate::compression::{decompress_exact_zstd_frame, validate_exact_zstd_frame};
 use crate::crypto::{
     decrypt_padded_aead_object, verify_hmac, AeadObjectContext, HmacDomain, MasterKey, Subkeys,
 };
-use crate::fec::repair_data_gf16;
+use crate::fec::{encode_parity_gf16, repair_data_gf16};
 use crate::format::{
     BlockKind, ExtractError, FormatError, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN,
     CRITICAL_METADATA_IMAGE_FIXED_LEN, CRITICAL_METADATA_RECOVERY_HEADER_LEN,
@@ -26,7 +23,9 @@ use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, DirectoryHintShardEntry, DirectoryHintTable,
     EnvelopeEntry, FileEntry, FrameEntry, IndexRoot, IndexShard, MetadataLimits, ShardEntry,
 };
-use crate::non_seekable_reader::StreamedPayloadSummary;
+use crate::non_seekable_reader::{
+    StreamedEnvelopeSummary, StreamedFrameSummary, StreamedPayloadSummary,
+};
 use crate::raw_stream_profile::reject_unsupported_raw_stream_profile;
 use crate::root_auth::{
     archive_root, critical_metadata_digest, data_block_merkle_root, fec_layout_digest,
@@ -36,8 +35,9 @@ use crate::root_auth::{
 use crate::tar_model::{
     parse_tar_member_group, restore_streaming_tar_member_group,
     stream_regular_tar_member_group_to_writer, validate_tar_stream_total_extraction_size,
-    MetadataDiagnostic, OwnedTarMember, SafeExtractionOptions, TarEntryKind, TarMemberGroupReader,
-    TarStreamTotalExtractionSizeValidator,
+    MetadataDiagnostic, NoopTarStreamObserver, OwnedTarMember, SafeExtractionOptions, TarEntryKind,
+    TarMemberGroupReader, TarStreamFilesystemRestoreObserver, TarStreamObserver,
+    TarStreamSummaryValidator, TarStreamTotalExtractionSizeValidator,
 };
 use crate::wire::{
     BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage, CriticalMetadataRecoveryHeader,
@@ -229,6 +229,14 @@ pub struct ArchiveContentVerification<'a> {
     archive: &'a OpenedArchive,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveRepairPatch {
+    pub volume_index: u32,
+    pub block_index: u64,
+    pub record_offset: u64,
+    pub record_bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootAuthDiagnostic {
     RootAuthContentVerified,
@@ -316,6 +324,12 @@ struct ObjectExtent {
     encrypted_size: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParityReadPolicy {
+    Always,
+    RepairOnly,
+}
+
 pub(crate) struct StreamedArchiveOpenParts {
     pub(crate) options: ReaderOptions,
     pub(crate) observed_archive_bytes: u64,
@@ -347,6 +361,7 @@ struct DecodedTarMemberGroupReader<'a> {
     archive: &'a OpenedArchive,
     shard: &'a IndexShard,
     file: &'a FileEntry,
+    decompressor: zstd::bulk::Decompressor<'static>,
     next_frame_offset: u64,
     cached_envelope_index: Option<u64>,
     cached_envelope_plaintext: Vec<u8>,
@@ -392,6 +407,30 @@ struct OpenedBlockProvider<'a> {
 }
 
 impl SeekableBlockSource {
+    fn record_location(&self, block_index: u64) -> Result<(u32, u64), FormatError> {
+        if self.stripe_width == 0 {
+            return Err(FormatError::ZeroStripeWidth);
+        }
+        let volume_index = u32::try_from(block_index % self.stripe_width as u64)
+            .map_err(|_| FormatError::InvalidArchive("BlockRecord volume index overflow"))?;
+        let Some(volume) = self
+            .volumes
+            .get(volume_index as usize)
+            .and_then(Option::as_ref)
+        else {
+            return Err(FormatError::InvalidArchive(
+                "repair output requires all archive volumes",
+            ));
+        };
+        let slot = block_index / self.stripe_width as u64;
+        if slot >= volume.block_count {
+            return Err(FormatError::InvalidArchive(
+                "BlockRecord global coverage has a gap",
+            ));
+        }
+        Ok((volume_index, volume.record_offset(slot)?))
+    }
+
     fn block(&self, block_index: u64) -> Result<Option<BlockRecord>, FormatError> {
         if self.stripe_width == 0 {
             return Err(FormatError::ZeroStripeWidth);
@@ -416,60 +455,40 @@ impl SeekableBlockSource {
         }
     }
 
-    fn validate_complete_coverage(&self) -> Result<(), FormatError> {
-        let mut total_block_count = 0u64;
-        for volume in &self.volumes {
-            let volume = volume.as_ref().ok_or(FormatError::InvalidArchive(
-                "missing volume in complete set",
-            ))?;
-            total_block_count = checked_u64_add(
-                total_block_count,
-                volume.block_count,
-                "BlockRecord count overflow",
-            )?;
-            for slot in 0..volume.block_count {
-                let block_index = checked_u64_add(
-                    volume.volume_index as u64,
-                    checked_u64_mul(slot, self.stripe_width as u64, "BlockRecord index overflow")?,
-                    "BlockRecord index overflow",
-                )?;
-                match volume.read_slot(slot, block_index) {
-                    Ok(_) => {}
-                    Err(err) if block_record_error_is_recoverable_erasure(&err) => {}
-                    Err(err) => return Err(err),
-                }
-            }
-        }
-        for volume in self.volumes.iter().flatten() {
-            let expected = expected_striped_volume_block_count(
-                total_block_count,
-                self.stripe_width,
-                volume.volume_index,
-            )?;
-            if volume.block_count != expected {
-                return Err(FormatError::InvalidArchive(
-                    "BlockRecord global coverage has a gap",
-                ));
-            }
-        }
-        Ok(())
-    }
-
     fn is_complete_volume_set(&self) -> bool {
         self.volumes.iter().all(Option::is_some)
+    }
+
+    fn total_block_count(&self) -> Result<u64, FormatError> {
+        self.volumes
+            .iter()
+            .map(|volume| {
+                volume
+                    .as_ref()
+                    .map(|volume| volume.block_count)
+                    .ok_or(FormatError::InvalidArchive(
+                        "missing volume in complete set",
+                    ))
+            })
+            .try_fold(0u64, |sum, count| {
+                checked_u64_add(sum, count?, "BlockRecord count overflow")
+            })
     }
 }
 
 impl SeekableVolumeSource {
-    fn read_slot(&self, slot: u64, expected_block_index: u64) -> Result<BlockRecord, FormatError> {
-        let record_offset = self
-            .crypto_end
+    fn record_offset(&self, slot: u64) -> Result<u64, FormatError> {
+        self.crypto_end
             .checked_add(checked_u64_mul(
                 slot,
                 self.record_len,
                 "BlockRecord offset overflow",
             )?)
-            .ok_or(FormatError::InvalidArchive("BlockRecord offset overflow"))?;
+            .ok_or(FormatError::InvalidArchive("BlockRecord offset overflow"))
+    }
+
+    fn read_slot(&self, slot: u64, expected_block_index: u64) -> Result<BlockRecord, FormatError> {
+        let record_offset = self.record_offset(slot)?;
         let raw = read_at_vec(
             self.reader.as_ref(),
             record_offset,
@@ -507,6 +526,16 @@ impl BlockProvider for OpenedBlockProvider<'_> {
 
 type DirectoryHintMap = BTreeMap<Vec<u8>, BTreeSet<u32>>;
 pub type ExtractedRegularFile = (Vec<u8>, Vec<MetadataDiagnostic>);
+const FAST_FULL_EXTRACT_UNIQUE_PATHS_UNSUPPORTED: &str =
+    "fast full extract requires unique archive paths";
+
+#[derive(Debug)]
+struct PayloadIndexTables {
+    shards: Vec<IndexShard>,
+    file_count: u64,
+    frames: BTreeMap<u64, FrameEntry>,
+    envelopes: BTreeMap<u64, EnvelopeEntry>,
+}
 
 pub fn open_archive(bytes: &[u8], master_key: &MasterKey) -> Result<OpenedArchive, FormatError> {
     OpenedArchive::open_with_options(bytes, master_key, ReaderOptions::default())
@@ -1451,16 +1480,238 @@ impl OpenedArchive {
             .transpose()
     }
 
+    pub fn extract_indexed_files_to(
+        &self,
+        root: &std::path::Path,
+        options: SafeExtractionOptions,
+        jobs: usize,
+    ) -> Result<Vec<(String, Vec<MetadataDiagnostic>)>, FormatError> {
+        if jobs == 0 {
+            return Err(FormatError::ReaderUnsupported("jobs must be at least 1"));
+        }
+
+        let shards = self.load_all_index_shards()?;
+        let entries = final_index_entry_winners(&shards)?.into_iter().collect();
+        self.extract_winning_index_entries_to(&shards, entries, root, options, jobs)
+    }
+
     pub fn verify(&self) -> Result<(), FormatError> {
         self.verify_content().map(|_| ())
     }
 
     pub fn verify_content(&self) -> Result<ArchiveContentVerification<'_>, FormatError> {
-        if let Some(source) = &self.lazy_blocks {
-            if source.is_complete_volume_set() {
-                source.validate_complete_coverage()?;
+        let tables = self.load_payload_index_tables()?;
+        let streamed = self.scan_seekable_payload(
+            &tables,
+            u64::MAX,
+            NoopTarStreamObserver,
+            true,
+            ParityReadPolicy::Always,
+        )?;
+        self.validate_streamed_payload_summary(&tables, &streamed, false, true)?;
+        Ok(ArchiveContentVerification { archive: self })
+    }
+
+    pub fn repair_patches(&self) -> Result<Vec<ArchiveRepairPatch>, FormatError> {
+        let lazy_source = self
+            .lazy_blocks
+            .as_ref()
+            .ok_or(FormatError::ReaderUnsupported(
+                "repair output requires seekable archive input",
+            ))?;
+        if !lazy_source.is_complete_volume_set() {
+            return Err(FormatError::ReaderUnsupported(
+                "repair output requires all archive volumes",
+            ));
+        }
+
+        let shards = self.load_all_index_shards()?;
+        let rows = self.root_auth_fec_layout_rows(&shards)?;
+        let block_provider = self.block_provider();
+        let mut patches = BTreeMap::<u64, ArchiveRepairPatch>::new();
+        for row in rows.into_iter().filter(|row| row.present) {
+            self.collect_repair_patches_for_object(
+                &block_provider,
+                lazy_source,
+                row,
+                &mut patches,
+            )?;
+        }
+        Ok(patches.into_values().collect())
+    }
+
+    pub fn extract_all_to(
+        &self,
+        root: &std::path::Path,
+        options: SafeExtractionOptions,
+    ) -> Result<Vec<(String, Vec<MetadataDiagnostic>)>, FormatError> {
+        let tables = self.load_payload_index_tables()?;
+        if final_index_entry_winners(&tables.shards)?.len() as u64 != tables.file_count {
+            return Err(FormatError::ReaderUnsupported(
+                FAST_FULL_EXTRACT_UNIQUE_PATHS_UNSUPPORTED,
+            ));
+        }
+
+        let observer = TarStreamFilesystemRestoreObserver::new(root, options);
+        let streamed = self.scan_seekable_payload(
+            &tables,
+            total_extraction_size_cap(self.options, self.observed_archive_bytes),
+            observer,
+            false,
+            ParityReadPolicy::RepairOnly,
+        )?;
+        self.validate_streamed_payload_summary(&tables, &streamed, true, false)?;
+        streamed
+            .tar
+            .members
+            .into_iter()
+            .map(|member| Ok((utf8_path(&member.path)?, member.diagnostics)))
+            .collect()
+    }
+
+    fn collect_repair_patches_for_object(
+        &self,
+        blocks: &impl BlockProvider,
+        source: &SeekableBlockSource,
+        row: FecLayoutObjectRow,
+        patches: &mut BTreeMap<u64, ArchiveRepairPatch>,
+    ) -> Result<(), FormatError> {
+        let (data_kind, parity_kind, data_max, parity_max) =
+            self.fec_object_class_shape(row.object_class)?;
+        let extent = ObjectExtent {
+            first_block_index: row.first_block_index,
+            data_block_count: row.data_block_count,
+            parity_block_count: row.parity_block_count,
+            encrypted_size: row.encrypted_size,
+        };
+        validate_object_extent(extent, &self.crypto_header, data_max, parity_max)?;
+
+        let block_size = self.crypto_header.block_size as usize;
+        let data_count = extent.data_block_count as usize;
+        let parity_count = extent.parity_block_count as usize;
+        let mut data_shards = Vec::with_capacity(data_count);
+        let mut parity_shards = Vec::with_capacity(parity_count);
+
+        for offset in 0..data_count {
+            let block_index = checked_u64_add(extent.first_block_index, offset as u64, "object")?;
+            match blocks.block(block_index)? {
+                Some(record) => {
+                    if record.kind != data_kind {
+                        return Err(FormatError::InvalidArchive(
+                            "object data block has unexpected kind",
+                        ));
+                    }
+                    let should_be_last = offset + 1 == data_count;
+                    if record.is_last_data() != should_be_last {
+                        return Err(FormatError::InvalidArchive(
+                            "object last-data flag is not on the final data block",
+                        ));
+                    }
+                    data_shards.push(Some(record.payload.clone()));
+                }
+                None => data_shards.push(None),
             }
         }
+
+        for offset in 0..parity_count {
+            let block_index = checked_u64_add(
+                extent.first_block_index,
+                data_count as u64 + offset as u64,
+                "object",
+            )?;
+            match blocks.block(block_index)? {
+                Some(record) => {
+                    if record.kind != parity_kind {
+                        return Err(FormatError::InvalidArchive(
+                            "object parity block has unexpected kind",
+                        ));
+                    }
+                    if record.is_last_data() {
+                        return Err(FormatError::InvalidArchive(
+                            "object parity block has last-data flag",
+                        ));
+                    }
+                    parity_shards.push(Some(record.payload.clone()));
+                }
+                None => parity_shards.push(None),
+            }
+        }
+
+        let repaired_data = repair_data_gf16(&data_shards, &parity_shards, block_size)?;
+        for (offset, payload) in repaired_data.iter().enumerate() {
+            if data_shards[offset].is_none() {
+                let block_index =
+                    checked_u64_add(extent.first_block_index, offset as u64, "object")?;
+                let flags = if offset + 1 == data_count { 0x01 } else { 0 };
+                self.insert_repair_patch(
+                    patches,
+                    source,
+                    block_index,
+                    data_kind,
+                    flags,
+                    payload.clone(),
+                )?;
+            }
+        }
+
+        if parity_count > 0 {
+            let repaired_parity = encode_parity_gf16(&repaired_data, parity_count)?;
+            for (offset, payload) in repaired_parity.into_iter().enumerate() {
+                if parity_shards[offset].as_ref() != Some(&payload) {
+                    let block_index = checked_u64_add(
+                        extent.first_block_index,
+                        data_count as u64 + offset as u64,
+                        "object",
+                    )?;
+                    self.insert_repair_patch(
+                        patches,
+                        source,
+                        block_index,
+                        parity_kind,
+                        0,
+                        payload,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn insert_repair_patch(
+        &self,
+        patches: &mut BTreeMap<u64, ArchiveRepairPatch>,
+        source: &SeekableBlockSource,
+        block_index: u64,
+        kind: BlockKind,
+        flags: u8,
+        payload: Vec<u8>,
+    ) -> Result<(), FormatError> {
+        let (volume_index, record_offset) = source.record_location(block_index)?;
+        let record = BlockRecord {
+            block_index,
+            kind,
+            flags,
+            payload,
+            record_crc32c: 0,
+        };
+        let patch = ArchiveRepairPatch {
+            volume_index,
+            block_index,
+            record_offset,
+            record_bytes: record.to_bytes(),
+        };
+        if let Some(existing) = patches.insert(block_index, patch.clone()) {
+            if existing != patch {
+                return Err(FormatError::InvalidArchive(
+                    "conflicting repair patch for BlockRecord",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn load_payload_index_tables(&self) -> Result<PayloadIndexTables, FormatError> {
         if self.index_root.header.file_count > DIRECTORY_HINT_REQUIRED_FILE_COUNT
             && self.index_root.directory_hint_shards.is_empty()
         {
@@ -1524,21 +1775,59 @@ impl OpenedArchive {
             ));
         }
 
-        let tar_len = self.index_root.header.tar_total_size;
-        let mut content_hasher = Sha256::new();
-        let mut tar_cursor = 0u64;
+        Ok(PayloadIndexTables {
+            shards,
+            file_count,
+            frames,
+            envelopes,
+        })
+    }
+
+    fn scan_seekable_payload<O: TarStreamObserver>(
+        &self,
+        tables: &PayloadIndexTables,
+        extraction_cap: u64,
+        observer: O,
+        hash_content: bool,
+        parity_policy: ParityReadPolicy,
+    ) -> Result<StreamedPayloadSummary, FormatError> {
+        let mut tar = TarStreamSummaryValidator::with_observer(
+            self.crypto_header.max_path_length,
+            extraction_cap,
+            usize::MAX,
+            self.index_root.header.file_count,
+            observer,
+        );
+        let mut content_hasher = hash_content.then(Sha256::new);
+        let mut streamed_frames = Vec::with_capacity(tables.frames.len());
+        let streamed_envelopes = tables
+            .envelopes
+            .values()
+            .map(|envelope| StreamedEnvelopeSummary {
+                envelope_index: envelope.envelope_index,
+                first_block_index: envelope.first_block_index,
+                data_block_count: envelope.data_block_count,
+                parity_block_count: envelope.parity_block_count,
+                encrypted_size: envelope.encrypted_size,
+                plaintext_size: envelope.plaintext_size,
+                first_frame_index: envelope.first_frame_index,
+                frame_count: envelope.frame_count,
+            })
+            .collect::<Vec<_>>();
         let mut cached_envelope_index = None;
         let mut cached_envelope_plaintext = Vec::new();
+        let mut decompressor = self.new_payload_decompressor()?;
 
-        for frame in frames.values() {
+        for frame in tables.frames.values() {
             let envelope =
-                envelopes
+                tables
+                    .envelopes
                     .get(&frame.envelope_index)
                     .ok_or(FormatError::InvalidArchive(
                         "FrameEntry references missing EnvelopeEntry",
                     ))?;
             if cached_envelope_index != Some(envelope.envelope_index) {
-                cached_envelope_plaintext = self.load_payload_envelope(envelope)?;
+                cached_envelope_plaintext = self.load_payload_envelope(envelope, parity_policy)?;
                 cached_envelope_index = Some(envelope.envelope_index);
             }
             let compressed = slice(
@@ -1547,35 +1836,139 @@ impl OpenedArchive {
                 frame.compressed_size as usize,
                 "FrameEntry",
             )?;
-            let decoded = self.decompress_payload_frame(compressed, frame.decompressed_size)?;
-            if frame.tar_stream_offset != tar_cursor {
+            let tar_stream_offset = tar.tar_total_size();
+            let decoded = self.decompress_payload_frame_with(
+                &mut decompressor,
+                compressed,
+                frame.decompressed_size,
+            )?;
+            if decoded.is_empty() {
                 return Err(FormatError::InvalidArchive(
-                    "decoded frames leave tar gap or overlap",
+                    "zstd payload frame decompressed to zero bytes",
                 ));
             }
-            tar_cursor = tar_cursor
-                .checked_add(decoded.len() as u64)
-                .ok_or(FormatError::InvalidArchive("tar stream size overflow"))?;
-            if tar_cursor > tar_len {
-                return Err(FormatError::InvalidArchive(
-                    "FrameEntry exceeds IndexRoot tar_total_size",
-                ));
+            if let Some(hasher) = &mut content_hasher {
+                hasher.update(&decoded);
             }
-            content_hasher.update(&decoded);
+            tar.observe(&decoded)?;
+            streamed_frames.push(StreamedFrameSummary {
+                frame_index: frame.frame_index,
+                envelope_index: frame.envelope_index,
+                offset_in_envelope: frame.offset_in_envelope,
+                compressed_size: u32::try_from(compressed.len()).map_err(|_| {
+                    FormatError::InvalidArchive("FrameEntry.compressed_size overflow")
+                })?,
+                decompressed_size: u32::try_from(decoded.len()).map_err(|_| {
+                    FormatError::InvalidArchive("FrameEntry.decompressed_size overflow")
+                })?,
+                tar_stream_offset,
+            });
         }
 
-        if tar_cursor != tar_len {
-            return Err(FormatError::InvalidArchive("decoded frames leave tar gap"));
+        let mut content_sha256 = [0u8; 32];
+        if let Some(hasher) = content_hasher {
+            let digest = hasher.finalize();
+            content_sha256.copy_from_slice(&digest);
         }
-        if content_hasher.finalize().as_slice() != self.index_root.header.content_sha256 {
+        Ok(StreamedPayloadSummary {
+            tar: tar.finish()?,
+            content_sha256,
+            envelopes: streamed_envelopes,
+            frames: streamed_frames,
+        })
+    }
+
+    fn validate_streamed_payload_summary(
+        &self,
+        tables: &PayloadIndexTables,
+        streamed: &StreamedPayloadSummary,
+        enforce_total_extraction_cap: bool,
+        enforce_content_sha256: bool,
+    ) -> Result<(), FormatError> {
+        if enforce_total_extraction_cap
+            && streamed.tar.total_extraction_size
+                > total_extraction_size_cap(self.options, self.observed_archive_bytes)
+        {
+            return Err(FormatError::ReaderUnsupported(
+                "total extraction size exceeds configured cap",
+            ));
+        }
+
+        let streamed_payload_block_count =
+            streamed.envelopes.iter().try_fold(0u64, |sum, envelope| {
+                sum.checked_add(envelope.data_block_count as u64)
+                    .ok_or(FormatError::InvalidArchive("payload block count overflow"))
+            })?;
+        if streamed_payload_block_count != self.index_root.header.payload_block_count {
+            return Err(FormatError::InvalidArchive(
+                "streamed payload block count does not match IndexRoot",
+            ));
+        }
+
+        if streamed.tar.tar_total_size != self.index_root.header.tar_total_size {
+            return Err(FormatError::InvalidArchive(
+                "IndexRoot tar_total_size does not match streamed tar stream",
+            ));
+        }
+        if enforce_content_sha256
+            && streamed.content_sha256 != self.index_root.header.content_sha256
+        {
             return Err(FormatError::InvalidArchive(
                 "IndexRoot content_sha256 does not match decoded tar stream",
             ));
         }
 
+        let streamed_envelopes = streamed.envelope_map()?;
+        for envelope in tables.envelopes.values() {
+            let actual = streamed_envelopes.get(&envelope.envelope_index).ok_or(
+                FormatError::InvalidArchive(
+                    "metadata references missing streamed payload envelope",
+                ),
+            )?;
+            if actual.first_block_index != envelope.first_block_index
+                || actual.data_block_count != envelope.data_block_count
+                || actual.parity_block_count != envelope.parity_block_count
+                || actual.encrypted_size != envelope.encrypted_size
+                || actual.plaintext_size != envelope.plaintext_size
+                || actual.first_frame_index != envelope.first_frame_index
+                || actual.frame_count != envelope.frame_count
+            {
+                return Err(FormatError::InvalidArchive(
+                    "EnvelopeEntry does not match streamed payload envelope",
+                ));
+            }
+        }
+
+        let streamed_frames = streamed.frame_map()?;
+        for frame in tables.frames.values() {
+            let actual =
+                streamed_frames
+                    .get(&frame.frame_index)
+                    .ok_or(FormatError::InvalidArchive(
+                        "metadata references missing streamed payload frame",
+                    ))?;
+            if actual.envelope_index != frame.envelope_index
+                || actual.offset_in_envelope != frame.offset_in_envelope
+                || actual.compressed_size != frame.compressed_size
+                || actual.decompressed_size != frame.decompressed_size
+                || actual.tar_stream_offset != frame.tar_stream_offset
+                || streamed.frame_flags(actual)? != frame.flags
+            {
+                return Err(FormatError::InvalidArchive(
+                    "FrameEntry does not match streamed payload frame",
+                ));
+            }
+        }
+
+        let streamed_members = streamed.member_start_map()?;
+        if streamed.tar.members.len() as u64 != tables.file_count {
+            return Err(FormatError::InvalidArchive(
+                "streamed tar member count does not match decoded shards",
+            ));
+        }
         let mut file_extents = Vec::new();
         let mut directory_hint_map = DirectoryHintMap::new();
-        for (shard_row_index, shard) in shards.iter().enumerate() {
+        for (shard_row_index, shard) in tables.shards.iter().enumerate() {
             let shard_row_index = u32::try_from(shard_row_index)
                 .map_err(|_| FormatError::InvalidArchive("shard row index overflow"))?;
             for idx in 0..shard.files.len() {
@@ -1587,10 +1980,29 @@ impl OpenedArchive {
                             "FileEntry tar member start is missing",
                         ))?;
                 file_extents.push((start, file.tar_member_group_size));
-                let member = self.decode_loaded_owned_tar_member(shard, idx, false)?;
                 let path = shard
                     .file_path(idx)
                     .ok_or(FormatError::InvalidArchive("FileEntry path is missing"))?;
+                let member = streamed_members
+                    .get(&start)
+                    .ok_or(FormatError::InvalidArchive(
+                        "FileEntry tar member start is missing from streamed tar",
+                    ))?;
+                if member.path != path {
+                    return Err(FormatError::InvalidArchive(
+                        "tar member path does not match FileEntry path",
+                    ));
+                }
+                if member.logical_size != file.file_data_size {
+                    return Err(FormatError::InvalidArchive(
+                        "tar member size does not match FileEntry file_data_size",
+                    ));
+                }
+                if member.group_size != file.tar_member_group_size {
+                    return Err(FormatError::InvalidArchive(
+                        "FileEntry does not match streamed tar member",
+                    ));
+                }
                 add_expected_directory_hint_rows(
                     &mut directory_hint_map,
                     shard_row_index,
@@ -1599,13 +2011,13 @@ impl OpenedArchive {
                 );
             }
         }
-        validate_file_extent_coverage_ranges(&file_extents, tar_len)?;
+        validate_file_extent_coverage_ranges(&file_extents, self.index_root.header.tar_total_size)?;
         if !self.index_root.directory_hint_shards.is_empty() {
             let hint_tables = self.load_all_directory_hint_tables()?;
             validate_directory_hint_tables_against_expected(&hint_tables, &directory_hint_map)?;
         }
 
-        Ok(ArchiveContentVerification { archive: self })
+        Ok(())
     }
 
     pub(crate) fn from_streamed_parts(
@@ -1662,190 +2074,8 @@ impl OpenedArchive {
         &self,
         streamed: &StreamedPayloadSummary,
     ) -> Result<(), FormatError> {
-        if self.index_root.header.file_count > DIRECTORY_HINT_REQUIRED_FILE_COUNT
-            && self.index_root.directory_hint_shards.is_empty()
-        {
-            return Err(FormatError::InvalidArchive(
-                "IndexRoot file_count requires directory hints",
-            ));
-        }
-        if streamed.tar.total_extraction_size
-            > total_extraction_size_cap(self.options, self.observed_archive_bytes)
-        {
-            return Err(FormatError::ReaderUnsupported(
-                "total extraction size exceeds configured cap",
-            ));
-        }
-
-        let shards = self.load_all_index_shards()?;
-        let mut file_count = 0u64;
-        let mut frames = BTreeMap::<u64, FrameEntry>::new();
-        let mut envelopes = BTreeMap::<u64, EnvelopeEntry>::new();
-
-        for shard in &shards {
-            file_count = file_count
-                .checked_add(shard.files.len() as u64)
-                .ok_or(FormatError::InvalidArchive("file count overflow"))?;
-            for frame in &shard.frames {
-                if let Some(existing) = frames.insert(frame.frame_index, frame.clone()) {
-                    if existing != *frame {
-                        return Err(FormatError::InvalidArchive(
-                            "duplicate FrameEntry rows do not match",
-                        ));
-                    }
-                }
-            }
-            for envelope in &shard.envelopes {
-                if let Some(existing) = envelopes.insert(envelope.envelope_index, envelope.clone())
-                {
-                    if existing != *envelope {
-                        return Err(FormatError::InvalidArchive(
-                            "duplicate EnvelopeEntry rows do not match",
-                        ));
-                    }
-                }
-            }
-        }
-        validate_global_file_table_order(&shards)?;
-
-        if file_count != self.index_root.header.file_count {
-            return Err(FormatError::InvalidArchive(
-                "IndexRoot file_count does not match decoded shards",
-            ));
-        }
-        verify_dense_keys(&frames, self.index_root.header.frame_count, "FrameEntry")?;
-        verify_dense_keys(
-            &envelopes,
-            self.index_root.header.envelope_count,
-            "EnvelopeEntry",
-        )?;
-        validate_envelope_frame_coverage(&frames, &envelopes)?;
-        self.validate_encrypted_object_block_ranges(&envelopes)?;
-
-        let metadata_payload_block_count = envelopes.values().try_fold(0u64, |sum, envelope| {
-            sum.checked_add(envelope.data_block_count as u64)
-                .ok_or(FormatError::InvalidArchive("payload block count overflow"))
-        })?;
-        if metadata_payload_block_count != self.index_root.header.payload_block_count {
-            return Err(FormatError::InvalidArchive(
-                "IndexRoot payload_block_count does not match envelopes",
-            ));
-        }
-        let streamed_payload_block_count =
-            streamed.envelopes.iter().try_fold(0u64, |sum, envelope| {
-                sum.checked_add(envelope.data_block_count as u64)
-                    .ok_or(FormatError::InvalidArchive("payload block count overflow"))
-            })?;
-        if streamed_payload_block_count != self.index_root.header.payload_block_count {
-            return Err(FormatError::InvalidArchive(
-                "streamed payload block count does not match IndexRoot",
-            ));
-        }
-
-        if streamed.tar.tar_total_size != self.index_root.header.tar_total_size {
-            return Err(FormatError::InvalidArchive(
-                "IndexRoot tar_total_size does not match streamed tar stream",
-            ));
-        }
-        if streamed.content_sha256 != self.index_root.header.content_sha256 {
-            return Err(FormatError::InvalidArchive(
-                "IndexRoot content_sha256 does not match streamed tar stream",
-            ));
-        }
-
-        let streamed_envelopes = streamed.envelope_map()?;
-        for envelope in envelopes.values() {
-            let actual = streamed_envelopes.get(&envelope.envelope_index).ok_or(
-                FormatError::InvalidArchive(
-                    "metadata references missing streamed payload envelope",
-                ),
-            )?;
-            if actual.first_block_index != envelope.first_block_index
-                || actual.data_block_count != envelope.data_block_count
-                || actual.parity_block_count != envelope.parity_block_count
-                || actual.encrypted_size != envelope.encrypted_size
-                || actual.plaintext_size != envelope.plaintext_size
-                || actual.first_frame_index != envelope.first_frame_index
-                || actual.frame_count != envelope.frame_count
-            {
-                return Err(FormatError::InvalidArchive(
-                    "EnvelopeEntry does not match streamed payload envelope",
-                ));
-            }
-        }
-
-        let streamed_frames = streamed.frame_map()?;
-        for frame in frames.values() {
-            let actual =
-                streamed_frames
-                    .get(&frame.frame_index)
-                    .ok_or(FormatError::InvalidArchive(
-                        "metadata references missing streamed payload frame",
-                    ))?;
-            if actual.envelope_index != frame.envelope_index
-                || actual.offset_in_envelope != frame.offset_in_envelope
-                || actual.compressed_size != frame.compressed_size
-                || actual.decompressed_size != frame.decompressed_size
-                || actual.tar_stream_offset != frame.tar_stream_offset
-                || streamed.frame_flags(actual)? != frame.flags
-            {
-                return Err(FormatError::InvalidArchive(
-                    "FrameEntry does not match streamed payload frame",
-                ));
-            }
-        }
-
-        let streamed_members = streamed.member_start_map()?;
-        if streamed.tar.members.len() as u64 != file_count {
-            return Err(FormatError::InvalidArchive(
-                "streamed tar member count does not match decoded shards",
-            ));
-        }
-        let mut file_extents = Vec::new();
-        let mut directory_hint_map = DirectoryHintMap::new();
-        for (shard_row_index, shard) in shards.iter().enumerate() {
-            let shard_row_index = u32::try_from(shard_row_index)
-                .map_err(|_| FormatError::InvalidArchive("shard row index overflow"))?;
-            for idx in 0..shard.files.len() {
-                let file = &shard.files[idx];
-                let start =
-                    shard
-                        .tar_member_group_start(idx)
-                        .ok_or(FormatError::InvalidArchive(
-                            "FileEntry tar member start is missing",
-                        ))?;
-                file_extents.push((start, file.tar_member_group_size));
-                let path = shard
-                    .file_path(idx)
-                    .ok_or(FormatError::InvalidArchive("FileEntry path is missing"))?;
-                let member = streamed_members
-                    .get(&start)
-                    .ok_or(FormatError::InvalidArchive(
-                        "FileEntry tar member start is missing from streamed tar",
-                    ))?;
-                if member.path != path
-                    || member.logical_size != file.file_data_size
-                    || member.group_size != file.tar_member_group_size
-                {
-                    return Err(FormatError::InvalidArchive(
-                        "FileEntry does not match streamed tar member",
-                    ));
-                }
-                add_expected_directory_hint_rows(
-                    &mut directory_hint_map,
-                    shard_row_index,
-                    path,
-                    member.kind,
-                );
-            }
-        }
-        validate_file_extent_coverage_ranges(&file_extents, streamed.tar.tar_total_size)?;
-        if !self.index_root.directory_hint_shards.is_empty() {
-            let hint_tables = self.load_all_directory_hint_tables()?;
-            validate_directory_hint_tables_against_expected(&hint_tables, &directory_hint_map)?;
-        }
-
-        Ok(())
+        let tables = self.load_payload_index_tables()?;
+        self.validate_streamed_payload_summary(&tables, streamed, true, true)
     }
 
     pub fn verify_root_auth_with<F>(&self, verifier: F) -> Result<RootAuthVerification, FormatError>
@@ -1953,9 +2183,13 @@ impl OpenedArchive {
         )
     }
 
-    fn load_payload_envelope(&self, envelope: &EnvelopeEntry) -> Result<Vec<u8>, FormatError> {
+    fn load_payload_envelope(
+        &self,
+        envelope: &EnvelopeEntry,
+        parity_policy: ParityReadPolicy,
+    ) -> Result<Vec<u8>, FormatError> {
         let block_provider = self.block_provider();
-        let plaintext = load_decrypted_object_from_parts(
+        let plaintext = load_decrypted_object_from_parts_with_parity_policy(
             &block_provider,
             ObjectLoadContext::payload(
                 &self.volume_header,
@@ -1963,6 +2197,7 @@ impl OpenedArchive {
                 &self.subkeys,
                 envelope,
             ),
+            parity_policy,
         )?;
         if plaintext.len() != envelope.plaintext_size as usize {
             return Err(FormatError::InvalidArchive(
@@ -2054,7 +2289,7 @@ impl OpenedArchive {
         let expected_path = shard
             .file_path(file_index)
             .ok_or(FormatError::InvalidArchive("FileEntry path is missing"))?;
-        let mut reader = DecodedTarMemberGroupReader::new(self, shard, file);
+        let mut reader = DecodedTarMemberGroupReader::new(self, shard, file)?;
         stream_regular_tar_member_group_to_writer(
             &mut reader,
             expected_path,
@@ -2080,7 +2315,7 @@ impl OpenedArchive {
         let expected_path = shard
             .file_path(file_index)
             .ok_or(FormatError::InvalidArchive("FileEntry path is missing"))?;
-        let mut reader = DecodedTarMemberGroupReader::new(self, shard, file);
+        let mut reader = DecodedTarMemberGroupReader::new(self, shard, file)?;
         restore_streaming_tar_member_group(
             root,
             expected_path,
@@ -2091,6 +2326,71 @@ impl OpenedArchive {
             &mut reader,
         )
         .map_err(format_error_from_extract_error)
+    }
+
+    fn extract_winning_index_entries_to(
+        &self,
+        shards: &[IndexShard],
+        entries: Vec<(String, WinningIndexEntry)>,
+        root: &std::path::Path,
+        options: SafeExtractionOptions,
+        jobs: usize,
+    ) -> Result<Vec<(String, Vec<MetadataDiagnostic>)>, FormatError> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        if jobs <= 1 || entries.len() <= 1 {
+            return entries
+                .into_iter()
+                .map(|(path, entry)| {
+                    let shard =
+                        shards
+                            .get(entry.shard_index)
+                            .ok_or(FormatError::InvalidArchive(
+                                "winning FileEntry shard is out of bounds",
+                            ))?;
+                    let diagnostics =
+                        self.stream_loaded_file_to_path(shard, entry.file_index, root, options)?;
+                    Ok((path, diagnostics))
+                })
+                .collect();
+        }
+
+        let worker_count = jobs.min(entries.len());
+        let chunk_size = entries.len().div_ceil(worker_count);
+        std::thread::scope(|scope| {
+            let handles = entries
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for (path, entry) in chunk {
+                            let shard = shards.get(entry.shard_index).ok_or(
+                                FormatError::InvalidArchive(
+                                    "winning FileEntry shard is out of bounds",
+                                ),
+                            )?;
+                            let diagnostics = self.stream_loaded_file_to_path(
+                                shard,
+                                entry.file_index,
+                                root,
+                                options,
+                            )?;
+                            out.push((path.clone(), diagnostics));
+                        }
+                        Ok(out)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut out = Vec::new();
+            for handle in handles {
+                let mut chunk = handle
+                    .join()
+                    .map_err(|_| FormatError::ReaderUnsupported("extract worker panicked"))??;
+                out.append(&mut chunk);
+            }
+            Ok(out)
+        })
     }
 
     fn decode_loaded_owned_tar_member(
@@ -2122,7 +2422,7 @@ impl OpenedArchive {
                     "FrameEntry references missing EnvelopeEntry",
                 ))?;
             if let Entry::Vacant(entry) = envelope_cache.entry(envelope.envelope_index) {
-                entry.insert(self.load_payload_envelope(envelope)?);
+                entry.insert(self.load_payload_envelope(envelope, ParityReadPolicy::RepairOnly)?);
             }
             let envelope_plaintext = envelope_cache
                 .get(&envelope.envelope_index)
@@ -2338,6 +2638,47 @@ impl OpenedArchive {
         Ok(rows)
     }
 
+    fn fec_object_class_shape(
+        &self,
+        object_class: u8,
+    ) -> Result<(BlockKind, BlockKind, u16, u16), FormatError> {
+        match object_class {
+            1 => Ok((
+                BlockKind::IndexRootData,
+                BlockKind::IndexRootParity,
+                self.crypto_header.index_root_fec_data_shards,
+                self.crypto_header.index_root_fec_parity_shards,
+            )),
+            2 => Ok((
+                BlockKind::DictionaryData,
+                BlockKind::DictionaryParity,
+                self.crypto_header.index_root_fec_data_shards,
+                self.crypto_header.index_root_fec_parity_shards,
+            )),
+            3 => Ok((
+                BlockKind::IndexShardData,
+                BlockKind::IndexShardParity,
+                self.crypto_header.index_fec_data_shards,
+                self.crypto_header.index_fec_parity_shards,
+            )),
+            4 => Ok((
+                BlockKind::PayloadData,
+                BlockKind::PayloadParity,
+                self.crypto_header.fec_data_shards,
+                self.crypto_header.fec_parity_shards,
+            )),
+            5 => Ok((
+                BlockKind::DirectoryHintData,
+                BlockKind::DirectoryHintParity,
+                self.crypto_header.index_fec_data_shards,
+                self.crypto_header.index_fec_parity_shards,
+            )),
+            _ => Err(FormatError::InvalidArchive(
+                "unknown root-auth FEC row class",
+            )),
+        }
+    }
+
     fn root_auth_data_block_leaves(
         &self,
         rows: &[FecLayoutObjectRow],
@@ -2346,43 +2687,8 @@ impl OpenedArchive {
         let present_rows = rows.iter().filter(|row| row.present).collect::<Vec<_>>();
         let chunks = parallel_map_ref(&present_rows, self.options.jobs, |row| {
             let row = **row;
-            let (data_kind, parity_kind, data_max, parity_max) = match row.object_class {
-                1 => (
-                    BlockKind::IndexRootData,
-                    BlockKind::IndexRootParity,
-                    self.crypto_header.index_root_fec_data_shards,
-                    self.crypto_header.index_root_fec_parity_shards,
-                ),
-                2 => (
-                    BlockKind::DictionaryData,
-                    BlockKind::DictionaryParity,
-                    self.crypto_header.index_root_fec_data_shards,
-                    self.crypto_header.index_root_fec_parity_shards,
-                ),
-                3 => (
-                    BlockKind::IndexShardData,
-                    BlockKind::IndexShardParity,
-                    self.crypto_header.index_fec_data_shards,
-                    self.crypto_header.index_fec_parity_shards,
-                ),
-                4 => (
-                    BlockKind::PayloadData,
-                    BlockKind::PayloadParity,
-                    self.crypto_header.fec_data_shards,
-                    self.crypto_header.fec_parity_shards,
-                ),
-                5 => (
-                    BlockKind::DirectoryHintData,
-                    BlockKind::DirectoryHintParity,
-                    self.crypto_header.index_fec_data_shards,
-                    self.crypto_header.index_fec_parity_shards,
-                ),
-                _ => {
-                    return Err(FormatError::InvalidArchive(
-                        "unknown root-auth FEC row class",
-                    ))
-                }
-            };
+            let (data_kind, parity_kind, data_max, parity_max) =
+                self.fec_object_class_shape(row.object_class)?;
             let extent = ObjectExtent {
                 first_block_index: row.first_block_index,
                 data_block_count: row.data_block_count,
@@ -2440,15 +2746,36 @@ impl OpenedArchive {
         compressed: &[u8],
         decompressed_size: u32,
     ) -> Result<Vec<u8>, FormatError> {
-        if let Some(dictionary) = &self.payload_dictionary {
-            decompress_exact_zstd_frame_with_dictionary(
-                compressed,
-                decompressed_size as usize,
-                dictionary,
-            )
-        } else {
-            decompress_exact_zstd_frame(compressed, decompressed_size as usize)
+        let mut decompressor = self.new_payload_decompressor()?;
+        self.decompress_payload_frame_with(&mut decompressor, compressed, decompressed_size)
+    }
+
+    fn new_payload_decompressor(&self) -> Result<zstd::bulk::Decompressor<'static>, FormatError> {
+        match &self.payload_dictionary {
+            Some(dictionary) => zstd::bulk::Decompressor::with_dictionary(dictionary),
+            None => zstd::bulk::Decompressor::new(),
         }
+        .map_err(|_| FormatError::ZstdDecompressionFailure)
+    }
+
+    fn decompress_payload_frame_with(
+        &self,
+        decompressor: &mut zstd::bulk::Decompressor<'static>,
+        compressed: &[u8],
+        decompressed_size: u32,
+    ) -> Result<Vec<u8>, FormatError> {
+        validate_exact_zstd_frame(compressed)?;
+        let expected = decompressed_size as usize;
+        let decoded = decompressor
+            .decompress(compressed, expected)
+            .map_err(|_| FormatError::ZstdDecompressionFailure)?;
+        if decoded.len() != expected {
+            return Err(FormatError::ZstdDecompressedSizeMismatch {
+                expected,
+                actual: decoded.len(),
+            });
+        }
+        Ok(decoded)
     }
 
     fn validate_encrypted_object_block_ranges(
@@ -2494,23 +2821,38 @@ impl OpenedArchive {
                 "EnvelopeEntry",
             )?);
         }
-        validate_non_overlapping_object_ranges(&mut ranges)
+        validate_non_overlapping_object_ranges(&mut ranges)?;
+        if let Some(source) = &self.lazy_blocks {
+            if source.is_complete_volume_set() {
+                validate_exact_coverage_ranges_u64(
+                    &mut ranges,
+                    source.total_block_count()?,
+                    "encrypted object block ranges do not cover complete archive exactly",
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
 impl<'a> DecodedTarMemberGroupReader<'a> {
-    fn new(archive: &'a OpenedArchive, shard: &'a IndexShard, file: &'a FileEntry) -> Self {
-        Self {
+    fn new(
+        archive: &'a OpenedArchive,
+        shard: &'a IndexShard,
+        file: &'a FileEntry,
+    ) -> Result<Self, FormatError> {
+        Ok(Self {
             archive,
             shard,
             file,
+            decompressor: archive.new_payload_decompressor()?,
             next_frame_offset: 0,
             cached_envelope_index: None,
             cached_envelope_plaintext: Vec::new(),
             current_frame: Vec::new(),
             current_frame_offset: 0,
             remaining_group_bytes: file.tar_member_group_size,
-        }
+        })
     }
 
     fn ensure_frame_available(&mut self) -> Result<(), ExtractError> {
@@ -2530,7 +2872,9 @@ impl<'a> DecodedTarMemberGroupReader<'a> {
             let frame = frame_by_index(self.shard, frame_index)?;
             let envelope = envelope_by_index(self.shard, frame.envelope_index)?;
             if self.cached_envelope_index != Some(envelope.envelope_index) {
-                self.cached_envelope_plaintext = self.archive.load_payload_envelope(envelope)?;
+                self.cached_envelope_plaintext = self
+                    .archive
+                    .load_payload_envelope(envelope, ParityReadPolicy::RepairOnly)?;
                 self.cached_envelope_index = Some(envelope.envelope_index);
             }
             let compressed = slice(
@@ -2539,9 +2883,11 @@ impl<'a> DecodedTarMemberGroupReader<'a> {
                 frame.compressed_size as usize,
                 "FrameEntry",
             )?;
-            let decoded = self
-                .archive
-                .decompress_payload_frame(compressed, frame.decompressed_size)?;
+            let decoded = self.archive.decompress_payload_frame_with(
+                &mut self.decompressor,
+                compressed,
+                frame.decompressed_size,
+            )?;
             let offset = if self.next_frame_offset == 0 {
                 self.file.offset_in_first_frame_plaintext as usize
             } else {
@@ -5584,27 +5930,6 @@ fn block_record_len(block_size: usize) -> Result<u64, FormatError> {
     u64::try_from(len).map_err(|_| FormatError::InvalidArchive("BlockRecord length overflow"))
 }
 
-fn expected_striped_volume_block_count(
-    total_block_count: u64,
-    stripe_width: u32,
-    volume_index: u32,
-) -> Result<u64, FormatError> {
-    if stripe_width == 0 {
-        return Err(FormatError::ZeroStripeWidth);
-    }
-    if volume_index >= stripe_width {
-        return Err(FormatError::VolumeIndexOutOfRange {
-            volume_index,
-            stripe_width,
-        });
-    }
-    let volume_index = volume_index as u64;
-    if total_block_count <= volume_index {
-        return Ok(0);
-    }
-    Ok((total_block_count - 1 - volume_index) / stripe_width as u64 + 1)
-}
-
 fn checked_u64_mul(lhs: u64, rhs: u64, reason: &'static str) -> Result<u64, FormatError> {
     lhs.checked_mul(rhs)
         .ok_or(FormatError::InvalidArchive(reason))
@@ -6389,7 +6714,15 @@ fn load_decrypted_object_from_parts(
     blocks: &impl BlockProvider,
     context: ObjectLoadContext<'_>,
 ) -> Result<Vec<u8>, FormatError> {
-    let repaired = load_repaired_object_data_shards_from_parts(
+    load_decrypted_object_from_parts_with_parity_policy(blocks, context, ParityReadPolicy::Always)
+}
+
+fn load_decrypted_object_from_parts_with_parity_policy(
+    blocks: &impl BlockProvider,
+    context: ObjectLoadContext<'_>,
+    parity_policy: ParityReadPolicy,
+) -> Result<Vec<u8>, FormatError> {
+    let repaired = load_repaired_object_data_shards_from_parts_with_parity_policy(
         blocks,
         context.crypto_header,
         context.extent,
@@ -6397,6 +6730,7 @@ fn load_decrypted_object_from_parts(
         context.parity_kind,
         context.class_data_shard_max,
         context.class_parity_shard_max,
+        parity_policy,
     )?;
     let mut encrypted = Vec::with_capacity(context.extent.encrypted_size as usize);
     for shard in repaired {
@@ -6431,6 +6765,28 @@ fn load_repaired_object_data_shards_from_parts(
     class_data_shard_max: u16,
     class_parity_shard_max: u16,
 ) -> Result<Vec<Vec<u8>>, FormatError> {
+    load_repaired_object_data_shards_from_parts_with_parity_policy(
+        blocks,
+        crypto_header,
+        extent,
+        data_kind,
+        parity_kind,
+        class_data_shard_max,
+        class_parity_shard_max,
+        ParityReadPolicy::Always,
+    )
+}
+
+fn load_repaired_object_data_shards_from_parts_with_parity_policy(
+    blocks: &impl BlockProvider,
+    crypto_header: &CryptoHeaderFixed,
+    extent: ObjectExtent,
+    data_kind: BlockKind,
+    parity_kind: BlockKind,
+    class_data_shard_max: u16,
+    class_parity_shard_max: u16,
+    parity_policy: ParityReadPolicy,
+) -> Result<Vec<Vec<u8>>, FormatError> {
     validate_object_extent(
         extent,
         crypto_header,
@@ -6461,6 +6817,10 @@ fn load_repaired_object_data_shards_from_parts(
         } else {
             data_shards.push(None);
         }
+    }
+
+    if parity_policy == ParityReadPolicy::RepairOnly && data_shards.iter().all(Option::is_some) {
+        return repair_data_gf16(&data_shards, &[], block_size);
     }
 
     for offset in 0..parity_count {
@@ -7787,6 +8147,77 @@ mod tests {
             std::fs::read(tmp.path().join("dir").join("hello.txt")).unwrap(),
             b"safe m8"
         );
+    }
+
+    #[test]
+    fn seekable_extract_all_to_streams_unique_archive() {
+        let archive = write_archive(
+            &[
+                RegularFile::new("alpha.txt", b"alpha"),
+                RegularFile::new("dir/beta.txt", b"beta"),
+            ],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let diagnostics = opened
+            .extract_all_to(tmp.path(), SafeExtractionOptions::default())
+            .unwrap();
+
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(fs::read(tmp.path().join("alpha.txt")).unwrap(), b"alpha");
+        assert_eq!(
+            fs::read(tmp.path().join("dir").join("beta.txt")).unwrap(),
+            b"beta"
+        );
+    }
+
+    #[test]
+    fn seekable_extract_all_to_rejects_duplicate_paths_for_cli_fallback() {
+        let archive = write_archive(
+            &[
+                RegularFile::new("same.txt", b"old"),
+                RegularFile::new("same.txt", b"new"),
+            ],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            opened
+                .extract_all_to(tmp.path(), SafeExtractionOptions::default())
+                .unwrap_err(),
+            FormatError::ReaderUnsupported("fast full extract requires unique archive paths")
+        );
+    }
+
+    #[test]
+    fn seekable_extract_indexed_files_to_restores_final_duplicate_winner() {
+        let archive = write_archive(
+            &[
+                RegularFile::new("same.txt", b"old"),
+                RegularFile::new("same.txt", b"new"),
+            ],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let diagnostics = opened
+            .extract_indexed_files_to(tmp.path(), SafeExtractionOptions::default(), 2)
+            .unwrap();
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].0, "same.txt");
+        assert_eq!(fs::read(tmp.path().join("same.txt")).unwrap(), b"new");
     }
 
     #[test]
@@ -11048,6 +11479,54 @@ mod tests {
     }
 
     #[test]
+    fn repair_patches_restore_crc_erased_payload_block() {
+        let payload = pseudo_random_bytes(12_000);
+        let archive = write_archive(
+            &[RegularFile::new("rot.bin", &payload)],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+        let payload_slot = first_payload_data_run_slots(&archive.bytes)[0];
+        let mut corrupted = archive.bytes.clone();
+        corrupt_block_record_payload_at_slot(&mut corrupted, payload_slot);
+
+        let opened = open_seekable_archive(corrupted.clone(), &master_key()).unwrap();
+        opened.verify().unwrap();
+        let patches = opened.repair_patches().unwrap();
+        assert_eq!(patches.len(), 1);
+        apply_repair_patches(&mut corrupted, &patches);
+
+        let repaired = open_seekable_archive(corrupted, &master_key()).unwrap();
+        repaired.verify().unwrap();
+        assert!(repaired.repair_patches().unwrap().is_empty());
+    }
+
+    #[test]
+    fn repair_patches_restore_crc_erased_payload_parity_block() {
+        let payload = pseudo_random_bytes(12_000);
+        let archive = write_archive(
+            &[RegularFile::new("parity-erasure.bin", &payload)],
+            &master_key(),
+            parity_rich_recovery_options(),
+        )
+        .unwrap();
+        let parity_slot = block_record_slots_with_kind(&archive.bytes, BlockKind::PayloadParity)[0];
+        let mut corrupted = archive.bytes.clone();
+        corrupt_block_record_payload_at_slot(&mut corrupted, parity_slot);
+
+        let opened = open_seekable_archive(corrupted.clone(), &master_key()).unwrap();
+        opened.verify().unwrap();
+        let patches = opened.repair_patches().unwrap();
+        assert_eq!(patches.len(), 1);
+        apply_repair_patches(&mut corrupted, &patches);
+
+        let repaired = open_seekable_archive(corrupted, &master_key()).unwrap();
+        repaired.verify().unwrap();
+        assert!(repaired.repair_patches().unwrap().is_empty());
+    }
+
+    #[test]
     fn rejects_odd_block_size_before_fec_repair() {
         let archive = write_archive(
             &[RegularFile::new("odd-block.txt", b"payload")],
@@ -11834,6 +12313,14 @@ mod tests {
     fn corrupt_block_record_payload_at_slot(volume: &mut [u8], slot: usize) {
         let (record_offset, _) = block_record_at_slot(volume, slot);
         volume[record_offset + 16] ^= 0x55;
+    }
+
+    fn apply_repair_patches(volume: &mut [u8], patches: &[ArchiveRepairPatch]) {
+        for patch in patches {
+            let offset = patch.record_offset as usize;
+            let end = offset + patch.record_bytes.len();
+            volume[offset..end].copy_from_slice(&patch.record_bytes);
+        }
     }
 
     fn corrupt_block_record_magic_at_slot(volume: &mut [u8], slot: usize) {

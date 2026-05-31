@@ -267,6 +267,39 @@ Operational shape:
 - Public no-key verification still needs a complete volume set and validates
   public RootAuth data-block commitments rather than providing keyed extraction.
 
+## Verify repaired copies
+
+Key-holding `tzap verify` can write repaired sibling copies for volumes that
+contain recoverable BlockRecord CRC damage:
+
+```sh
+tzap verify --keyfile project.key --write-repaired archive.tzap
+# writes archive.repaired.tzap when recoverable damage was found
+
+tzap verify --keyfile project.key --write-repaired archive.vol003.tzap
+# writes archive.repaired.vol003.tzap when that volume had recoverable damage
+```
+
+Operational shape:
+
+- Original archive files are never modified.
+- Only volumes with repaired BlockRecords are copied and patched.
+- Existing repaired output paths are not overwritten.
+- `--write-repaired` requires key-holding, file-backed verify.
+- `--write-repaired` is rejected with archive stdin, `--public-no-key`, and
+  `--bootstrap`.
+- A complete volume set is required for repaired output. Missing-volume
+  recovery can prove data is still recoverable, but it does not synthesize a
+  replacement archive volume in this mode.
+
+What to do:
+
+- Run ordinary `tzap verify` first when you only need an integrity check.
+- Add `--write-repaired` when verify succeeds through recovery and you want a
+  clean sibling file to replace the damaged volume manually.
+- For bootstrap-assisted single-volume damage, extract and recreate the archive
+  until bootstrap repair output is added as a separate feature.
+
 ## Sequential reader and provisional output
 
 The core reader exposes live `Read` APIs for single-volume archive streams:

@@ -40,8 +40,8 @@ pub use reader::{
     open_seekable_archive_with_bootstrap_sidecar_options, public_no_key_verify_archive_with,
     public_no_key_verify_volumes_with, public_no_key_verify_volumes_with_options,
     sequential_extract_tar_stream, ArchiveContentVerification, ArchiveEntry, ArchiveIndexEntry,
-    ArchiveReadAt, OpenedArchive, PublicNoKeyDiagnostic, PublicNoKeyVerification, ReaderOptions,
-    RootAuthDiagnostic, RootAuthVerification,
+    ArchiveReadAt, ArchiveRepairPatch, OpenedArchive, PublicNoKeyDiagnostic,
+    PublicNoKeyVerification, ReaderOptions, RootAuthDiagnostic, RootAuthVerification,
 };
 pub use streaming_writer::{
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth, write_tar_stream_archive,

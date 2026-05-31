@@ -1,5 +1,6 @@
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -29,10 +30,10 @@ use tzap_core::{
     write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
     write_tar_stream_archive_to_sink_with_kdf_and_root_auth, ArchiveContentVerification,
-    ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfParams, MasterKey, MemoryArchiveSink,
-    MetadataDiagnostic, NonSeekableReaderOptions, OpenedArchive, PublicNoKeyVerification,
-    ReaderOptions, RegularFile, RegularFileSource, RootAuthSigningRequest, RootAuthVerification,
-    RootAuthWriterConfig, SafeExtractionOptions, StreamingRawWriterSummary,
+    ArchiveRepairPatch, ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfParams, MasterKey,
+    MemoryArchiveSink, MetadataDiagnostic, NonSeekableReaderOptions, OpenedArchive,
+    PublicNoKeyVerification, ReaderOptions, RegularFile, RegularFileSource, RootAuthSigningRequest,
+    RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions, StreamingRawWriterSummary,
     StreamingTarWriterSummary, TarEntryKind, WriterOptions, WriterTimings, WrittenArchiveSummary,
 };
 use tzap_plugin_signing::ed25519_raw::{
@@ -524,8 +525,8 @@ enum Command {
     },
     #[command(
         about = "Verify archive integrity",
-        long_about = "Verify archive signatures and checksum integrity. No payload changes are made.\n\nBy default verify is key-holding and requires --keyfile, --password, --password-stdin, or --insecure-zero-key. With --public-no-key, verify uses the v41 public RootAuth profile and does not require the archive key.",
-        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --public-no-key --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --keyfile key.hex backup.vol000.tzap backup.vol001.tzap\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives named `.volNNN.tzap`, passing any one volume discovers matching siblings in the same directory. Additional positionals are explicit extra volumes."
+        long_about = "Verify archive signatures and checksum integrity. No payload changes are made unless --write-repaired is set; original archive files are never modified.\n\nBy default verify is key-holding and requires --keyfile, --password, --password-stdin, or --insecure-zero-key. With --public-no-key, verify uses the v41 public RootAuth profile and does not require the archive key.",
+        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex --write-repaired backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --public-no-key --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --keyfile key.hex backup.vol000.tzap backup.vol001.tzap\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives named `.volNNN.tzap`, passing any one volume discovers matching siblings in the same directory. Additional positionals are explicit extra volumes."
     )]
     Verify {
         #[arg(
@@ -607,6 +608,12 @@ enum Command {
             help = "Emit stable machine-readable JSON output."
         )]
         json: bool,
+
+        #[arg(
+            long = "write-repaired",
+            help = "After successful key-holding verification, write repaired copies for volumes that had recoverable block damage."
+        )]
+        write_repaired: bool,
 
         #[arg(
             long = "jobs",
@@ -1326,8 +1333,11 @@ fn run(cli: Cli) -> Result<()> {
                 reader_options,
             )
             .with_context(|| format!("failed to open archive {archive}"))?;
-            let (requested_entries, missing_paths) =
-                resolve_extract_index_entries(&opened, &paths)?;
+            let (requested_entries, missing_paths) = if stdout || dry_run || !paths.is_empty() {
+                resolve_extract_index_entries(&opened, &paths)?
+            } else {
+                (Vec::new(), Vec::new())
+            };
             if !missing_paths.is_empty() {
                 for missing in missing_paths {
                     eprintln!("missing archive path: {missing}");
@@ -1371,13 +1381,17 @@ fn run(cli: Cli) -> Result<()> {
             let options = SafeExtractionOptions {
                 overwrite_existing: overwrite,
             };
-            let diagnostics = extract_entries_to_dir_parallel(
-                &opened,
-                requested_entries,
-                &root,
-                options,
-                reader_options.jobs,
-            )?;
+            let diagnostics = if paths.is_empty() {
+                opened.extract_indexed_files_to(&root, options, reader_options.jobs)?
+            } else {
+                extract_entries_to_dir_parallel(
+                    &opened,
+                    requested_entries,
+                    &root,
+                    options,
+                    reader_options.jobs,
+                )?
+            };
             for (path, diagnostics) in diagnostics {
                 extracted_count = extracted_count
                     .checked_add(1)
@@ -1573,6 +1587,7 @@ fn run(cli: Cli) -> Result<()> {
             public_no_key,
             bootstrap,
             json,
+            write_repaired,
             jobs,
         } => {
             let reader_options = reader_options(resolve_jobs(jobs)?);
@@ -1581,6 +1596,15 @@ fn run(cli: Cli) -> Result<()> {
                 .ok_or_else(|| anyhow!("at least one archive volume is required"))?;
             let archive_paths = archives.to_vec();
             if archives.iter().any(|path| path == "-") {
+                if write_repaired {
+                    let err = anyhow!(FormatError::ReaderUnsupported(
+                        "--write-repaired is not supported for archive stdin",
+                    ));
+                    if json {
+                        emit_verify_json_error(&archive_paths, None, None, &err)?;
+                    }
+                    return Err(err);
+                }
                 if json && archives.len() != 1 {
                     let err = anyhow!(FormatError::ReaderUnsupported(
                         "archive stdin must be the only archive input",
@@ -1687,6 +1711,15 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             if public_no_key {
+                if write_repaired {
+                    let err = anyhow!(FormatError::ReaderUnsupported(
+                        "--write-repaired requires key-holding verification",
+                    ));
+                    if json {
+                        emit_verify_json_error(&archive_paths, None, None, &err)?;
+                    }
+                    return Err(err);
+                }
                 return run_public_no_key_verify(PublicNoKeyVerifyRequest {
                     archive_paths: &archive_paths,
                     trusted_public_key: trusted_public_key.as_deref(),
@@ -1719,6 +1752,15 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 return Err(err);
             }
+            if write_repaired && bootstrap.is_some() {
+                let err = anyhow!(FormatError::ReaderUnsupported(
+                    "--write-repaired is not supported with --bootstrap",
+                ));
+                if json {
+                    emit_verify_json_error(&archive_paths, None, None, &err)?;
+                }
+                return Err(err);
+            }
             let selection =
                 match resolve_archive_input_paths(first, &archives[1..], bootstrap.is_none()) {
                     Ok(selection) => selection,
@@ -1745,7 +1787,7 @@ fn run(cli: Cli) -> Result<()> {
                     return Err(err);
                 }
             };
-            let opened = match open_selection_maybe_bootstrap(
+            let opened_selection = match open_selection_maybe_bootstrap_resolved(
                 &selection,
                 &master_key,
                 bootstrap.as_deref(),
@@ -1761,6 +1803,8 @@ fn run(cli: Cli) -> Result<()> {
                     return Err(err);
                 }
             };
+            let archive_paths = opened_selection.paths;
+            let opened = opened_selection.opened;
             let result = opened
                 .verify_content()
                 .with_context(|| format!("failed to verify archive {first}"));
@@ -1792,6 +1836,24 @@ fn run(cli: Cli) -> Result<()> {
                     };
                     let entries = opened.list_files()?;
                     emit_entry_metadata_diagnostics(quiet, &entries)?;
+                    let repaired_outputs = if write_repaired {
+                        match write_repaired_archive_copies(&archive_paths, &opened) {
+                            Ok(outputs) => outputs,
+                            Err(err) => {
+                                if json {
+                                    emit_verify_json_error(
+                                        &archive_paths,
+                                        Some(volume_count as u64),
+                                        Some(file_count),
+                                        &err,
+                                    )?;
+                                }
+                                return Err(err);
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
                     if json {
                         let mut payload = json!({
                             "ok": true,
@@ -1802,6 +1864,16 @@ fn run(cli: Cli) -> Result<()> {
                         });
                         if let Some(root_auth) = &root_auth {
                             payload["root_auth"] = root_auth_json(root_auth);
+                        }
+                        if write_repaired {
+                            payload["repaired_outputs"] = json!(repaired_outputs
+                                .iter()
+                                .map(|output| json!({
+                                    "path": output.path.clone(),
+                                    "volume_index": output.volume_index,
+                                    "repaired_block_count": output.repaired_block_count,
+                                }))
+                                .collect::<Vec<_>>());
                         }
                         println!(
                             "{}",
@@ -1819,6 +1891,24 @@ fn run(cli: Cli) -> Result<()> {
                     )?;
                     if let Some(root_auth) = &root_auth {
                         emit_root_auth_stdout(quiet, root_auth)?;
+                    }
+                    if write_repaired {
+                        if repaired_outputs.is_empty() {
+                            emit_success_stdout(
+                                quiet,
+                                "no repaired output written; no recoverable block damage found",
+                            )?;
+                        } else {
+                            for output in repaired_outputs {
+                                emit_success_stdout(
+                                    quiet,
+                                    &format!(
+                                        "wrote repaired volume copy {} ({} block(s))",
+                                        output.path, output.repaired_block_count
+                                    ),
+                                )?;
+                            }
+                        }
                     }
                     Ok(())
                 }
@@ -3167,6 +3257,17 @@ struct ArchiveInputSelection {
     autodiscovered: bool,
 }
 
+struct OpenedArchiveSelection {
+    paths: Vec<String>,
+    opened: OpenedArchive,
+}
+
+struct RepairedArchiveOutput {
+    path: String,
+    volume_index: u32,
+    repaired_block_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VolumePathPattern {
     base: String,
@@ -3219,6 +3320,118 @@ fn open_volume_inputs_from_paths(paths: &[String]) -> Result<Vec<File>> {
         .iter()
         .map(|path| File::open(path).with_context(|| format!("failed to read archive {path}")))
         .collect()
+}
+
+fn write_repaired_archive_copies(
+    paths: &[String],
+    opened: &OpenedArchive,
+) -> Result<Vec<RepairedArchiveOutput>> {
+    let patches = opened
+        .repair_patches()
+        .context("failed to prepare repaired archive output")?;
+    if patches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut path_by_volume = BTreeMap::<u32, String>::new();
+    for path in paths {
+        let volume_index = read_volume_index_from_path(path)?;
+        if path_by_volume.insert(volume_index, path.clone()).is_some() {
+            bail!("duplicate archive input for volume index {volume_index}");
+        }
+    }
+
+    let mut patches_by_volume = BTreeMap::<u32, Vec<&ArchiveRepairPatch>>::new();
+    for patch in &patches {
+        patches_by_volume
+            .entry(patch.volume_index)
+            .or_default()
+            .push(patch);
+    }
+
+    let mut outputs = Vec::new();
+    for (volume_index, volume_patches) in patches_by_volume {
+        let input_path = path_by_volume.get(&volume_index).ok_or_else(|| {
+            anyhow!("repair output references unavailable volume index {volume_index}")
+        })?;
+        let output_path = repaired_archive_output_path(input_path)?;
+        if output_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("repaired output already exists: {}", output_path.display()),
+            )
+            .into());
+        }
+        fs::copy(input_path, &output_path).with_context(|| {
+            format!(
+                "failed to copy archive volume {} to {}",
+                input_path,
+                output_path.display()
+            )
+        })?;
+
+        let mut output = OpenOptions::new()
+            .write(true)
+            .open(&output_path)
+            .with_context(|| format!("failed to open repaired output {}", output_path.display()))?;
+        for patch in &volume_patches {
+            output
+                .seek(SeekFrom::Start(patch.record_offset))
+                .with_context(|| {
+                    format!(
+                        "failed to seek repaired output {} to offset {}",
+                        output_path.display(),
+                        patch.record_offset
+                    )
+                })?;
+            output.write_all(&patch.record_bytes).with_context(|| {
+                format!(
+                    "failed to write repaired block {} to {}",
+                    patch.block_index,
+                    output_path.display()
+                )
+            })?;
+        }
+        output.flush().with_context(|| {
+            format!("failed to flush repaired output {}", output_path.display())
+        })?;
+        outputs.push(RepairedArchiveOutput {
+            path: output_path.to_string_lossy().into_owned(),
+            volume_index,
+            repaired_block_count: volume_patches.len(),
+        });
+    }
+
+    Ok(outputs)
+}
+
+fn read_volume_index_from_path(path: &str) -> Result<u32> {
+    let mut file = File::open(path).with_context(|| format!("failed to read archive {path}"))?;
+    let mut header = [0u8; VOLUME_HEADER_LEN];
+    file.read_exact(&mut header)
+        .with_context(|| format!("failed to read archive header {path}"))?;
+    Ok(VolumeHeader::parse(&header)
+        .with_context(|| format!("failed to parse archive header {path}"))?
+        .volume_index)
+}
+
+fn repaired_archive_output_path(input: &str) -> Result<PathBuf> {
+    let path = Path::new(input);
+    let file_name = path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .ok_or_else(|| anyhow!("archive path has no UTF-8 file name: {input}"))?;
+    let repaired_name = if let Some(pattern) = parse_volume_file_name(file_name) {
+        format!(
+            "{}.repaired.vol{:03}.tzap",
+            pattern.base, pattern.volume_index
+        )
+    } else if let Some(stem) = file_name.strip_suffix(".tzap") {
+        format!("{stem}.repaired.tzap")
+    } else {
+        format!("{file_name}.repaired")
+    };
+    Ok(path.with_file_name(repaired_name))
 }
 
 fn parse_volume_path_pattern(path: &Path) -> Option<VolumePathPattern> {
@@ -3418,9 +3631,21 @@ fn open_selection_maybe_bootstrap(
     bootstrap: Option<&str>,
     options: ReaderOptions,
 ) -> Result<OpenedArchive> {
+    Ok(open_selection_maybe_bootstrap_resolved(selection, master_key, bootstrap, options)?.opened)
+}
+
+fn open_selection_maybe_bootstrap_resolved(
+    selection: &ArchiveInputSelection,
+    master_key: &MasterKey,
+    bootstrap: Option<&str>,
+    options: ReaderOptions,
+) -> Result<OpenedArchiveSelection> {
     let volume_files = open_volume_inputs_from_paths(&selection.paths)?;
     match open_inputs_maybe_bootstrap(volume_files, master_key, bootstrap, options) {
-        Ok(opened) => Ok(opened),
+        Ok(opened) => Ok(OpenedArchiveSelection {
+            paths: selection.paths.clone(),
+            opened,
+        }),
         Err(err)
             if selection.autodiscovered && bootstrap.is_none() && selection.paths.len() > 1 =>
         {
@@ -3431,8 +3656,11 @@ fn open_selection_maybe_bootstrap(
                 return Err(err);
             }
             let volume_files = open_volume_inputs_from_paths(&usable_paths)?;
-            open_inputs_maybe_bootstrap(volume_files, master_key, bootstrap, options)
-                .map_err(Into::into)
+            let opened = open_inputs_maybe_bootstrap(volume_files, master_key, bootstrap, options)?;
+            Ok(OpenedArchiveSelection {
+                paths: usable_paths,
+                opened,
+            })
         }
         Err(err) => Err(err),
     }
