@@ -4,7 +4,7 @@ Source scope:
 
 - `crates/tzap-plugin-signing`
 - `crates/tzap-cli` RootAuth signing and verification integration
-- v41 RootAuth carriage and verification APIs in `tzap-core`
+- v43 RootAuth carriage and verification APIs in `tzap-core`
 
 This matrix covers the supported signing profiles. Timestamp authority,
 transparency logs, revocation checking, EdDSA certificates in the X.509 profile,
@@ -13,7 +13,7 @@ supported surface unless a caller supplies its own core verifier callback.
 
 | ID | Requirement | Status | Implementation | Evidence |
 |---|---|---|---|---|
-| SIGN-001 | Keep authenticator-profile behavior outside `tzap-core`; core owns v41 fields and archive-root inputs. | Implemented and tested | `crates/tzap-plugin-signing/src/lib.rs`; `crates/tzap-core/src/root_auth.rs`; `crates/tzap-core/src/reader.rs` | Workspace package split; `reader::tests::root_auth_archive_round_trips_and_verifies_with_callback`; plugin unit tests |
+| SIGN-001 | Keep authenticator-profile behavior outside `tzap-core`; core owns v43 fields and archive-root inputs. | Implemented and tested | `crates/tzap-plugin-signing/src/lib.rs`; `crates/tzap-core/src/root_auth.rs`; `crates/tzap-core/src/reader.rs` | Workspace package split; `reader::tests::root_auth_archive_round_trips_and_verifies_with_callback`; plugin unit tests |
 | SIGN-002 | Ed25519 profile uses authenticator id `0x0002`, fixed authenticator value length, and strict RootAuth signing input. | Implemented and tested | `crates/tzap-plugin-signing/src/ed25519_raw.rs`; `crates/tzap-cli/src/main.rs` | `ed25519_raw::tests::ed25519_authenticator_value_round_trips_strict_profile`; `cli_create_signed_archive_and_verify_root_auth_profiles` |
 | SIGN-003 | Ed25519 verification distinguishes trusted-key matching, embedded identity, reserved identity classes, key-holding mode, and public no-key mode. | Implemented and tested | `crates/tzap-plugin-signing/src/ed25519_raw.rs` | `rejects_trusted_key_mismatch_with_embedded_identity`; `rejects_unsupported_identity_even_with_trusted_key`; `verifies_type_zero_only_with_trusted_key_and_empty_identity`; `root_auth_verifies_key_holding_and_public_no_key_modes` |
 | SIGN-004 | X.509 profile uses authenticator id `0x0003` and DER certificate signer identity type `2`. | Implemented and tested | `crates/tzap-plugin-signing/src/x509_chain.rs`; CLI trust dispatch in `crates/tzap-cli/src/main.rs` | `x509_authenticator_round_trips_with_trusted_root`; `cli_create_x509_signed_archive_and_verify_certificate_details` |

@@ -299,7 +299,7 @@ fn cli_top_level_help_contains_product_description_and_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Create, list, verify, and extract v41 archives",
+            "Create, list, verify, and extract v43 archives",
         ))
         .stdout(predicate::str::contains("create"))
         .stdout(predicate::str::contains("extract"))
@@ -356,7 +356,7 @@ fn cli_jobs_must_be_at_least_one() {
     for args in [
         vec![
             "create",
-            "--insecure-zero-key",
+            "--no-encryption",
             "--jobs",
             "0",
             "-o",
@@ -365,27 +365,14 @@ fn cli_jobs_must_be_at_least_one() {
         ],
         vec![
             "extract",
-            "--insecure-zero-key",
             "--jobs",
             "0",
             "--directory",
             directory.to_str().unwrap(),
             archive.to_str().unwrap(),
         ],
-        vec![
-            "list",
-            "--insecure-zero-key",
-            "--jobs",
-            "0",
-            archive.to_str().unwrap(),
-        ],
-        vec![
-            "verify",
-            "--insecure-zero-key",
-            "--jobs",
-            "0",
-            archive.to_str().unwrap(),
-        ],
+        vec!["list", "--jobs", "0", archive.to_str().unwrap()],
+        vec!["verify", "--jobs", "0", archive.to_str().unwrap()],
     ] {
         Command::cargo_bin("tzap")
             .unwrap()
@@ -418,7 +405,8 @@ fn cli_create_help_includes_examples_and_flags() {
     assert!(stdout.contains("--password"));
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
-    assert!(stdout.contains("--insecure-zero-key"));
+    assert!(stdout.contains("--no-encryption"));
+    assert!(!stdout.contains("--insecure-zero-key"));
     assert!(stdout.contains("--argon2-t-cost <COUNT>"));
     assert!(stdout.contains("--argon2-m-cost-kib <KIB>"));
     assert!(stdout.contains("--argon2-parallelism <COUNT>"));
@@ -469,7 +457,7 @@ fn cli_extract_help_includes_examples_and_flags() {
     assert!(stdout.contains("--jobs <N>"));
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
-    assert!(stdout.contains("--insecure-zero-key"));
+    assert!(!stdout.contains("--insecure-zero-key"));
 }
 
 #[test]
@@ -489,7 +477,7 @@ fn cli_list_help_includes_examples_and_flags() {
     assert!(stdout.contains("--password"));
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
-    assert!(stdout.contains("--insecure-zero-key"));
+    assert!(!stdout.contains("--insecure-zero-key"));
     assert!(stdout.contains("--bootstrap"));
     assert!(stdout.contains("--volume"));
     assert!(stdout.contains("--long"));
@@ -514,7 +502,7 @@ fn cli_verify_help_includes_examples_and_flags() {
     assert!(stdout.contains("--password"));
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
-    assert!(stdout.contains("--insecure-zero-key"));
+    assert!(!stdout.contains("--insecure-zero-key"));
     assert!(stdout.contains("--trusted-public-key <FILE>"));
     assert!(stdout.contains("--trusted-ca-cert <FILE>"));
     assert!(stdout.contains("--trusted-system-roots"));
@@ -578,7 +566,30 @@ fn cli_create_requires_key_source_before_running() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("required"));
+        .stderr(predicate::str::contains("no key source provided"));
+}
+
+#[test]
+fn cli_insecure_zero_key_is_removed_in_v43() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("sample.tzap");
+    let input = temp.path().join("hello.txt");
+
+    fs::write(&input, b"hello\n").unwrap();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--insecure-zero-key",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--insecure-zero-key was removed in v43",
+        ));
 }
 
 #[test]
@@ -691,7 +702,7 @@ fn cli_create_timings_prints_breakdown() {
 }
 
 #[test]
-fn cli_insecure_zero_key_rejects_mixed_key_sources_and_public_no_key() {
+fn cli_no_encryption_rejects_mixed_key_sources_and_public_no_key_rejects_keys() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
     let output = temp.path().join("sample.tzap");
@@ -707,7 +718,7 @@ fn cli_insecure_zero_key_rejects_mixed_key_sources_and_public_no_key() {
         .unwrap()
         .args([
             "create",
-            "--insecure-zero-key",
+            "--no-encryption",
             "--keyfile",
             keyfile.to_str().unwrap(),
             "-o",
@@ -723,7 +734,8 @@ fn cli_insecure_zero_key_rejects_mixed_key_sources_and_public_no_key() {
         .args([
             "verify",
             "--public-no-key",
-            "--insecure-zero-key",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
             "--trusted-public-key",
             public_key.to_str().unwrap(),
             missing_archive.to_str().unwrap(),
@@ -733,7 +745,7 @@ fn cli_insecure_zero_key_rejects_mixed_key_sources_and_public_no_key() {
         .stderr(predicate::str::contains(
             "--public-no-key cannot be combined",
         ))
-        .stderr(predicate::str::contains("--insecure-zero-key"));
+        .stderr(predicate::str::contains("--keyfile"));
 }
 
 #[test]
@@ -2137,43 +2149,166 @@ fn cli_create_with_interactive_password_requires_matching_confirmation() {
 }
 
 #[test]
-fn cli_extract_requires_key_source_before_running() {
+fn cli_extract_reads_unencrypted_archive_without_key_source() {
     let temp = tempdir().unwrap();
+    let input = temp.path().join("sample.txt");
     let archive = temp.path().join("sample.tzap");
+    let output = temp.path().join("out");
+    fs::write(&input, b"plaintext v43\n").unwrap();
 
     Command::cargo_bin("tzap")
         .unwrap()
-        .args(["extract", archive.to_str().unwrap()])
+        .args([
+            "create",
+            "--no-encryption",
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
         .assert()
-        .code(2)
-        .stderr(predicate::str::contains("required"));
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "-C",
+            output.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(output.join("sample.txt")).unwrap(),
+        b"plaintext v43\n"
+    );
 }
 
 #[test]
-fn cli_list_requires_key_source_before_running() {
+fn cli_list_reads_unencrypted_archive_without_key_source() {
     let temp = tempdir().unwrap();
+    let input = temp.path().join("sample.txt");
     let archive = temp.path().join("sample.tzap");
+    fs::write(&input, b"plaintext v43\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--no-encryption",
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
 
     Command::cargo_bin("tzap")
         .unwrap()
         .args(["list", archive.to_str().unwrap()])
         .assert()
-        .code(2)
-        .stderr(predicate::str::contains("required"));
+        .success()
+        .stdout(predicate::str::contains("sample.txt"));
 }
 
 #[test]
-fn cli_verify_requires_key_source_before_running() {
+fn cli_verify_reads_unencrypted_archive_without_key_source() {
     let temp = tempdir().unwrap();
+    let input = temp.path().join("sample.txt");
     let archive = temp.path().join("sample.tzap");
+    fs::write(&input, b"plaintext v43\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--no-encryption",
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
 
     Command::cargo_bin("tzap")
         .unwrap()
         .args(["verify", archive.to_str().unwrap()])
         .assert()
-        .code(2)
-        .stderr(predicate::str::contains("exactly one key source"))
-        .stderr(predicate::str::contains("--insecure-zero-key"));
+        .success()
+        .stdout(predicate::str::contains("OK (1 volume(s), 1 file(s))"));
+}
+
+#[test]
+fn cli_no_key_does_not_open_encrypted_zero_key_archive() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("zero.key");
+    let input = temp.path().join("sample.txt");
+    let archive = temp.path().join("sample.tzap");
+
+    fs::write(&keyfile, "00".repeat(32)).unwrap();
+    fs::write(&input, b"encrypted zero key\n").unwrap();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["list", archive.to_str().unwrap()])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("wrong-key"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["verify", archive.to_str().unwrap()])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("wrong-key"));
+}
+
+#[test]
+fn cli_plaintext_header_digest_corruption_is_corrupt_archive_not_wrong_key() {
+    let temp = tempdir().unwrap();
+    let input = temp.path().join("sample.txt");
+    let archive = temp.path().join("sample.tzap");
+
+    fs::write(&input, b"plaintext v43\n").unwrap();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--no-encryption",
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let mut bytes = fs::read(&archive).unwrap();
+    let header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
+    let digest_index =
+        header.crypto_header_offset as usize + header.crypto_header_length as usize - 1;
+    bytes[digest_index] ^= 0x01;
+    fs::write(&archive, bytes).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["verify", archive.to_str().unwrap()])
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("corrupt-archive"))
+        .stderr(predicate::str::contains("integrity digest"));
 }
 
 #[test]
@@ -2276,6 +2411,103 @@ fn cli_verify_reads_dash_as_archive_stdin() {
         .assert()
         .success()
         .stdout(predicate::str::contains("OK non-seekable stream"));
+}
+
+fn create_plaintext_dash_archive(temp: &Path) -> (PathBuf, Vec<u8>) {
+    let input = temp.join("plain.txt");
+    let archive = temp.join("plain.tzap");
+
+    fs::write(&input, b"hello plaintext stdin\n").unwrap();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--no-encryption",
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    (archive.clone(), fs::read(archive).unwrap())
+}
+
+#[test]
+fn cli_unencrypted_archive_stdin_reads_without_key_source() {
+    let temp = tempdir().unwrap();
+    let (_archive, archive_bytes) = create_plaintext_dash_archive(temp.path());
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["list", "-"])
+        .write_stdin(archive_bytes.clone())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("plain.txt\n"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["verify", "-"])
+        .write_stdin(archive_bytes)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK non-seekable stream"));
+}
+
+#[test]
+fn cli_encrypted_zero_key_archive_stdin_without_key_is_rejected() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("zero.key");
+    let input = temp.path().join("sample.txt");
+    let archive = temp.path().join("sample.tzap");
+
+    fs::write(&keyfile, "00".repeat(32)).unwrap();
+    fs::write(&input, b"encrypted zero key\n").unwrap();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["verify", "-"])
+        .write_stdin(fs::read(&archive).unwrap())
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("wrong-key"));
+}
+
+#[test]
+fn cli_extract_plaintext_archive_stdin_digest_corruption_is_corrupt_archive() {
+    let temp = tempdir().unwrap();
+    let (_archive, mut archive_bytes) = create_plaintext_dash_archive(temp.path());
+    let output = temp.path().join("out");
+    let header = VolumeHeader::parse(&archive_bytes[..VOLUME_HEADER_LEN]).unwrap();
+    let digest_index =
+        header.crypto_header_offset as usize + header.crypto_header_length as usize - 1;
+    archive_bytes[digest_index] ^= 0x01;
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["extract", "-C", output.to_str().unwrap(), "-"])
+        .write_stdin(archive_bytes)
+        .assert()
+        .code(11)
+        .stderr(predicate::str::contains("corrupt-archive"))
+        .stderr(predicate::str::contains("integrity digest"));
 }
 
 #[test]
@@ -2797,7 +3029,7 @@ fn cli_create_signed_archive_and_verify_root_auth_profiles() {
 }
 
 #[test]
-fn cli_insecure_zero_key_signed_archive_round_trips_and_publicly_verifies() {
+fn cli_no_encryption_signed_archive_round_trips_and_publicly_verifies() {
     let temp = tempdir().unwrap();
     let signing_secret = temp.path().join("root.signing.hex");
     let signing_public = temp.path().join("root.public.hex");
@@ -2824,7 +3056,7 @@ fn cli_insecure_zero_key_signed_archive_round_trips_and_publicly_verifies() {
         .unwrap()
         .args([
             "create",
-            "--insecure-zero-key",
+            "--no-encryption",
             "--signing-key",
             signing_secret.to_str().unwrap(),
             "-o",
@@ -2837,7 +3069,7 @@ fn cli_insecure_zero_key_signed_archive_round_trips_and_publicly_verifies() {
 
     Command::cargo_bin("tzap")
         .unwrap()
-        .args(["list", "--insecure-zero-key", archive.to_str().unwrap()])
+        .args(["list", archive.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("public.txt"));
@@ -2846,7 +3078,6 @@ fn cli_insecure_zero_key_signed_archive_round_trips_and_publicly_verifies() {
         .unwrap()
         .args([
             "verify",
-            "--insecure-zero-key",
             "--trusted-public-key",
             signing_public.to_str().unwrap(),
             archive.to_str().unwrap(),
@@ -2877,7 +3108,6 @@ fn cli_insecure_zero_key_signed_archive_round_trips_and_publicly_verifies() {
         .unwrap()
         .args([
             "extract",
-            "--insecure-zero-key",
             "-C",
             output.to_str().unwrap(),
             archive.to_str().unwrap(),

@@ -8,16 +8,18 @@ use sha2::{Digest, Sha256};
 
 use crate::compression::{decompress_exact_zstd_frame, validate_exact_zstd_frame};
 use crate::crypto::{
-    decrypt_padded_aead_object, verify_hmac, AeadObjectContext, HmacDomain, MasterKey, Subkeys,
+    decrypt_padded_aead_object, verify_integrity_tag, AeadObjectContext, HmacDomain, MasterKey,
+    Subkeys,
 };
 use crate::fec::{encode_parity_gf16, repair_data_gf16};
 use crate::format::{
-    BlockKind, ExtractError, FormatError, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN,
-    CRITICAL_METADATA_IMAGE_FIXED_LEN, CRITICAL_METADATA_RECOVERY_HEADER_LEN,
-    CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN, CRITICAL_RECOVERY_LOCATOR_LEN,
-    CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, IMAGE_CRC_LEN, LOCATOR_PAIR_LEN, MANIFEST_FOOTER_LEN,
-    READER_MAX_CMRA_PARITY_PCT, READER_MAX_CRYPTO_HEADER_LEN, READER_MAX_ROOT_AUTH_FOOTER_LEN,
-    SERIALIZED_REGION_HEADER_LEN, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    AeadAlgo, BlockKind, ExtractError, FormatError, KdfAlgo, BLOCK_RECORD_FRAMING_LEN,
+    BOOTSTRAP_SIDECAR_HEADER_LEN, CRITICAL_METADATA_IMAGE_FIXED_LEN,
+    CRITICAL_METADATA_RECOVERY_HEADER_LEN, CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN,
+    CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, IMAGE_CRC_LEN,
+    LOCATOR_PAIR_LEN, MANIFEST_FOOTER_LEN, READER_MAX_CMRA_PARITY_PCT,
+    READER_MAX_CRYPTO_HEADER_LEN, READER_MAX_ROOT_AUTH_FOOTER_LEN, SERIALIZED_REGION_HEADER_LEN,
+    VOLUME_FORMAT_REV, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, DirectoryHintShardEntry, DirectoryHintTable,
@@ -524,6 +526,23 @@ impl BlockProvider for OpenedBlockProvider<'_> {
     }
 }
 
+fn subkeys_for_open(
+    master_key: Option<&MasterKey>,
+    aead_algo: AeadAlgo,
+    archive_uuid: &[u8; 16],
+    session_id: &[u8; 16],
+) -> Result<Subkeys, FormatError> {
+    if aead_algo.is_encrypted() {
+        Subkeys::derive(
+            master_key.ok_or(FormatError::KeyMaterialMismatch)?,
+            archive_uuid,
+            session_id,
+        )
+    } else {
+        Ok(Subkeys::unencrypted_placeholder())
+    }
+}
+
 type DirectoryHintMap = BTreeMap<Vec<u8>, BTreeSet<u32>>;
 pub type ExtractedRegularFile = (Vec<u8>, Vec<MetadataDiagnostic>);
 const FAST_FULL_EXTRACT_UNIQUE_PATHS_UNSUPPORTED: &str =
@@ -541,11 +560,25 @@ pub fn open_archive(bytes: &[u8], master_key: &MasterKey) -> Result<OpenedArchiv
     OpenedArchive::open_with_options(bytes, master_key, ReaderOptions::default())
 }
 
+pub fn open_archive_unencrypted(bytes: &[u8]) -> Result<OpenedArchive, FormatError> {
+    require_unencrypted_volume_profile(bytes)?;
+    let placeholder = MasterKey::from_raw_key(&[0; 32])?;
+    OpenedArchive::open_with_options(bytes, &placeholder, ReaderOptions::default())
+}
+
 pub fn open_archive_volumes(
     volumes: &[&[u8]],
     master_key: &MasterKey,
 ) -> Result<OpenedArchive, FormatError> {
     OpenedArchive::open_volumes_with_options(volumes, master_key, ReaderOptions::default())
+}
+
+pub fn open_archive_volumes_unencrypted(volumes: &[&[u8]]) -> Result<OpenedArchive, FormatError> {
+    for volume in volumes {
+        require_unencrypted_volume_profile(volume)?;
+    }
+    let placeholder = MasterKey::from_raw_key(&[0; 32])?;
+    OpenedArchive::open_volumes_with_options(volumes, &placeholder, ReaderOptions::default())
 }
 
 pub fn open_archive_with_bootstrap_sidecar(
@@ -559,6 +592,28 @@ pub fn open_archive_with_bootstrap_sidecar(
         master_key,
         ReaderOptions::default(),
     )
+}
+
+fn require_unencrypted_volume_profile(bytes: &[u8]) -> Result<(), FormatError> {
+    if bytes.len() < VOLUME_HEADER_LEN {
+        return Err(FormatError::InvalidLength {
+            structure: "archive",
+            expected: VOLUME_HEADER_LEN,
+            actual: bytes.len(),
+        });
+    }
+    let volume_header = VolumeHeader::parse(slice(bytes, 0, VOLUME_HEADER_LEN, "archive")?)?;
+    let crypto_start = volume_header.crypto_header_offset as usize;
+    let crypto_len = volume_header.crypto_header_length as usize;
+    let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
+    let crypto_header = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length)?;
+    if crypto_header.fixed.aead_algo == AeadAlgo::None
+        && crypto_header.fixed.kdf_algo == KdfAlgo::None
+    {
+        Ok(())
+    } else {
+        Err(FormatError::KeyMaterialMismatch)
+    }
 }
 
 pub fn open_seekable_archive<R: ArchiveReadAt>(
@@ -1185,14 +1240,16 @@ impl OpenedArchive {
         let crypto_end = checked_add(crypto_start, crypto_len, "CryptoHeader")?;
         let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
         let parsed_crypto = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length)?;
-        let subkeys = Subkeys::derive(
-            master_key,
+        let subkeys = subkeys_for_open(
+            Some(master_key),
+            parsed_crypto.fixed.aead_algo,
             &volume_header.archive_uuid,
             &volume_header.session_id,
         )?;
-        verify_hmac(
+        verify_integrity_tag(
             HmacDomain::CryptoHeader,
-            &subkeys.mac_key,
+            parsed_crypto.fixed.aead_algo,
+            Some(&subkeys.mac_key),
             &volume_header.archive_uuid,
             &volume_header.session_id,
             parsed_crypto.hmac_covered_bytes,
@@ -3066,14 +3123,16 @@ fn parse_seekable_volume(
     let crypto_end = checked_add(crypto_start, crypto_len, "CryptoHeader")?;
     let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
     let parsed_crypto = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length)?;
-    let subkeys = Subkeys::derive(
-        master_key,
+    let subkeys = subkeys_for_open(
+        Some(master_key),
+        parsed_crypto.fixed.aead_algo,
         &volume_header.archive_uuid,
         &volume_header.session_id,
     )?;
-    verify_hmac(
+    verify_integrity_tag(
         HmacDomain::CryptoHeader,
-        &subkeys.mac_key,
+        parsed_crypto.fixed.aead_algo,
+        Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
         parsed_crypto.hmac_covered_bytes,
@@ -3125,9 +3184,9 @@ fn parse_seekable_volume(
     let manifest_bytes = &terminal.manifest_footer_bytes;
     let (manifest_footer, manifest_footer_error) = match parse_valid_manifest_footer(
         &volume_header,
+        &parsed_crypto.fixed,
         &subkeys,
         manifest_bytes,
-        parsed_crypto.fixed.block_size,
     ) {
         Ok(footer) => (Some(footer), None),
         Err(err) if manifest_footer_copy_error_is_recoverable(&err) => (None, Some(err)),
@@ -3184,14 +3243,16 @@ fn parse_seekable_read_at_volume(
         "CryptoHeader",
     )?;
     let parsed_crypto = CryptoHeader::parse(&crypto_bytes, volume_header.crypto_header_length)?;
-    let subkeys = Subkeys::derive(
-        master_key,
+    let subkeys = subkeys_for_open(
+        Some(master_key),
+        parsed_crypto.fixed.aead_algo,
         &volume_header.archive_uuid,
         &volume_header.session_id,
     )?;
-    verify_hmac(
+    verify_integrity_tag(
         HmacDomain::CryptoHeader,
-        &subkeys.mac_key,
+        parsed_crypto.fixed.aead_algo,
+        Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
         parsed_crypto.hmac_covered_bytes,
@@ -3254,9 +3315,9 @@ fn parse_seekable_read_at_volume(
     let manifest_bytes = &terminal.manifest_footer_bytes;
     let (manifest_footer, manifest_footer_error) = match parse_valid_manifest_footer(
         &volume_header,
+        &parsed_crypto.fixed,
         &subkeys,
         manifest_bytes,
-        parsed_crypto.fixed.block_size,
     ) {
         Ok(footer) => (Some(footer), None),
         Err(err) if manifest_footer_copy_error_is_recoverable(&err) => (None, Some(err)),
@@ -3482,13 +3543,19 @@ fn recompute_public_archive_root(
 
 fn parse_valid_manifest_footer(
     volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
     subkeys: &Subkeys,
     manifest_bytes: &[u8],
-    block_size: u32,
 ) -> Result<ManifestFooter, FormatError> {
     let manifest_footer = ManifestFooter::parse(manifest_bytes)?;
-    validate_manifest_footer(volume_header, &manifest_footer, subkeys, manifest_bytes)?;
-    manifest_footer.validate_index_root_extent(block_size)?;
+    validate_manifest_footer(
+        volume_header,
+        crypto_header,
+        &manifest_footer,
+        subkeys,
+        manifest_bytes,
+    )?;
+    manifest_footer.validate_index_root_extent(crypto_header.block_size)?;
     Ok(manifest_footer)
 }
 
@@ -3501,6 +3568,9 @@ fn manifest_footer_copy_error_is_recoverable(error: &FormatError) -> bool {
             structure: "ManifestFooter",
         } | FormatError::InvalidAuthoritativeFlag(_)
             | FormatError::HmacMismatch {
+                structure: "ManifestFooter",
+            }
+            | FormatError::IntegrityDigestMismatch {
                 structure: "ManifestFooter",
             }
     )
@@ -4909,9 +4979,10 @@ fn validate_recovered_terminal_inner(
             "CMRA CryptoHeader differs from parsed CryptoHeader",
         ));
     }
-    verify_hmac(
+    verify_integrity_tag(
         HmacDomain::CryptoHeader,
-        &subkeys.mac_key,
+        recovered_crypto.fixed.aead_algo,
+        Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
         recovered_crypto.hmac_covered_bytes,
@@ -4926,6 +4997,7 @@ fn validate_recovered_terminal_inner(
     let manifest_footer = ManifestFooter::parse(&manifest_region.bytes)?;
     validate_manifest_footer(
         volume_header,
+        crypto_header,
         &manifest_footer,
         subkeys,
         &manifest_region.bytes,
@@ -4954,9 +5026,10 @@ fn validate_recovered_terminal_inner(
         .region(5)
         .ok_or(FormatError::InvalidArchive("missing VolumeTrailer region"))?;
     let trailer = VolumeTrailer::parse(&trailer_region.bytes)?;
-    verify_hmac(
+    verify_integrity_tag(
         HmacDomain::VolumeTrailer,
-        &subkeys.mac_key,
+        crypto_header.aead_algo,
+        Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
         &trailer_region.bytes[..TRAILER_HMAC_COVERED_LEN],
@@ -5397,9 +5470,10 @@ fn parse_bootstrap_sidecar(
             "bootstrap sidecar identity does not match VolumeHeader",
         ));
     }
-    verify_hmac(
+    verify_integrity_tag(
         HmacDomain::BootstrapSidecar,
-        &subkeys.mac_key,
+        crypto_header.aead_algo,
+        Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
         &header_bytes[..SIDECAR_HMAC_COVERED_LEN],
@@ -5503,9 +5577,10 @@ fn validate_sidecar_manifest_footer(
             "sidecar ManifestFooter is not authoritative",
         ));
     }
-    verify_hmac(
+    verify_integrity_tag(
         HmacDomain::ManifestFooter,
-        &subkeys.mac_key,
+        crypto_header.aead_algo,
+        Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
         &raw[..MANIFEST_HMAC_COVERED_LEN],
@@ -5677,6 +5752,7 @@ fn validate_trailer_identity(
 
 fn validate_manifest_footer(
     volume_header: &VolumeHeader,
+    crypto_header: &CryptoHeaderFixed,
     footer: &ManifestFooter,
     subkeys: &Subkeys,
     raw: &[u8],
@@ -5699,9 +5775,10 @@ fn validate_manifest_footer(
             "ManifestFooter is not authoritative",
         ));
     }
-    verify_hmac(
+    verify_integrity_tag(
         HmacDomain::ManifestFooter,
-        &subkeys.mac_key,
+        crypto_header.aead_algo,
+        Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
         &raw[..MANIFEST_HMAC_COVERED_LEN],
@@ -6187,14 +6264,16 @@ fn sequential_extract_tar_stream_with_options(
     let crypto_end = checked_add(crypto_start, crypto_len, "CryptoHeader")?;
     let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
     let parsed_crypto = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length)?;
-    let subkeys = Subkeys::derive(
-        master_key,
+    let subkeys = subkeys_for_open(
+        Some(master_key),
+        parsed_crypto.fixed.aead_algo,
         &volume_header.archive_uuid,
         &volume_header.session_id,
     )?;
-    verify_hmac(
+    verify_integrity_tag(
         HmacDomain::CryptoHeader,
-        &subkeys.mac_key,
+        parsed_crypto.fixed.aead_algo,
+        Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
         parsed_crypto.hmac_covered_bytes,
@@ -6777,6 +6856,7 @@ fn load_repaired_object_data_shards_from_parts(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_repaired_object_data_shards_from_parts_with_parity_policy(
     blocks: &impl BlockProvider,
     crypto_header: &CryptoHeaderFixed,

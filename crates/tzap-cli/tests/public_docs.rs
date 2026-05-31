@@ -158,14 +158,14 @@ fn public_reference_file_exists_and_covers_commands() {
 
 #[test]
 fn public_spec_file_remains_linked() {
-    let spec = read_workspace_file("specs/tzap-format-revisedv41.md");
+    let spec = read_workspace_file("specs/tzap-format-revisedv43.md");
     let root_readme = read_workspace_file("README.md");
     let cli_readme = read_workspace_file("crates/tzap-cli/README.md");
 
-    assert!(spec.contains("### 28.1 Test corpus additions through v0.41"));
+    assert!(spec.contains("### 28.1 Test corpus additions through v0.43"));
     assert!(spec.contains("## 29. Conformance"));
-    assert!(root_readme.contains("specs/tzap-format-revisedv41.md"));
-    assert!(cli_readme.contains("specs/tzap-format-revisedv41.md"));
+    assert!(root_readme.contains("specs/tzap-format-revisedv43.md"));
+    assert!(cli_readme.contains("specs/tzap-format-revisedv43.md"));
 }
 
 #[test]
@@ -470,12 +470,12 @@ fn traceability_materials_live_under_requested_folder_and_cover_claim_gates() {
     assert!(root.is_dir());
 
     let index = read_workspace_file("implmentation-docs/traceability/README.md");
-    let v41 = read_workspace_file("implmentation-docs/traceability/v41-core-traceability.md");
+    let v43 = read_workspace_file("implmentation-docs/traceability/v43-core-traceability.md");
     let signing =
         read_workspace_file("implmentation-docs/traceability/signing-plugin-traceability.md");
     let runbook = read_workspace_file("implmentation-docs/traceability/verification-runbook.md");
 
-    assert!(index.contains("v41-compliant for the documented supported archive workflows"));
+    assert!(index.contains("v43-compliant for the documented supported archive workflows"));
     assert!(index.contains("implmentation-docs/traceability"));
     assert!(index.contains("cargo fmt --check"));
     assert!(index.contains("cargo clippy --workspace --all-targets -- -D warnings"));
@@ -484,16 +484,17 @@ fn traceability_materials_live_under_requested_folder_and_cover_claim_gates() {
     assert!(index.contains("cargo audit"));
 
     for required in [
-        "V41-001",
-        "V41-014",
-        "V41-019",
-        "V41-022",
+        "V43-001",
+        "V43-014",
+        "V43-019",
+        "V43-022",
+        "V43-027",
         "Unsupported and documented",
         "No implementation gap is recorded",
     ] {
         assert!(
-            v41.contains(required),
-            "missing v41 traceability marker {required}"
+            v43.contains(required),
+            "missing v43 traceability marker {required}"
         );
     }
 

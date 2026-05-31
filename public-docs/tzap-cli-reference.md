@@ -3,7 +3,7 @@
 This document is a compact command reference for `tzap` operators and automation.
 
 - **Version**: from binary metadata (`tzap --version`)
-- **Revision**: format v0.41
+- **Revision**: format v0.43
 
 ## Global options
 
@@ -38,8 +38,8 @@ printf '%s\n' "$TZAP_PASSPHRASE" | \
 # Raw key source
 tzap create --keyfile project.key -o backup.tzap ./project
 
-# Explicit no-secret convenience archive
-tzap create --insecure-zero-key --signing-key root.signing.hex -o public.tzap ./project
+# Explicit plaintext archive
+tzap create --no-encryption --signing-key root.signing.hex -o public.tzap ./project
 
 # Signed RootAuth archive
 tzap create --keyfile project.key --signing-key root.signing.hex -o backup.tzap ./project
@@ -71,10 +71,10 @@ Useful flags:
   modes default to 0.
 - `--bit-rot-buffer-pct`: recovery budget as percentage
 - `--argon2-*`: passphrase derivation tuning
-- `--insecure-zero-key`: use a 32-byte all-zero raw key for explicit
-  no-secret convenience archives
+- `--no-encryption`: write an explicit plaintext archive with unkeyed v43
+  integrity digests
 - `--dictionary`: optional zstd dictionary
-- `--signing-key`: Ed25519 signing seed for v41 RootAuth
+- `--signing-key`: Ed25519 signing seed for v43 RootAuth
 - `--signing-cert`: X.509 leaf certificate for RootAuth
 - `--signing-private-key`: private key for `--signing-cert`
 - `--signing-chain`: optional PEM or DER intermediate certificate chain
@@ -98,10 +98,12 @@ Notes:
 
 - `--bootstrap-out` rejects `--volumes > 1` and `--volume-size` with
   `unsupported-feature`.
-- `--insecure-zero-key` uses raw-key mode with 32 zero bytes, skips Argon2,
-  and provides no confidentiality. Use it only when the archive is intended to
-  behave like a convenience zip. RootAuth signing can still authenticate the
-  archive, and readers must pass the same explicit flag.
+- `--no-encryption` stores payload and metadata without confidentiality. It
+  uses `aead_algo = None`, `kdf_algo = None`, and unkeyed v43 integrity
+  digests for fixed metadata. RootAuth signing can still authenticate the
+  archive and signer provenance.
+- `--insecure-zero-key` was removed in v43. Use `--no-encryption` when the
+  archive is intentionally public plaintext.
 - Create writes archive files to explicit paths. `-o -` is not archive stdout;
   the current CLI rejects that sentinel with `unsupported-feature`.
 - `--tar-stdin` requires exactly one input path, `-`, and writes to a
@@ -112,11 +114,11 @@ Notes:
   `--volume-size`, and `--volume-loss-tolerance > 0` before reading payload
   stdin.
 - `--raw-stdin --stdin-size SIZE` streams exactly `SIZE` bytes into one
-  regular-file member in the standard tar-member v41 profile. Add `--volumes N`
+  regular-file member in the standard tar-member v43 profile. Add `--volumes N`
   for fixed-count multi-volume output. Short or overlong stdin is rejected and
   the temporary archive path or volume set is not published.
 - `--raw-stdin --spool-stdin` writes stdin to an explicit plaintext temporary
-  spool first, then archives it as the same tar-member v41 profile. Add
+  spool first, then archives it as the same tar-member v43 profile. Add
   `--volumes N` for fixed-count multi-volume output. After EOF the spool gives
   tzap a file-backed raw source with a known size, while `-o` still writes a
   normal file-backed archive path or volume set. That output shape is faster
@@ -145,7 +147,7 @@ Extract selected paths or all members:
 
 ```sh
 tzap extract --keyfile project.key -C restored project.tzap
-tzap extract --insecure-zero-key -C restored public.tzap
+tzap extract -C restored public.tzap
 cat project.tzap | tzap extract --keyfile project.key -C restored -
 # Single file to stdout
 tzap extract --keyfile project.key --stdout project.tzap project/readme.txt
@@ -157,7 +159,6 @@ Useful flags:
 - `--stdout`: emit a single file payload to stdout
 - `--overwrite`: replace existing files
 - `--dry-run`: show what would be extracted
-- `--insecure-zero-key`: open an explicit no-secret convenience archive
 - `--bootstrap`: bootstrap sidecar path
 - `--volume`: additional multi-volume input paths
 - `--jobs`: worker count for reader CPU work; defaults to the logical CPU count
@@ -165,10 +166,11 @@ Useful flags:
 
 Notes:
 
-- `-` is archive stdin for staged extract-all of single-volume streams with
-  `--keyfile` or `--insecure-zero-key`. Dictionary-compressed streams require
-  `--bootstrap`. It rejects selected paths, `--stdout`, extra `--volume`
-  inputs, and passphrase modes because stdin is the archive byte stream.
+- `-` is archive stdin for staged extract-all of single-volume streams with a
+  raw `--keyfile` or no key for an unencrypted archive. Dictionary-compressed
+  streams require `--bootstrap`. It rejects selected paths, `--stdout`, extra
+  `--volume` inputs, and passphrase modes because stdin is the archive byte
+  stream.
 - For selected-file workflows, use a file-backed archive path. This is the fast
   path: the random-access reader uses the authenticated index to read only the
   selected member's metadata and payload envelopes instead of streaming through
@@ -198,7 +200,7 @@ Inspect archive content paths:
 ```sh
 tzap list --keyfile project.key project.tzap
 printf '%s\n' "$TZAP_PASSPHRASE" | tzap list --password-stdin project.tzap
-tzap list --insecure-zero-key public.tzap
+tzap list public.tzap
 cat project.tzap | tzap list --keyfile project.key -
 
 tzap list --keyfile project.key --long project.tzap
@@ -209,7 +211,6 @@ Useful flags:
 
 - `--long`: human-readable long listing
 - `--json`: machine-readable JSON output
-- `--insecure-zero-key`: open an explicit no-secret convenience archive
 - `--bootstrap`: bootstrap sidecar path
 - `--volume`: additional multi-volume input paths
 - `--jobs`: worker count for reader CPU work; defaults to the logical CPU count
@@ -217,8 +218,8 @@ Useful flags:
 
 Notes:
 
-- `-` is archive stdin for single-volume streams with `--keyfile` or
-  `--insecure-zero-key`.
+- `-` is archive stdin for single-volume streams with a raw `--keyfile` or no
+  key for an unencrypted archive.
   Dictionary-compressed streams require `--bootstrap`. Listing is emitted only
   after EOF, terminal authentication, and metadata/content conformance checks
   succeed.
@@ -242,7 +243,7 @@ Validate archive integrity and recovery profile:
 
 ```sh
 tzap verify --keyfile project.key project.tzap
-tzap verify --insecure-zero-key --trusted-public-key root.public.hex public.tzap
+tzap verify --trusted-public-key root.public.hex public.tzap
 cat project.tzap | tzap verify --keyfile project.key -
 tzap verify --keyfile project.key project.vol000.tzap
 printf '%s\n' "$TZAP_PASSPHRASE" | tzap verify --password-stdin project.tzap
@@ -265,31 +266,31 @@ Useful flags:
 - `--trusted-public-key`: verify Ed25519 RootAuth with a trusted public key
 - `--trusted-ca-cert`: verify X.509 RootAuth with a trusted CA certificate
 - `--trusted-system-roots`: allow OpenSSL default trust roots for X.509 RootAuth
-- `--public-no-key`: verify public v41 RootAuth commitments without the archive key
-- `--insecure-zero-key`: verify an explicit no-secret convenience archive
+- `--public-no-key`: verify public v43 RootAuth commitments without the archive key
 - `--bootstrap`: bootstrap sidecar path
 - `--jobs`: worker count for reader CPU work; defaults to the logical CPU count
   reported by the operating system
 
 Notes:
 
-- Key-holding verification uses `--keyfile`, `--password`, `--password-stdin`,
-  or `--insecure-zero-key`. Add `--trusted-public-key` to require RootAuth
-  content verification after ordinary archive integrity verification for
-  Ed25519, or add `--trusted-ca-cert` / `--trusted-system-roots` for X.509
-  RootAuth.
+- Key-holding verification uses `--keyfile`, `--password`, or
+  `--password-stdin` for encrypted archives. Unencrypted v43 archives use no
+  archive key. Add `--trusted-public-key` to require RootAuth content
+  verification after ordinary archive integrity verification for Ed25519, or
+  add `--trusted-ca-cert` / `--trusted-system-roots` for X.509 RootAuth.
 - Key-holding verification opens archive files through the core file-backed
   random-access reader, then intentionally walks the payload and metadata needed
   to validate the full archive.
-- Public no-key verification requires `--public-no-key --trusted-public-key`.
+- Public no-key verification requires `--public-no-key` plus one trust source:
+  `--trusted-public-key`, `--trusted-ca-cert`, or `--trusted-system-roots`.
   It does not use archive key material or bootstrap sidecars, and reports the
-  public v41 diagnostics `public_data_block_commitment_verified`,
+  public v43 diagnostics `public_data_block_commitment_verified`,
   `public_physical_completeness_unverified`, and
   `public_recovery_margin_unchecked` on success.
 - Verification reports unsupported local tar metadata profiles to stderr as
   `tzap: degraded-metadata: ...` after the archive structure and content verify.
-- `-` is archive stdin for single-volume key-holding verification with
-  `--keyfile` or `--insecure-zero-key`. Dictionary-compressed streams require
+- `-` is archive stdin for single-volume verification with a raw `--keyfile`
+  or no key for an unencrypted archive. Dictionary-compressed streams require
   `--bootstrap`. Archive stdin does not support `--password-stdin`,
   passphrase KDF discovery, RootAuth external verification flags,
   `--public-no-key`, or multi-volume recovery.

@@ -20,12 +20,12 @@ fuzz/              Parser fuzz targets, deterministic seeds, and fuzz smoke.
 The archive pipeline is:
 
 ```text
-tar member groups -> zstd frames -> pack -> pad -> AEAD -> FEC -> stripe -> split
+tar member groups -> zstd frames -> pack -> pad -> optional AEAD -> FEC -> stripe -> split
 ```
 
-The format stores encrypted payload objects, encrypted indexes, authenticated
-headers and trailers, and enough metadata to support random access after the
-archive is opened. The v0.41 spec defines the wire structures, algorithm
+The format stores payload objects, indexes, integrity-protected headers and
+trailers, and enough metadata to support random access after the archive is
+opened. The v0.43 spec defines the wire structures, optional-encryption
 registry, integrity model, FEC layout, bootstrap behavior, and reader/writer
 requirements.
 

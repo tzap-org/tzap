@@ -8,18 +8,19 @@
 
 Backups should survive real life.
 
-`tzap` is a fast, encrypted, self-healing archive tool for serious long-term
-storage. It keeps private data private, adds recovery data for damaged storage,
-splits cleanly across drives or cloud objects, and restores one file from a huge
-archive without unpacking everything else.
+`tzap` is a fast, self-healing archive tool for serious long-term storage. It
+can encrypt private archives, publish explicit plaintext archives, add recovery
+data for damaged storage, split cleanly across drives or cloud objects, and
+restore one file from a huge archive without unpacking everything else.
 
 One command. One archive. No duct-taping together tar, compression, encryption,
 checksums, parity files, split-volume naming, and restore logic.
 
 ## Why people choose tzap
 
-- **It protects the stuff that matters.** File contents, names, metadata, and
-  indexes are encrypted.
+- **It protects the stuff that matters.** Choose passphrase or raw-key
+  encryption for private archives, or explicit no-encryption mode for public
+  recovery-focused archives.
 - **It is built for ugly storage reality.** Bit rot, missing volumes, old drives,
   cloud copies, and cold archives are part of the design.
 - **It gets you one file fast.** Pull a photo, contract, source file, or record
@@ -54,6 +55,12 @@ printf '%s\n' "$TZAP_PASSPHRASE" | \
   tzap create --password-stdin \
   -o backup.tzap \
   ./project
+```
+
+Create an explicit plaintext archive:
+
+```sh
+tzap create --no-encryption -o public.tzap ./public-project
 ```
 
 Check it before you trust it:
@@ -111,7 +118,7 @@ See the [recovery matrix](public-docs/tzap-recovery-matrix.md) for the simple
 - CLI crate: [crates.io/crates/tzap](https://crates.io/crates/tzap)
 - Core library: [crates.io/crates/tzap-core](https://crates.io/crates/tzap-core)
 - Signing plugin: [crates.io/crates/tzap-plugin-signing](https://crates.io/crates/tzap-plugin-signing)
-- Format spec: [specs/tzap-format-revisedv41.md](specs/tzap-format-revisedv41.md)
+- Format spec: [specs/tzap-format-revisedv43.md](specs/tzap-format-revisedv43.md)
 - Development guide: [public-docs/tzap-development.md](public-docs/tzap-development.md)
 
 ## License

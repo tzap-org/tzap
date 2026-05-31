@@ -17,7 +17,7 @@ const TARGETS: [(&str, fn(&[u8])); 3] = [
 const EMBEDDED_SEEDS: [(&str, &[u8]); 5] = [
     ("empty", b""),
     (
-        "v41-magic-markers",
+        "v43-magic-markers",
         b"TZAPTZCHTZBKTZMFTZVTTZRATZMITZCRTZCSTZCLTZBS",
     ),
     ("metadata-magic-markers", b"TZIRTZISTZDH"),

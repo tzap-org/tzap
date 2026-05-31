@@ -6,13 +6,13 @@ use crate::format::{
 };
 
 const ROOT_AUTH_DESCRIPTOR_DOMAIN: &[u8] = b"tzap-root-auth-descriptor-v1\0";
-const ARCHIVE_ROOT_DOMAIN: &[u8] = b"tzap-archive-root-v41\0";
-const CRYPTO_HEADER_PRE_HMAC_DOMAIN: &[u8] = b"tzap-crypto-header-pre-hmac-v41\0";
-const MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN: &[u8] = b"tzap-manifest-footer-global-pre-hmac-v41\0";
-const CRITICAL_METADATA_DOMAIN: &[u8] = b"tzap-critical-metadata-v41\0";
-const INDEX_ROOT_DOMAIN: &[u8] = b"tzap-index-root-v41\0";
-const FEC_LAYOUT_DOMAIN: &[u8] = b"tzap-fec-layout-v41\0";
-const DATA_BLOCK_MERKLE_DOMAIN: &[u8] = b"tzap-data-block-merkle-v41\0";
+const ARCHIVE_ROOT_DOMAIN: &[u8] = b"tzap-archive-root-v43\0";
+const CRYPTO_HEADER_PRE_HMAC_DOMAIN: &[u8] = b"tzap-crypto-header-pre-hmac-v43\0";
+const MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN: &[u8] = b"tzap-manifest-footer-global-pre-hmac-v43\0";
+const CRITICAL_METADATA_DOMAIN: &[u8] = b"tzap-critical-metadata-v43\0";
+const INDEX_ROOT_DOMAIN: &[u8] = b"tzap-index-root-v43\0";
+const FEC_LAYOUT_DOMAIN: &[u8] = b"tzap-fec-layout-v43\0";
+const DATA_BLOCK_MERKLE_DOMAIN: &[u8] = b"tzap-data-block-merkle-v43\0";
 const EMPTY_MERKLE_DOMAIN: &[u8] = b"tzap-empty-merkle-tree-v1\0";
 const SIGNER_IDENTITY_DOMAIN: &[u8] = b"tzap-signer-identity-v1\0";
 

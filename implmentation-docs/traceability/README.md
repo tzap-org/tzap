@@ -1,6 +1,6 @@
-# tzap v41 traceability pack
+# tzap v43 traceability pack
 
-This folder is the working evidence set for v41 and RootAuth signing-plugin
+This folder is the working evidence set for v43 and RootAuth signing-plugin
 compliance. The root README stays product-facing; this folder carries the
 review map, verification gates, and audit notes.
 
@@ -12,20 +12,20 @@ is the path requested for this pass.
 Allowed after all required gates pass:
 
 ```text
-tzap is v41-compliant for the documented supported archive workflows, including
+tzap is v43-compliant for the documented supported archive workflows, including
 the RootAuth signing plugin profiles covered by this matrix.
 ```
 
 Avoid without a separate external conformance program:
 
 ```text
-tzap is completely v41-compliant for every optional, future, or unsupported
+tzap is completely v43-compliant for every optional, future, or unsupported
 profile described by the specification.
 ```
 
 ## Materials
 
-- [v41-core-traceability.md](v41-core-traceability.md): core archive-format
+- [v43-core-traceability.md](v43-core-traceability.md): core archive-format
   requirement map.
 - [signing-plugin-traceability.md](signing-plugin-traceability.md): Ed25519 and
   X.509 RootAuth profile map.

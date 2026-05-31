@@ -1,11 +1,11 @@
 # tzap
 
-Fast encrypted archives that can heal.
+Fast archives that can heal.
 
-`tzap` is the archive CLI for people who want backups to be private, fast,
-recoverable, and easy to restore. It packs zstd compression, authenticated
-encryption, safe extraction defaults, multi-volume recovery, and instant
-selected-file restores into one practical command.
+`tzap` is the archive CLI for people who want backups to be private when needed,
+fast, recoverable, and easy to restore. It packs zstd compression, optional
+authenticated encryption, safe extraction defaults, multi-volume recovery, and
+instant selected-file restores into one practical command.
 
 Use it for project folders, private datasets, media collections, cold storage,
 cloud object storage, and long-lived backup sets where "just zip it" is not
@@ -14,8 +14,8 @@ enough.
 ## Why use it
 
 - **Fast archives.** Rust, zstd, and indexed metadata keep large backups moving.
-- **Private archives.** File contents, file names, metadata, and indexes are
-  encrypted.
+- **Private or public archives.** Use passphrase/raw-key encryption for private
+  archives, or `--no-encryption` for explicit plaintext archives.
 - **Self-healing archives.** Recovery data can repair accidental damage within
   the budget chosen at create time.
 - **Instant targeted restores.** Restore one file from a large archive without
@@ -85,6 +85,15 @@ tzap list --keyfile project.key project.tzap
 tzap extract --keyfile project.key -C restored project.tzap
 ```
 
+## Quick start: plaintext archive
+
+```sh
+tzap create --no-encryption -o public.tzap ./public-project
+tzap verify public.tzap
+tzap list public.tzap
+tzap extract -C restored public.tzap
+```
+
 ## Recoverable multi-volume archive
 
 Create three volumes that can survive one missing volume:
@@ -142,6 +151,6 @@ archive data; raw-key archives require the original 32-byte key.
 ## More information
 
 - Repository: <https://github.com/frankmanzhu/tzap>
-- Format specification: <https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv41.md>
+- Format specification: <https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv43.md>
 - Library crate: <https://crates.io/crates/tzap-core>
 - Signing plugin crate: <https://crates.io/crates/tzap-plugin-signing>

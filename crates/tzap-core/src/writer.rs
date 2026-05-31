@@ -9,7 +9,8 @@ use crate::compression::{
     compress_zstd_frame_with_dictionary_and_jobs, compress_zstd_frame_with_jobs,
 };
 use crate::crypto::{
-    aead_encrypt, build_aad, compute_hmac, derive_nonce, HmacDomain, KdfParams, MasterKey, Subkeys,
+    aead_encrypt, build_aad, compute_integrity_tag, derive_nonce, HmacDomain, KdfParams, MasterKey,
+    Subkeys,
 };
 use crate::fec::encode_parity_gf16;
 use crate::format::{
@@ -509,6 +510,23 @@ pub fn write_archive(
     )
 }
 
+pub fn write_archive_unencrypted(
+    files: &[RegularFile<'_>],
+    mut options: WriterOptions,
+) -> Result<WrittenArchive, FormatError> {
+    options.aead_algo = AeadAlgo::None;
+    let placeholder = MasterKey::from_raw_key(&[0; 32])?;
+    write_archive_inner(
+        files,
+        &placeholder,
+        options,
+        None,
+        &KdfParams::None,
+        None,
+        None,
+    )
+}
+
 pub fn write_archive_with_kdf(
     files: &[RegularFile<'_>],
     master_key: &MasterKey,
@@ -808,6 +826,19 @@ fn format_error_from_archive_write_error(error: ArchiveWriteError) -> FormatErro
     }
 }
 
+fn writer_subkeys(
+    master_key: &MasterKey,
+    aead_algo: AeadAlgo,
+    archive_uuid: &[u8; 16],
+    session_id: &[u8; 16],
+) -> Result<Subkeys, FormatError> {
+    if aead_algo.is_encrypted() {
+        Subkeys::derive(master_key, archive_uuid, session_id)
+    } else {
+        Ok(Subkeys::unencrypted_placeholder())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_archive_stream_inner<S, O>(
     files: &[S],
@@ -908,6 +939,7 @@ struct TimedWriterPlan {
     timings: WriterTimings,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_writer_plan<S: RegularFileSource>(
     files: &[S],
     master_key: &MasterKey,
@@ -956,7 +988,7 @@ fn build_writer_plan_from_payload(
     session_id: [u8; 16],
     root_auth: Option<RootAuthWriterConfig<'_>>,
 ) -> Result<WriterPlan, ArchiveWriteError> {
-    let subkeys = Subkeys::derive(master_key, &archive_uuid, &session_id)?;
+    let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
     let (shard_file_rows, planned_index_shards) = if payload.tar_members.is_empty() {
         (Vec::new(), Vec::new())
     } else {
@@ -1281,7 +1313,7 @@ where
     let session_id = options
         .session_id
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
-    let subkeys = Subkeys::derive(master_key, &archive_uuid, &session_id)?;
+    let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
     let crypto_header = build_crypto_header(
         options,
         false,
@@ -1419,7 +1451,7 @@ where
     let session_id = options
         .session_id
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
-    let subkeys = Subkeys::derive(master_key, &archive_uuid, &session_id)?;
+    let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
     let crypto_header = build_crypto_header(
         options,
         false,
@@ -1695,7 +1727,7 @@ where
     let session_id = options
         .session_id
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
-    let subkeys = Subkeys::derive(master_key, &archive_uuid, &session_id)?;
+    let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
     let crypto_header = build_crypto_header(
         options,
         false,
@@ -2833,7 +2865,12 @@ fn required_stripe_width_for_plan(
     master_key: &MasterKey,
     target_volume_size: u64,
 ) -> Result<u32, FormatError> {
-    let subkeys = Subkeys::derive(master_key, &plan.archive_uuid, &plan.session_id)?;
+    let subkeys = writer_subkeys(
+        master_key,
+        plan.options.aead_algo,
+        &plan.archive_uuid,
+        &plan.session_id,
+    )?;
     let mut max_volume_size = 0u64;
     let mut max_overhead = 0u64;
     let block_record_len = plan.options.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
@@ -2903,6 +2940,7 @@ fn planned_v41_volume_size(
     )?;
     let manifest_footer = build_manifest_footer(
         subkeys,
+        plan.options.aead_algo,
         plan.archive_uuid,
         plan.session_id,
         volume_index,
@@ -2930,6 +2968,7 @@ fn planned_v41_volume_size(
     )?;
     let trailer = build_volume_trailer(VolumeTrailerBuildInput {
         subkeys,
+        aead_algo: plan.options.aead_algo,
         archive_uuid: plan.archive_uuid,
         session_id: plan.session_id,
         volume_index,
@@ -2938,7 +2977,7 @@ fn planned_v41_volume_size(
         manifest_footer_offset,
         closed_at_ns: plan.options.closed_at_ns,
         root_auth_footer: root_auth_footer_offset.zip(plan.root_auth_footer_length),
-    });
+    })?;
     let cmra_offset = checked_u64_add(trailer_offset, VOLUME_TRAILER_LEN as u64, "CMRA")?;
     let cmra = build_v41_cmra(CmraBuildInput {
         volume_header_bytes: &volume_header_bytes,
@@ -2986,7 +3025,12 @@ where
     S: RegularFileSource,
     O: ArchiveWriteSink,
 {
-    let subkeys = Subkeys::derive(master_key, &plan.archive_uuid, &plan.session_id)?;
+    let subkeys = writer_subkeys(
+        master_key,
+        plan.options.aead_algo,
+        &plan.archive_uuid,
+        &plan.session_id,
+    )?;
     let mut state = begin_writer_emission_state(
         sink,
         plan.options,
@@ -3130,6 +3174,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
 
     let volume_zero_manifest = build_manifest_footer(
         subkeys,
+        plan.options.aead_algo,
         plan.archive_uuid,
         plan.session_id,
         0,
@@ -3174,6 +3219,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
         let manifest_footer_offset = state.bytes_written[volume_index];
         let manifest_footer = build_manifest_footer(
             subkeys,
+            plan.options.aead_algo,
             plan.archive_uuid,
             plan.session_id,
             volume_index_u32,
@@ -3204,6 +3250,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
         let trailer_offset = state.bytes_written[volume_index];
         let trailer = build_volume_trailer(VolumeTrailerBuildInput {
             subkeys,
+            aead_algo: plan.options.aead_algo,
             archive_uuid: plan.archive_uuid,
             session_id: plan.session_id,
             volume_index: volume_index_u32,
@@ -3212,7 +3259,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
             manifest_footer_offset,
             closed_at_ns: plan.options.closed_at_ns,
             root_auth_footer: root_auth_footer_offset.zip(root_auth_footer_length),
-        });
+        })?;
         sink.write_volume(volume_index, &trailer)?;
         state.bytes_written[volume_index] = checked_u64_add(
             state.bytes_written[volume_index],
@@ -3281,6 +3328,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
     let bootstrap_sidecar_bytes = if plan.options.stripe_width == 1 {
         let sidecar = build_bootstrap_sidecar(
             subkeys,
+            plan.options.aead_algo,
             plan.archive_uuid,
             plan.session_id,
             &volume_zero_manifest,
@@ -3728,7 +3776,11 @@ fn validate_writer_options_match_reader_caps(options: WriterOptions) -> Result<(
         compression_algo: CompressionAlgo::ZstdFramed,
         aead_algo: options.aead_algo,
         fec_algo: FecAlgo::ReedSolomonGF16,
-        kdf_algo: KdfAlgo::Raw,
+        kdf_algo: if options.aead_algo.is_encrypted() {
+            KdfAlgo::Raw
+        } else {
+            KdfAlgo::None
+        },
         chunk_size: options.chunk_size,
         envelope_target_size: options.envelope_target_size,
         block_size: options.block_size,
@@ -3765,9 +3817,20 @@ fn build_crypto_header(
             "CryptoHeader length overflow",
         ))?;
     let kdf_algo = match kdf_params {
+        KdfParams::None => KdfAlgo::None,
         KdfParams::Raw => KdfAlgo::Raw,
         KdfParams::Argon2id { .. } => KdfAlgo::Argon2id,
     };
+    match (options.aead_algo, kdf_algo) {
+        (AeadAlgo::None, KdfAlgo::None) => {}
+        (aead_algo, KdfAlgo::Raw | KdfAlgo::Argon2id) if aead_algo.is_encrypted() => {}
+        _ => {
+            return Err(FormatError::InvalidProtectionMode {
+                aead_algo: options.aead_algo,
+                kdf_algo,
+            });
+        }
+    }
     let fixed = CryptoHeaderFixed {
         length: length as u32,
         compression_algo: CompressionAlgo::ZstdFramed,
@@ -3795,13 +3858,14 @@ fn build_crypto_header(
     bytes.extend_from_slice(&kdf_payload);
     bytes.extend_from_slice(&0u16.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
-    let hmac = compute_hmac(
+    let hmac = compute_integrity_tag(
         HmacDomain::CryptoHeader,
-        &subkeys.mac_key,
+        options.aead_algo,
+        Some(&subkeys.mac_key),
         archive_uuid,
         session_id,
         &bytes,
-    );
+    )?;
     bytes.extend_from_slice(&hmac);
     Ok(bytes)
 }
@@ -3809,6 +3873,9 @@ fn build_crypto_header(
 fn serialize_kdf_params(params: &KdfParams) -> Result<Vec<u8>, FormatError> {
     let mut bytes = Vec::new();
     match params {
+        KdfParams::None => {
+            bytes.extend_from_slice(&(KdfAlgo::None as u16).to_le_bytes());
+        }
         KdfParams::Raw => {
             bytes.extend_from_slice(&(KdfAlgo::Raw as u16).to_le_bytes());
         }
@@ -5113,8 +5180,10 @@ fn validate_root_auth_variable_lengths_for_writer(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_manifest_footer(
     subkeys: &Subkeys,
+    aead_algo: AeadAlgo,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
     volume_index: u32,
@@ -5136,13 +5205,14 @@ fn build_manifest_footer(
         manifest_hmac: [0u8; 32],
     };
     let mut bytes = footer.to_bytes();
-    footer.manifest_hmac = compute_hmac(
+    footer.manifest_hmac = compute_integrity_tag(
         HmacDomain::ManifestFooter,
-        &subkeys.mac_key,
+        aead_algo,
+        Some(&subkeys.mac_key),
         &archive_uuid,
         &session_id,
         &bytes[..104],
-    );
+    )?;
     bytes = footer.to_bytes();
     Ok(bytes)
 }
@@ -5150,6 +5220,7 @@ fn build_manifest_footer(
 #[derive(Debug, Clone, Copy)]
 struct VolumeTrailerBuildInput<'a> {
     subkeys: &'a Subkeys,
+    aead_algo: AeadAlgo,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
     volume_index: u32,
@@ -5160,7 +5231,9 @@ struct VolumeTrailerBuildInput<'a> {
     root_auth_footer: Option<(u64, u32)>,
 }
 
-fn build_volume_trailer(input: VolumeTrailerBuildInput<'_>) -> [u8; VOLUME_TRAILER_LEN] {
+fn build_volume_trailer(
+    input: VolumeTrailerBuildInput<'_>,
+) -> Result<[u8; VOLUME_TRAILER_LEN], FormatError> {
     let (root_auth_footer_offset, root_auth_footer_length, root_auth_flags) =
         match input.root_auth_footer {
             Some((offset, length)) => (offset, length, 0x0000_0001),
@@ -5181,15 +5254,16 @@ fn build_volume_trailer(input: VolumeTrailerBuildInput<'_>) -> [u8; VOLUME_TRAIL
         trailer_hmac: [0u8; 32],
     };
     let mut bytes = trailer.to_bytes();
-    trailer.trailer_hmac = compute_hmac(
+    trailer.trailer_hmac = compute_integrity_tag(
         HmacDomain::VolumeTrailer,
-        &input.subkeys.mac_key,
+        input.aead_algo,
+        Some(&input.subkeys.mac_key),
         &input.archive_uuid,
         &input.session_id,
         &bytes[..96],
-    );
+    )?;
     bytes = trailer.to_bytes();
-    bytes
+    Ok(bytes)
 }
 
 struct BuiltCmra {
@@ -5525,6 +5599,7 @@ fn checked_u64_mul(lhs: u64, rhs: u64, field: &'static str) -> Result<u64, Forma
 
 fn build_bootstrap_sidecar(
     subkeys: &Subkeys,
+    aead_algo: AeadAlgo,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
     manifest_footer: &[u8; MANIFEST_FOOTER_LEN],
@@ -5565,13 +5640,14 @@ fn build_bootstrap_sidecar(
         header_crc32c: 0,
     };
     let mut header_bytes = header.to_bytes();
-    header.sidecar_hmac = compute_hmac(
+    header.sidecar_hmac = compute_integrity_tag(
         HmacDomain::BootstrapSidecar,
-        &subkeys.mac_key,
+        aead_algo,
+        Some(&subkeys.mac_key),
         &archive_uuid,
         &session_id,
         &header_bytes[..92],
-    );
+    )?;
     header_bytes = header.to_bytes();
 
     let mut sidecar = Vec::with_capacity(

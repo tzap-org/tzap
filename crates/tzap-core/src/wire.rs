@@ -204,6 +204,16 @@ impl CryptoHeaderFixed {
         if self.fec_algo != FecAlgo::ReedSolomonGF16 {
             return Err(FormatError::UnsupportedFec(self.fec_algo));
         }
+        match (self.aead_algo, self.kdf_algo) {
+            (AeadAlgo::None, KdfAlgo::None) => {}
+            (aead_algo, KdfAlgo::Raw | KdfAlgo::Argon2id) if aead_algo.is_encrypted() => {}
+            _ => {
+                return Err(FormatError::InvalidProtectionMode {
+                    aead_algo: self.aead_algo,
+                    kdf_algo: self.kdf_algo,
+                });
+            }
+        }
         if self.has_dictionary > 1 {
             return Err(FormatError::InvalidBoolean {
                 field: "has_dictionary",
@@ -2001,6 +2011,36 @@ mod tests {
             CryptoHeaderFixed::parse(&bytes, crypto_fixed().length).unwrap_err(),
             FormatError::NonZeroReserved {
                 structure: "CryptoHeaderFixed"
+            }
+        );
+    }
+
+    #[test]
+    fn crypto_header_fixed_validates_v43_protection_mode_pairs() {
+        let mut header = crypto_fixed();
+        header.aead_algo = AeadAlgo::None;
+        header.kdf_algo = KdfAlgo::None;
+        header.validate_supported_profile().unwrap();
+
+        let mut header = crypto_fixed();
+        header.aead_algo = AeadAlgo::None;
+        header.kdf_algo = KdfAlgo::Raw;
+        assert_eq!(
+            header.validate_supported_profile().unwrap_err(),
+            FormatError::InvalidProtectionMode {
+                aead_algo: AeadAlgo::None,
+                kdf_algo: KdfAlgo::Raw,
+            }
+        );
+
+        let mut header = crypto_fixed();
+        header.aead_algo = AeadAlgo::AesGcmSiv256;
+        header.kdf_algo = KdfAlgo::None;
+        assert_eq!(
+            header.validate_supported_profile().unwrap_err(),
+            FormatError::InvalidProtectionMode {
+                aead_algo: AeadAlgo::AesGcmSiv256,
+                kdf_algo: KdfAlgo::None,
             }
         );
     }

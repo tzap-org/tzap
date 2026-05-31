@@ -1,7 +1,7 @@
 # tzap Recovery Matrix
 
 This document explains what `tzap` recovery means for normal archive users.
-The detailed implementation rules live in the v0.41 format specification and
+The detailed implementation rules live in the v0.43 format specification and
 the operational boundaries document.
 
 ## Plain-English promise
@@ -27,7 +27,7 @@ strong, but it is still a budget.
 | More missing volumes than the chosen tolerance | Fails clearly | Restore a missing volume from another copy |
 | Random bit rot within `--bit-rot-buffer-pct` budget | Repairs, then authenticates | Run `tzap verify` after copying or before restoring |
 | Random bit rot beyond the budget | Fails clearly | Restore the archive or volume from another copy |
-| Corrupted file payload block within budget | Repairs the affected encrypted object | Verify before extracting important data |
+| Corrupted file payload block within budget | Repairs the affected stored object | Verify before extracting important data |
 | Corrupted index or directory metadata within budget | Repairs metadata, then authenticates | Verify the archive |
 | Corrupted terminal metadata within CMRA budget | Repairs startup metadata | Verify the archive |
 | Deliberate tamper with recomputed checksums | Authentication fails | Treat the archive as untrusted |
@@ -38,7 +38,7 @@ strong, but it is still a budget.
 
 `--bit-rot-buffer-pct 5` tells `tzap` to spend about five percent of the
 protected object layout on repair data. That repair data applies across payload
-and metadata objects in v0.41.
+and metadata objects in v0.43.
 
 For users, the practical message is:
 
@@ -52,7 +52,7 @@ The default CLI value is five percent.
 
 ## Payload and metadata coverage
 
-v0.41 protects the main archive pieces users expect:
+v0.43 protects the main archive pieces users expect:
 
 - file payload envelopes
 - IndexRoot
@@ -61,6 +61,8 @@ v0.41 protects the main archive pieces users expect:
 - dictionary objects when present
 - critical terminal metadata through CMRA
 - multi-volume layouts through per-object FEC and volume discovery
+- encrypted archives with keyed authentication, and plaintext archives with
+  explicit no-encryption framing plus unkeyed integrity digests
 
 That means recovery is not only for file contents. It also helps the archive
 find, list, verify, and restore data after ordinary storage damage.
@@ -120,4 +122,4 @@ tzap create \
 - Security model: `public-docs/tzap-security-model.md`
 - CLI reference: `public-docs/tzap-cli-reference.md`
 - Operational boundaries: `public-docs/tzap-operational-boundaries.md`
-- Format specification: `specs/tzap-format-revisedv41.md`
+- Format specification: `specs/tzap-format-revisedv43.md`

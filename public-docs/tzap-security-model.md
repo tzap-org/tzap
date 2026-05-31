@@ -1,17 +1,18 @@
 # tzap Security Model
 
 This document explains what `tzap` is trying to protect in everyday language.
-The full wire-level rules live in the v0.41 format specification.
+The full wire-level rules live in the v0.43 format specification.
 
 ## Plain-English promise
 
-`tzap` is built so an archive can be private, checked, and repaired without
-turning backup safety into a puzzle.
+`tzap` is built so an archive can be private when encrypted, public when
+created as explicit plaintext, checked, and repaired without turning backup
+safety into a puzzle.
 
-- Your file contents are encrypted.
-- Your file names and archive index are encrypted.
-- Archive structure is authenticated so modified data is caught before clean
-  extraction.
+- Encrypted archives protect file contents, file names, and archive indexes.
+- Explicit plaintext archives are easy to publish and open without a key.
+- Archive structure is checked before clean extraction; encrypted and signed
+  archives add keyed or public-authenticated tamper evidence.
 - Safe extraction rejects dangerous archive paths before writing files.
 - Optional RootAuth signing lets a verifier check who signed the archive.
 - Recovery data helps repair accidental damage such as bit rot or missing
@@ -19,12 +20,12 @@ turning backup safety into a puzzle.
 
 The short version for users:
 
-> If the key is right and the archive verifies, `tzap` should either restore the
-> original files or fail loudly before pretending damaged data is safe.
+> If the archive verifies, `tzap` should either restore the original files or
+> fail loudly before pretending damaged data is safe.
 
 ## What is encrypted
 
-`tzap` encrypts the parts users usually care about most:
+In encrypted mode, `tzap` encrypts the parts users usually care about most:
 
 - regular file contents
 - archive member names
@@ -34,6 +35,16 @@ The short version for users:
 
 Someone without the key should not be able to browse the file list or read file
 contents from a normal encrypted archive.
+
+## What plaintext mode means
+
+In v43, `tzap create --no-encryption` writes an explicit plaintext archive.
+Payloads, member names, and index metadata are not confidential, and list,
+verify, and extract can run without a password or keyfile.
+
+Plaintext archives still use block CRCs, FEC, fixed-metadata integrity digests,
+safe extraction checks, and optional RootAuth signing. Use RootAuth when a
+public archive needs tamper evidence or signer provenance.
 
 ## What is still visible
 
@@ -51,7 +62,7 @@ roughly how large it is.
 
 ## Keys and passphrases
 
-`tzap` supports two common ways to protect an archive:
+`tzap` supports two common ways to encrypt an archive:
 
 - **Passphrase mode** derives the archive key with Argon2id. This is convenient
   for people who want to remember one secret.
@@ -61,6 +72,8 @@ roughly how large it is.
 
 Keep the key or passphrase separate from the archive. Losing the archive key
 means losing access to the encrypted archive.
+
+Plaintext archives use `--no-encryption` and do not need an archive key.
 
 ## Integrity checks
 
@@ -85,9 +98,10 @@ Recovery data is meant for normal storage damage:
 - one or more missing volumes when configured for that
 - corrupted blocks detected by checksums
 
-Recovery is not a replacement for authentication. If someone deliberately edits
-archive bytes and also updates unkeyed checksums, `tzap` should detect the final
-authentication failure and refuse clean plaintext rather than promise repair.
+Recovery is not a replacement for authentication. Encrypted archives authenticate
+with keyed tags. Plaintext archives can detect ordinary corruption through CRCs,
+FEC, and unkeyed metadata digests; use RootAuth signing when you need a public
+tamper-evidence boundary against deliberate edits.
 
 ## RootAuth signing
 
@@ -119,7 +133,7 @@ channel is arranged.
 
 ## Deeper references
 
-- Format specification: `specs/tzap-format-revisedv41.md`
+- Format specification: `specs/tzap-format-revisedv43.md`
 - CLI reference: `public-docs/tzap-cli-reference.md`
 - Recovery matrix: `public-docs/tzap-recovery-matrix.md`
 - Operational boundaries: `public-docs/tzap-operational-boundaries.md`

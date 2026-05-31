@@ -8,7 +8,7 @@ writer or reader path.
 ## Writer shape validation
 
 The writer validates archive layout choices before writing bytes. If a request
-cannot produce a valid v0.41 archive with this implementation, `tzap` exits with
+cannot produce a valid v0.43 archive with this implementation, `tzap` exits with
 `16 unsupported-feature`.
 
 Examples:
@@ -50,7 +50,7 @@ What to do:
 - Keep `--chunk-size <= --envelope-size`.
 - Increase very small `--volume-size` values.
 - Large regular-file input sets are supported. The writer emits multiple
-  IndexShard objects and directory-hint shards when the v0.41 layout requires
+  IndexShard objects and directory-hint shards when the v0.43 layout requires
   them.
 - If `tzap create` still returns `unsupported-feature`, check the exact resource
   choice in the diagnostic and the additional boundaries below.
@@ -107,9 +107,9 @@ What to do:
 - For multi-volume workflows, pass the available volume files and omit
   `--bootstrap-out` and `--bootstrap`.
 
-## Root-authenticated v41 archives
+## Root-authenticated v43 archives
 
-The core library and CLI can create and verify root-authenticated v41 archives
+The core library and CLI can create and verify root-authenticated v43 archives
 with the Ed25519 helper profile or an X.509 certificate profile. CLI Ed25519
 signing uses a 32-byte signing seed and writes the derived 32-byte public key
 through `signing-keygen`. CLI X.509 signing uses a leaf certificate plus its
@@ -129,7 +129,7 @@ tzap create \
   ./project
 
 tzap create \
-  --insecure-zero-key \
+  --no-encryption \
   --signing-key root.signing.hex \
   -o public.tzap \
   ./project
@@ -161,7 +161,7 @@ tzap verify \
 Operational shape:
 
 - `--signing-key` may be combined with raw-key, passphrase,
-  `--insecure-zero-key`, dictionary, and normal volume options.
+  `--no-encryption`, dictionary, and normal volume options.
 - `--signing-cert` uses the leaf certificate as signer identity and stores the
   RootAuth signature plus optional `--signing-chain` intermediates in the
   authenticator value.
@@ -172,9 +172,9 @@ Operational shape:
 - X.509 verification reports the certificate subject, issuer, serial number,
   certificate SHA-256, verified chain subjects, trust anchor subject, and the
   signer-claimed signing time.
-- Public no-key verification is requested with
-  `--public-no-key --trusted-public-key`. It does not use `--keyfile`,
-  `--password`, `--password-stdin`, `--insecure-zero-key`, or `--bootstrap`.
+- Public no-key verification is requested with `--public-no-key` plus
+  `--trusted-public-key`, `--trusted-ca-cert`, or `--trusted-system-roots`. It
+  does not use `--keyfile`, `--password`, `--password-stdin`, or `--bootstrap`.
 - X.509 RootAuth signing time is a signer-claimed timestamp embedded in the
   authenticator and used for certificate validity checks. It is not a trusted
   timestamp token, transparency log proof, notarization receipt, or revocation
@@ -184,24 +184,23 @@ Operational shape:
   `public_physical_completeness_unverified`, and
   `public_recovery_margin_unchecked`.
 
-## Explicit no-secret convenience archives
+## Explicit plaintext archives
 
-`--insecure-zero-key` is an explicit no-secret mode for workflows that want a
-convenience archive without managing archive key material. It uses raw-key mode
-with a 32-byte all-zero master key, stores `KdfParams::Raw`, and does not run
-Argon2.
+`--no-encryption` is the v43 mode for workflows that intentionally publish
+archive payloads and metadata without archive key material. It sets
+`aead_algo = None`, `kdf_algo = None`, and uses unkeyed v43 integrity digests
+for fixed metadata instead of HMAC.
 
 Example:
 
 ```text
 tzap create \
-  --insecure-zero-key \
+  --no-encryption \
   --signing-key root.signing.hex \
   -o public.tzap \
   ./project
 
 tzap verify \
-  --insecure-zero-key \
   --trusted-public-key root.public.hex \
   public.tzap
 
@@ -213,20 +212,22 @@ tzap verify \
 
 Operational shape:
 
-- `--insecure-zero-key` provides no confidentiality. Anyone can reconstruct the
-  archive key.
+- `--no-encryption` provides no confidentiality. Anyone with the archive bytes
+  can read payloads and metadata.
 - RootAuth signing can still authenticate archive integrity and signer
-  provenance for zero-key archives.
-- Readers must pass `--insecure-zero-key` explicitly on `list`, `extract`, and
-  key-holding `verify`; there is no silent no-key fallback.
-- `--public-no-key` remains separate and rejects `--insecure-zero-key` because
-  it verifies public RootAuth commitments without opening archive contents.
+  provenance for plaintext archives.
+- `tzap list`, `tzap extract`, and ordinary `tzap verify` open unencrypted
+  archives without `--keyfile`, `--password`, or `--password-stdin`.
+- `--public-no-key` remains separate because it verifies public RootAuth
+  commitments without opening archive contents.
+- The old `--insecure-zero-key` flag was removed in v43 and now exits with a
+  usage error; use `--no-encryption` for plaintext archives.
 
 ## Archive stdin and file paths
 
 For `verify`, `list`, and extract-all, `-` is archive stdin for the live
 non-seekable profile: single-volume archive streams with a raw `--keyfile` or
-`--insecure-zero-key`. Dictionary-compressed streams require a matching
+no key for an unencrypted archive. Dictionary-compressed streams require a matching
 `--bootstrap` sidecar. `--password-stdin` reads passphrases for file-backed
 archives; it cannot share stdin with archive bytes.
 
@@ -236,7 +237,7 @@ Example:
 cat archive.tzap | tzap verify --keyfile project.key -
 cat archive.tzap | tzap list --keyfile project.key -
 cat archive.tzap | tzap extract --keyfile project.key -C restored -
-cat public.tzap | tzap verify --insecure-zero-key -
+cat public.tzap | tzap verify -
 cat dictionary.tzap | tzap verify --keyfile project.key --bootstrap dictionary.tzap.bootstrap -
 ```
 
@@ -343,8 +344,8 @@ tzap verify --keyfile project.key -
 What to do:
 
 - Use `tzap verify --keyfile project.key -`, `tzap list --keyfile project.key
-  -`, `tzap extract --keyfile project.key -C restored -`, or the same commands
-  with `--insecure-zero-key` for live single-volume archive streams.
+  -`, `tzap extract --keyfile project.key -C restored -`, or omit the archive
+  key flags for unencrypted live single-volume archive streams.
 - Provide `--bootstrap <path>` for dictionary-compressed archive streams.
 - Store archive bytes in files when you need selected-path extraction,
   `--stdout`, passphrase KDF discovery, public no-key verification,
@@ -388,14 +389,14 @@ file-backed path is also much faster for later selected-file workflows because
 seekable readers can use random access.
 
 Known-size raw stdin (`--stdin-size`) is consumed once and archived as one
-regular-file member in the standard tar-member v41 profile. With `--volumes N`,
+regular-file member in the standard tar-member v43 profile. With `--volumes N`,
 the same member is striped across the fixed output volume set. Short stdin or
 extra bytes after the declared size reject the create and remove the temporary
 archive output or volume set.
 
 Unknown-size raw stdin is supported only with explicit `--spool-stdin`. That
 mode writes plaintext stdin to a restrictive temporary file, then archives that
-file as a regular tar-member v41 member. With `--volumes N`, tzap waits for EOF,
+file as a regular tar-member v43 member. With `--volumes N`, tzap waits for EOF,
 uses the file-backed spool size as the known raw member size, and stripes the
 member across the fixed output volume set. The spool is removed after normal
 success or normal failure, but the plaintext exists on local disk while the
@@ -471,7 +472,7 @@ What to do:
 
 ## Tar metadata profile
 
-The current v0.41 CLI create path emits regular-file tar member groups. Archive
+The current v0.43 CLI create path emits regular-file tar member groups. Archive
 paths are normalized safe relative UTF-8 paths using `/` separators. Long paths
 and non-ASCII paths are represented with a path-specific local PAX `path` record
 inside the same member group as the file it modifies. The writer does not emit
@@ -516,11 +517,11 @@ surface metadata fidelity should use `list_files`, `extract_member`,
 
 ## Cloud directory-prefix optimization
 
-The v0.41 spec defines a cloud/object-store optimized directory-prefix mode
+The v0.43 spec defines a cloud/object-store optimized directory-prefix mode
 that requires directory hints even for small archives. The current CLI/API does
 not expose that mode and does not claim optimized directory-prefix operations.
 Directory hints are emitted automatically for large regular-file archives when
-the v0.41 threshold requires them.
+the v0.43 threshold requires them.
 
 Example:
 

@@ -1,14 +1,14 @@
 use thiserror::Error;
 
 pub const FORMAT_VERSION: u16 = 1;
-pub const VOLUME_FORMAT_REV: u16 = 41;
+pub const VOLUME_FORMAT_REV: u16 = 43;
 
 pub const VOLUME_HEADER_LEN: usize = 128;
 pub const CRYPTO_HEADER_FIXED_LEN: usize = 76;
 pub const MANIFEST_FOOTER_LEN: usize = 136;
 pub const VOLUME_TRAILER_LEN: usize = 128;
 pub const ROOT_AUTH_FOOTER_FIXED_LEN: usize = 318;
-pub const ROOT_AUTH_SPEC_ID: [u8; 24] = *b"tzap-root-auth-v0.17\0\0\0\0";
+pub const ROOT_AUTH_SPEC_ID: [u8; 24] = *b"tzap-root-auth-v0.43\0\0\0\0";
 pub const CRITICAL_METADATA_IMAGE_FIXED_LEN: usize = 320;
 pub const SERIALIZED_REGION_HEADER_LEN: usize = 16;
 pub const IMAGE_CRC_LEN: usize = 4;
@@ -80,6 +80,7 @@ impl TryFrom<u16> for CompressionAlgo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum AeadAlgo {
+    None = 0,
     AesGcmSiv256 = 1,
     XChaCha20Poly1305 = 2,
     AesGcm256 = 3,
@@ -90,6 +91,7 @@ impl TryFrom<u16> for AeadAlgo {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
+            0 => Ok(Self::None),
             1 => Ok(Self::AesGcmSiv256),
             2 => Ok(Self::XChaCha20Poly1305),
             3 => Ok(Self::AesGcm256),
@@ -101,13 +103,21 @@ impl TryFrom<u16> for AeadAlgo {
 impl AeadAlgo {
     pub const fn nonce_len(self) -> usize {
         match self {
+            Self::None => 0,
             Self::AesGcmSiv256 | Self::AesGcm256 => 12,
             Self::XChaCha20Poly1305 => 24,
         }
     }
 
     pub const fn tag_len(self) -> usize {
-        16
+        match self {
+            Self::None => 0,
+            Self::AesGcmSiv256 | Self::XChaCha20Poly1305 | Self::AesGcm256 => 16,
+        }
+    }
+
+    pub const fn is_encrypted(self) -> bool {
+        !matches!(self, Self::None)
     }
 }
 
@@ -137,6 +147,7 @@ impl TryFrom<u16> for FecAlgo {
 pub enum KdfAlgo {
     Raw = 0,
     Argon2id = 1,
+    None = 2,
 }
 
 impl TryFrom<u16> for KdfAlgo {
@@ -146,6 +157,7 @@ impl TryFrom<u16> for KdfAlgo {
         match value {
             0 => Ok(Self::Raw),
             1 => Ok(Self::Argon2id),
+            2 => Ok(Self::None),
             other => Err(FormatError::UnknownKdfAlgo(other)),
         }
     }
@@ -259,11 +271,17 @@ pub enum FormatError {
     )]
     CryptoHeaderLengthMismatch { fixed: u32, volume: u32 },
 
-    #[error("compression algorithm {0:?} is not valid for v0.41")]
+    #[error("compression algorithm {0:?} is not valid for v0.43")]
     UnsupportedCompression(CompressionAlgo),
 
-    #[error("FEC algorithm {0:?} is not valid for v0.41")]
+    #[error("FEC algorithm {0:?} is not valid for v0.43")]
     UnsupportedFec(FecAlgo),
+
+    #[error("invalid v0.43 protection mode: aead_algo={aead_algo:?}, kdf_algo={kdf_algo:?}")]
+    InvalidProtectionMode {
+        aead_algo: AeadAlgo,
+        kdf_algo: KdfAlgo,
+    },
 
     #[error("invalid boolean field {field}={value}")]
     InvalidBoolean { field: &'static str, value: u8 },
@@ -292,7 +310,7 @@ pub enum FormatError {
         envelope_target_size: u32,
     },
 
-    #[error("block_size {0} is below the v0.41 minimum")]
+    #[error("block_size {0} is below the v0.43 minimum")]
     BlockSizeTooSmall(u32),
 
     #[error("block_size {0} must be even")]
@@ -382,6 +400,9 @@ pub enum FormatError {
 
     #[error("HMAC verification failed for {structure}")]
     HmacMismatch { structure: &'static str },
+
+    #[error("integrity digest verification failed for {structure}")]
+    IntegrityDigestMismatch { structure: &'static str },
 
     #[error("forbidden CryptoHeader extension tag 0x{0:04x}")]
     ForbiddenExtensionTag(u16),

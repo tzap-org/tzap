@@ -20,18 +20,24 @@ use tzap_core::reader::{ArchiveEntry, ArchiveIndexEntry};
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
 use tzap_core::{
     extract_non_seekable_stream_to_dir, extract_non_seekable_stream_to_dir_with_bootstrap_sidecar,
+    extract_unencrypted_non_seekable_stream_to_dir,
+    extract_unencrypted_non_seekable_stream_to_dir_with_bootstrap_sidecar,
     list_non_seekable_stream, list_non_seekable_stream_with_bootstrap_sidecar,
-    open_seekable_archive, open_seekable_archive_with_bootstrap_sidecar_options,
+    list_unencrypted_non_seekable_stream,
+    list_unencrypted_non_seekable_stream_with_bootstrap_sidecar, open_seekable_archive,
+    open_seekable_archive_with_bootstrap_sidecar_options,
     public_no_key_verify_volumes_with_options, verify_non_seekable_stream_with_bootstrap_sidecar,
-    verify_non_seekable_stream_with_options, write_archive,
+    verify_non_seekable_stream_with_options,
+    verify_unencrypted_non_seekable_stream_with_bootstrap_sidecar,
+    verify_unencrypted_non_seekable_stream_with_options, write_archive,
     write_archive_sources_to_sink_ordered_parallel, write_archive_with_dictionary,
     write_archive_with_dictionary_and_kdf, write_archive_with_dictionary_and_root_auth,
     write_archive_with_dictionary_kdf_and_root_auth, write_archive_with_kdf,
     write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
-    write_tar_stream_archive_to_sink_with_kdf_and_root_auth, ArchiveContentVerification,
-    ArchiveRepairPatch, ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfParams, MasterKey,
-    MemoryArchiveSink, MetadataDiagnostic, NonSeekableReaderOptions, OpenedArchive,
+    write_tar_stream_archive_to_sink_with_kdf_and_root_auth, AeadAlgo, ArchiveContentVerification,
+    ArchiveRepairPatch, ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfAlgo, KdfParams,
+    MasterKey, MemoryArchiveSink, MetadataDiagnostic, NonSeekableReaderOptions, OpenedArchive,
     PublicNoKeyVerification, ReaderOptions, RegularFile, RegularFileSource, RootAuthSigningRequest,
     RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions, StreamingRawWriterSummary,
     StreamingTarWriterSummary, TarEntryKind, WriterOptions, WriterTimings, WrittenArchiveSummary,
@@ -70,9 +76,9 @@ type CliRootAuthAuthenticator<'a> =
 #[derive(Debug, Parser)]
 #[command(name = "tzap")]
 #[command(version)]
-#[command(about = "Create, list, verify, and extract v41 archives")]
+#[command(about = "Create, list, verify, and extract v43 archives")]
 #[command(
-    long_about = "Create, list, verify, and extract v41 archives.\n\nUsage is centered on an explicit key source per command: either `--keyfile` for raw-key archives, `--password` for interactive prompt, `--password-stdin` for scripted passphrase input, or `--insecure-zero-key` for explicit no-secret convenience archives. The `verify --public-no-key` mode verifies signed public RootAuth commitments without the archive key.\n\nSize suffixes accepted by size flags:\n  0-9 (bytes), K/KB/KiB, M/MB/MiB, G/GB/GiB.\n\nMulti-volume output naming for this CLI:\n  - one volume: --output writes exactly that path\n  - multiple volumes: --output backup.tzap writes backup.vol000.tzap, backup.vol001.tzap, ...\n\nExit codes:\n  2  usage / argument error\n  3  I/O failure (missing file, permission denied, etc.)\n  10 wrong key\n  11 archive corruption or integrity mismatch\n  12 unsupported archive revision / format version\n  13 unsafe extraction attempt\n  14 missing required bootstrap metadata\n  16 unsupported feature in this CLI/core version\n  1  generic failure\n\nSubcommands:\n  create   Build a new archive\n  extract  Extract files from an archive\n  list     List archive contents\n  verify   Validate archive integrity\n  keygen   Generate a random raw keyfile\n  signing-keygen Generate an Ed25519 RootAuth signing keypair"
+    long_about = "Create, list, verify, and extract v43 archives.\n\nCreate selects one protection mode: `--keyfile` for encrypted raw-key archives, `--password` or `--password-stdin` for encrypted passphrase archives, or `--no-encryption` for explicit plaintext archives. Plaintext archives can be listed, verified, and extracted without a password or keyfile. The `verify --public-no-key` mode verifies signed public RootAuth commitments without the archive key.\n\nSize suffixes accepted by size flags:\n  0-9 (bytes), K/KB/KiB, M/MB/MiB, G/GB/GiB.\n\nMulti-volume output naming for this CLI:\n  - one volume: --output writes exactly that path\n  - multiple volumes: --output backup.tzap writes backup.vol000.tzap, backup.vol001.tzap, ...\n\nExit codes:\n  2  usage / argument error\n  3  I/O failure (missing file, permission denied, etc.)\n  10 wrong key\n  11 archive corruption or integrity mismatch\n  12 unsupported archive revision / format version\n  13 unsafe extraction attempt\n  14 missing required bootstrap metadata\n  16 unsupported feature in this CLI/core version\n  1  generic failure\n\nSubcommands:\n  create   Build a new archive\n  extract  Extract files from an archive\n  list     List archive contents\n  verify   Validate archive integrity\n  keygen   Generate a random raw keyfile\n  signing-keygen Generate an Ed25519 RootAuth signing keypair"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -92,11 +98,12 @@ enum Command {
         about = "Create a new archive",
         long_about = "Create a new archive from files and directories.\n\nThe command writes one output path for single-volume archives, or `.vol000.tzap`, `.vol001.tzap`, ... files for multi-volume archives.",
         after_help = "Examples:\n  tzap create --keyfile key.hex -o backup.tzap file.txt\n  tzap create --password -o backup.tzap file.txt\n  tzap create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8192 -o backup.tzap file.txt\n  tar cf - ./dir | tzap create --tar-stdin --keyfile key.hex -o backup.tzap -\n  tzap create --keyfile key.hex --signing-key root.signing.hex -o backup.tzap file.txt\n  tzap create --keyfile key.hex --signing-cert signer.pem --signing-private-key signer.key -o backup.tzap file.txt\n  tzap create --keyfile key.hex -o backup.tzap --volumes 3 dir/\n  tzap create --keyfile key.hex --volume-size 64M --volume-loss-tolerance 1 -o backup.tzap dir/\n  tzap create --keyfile key.hex --bootstrap-out backup.tzap.bootstrap file.txt",
-        group(
-            ArgGroup::new("create-key-source")
-                .required(true)
-                .args(["password_stdin", "password", "keyfile", "insecure_zero_key"])
-        )
+        group(ArgGroup::new("create-key-source").args([
+            "password_stdin",
+            "password",
+            "keyfile",
+            "no_encryption",
+        ]))
     )]
     Create {
         #[arg(
@@ -142,7 +149,7 @@ enum Command {
             long = "password-stdin",
             conflicts_with = "keyfile",
             conflicts_with = "password",
-            conflicts_with = "insecure_zero_key",
+            conflicts_with = "no_encryption",
             value_name = "STDIN",
             help = "Read passphrase from stdin; one trailing LF or CRLF is stripped."
         )]
@@ -152,7 +159,7 @@ enum Command {
             long = "password",
             conflicts_with = "keyfile",
             conflicts_with = "password_stdin",
-            conflicts_with = "insecure_zero_key",
+            conflicts_with = "no_encryption",
             help = "Read passphrase from an interactive prompt."
         )]
         password: bool,
@@ -160,14 +167,21 @@ enum Command {
         #[arg(
             long = "keyfile",
             value_name = "KEYFILE",
-            conflicts_with = "insecure_zero_key",
+            conflicts_with = "no_encryption",
             help = "Use a raw key from KEYFILE."
         )]
         keyfile: Option<String>,
 
         #[arg(
+            long = "no-encryption",
+            help = "Create an explicit plaintext v43 archive with no password or keyfile."
+        )]
+        no_encryption: bool,
+
+        #[arg(
             long = "insecure-zero-key",
-            help = "Use an all-zero raw key. This provides no secrecy and is for explicit convenience archives."
+            hide = true,
+            help = "Removed in v43; use --no-encryption for plaintext archives."
         )]
         insecure_zero_key: bool,
 
@@ -342,7 +356,6 @@ enum Command {
         after_help = "Examples:\n  tzap extract --keyfile key.hex -C out/ backup.tzap\n  tzap extract --keyfile key.hex backup.tzap file.txt\n  tzap extract --keyfile key.hex --stdout backup.tzap hello.txt > out.bin\n  tzap extract --password-stdin --overwrite backup.tzap target/\n  tzap extract --dry-run -C out backup.tzap file.txt\n  tzap extract --bootstrap backup.tzap.bootstrap -C out backup.tzap",
         group(
             ArgGroup::new("open-key-source")
-                .required(true)
                 .args(["password_stdin", "password", "keyfile", "insecure_zero_key"])
         )
     )]
@@ -413,7 +426,8 @@ enum Command {
 
         #[arg(
             long = "insecure-zero-key",
-            help = "Use an all-zero raw key. This provides no secrecy and is for explicit convenience archives."
+            hide = true,
+            help = "Removed in v43; plaintext archives need no key source."
         )]
         insecure_zero_key: bool,
 
@@ -444,7 +458,6 @@ enum Command {
         after_help = "Examples:\n  tzap list --keyfile key.hex backup.tzap\n  tzap list --keyfile key.hex --long backup.tzap\n  tzap list --keyfile key.hex --json backup.tzap\n  tzap list --password-stdin --bootstrap backup.tzap.bootstrap backup.tzap",
         group(
             ArgGroup::new("open-key-source")
-                .required(true)
                 .args(["password_stdin", "password", "keyfile", "insecure_zero_key"])
         )
     )]
@@ -484,7 +497,8 @@ enum Command {
 
         #[arg(
             long = "insecure-zero-key",
-            help = "Use an all-zero raw key. This provides no secrecy and is for explicit convenience archives."
+            hide = true,
+            help = "Removed in v43; plaintext archives need no key source."
         )]
         insecure_zero_key: bool,
 
@@ -525,7 +539,7 @@ enum Command {
     },
     #[command(
         about = "Verify archive integrity",
-        long_about = "Verify archive signatures and checksum integrity. No payload changes are made unless --write-repaired is set; original archive files are never modified.\n\nBy default verify is key-holding and requires --keyfile, --password, --password-stdin, or --insecure-zero-key. With --public-no-key, verify uses the v41 public RootAuth profile and does not require the archive key.",
+        long_about = "Verify archive signatures and checksum integrity. No payload changes are made unless --write-repaired is set; original archive files are never modified.\n\nEncrypted archives need --keyfile, --password, or --password-stdin. Unencrypted v43 archives need no key source. With --public-no-key, verify uses the v43 public RootAuth profile and does not require the archive key.",
         after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex --write-repaired backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --public-no-key --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --keyfile key.hex backup.vol000.tzap backup.vol001.tzap\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives named `.volNNN.tzap`, passing any one volume discovers matching siblings in the same directory. Additional positionals are explicit extra volumes."
     )]
     Verify {
@@ -565,7 +579,8 @@ enum Command {
 
         #[arg(
             long = "insecure-zero-key",
-            help = "Use an all-zero raw key. This provides no secrecy and is for explicit convenience archives."
+            hide = true,
+            help = "Removed in v43; plaintext archives need no key source."
         )]
         insecure_zero_key: bool,
 
@@ -591,7 +606,7 @@ enum Command {
 
         #[arg(
             long = "public-no-key",
-            help = "Verify v41 public RootAuth commitments without the archive key."
+            help = "Verify v43 public RootAuth commitments without the archive key."
         )]
         public_no_key: bool,
 
@@ -715,6 +730,7 @@ fn run(cli: Cli) -> Result<()> {
             password_stdin,
             password,
             keyfile,
+            no_encryption,
             insecure_zero_key,
             force,
             dry_run,
@@ -754,7 +770,7 @@ fn run(cli: Cli) -> Result<()> {
                 block_size: block_size.as_deref(),
             };
             let build_writer_options = |total_input_size: Option<u64>| -> Result<WriterOptions> {
-                create_writer_options(CreateWriterOptionsArgs {
+                let mut options = create_writer_options(CreateWriterOptionsArgs {
                     volumes,
                     volume_size: volume_size.as_deref(),
                     volume_loss_tolerance: resolved_volume_loss_tolerance,
@@ -763,8 +779,19 @@ fn run(cli: Cli) -> Result<()> {
                     jobs,
                     layout_overrides,
                     total_input_size,
-                })
+                })?;
+                if no_encryption {
+                    options.aead_algo = AeadAlgo::None;
+                }
+                Ok(options)
             };
+            validate_create_key_source(
+                keyfile.as_deref(),
+                password_stdin,
+                password,
+                no_encryption,
+                insecure_zero_key,
+            )?;
             if bootstrap_out.is_some() && (volumes.unwrap_or(1) > 1 || volume_size.is_some()) {
                 return Err(FormatError::WriterUnsupported(
                     "--bootstrap-out is currently supported only for single-volume output",
@@ -817,6 +844,7 @@ fn run(cli: Cli) -> Result<()> {
                             keyfile.as_deref(),
                             password_stdin,
                             password,
+                            no_encryption,
                             insecure_zero_key
                         )
                     );
@@ -853,6 +881,7 @@ fn run(cli: Cli) -> Result<()> {
                     keyfile.as_deref(),
                     password_stdin,
                     password,
+                    no_encryption,
                     insecure_zero_key,
                     argon2_t_cost,
                     argon2_m_cost_kib,
@@ -1002,6 +1031,7 @@ fn run(cli: Cli) -> Result<()> {
                         keyfile.as_deref(),
                         password_stdin,
                         password,
+                        no_encryption,
                         insecure_zero_key
                     )
                 );
@@ -1027,6 +1057,7 @@ fn run(cli: Cli) -> Result<()> {
                 keyfile.as_deref(),
                 password_stdin,
                 password,
+                no_encryption,
                 insecure_zero_key,
                 argon2_t_cost,
                 argon2_m_cost_kib,
@@ -1277,34 +1308,53 @@ fn run(cli: Cli) -> Result<()> {
                     eprintln!("  mode: staged non-seekable extract-all");
                     return Ok(());
                 }
-                let master_key = load_archive_stdin_key(
-                    keyfile.as_deref(),
-                    password_stdin,
-                    password,
-                    insecure_zero_key,
-                )?;
                 let options = SafeExtractionOptions {
                     overwrite_existing: overwrite,
                 };
                 let bootstrap_bytes = read_optional_bootstrap_sidecar(bootstrap.as_deref())?;
                 let stdin = io::stdin();
-                let report = if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
-                    extract_non_seekable_stream_to_dir_with_bootstrap_sidecar(
-                        stdin.lock(),
-                        bootstrap_bytes,
-                        &master_key,
-                        Path::new(&directory),
-                        non_seekable_reader_options(reader_options),
-                        options,
-                    )
+                let report = if let Some(keyfile) = keyfile.as_deref() {
+                    let master_key = load_archive_stdin_key(
+                        Some(keyfile),
+                        password_stdin,
+                        password,
+                        insecure_zero_key,
+                    )?;
+                    if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+                        extract_non_seekable_stream_to_dir_with_bootstrap_sidecar(
+                            stdin.lock(),
+                            bootstrap_bytes,
+                            &master_key,
+                            Path::new(&directory),
+                            non_seekable_reader_options(reader_options),
+                            options,
+                        )
+                    } else {
+                        extract_non_seekable_stream_to_dir(
+                            stdin.lock(),
+                            &master_key,
+                            Path::new(&directory),
+                            non_seekable_reader_options(reader_options),
+                            options,
+                        )
+                    }
                 } else {
-                    extract_non_seekable_stream_to_dir(
-                        stdin.lock(),
-                        &master_key,
-                        Path::new(&directory),
-                        non_seekable_reader_options(reader_options),
-                        options,
-                    )
+                    if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+                        extract_unencrypted_non_seekable_stream_to_dir_with_bootstrap_sidecar(
+                            stdin.lock(),
+                            bootstrap_bytes,
+                            Path::new(&directory),
+                            non_seekable_reader_options(reader_options),
+                            options,
+                        )
+                    } else {
+                        extract_unencrypted_non_seekable_stream_to_dir(
+                            stdin.lock(),
+                            Path::new(&directory),
+                            non_seekable_reader_options(reader_options),
+                            options,
+                        )
+                    }
                 }
                 .context("failed to extract non-seekable archive stream")?;
                 emit_success_summary(
@@ -1432,27 +1482,42 @@ fn run(cli: Cli) -> Result<()> {
                     keyfile.as_deref(),
                     insecure_zero_key,
                 )?;
-                let master_key = load_archive_stdin_key(
-                    keyfile.as_deref(),
-                    password_stdin,
-                    password,
-                    insecure_zero_key,
-                )?;
                 let bootstrap_bytes = read_optional_bootstrap_sidecar(bootstrap.as_deref())?;
                 let stdin = io::stdin();
-                let report = if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
-                    list_non_seekable_stream_with_bootstrap_sidecar(
-                        stdin.lock(),
-                        bootstrap_bytes,
-                        &master_key,
-                        non_seekable_reader_options(reader_options),
-                    )
+                let report = if let Some(keyfile) = keyfile.as_deref() {
+                    let master_key = load_archive_stdin_key(
+                        Some(keyfile),
+                        password_stdin,
+                        password,
+                        insecure_zero_key,
+                    )?;
+                    if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+                        list_non_seekable_stream_with_bootstrap_sidecar(
+                            stdin.lock(),
+                            bootstrap_bytes,
+                            &master_key,
+                            non_seekable_reader_options(reader_options),
+                        )
+                    } else {
+                        list_non_seekable_stream(
+                            stdin.lock(),
+                            &master_key,
+                            non_seekable_reader_options(reader_options),
+                        )
+                    }
                 } else {
-                    list_non_seekable_stream(
-                        stdin.lock(),
-                        &master_key,
-                        non_seekable_reader_options(reader_options),
-                    )
+                    if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+                        list_unencrypted_non_seekable_stream_with_bootstrap_sidecar(
+                            stdin.lock(),
+                            bootstrap_bytes,
+                            non_seekable_reader_options(reader_options),
+                        )
+                    } else {
+                        list_unencrypted_non_seekable_stream(
+                            stdin.lock(),
+                            non_seekable_reader_options(reader_options),
+                        )
+                    }
                 }
                 .context("failed to list non-seekable archive stream")?;
                 emit_entry_metadata_diagnostics(quiet, &report.entries)?;
@@ -1638,20 +1703,6 @@ fn run(cli: Cli) -> Result<()> {
                     }
                     return Err(err);
                 }
-                let master_key = match load_archive_stdin_key(
-                    keyfile.as_deref(),
-                    password_stdin,
-                    password,
-                    insecure_zero_key,
-                ) {
-                    Ok(master_key) => master_key,
-                    Err(err) => {
-                        if json {
-                            emit_verify_json_error(&archive_paths, None, None, &err)?;
-                        }
-                        return Err(err);
-                    }
-                };
                 let bootstrap_bytes = match read_optional_bootstrap_sidecar(bootstrap.as_deref()) {
                     Ok(bootstrap_bytes) => bootstrap_bytes,
                     Err(err) => {
@@ -1662,19 +1713,48 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 };
                 let stdin = io::stdin();
-                let result = if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
-                    verify_non_seekable_stream_with_bootstrap_sidecar(
-                        stdin.lock(),
-                        bootstrap_bytes,
-                        &master_key,
-                        non_seekable_reader_options(reader_options),
-                    )
+                let result = if let Some(keyfile) = keyfile.as_deref() {
+                    let master_key = match load_archive_stdin_key(
+                        Some(keyfile),
+                        password_stdin,
+                        password,
+                        insecure_zero_key,
+                    ) {
+                        Ok(master_key) => master_key,
+                        Err(err) => {
+                            if json {
+                                emit_verify_json_error(&archive_paths, None, None, &err)?;
+                            }
+                            return Err(err);
+                        }
+                    };
+                    if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+                        verify_non_seekable_stream_with_bootstrap_sidecar(
+                            stdin.lock(),
+                            bootstrap_bytes,
+                            &master_key,
+                            non_seekable_reader_options(reader_options),
+                        )
+                    } else {
+                        verify_non_seekable_stream_with_options(
+                            stdin.lock(),
+                            &master_key,
+                            non_seekable_reader_options(reader_options),
+                        )
+                    }
                 } else {
-                    verify_non_seekable_stream_with_options(
-                        stdin.lock(),
-                        &master_key,
-                        non_seekable_reader_options(reader_options),
-                    )
+                    if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+                        verify_unencrypted_non_seekable_stream_with_bootstrap_sidecar(
+                            stdin.lock(),
+                            bootstrap_bytes,
+                            non_seekable_reader_options(reader_options),
+                        )
+                    } else {
+                        verify_unencrypted_non_seekable_stream_with_options(
+                            stdin.lock(),
+                            non_seekable_reader_options(reader_options),
+                        )
+                    }
                 }
                 .context("failed to verify non-seekable archive stream");
                 let report = match result {
@@ -3187,6 +3267,7 @@ fn create_key_mode_label(
     keyfile: Option<&str>,
     password_stdin: bool,
     password: bool,
+    no_encryption: bool,
     insecure_zero_key: bool,
 ) -> String {
     if password_stdin {
@@ -3198,10 +3279,46 @@ fn create_key_mode_label(
     if keyfile.is_some() {
         return "keyfile".to_string();
     }
+    if no_encryption {
+        return "no-encryption".to_string();
+    }
     if insecure_zero_key {
         return "insecure-zero-key".to_string();
     }
     "unknown".to_string()
+}
+
+fn removed_insecure_zero_key_error() -> UsageError {
+    UsageError("--insecure-zero-key was removed in v43; use --no-encryption for plaintext archives")
+}
+
+fn validate_create_key_source(
+    keyfile: Option<&str>,
+    password_stdin: bool,
+    password: bool,
+    no_encryption: bool,
+    insecure_zero_key: bool,
+) -> Result<()> {
+    if insecure_zero_key {
+        return Err(removed_insecure_zero_key_error().into());
+    }
+    let count = usize::from(keyfile.is_some())
+        + usize::from(password_stdin)
+        + usize::from(password)
+        + usize::from(no_encryption);
+    if count == 0 {
+        return Err(UsageError(
+            "no key source provided; use --password-stdin, --password, --keyfile PATH, or --no-encryption",
+        )
+        .into());
+    }
+    if count > 1 {
+        return Err(UsageError(
+            "create accepts exactly one protection mode: --keyfile, --password, --password-stdin, or --no-encryption",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn create_root_auth_mode_label(signing_key: Option<&str>, signing_cert: Option<&str>) -> String {
@@ -3553,18 +3670,15 @@ fn reject_archive_stdin_list_options(
 fn reject_archive_stdin_key_options(
     password_stdin: bool,
     password: bool,
-    keyfile: Option<&str>,
+    _keyfile: Option<&str>,
     insecure_zero_key: bool,
 ) -> Result<()> {
+    if insecure_zero_key {
+        return Err(removed_insecure_zero_key_error().into());
+    }
     if password_stdin || password {
         return Err(anyhow!(FormatError::ReaderUnsupported(
-            "archive stdin currently supports raw --keyfile or --insecure-zero-key only",
-        )));
-    }
-    let raw_key_count = usize::from(keyfile.is_some()) + usize::from(insecure_zero_key);
-    if raw_key_count != 1 {
-        return Err(anyhow!(FormatError::ReaderUnsupported(
-            "archive stdin currently supports raw --keyfile or --insecure-zero-key only",
+            "archive stdin currently supports raw --keyfile or no-key unencrypted archives only",
         )));
     }
     Ok(())
@@ -3577,10 +3691,12 @@ fn load_archive_stdin_key(
     insecure_zero_key: bool,
 ) -> Result<MasterKey> {
     reject_archive_stdin_key_options(password_stdin, password, keyfile, insecure_zero_key)?;
-    if insecure_zero_key {
-        return insecure_zero_master_key();
+    if keyfile.is_some() {
+        return load_raw_master_key(keyfile);
     }
-    load_raw_master_key(keyfile)
+    Err(anyhow!(FormatError::KeyMaterialMismatch).context(
+        "encrypted archive stdin requires --keyfile; unencrypted archive stdin uses no key source",
+    ))
 }
 
 fn read_optional_bootstrap_sidecar(path: Option<&str>) -> Result<Option<Vec<u8>>> {
@@ -3717,13 +3833,14 @@ fn validate_verify_key_holding_key_source(
     password: bool,
     insecure_zero_key: bool,
 ) -> Result<()> {
-    let count = usize::from(keyfile.is_some())
-        + usize::from(password_stdin)
-        + usize::from(password)
-        + usize::from(insecure_zero_key);
-    if count != 1 {
+    if insecure_zero_key {
+        return Err(removed_insecure_zero_key_error().into());
+    }
+    let count =
+        usize::from(keyfile.is_some()) + usize::from(password_stdin) + usize::from(password);
+    if count > 1 {
         return Err(UsageError(
-            "verify requires exactly one key source: --keyfile, --password, --password-stdin, or --insecure-zero-key; use --public-no-key for public verification",
+            "verify accepts at most one key source: --keyfile, --password, or --password-stdin",
         )
         .into());
     }
@@ -3903,13 +4020,12 @@ fn load_public_no_key_trust(request: &PublicNoKeyVerifyRequest<'_>) -> Result<Pu
         )
         .into());
     }
-    if request.password_stdin
-        || request.password
-        || request.keyfile.is_some()
-        || request.insecure_zero_key
-    {
+    if request.insecure_zero_key {
+        return Err(removed_insecure_zero_key_error().into());
+    }
+    if request.password_stdin || request.password || request.keyfile.is_some() {
         return Err(UsageError(
-            "--public-no-key cannot be combined with --keyfile, --password, --password-stdin, or --insecure-zero-key",
+            "--public-no-key cannot be combined with --keyfile, --password, or --password-stdin",
         )
         .into());
     }
@@ -4410,10 +4526,12 @@ fn encode_hex(bytes: &[u8]) -> String {
     output
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_create_key(
     keyfile: Option<&str>,
     password_stdin: bool,
     password: bool,
+    no_encryption: bool,
     insecure_zero_key: bool,
     t_cost: u32,
     m_cost_kib: u32,
@@ -4453,11 +4571,14 @@ fn load_create_key(
             kdf_params,
         });
     }
-    if insecure_zero_key {
+    if no_encryption {
         return Ok(CreateKey {
             master_key: insecure_zero_master_key()?,
-            kdf_params: KdfParams::Raw,
+            kdf_params: KdfParams::None,
         });
+    }
+    if insecure_zero_key {
+        return Err(removed_insecure_zero_key_error().into());
     }
     Ok(CreateKey {
         master_key: load_raw_master_key(keyfile)?,
@@ -4483,9 +4604,17 @@ fn load_open_key_from_paths(
         return derive_key_from_passphrase(&kdf_params, &passphrase);
     }
     if insecure_zero_key {
+        return Err(removed_insecure_zero_key_error().into());
+    }
+    if keyfile.is_some() {
+        return load_raw_master_key(keyfile);
+    }
+    let protection = read_archive_protection_from_any_volume_path(volume_paths)?;
+    if protection.aead_algo == AeadAlgo::None && protection.kdf_algo == KdfAlgo::None {
         return insecure_zero_master_key();
     }
-    load_raw_master_key(keyfile)
+    Err(anyhow!(FormatError::KeyMaterialMismatch)
+        .context("encrypted archives require --keyfile, --password, or --password-stdin"))
 }
 
 fn insecure_zero_master_key() -> Result<MasterKey> {
@@ -4499,6 +4628,8 @@ fn derive_key_from_passphrase(kdf_params: &KdfParams, passphrase: &str) -> Resul
         }
         KdfParams::Raw => Err(anyhow!(FormatError::KeyMaterialMismatch)
             .context("raw-key archives require --keyfile, not passphrase input")),
+        KdfParams::None => Err(anyhow!(FormatError::KeyMaterialMismatch)
+            .context("unencrypted archives do not use passphrase input")),
     }
 }
 
@@ -4544,7 +4675,7 @@ fn validate_argon2_params(t_cost: u32, m_cost_kib: u32, parallelism: u32) -> Res
 fn load_raw_master_key(keyfile: Option<&str>) -> Result<MasterKey> {
     let keyfile = keyfile.ok_or_else(|| {
         anyhow!(
-            "no key source provided; use --password-stdin, --password, --keyfile PATH, or --insecure-zero-key"
+            "no key source provided; use --password-stdin, --password, --keyfile PATH, or --no-encryption for create"
         )
     })?;
     let bytes = fs::read(keyfile).with_context(|| format!("failed to read keyfile {keyfile}"))?;
@@ -4659,10 +4790,21 @@ fn read_kdf_params_from_volume(bytes: &[u8]) -> Result<KdfParams> {
             "volume is too short for CryptoHeader"
         ))
     })?;
-    read_kdf_params_from_headers(header_bytes, crypto_header_bytes)
+    Ok(read_archive_protection_from_headers(header_bytes, crypto_header_bytes)?.kdf_params)
 }
 
 fn read_kdf_params_from_volume_path(path: &str) -> Result<KdfParams> {
+    Ok(read_archive_protection_from_volume_path(path)?.kdf_params)
+}
+
+#[derive(Debug)]
+struct ArchiveProtection {
+    aead_algo: AeadAlgo,
+    kdf_algo: KdfAlgo,
+    kdf_params: KdfParams,
+}
+
+fn read_archive_protection_from_volume_path(path: &str) -> Result<ArchiveProtection> {
     let mut file = File::open(path).with_context(|| format!("failed to open archive {path}"))?;
     let mut header_bytes = vec![0u8; VOLUME_HEADER_LEN];
     file.read_exact(&mut header_bytes)
@@ -4675,7 +4817,7 @@ fn read_kdf_params_from_volume_path(path: &str) -> Result<KdfParams> {
     let mut crypto_header_bytes = vec![0u8; length];
     file.read_exact(&mut crypto_header_bytes)
         .with_context(|| format!("failed to read CryptoHeader from {path}"))?;
-    read_kdf_params_from_headers(&header_bytes, &crypto_header_bytes)
+    read_archive_protection_from_headers(&header_bytes, &crypto_header_bytes)
 }
 
 fn read_kdf_params_from_any_volume_path(paths: &[String]) -> Result<KdfParams> {
@@ -4694,10 +4836,26 @@ fn read_kdf_params_from_any_volume_path(paths: &[String]) -> Result<KdfParams> {
         .context("failed to read KDF parameters from any archive volume")
 }
 
-fn read_kdf_params_from_headers(
+fn read_archive_protection_from_any_volume_path(paths: &[String]) -> Result<ArchiveProtection> {
+    let mut first_error = None;
+    for path in paths {
+        match read_archive_protection_from_volume_path(path) {
+            Ok(protection) => return Ok(protection),
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+    Err(first_error.unwrap_or_else(|| anyhow!("at least one archive volume is required")))
+        .context("failed to read protection mode from any archive volume")
+}
+
+fn read_archive_protection_from_headers(
     header_bytes: &[u8],
     crypto_header_bytes: &[u8],
-) -> Result<KdfParams> {
+) -> Result<ArchiveProtection> {
     let volume_header = VolumeHeader::parse(header_bytes)?;
     let fixed_bytes = crypto_header_bytes
         .get(..CRYPTO_HEADER_FIXED_LEN)
@@ -4716,7 +4874,11 @@ fn read_kdf_params_from_headers(
     }
     let crypto_header =
         CryptoHeader::parse(crypto_header_bytes, volume_header.crypto_header_length)?;
-    Ok(crypto_header.kdf_params)
+    Ok(ArchiveProtection {
+        aead_algo: fixed.aead_algo,
+        kdf_algo: fixed.kdf_algo,
+        kdf_params: crypto_header.kdf_params,
+    })
 }
 
 fn parse_size_u32(value: &str, name: &'static str) -> Result<u32> {
@@ -4789,6 +4951,12 @@ fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 ArchiveWriteError::Io(io_error) => classify_io_error(io_error),
             };
         }
+        if let Some(extract_error) = cause.downcast_ref::<ExtractError>() {
+            return match extract_error {
+                ExtractError::Format(format) => classify_format_error(format),
+                ExtractError::Output(io_error) => classify_io_error(io_error),
+            };
+        }
         if let Some(format) = cause.downcast_ref::<FormatError>() {
             return classify_format_error(format);
         }
@@ -4856,6 +5024,11 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
             label: "wrong-key",
             exit_code: EXIT_WRONG_KEY,
             action: "confirm the archive key source (passphrase/raw key)",
+        },
+        FormatError::IntegrityDigestMismatch { .. } => Diagnostic {
+            label: "corrupt-archive",
+            exit_code: EXIT_CORRUPT_ARCHIVE,
+            action: "verify the archive bytes and source file path",
         },
         FormatError::FecTooFewAvailableShards => Diagnostic {
             label: "missing-volume",

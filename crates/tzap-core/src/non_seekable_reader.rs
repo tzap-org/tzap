@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 
 use crate::compression::validate_exact_zstd_frame;
 use crate::crypto::{
-    decrypt_padded_aead_object, verify_hmac, AeadObjectContext, HmacDomain, MasterKey, Subkeys,
+    decrypt_padded_aead_object, verify_integrity_tag, AeadObjectContext, HmacDomain, MasterKey,
+    Subkeys,
 };
 use crate::fec::repair_data_gf16;
 use crate::format::{
@@ -193,10 +194,21 @@ pub fn verify_non_seekable_stream_with_options<R: Read>(
     master_key: &MasterKey,
     options: NonSeekableReaderOptions,
 ) -> Result<SequentialVerifyReport, FormatError> {
-    Ok(
-        run_non_seekable_stream(reader, master_key, options, NoopTarStreamObserver, None)?
-            .verification,
-    )
+    Ok(run_non_seekable_stream(
+        reader,
+        Some(master_key),
+        options,
+        NoopTarStreamObserver,
+        None,
+    )?
+    .verification)
+}
+
+pub fn verify_unencrypted_non_seekable_stream_with_options<R: Read>(
+    reader: R,
+    options: NonSeekableReaderOptions,
+) -> Result<SequentialVerifyReport, FormatError> {
+    Ok(run_non_seekable_stream(reader, None, options, NoopTarStreamObserver, None)?.verification)
 }
 
 pub fn verify_non_seekable_stream_with_bootstrap_sidecar<R: Read>(
@@ -207,7 +219,22 @@ pub fn verify_non_seekable_stream_with_bootstrap_sidecar<R: Read>(
 ) -> Result<SequentialVerifyReport, FormatError> {
     Ok(run_non_seekable_stream(
         reader,
-        master_key,
+        Some(master_key),
+        options,
+        NoopTarStreamObserver,
+        Some(bootstrap_sidecar),
+    )?
+    .verification)
+}
+
+pub fn verify_unencrypted_non_seekable_stream_with_bootstrap_sidecar<R: Read>(
+    reader: R,
+    bootstrap_sidecar: &[u8],
+    options: NonSeekableReaderOptions,
+) -> Result<SequentialVerifyReport, FormatError> {
+    Ok(run_non_seekable_stream(
+        reader,
+        None,
         options,
         NoopTarStreamObserver,
         Some(bootstrap_sidecar),
@@ -229,7 +256,35 @@ pub fn extract_non_seekable_stream_to_dir<R: Read>(
             overwrite_existing: true,
         },
     );
-    let outcome = run_non_seekable_stream(reader, master_key, options, observer, None)?;
+    let outcome = run_non_seekable_stream(reader, Some(master_key), options, observer, None)?;
+    staging.commit(extraction)?;
+    Ok(SequentialExtractReport {
+        verification: outcome.verification,
+        extracted_member_count: outcome
+            .streamed_payload
+            .tar
+            .members
+            .len()
+            .try_into()
+            .map_err(|_| FormatError::InvalidArchive("extracted member count overflow"))?,
+        degraded_metadata_count: degraded_metadata_count(&outcome.streamed_payload)?,
+    })
+}
+
+pub fn extract_unencrypted_non_seekable_stream_to_dir<R: Read>(
+    reader: R,
+    output_dir: &Path,
+    options: NonSeekableReaderOptions,
+    extraction: SafeExtractionOptions,
+) -> Result<SequentialExtractReport, ExtractError> {
+    let staging = StagedExtraction::new(output_dir)?;
+    let observer = TarStreamFilesystemRestoreObserver::new(
+        staging.root(),
+        SafeExtractionOptions {
+            overwrite_existing: true,
+        },
+    );
+    let outcome = run_non_seekable_stream(reader, None, options, observer, None)?;
     staging.commit(extraction)?;
     Ok(SequentialExtractReport {
         verification: outcome.verification,
@@ -261,11 +316,41 @@ pub fn extract_non_seekable_stream_to_dir_with_bootstrap_sidecar<R: Read>(
     );
     let outcome = run_non_seekable_stream(
         reader,
-        master_key,
+        Some(master_key),
         options,
         observer,
         Some(bootstrap_sidecar),
     )?;
+    staging.commit(extraction)?;
+    Ok(SequentialExtractReport {
+        verification: outcome.verification,
+        extracted_member_count: outcome
+            .streamed_payload
+            .tar
+            .members
+            .len()
+            .try_into()
+            .map_err(|_| FormatError::InvalidArchive("extracted member count overflow"))?,
+        degraded_metadata_count: degraded_metadata_count(&outcome.streamed_payload)?,
+    })
+}
+
+pub fn extract_unencrypted_non_seekable_stream_to_dir_with_bootstrap_sidecar<R: Read>(
+    reader: R,
+    bootstrap_sidecar: &[u8],
+    output_dir: &Path,
+    options: NonSeekableReaderOptions,
+    extraction: SafeExtractionOptions,
+) -> Result<SequentialExtractReport, ExtractError> {
+    let staging = StagedExtraction::new(output_dir)?;
+    let observer = TarStreamFilesystemRestoreObserver::new(
+        staging.root(),
+        SafeExtractionOptions {
+            overwrite_existing: true,
+        },
+    );
+    let outcome =
+        run_non_seekable_stream(reader, None, options, observer, Some(bootstrap_sidecar))?;
     staging.commit(extraction)?;
     Ok(SequentialExtractReport {
         verification: outcome.verification,
@@ -285,8 +370,25 @@ pub fn list_non_seekable_stream<R: Read>(
     master_key: &MasterKey,
     options: NonSeekableReaderOptions,
 ) -> Result<SequentialListReport, FormatError> {
-    let outcome =
-        run_non_seekable_stream(reader, master_key, options, NoopTarStreamObserver, None)?;
+    let outcome = run_non_seekable_stream(
+        reader,
+        Some(master_key),
+        options,
+        NoopTarStreamObserver,
+        None,
+    )?;
+    let entries = streamed_list_entries(&outcome.opened, &outcome.streamed_payload)?;
+    Ok(SequentialListReport {
+        verification: outcome.verification,
+        entries,
+    })
+}
+
+pub fn list_unencrypted_non_seekable_stream<R: Read>(
+    reader: R,
+    options: NonSeekableReaderOptions,
+) -> Result<SequentialListReport, FormatError> {
+    let outcome = run_non_seekable_stream(reader, None, options, NoopTarStreamObserver, None)?;
     let entries = streamed_list_entries(&outcome.opened, &outcome.streamed_payload)?;
     Ok(SequentialListReport {
         verification: outcome.verification,
@@ -302,7 +404,26 @@ pub fn list_non_seekable_stream_with_bootstrap_sidecar<R: Read>(
 ) -> Result<SequentialListReport, FormatError> {
     let outcome = run_non_seekable_stream(
         reader,
-        master_key,
+        Some(master_key),
+        options,
+        NoopTarStreamObserver,
+        Some(bootstrap_sidecar),
+    )?;
+    let entries = streamed_list_entries(&outcome.opened, &outcome.streamed_payload)?;
+    Ok(SequentialListReport {
+        verification: outcome.verification,
+        entries,
+    })
+}
+
+pub fn list_unencrypted_non_seekable_stream_with_bootstrap_sidecar<R: Read>(
+    reader: R,
+    bootstrap_sidecar: &[u8],
+    options: NonSeekableReaderOptions,
+) -> Result<SequentialListReport, FormatError> {
+    let outcome = run_non_seekable_stream(
+        reader,
+        None,
         options,
         NoopTarStreamObserver,
         Some(bootstrap_sidecar),
@@ -322,7 +443,7 @@ struct SequentialStreamOutcome {
 
 fn run_non_seekable_stream<R, O>(
     mut reader: R,
-    master_key: &MasterKey,
+    master_key: Option<&MasterKey>,
     options: NonSeekableReaderOptions,
     observer: O,
     bootstrap_sidecar: Option<&[u8]>,
@@ -343,14 +464,19 @@ where
     let parsed_crypto =
         CryptoHeader::parse(&crypto_header_bytes, volume_header.crypto_header_length)?;
     let crypto_header = parsed_crypto.fixed.clone();
-    let subkeys = Subkeys::derive(
-        master_key,
-        &volume_header.archive_uuid,
-        &volume_header.session_id,
-    )?;
-    verify_hmac(
+    let subkeys = if crypto_header.aead_algo.is_encrypted() {
+        Subkeys::derive(
+            master_key.ok_or(FormatError::KeyMaterialMismatch)?,
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+        )?
+    } else {
+        Subkeys::unencrypted_placeholder()
+    };
+    verify_integrity_tag(
         HmacDomain::CryptoHeader,
-        &subkeys.mac_key,
+        crypto_header.aead_algo,
+        Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
         parsed_crypto.hmac_covered_bytes,

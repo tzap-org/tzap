@@ -4,7 +4,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::XChaCha20Poly1305;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -23,14 +23,20 @@ const CRYPTO_HEADER_HMAC_DOMAIN: &[u8] = b"tzap-v1-crypto-header";
 const MANIFEST_FOOTER_HMAC_DOMAIN: &[u8] = b"tzap-v1-manifest-footer";
 const VOLUME_TRAILER_HMAC_DOMAIN: &[u8] = b"tzap-v1-volume-trailer";
 const BOOTSTRAP_SIDECAR_HMAC_DOMAIN: &[u8] = b"tzap-v1-sidecar";
+const CRYPTO_HEADER_DIGEST_DOMAIN: &[u8] = b"tzap-header-v43";
+const MANIFEST_FOOTER_DIGEST_DOMAIN: &[u8] = b"tzap-manifest-v43";
+const VOLUME_TRAILER_DIGEST_DOMAIN: &[u8] = b"tzap-trailer-v43";
+const BOOTSTRAP_SIDECAR_DIGEST_DOMAIN: &[u8] = b"tzap-sidecar-v43";
 
 const RAW_KDF_PARAMS_LEN: usize = 2;
+const NONE_KDF_PARAMS_LEN: usize = 2;
 const ARGON2ID_FIXED_PARAMS_LEN: usize = 16;
 const ARGON2ID_MIN_SALT_LEN: u16 = 8;
 const ARGON2ID_MAX_SALT_LEN: u16 = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KdfParams {
+    None,
     Raw,
     Argon2id {
         t_cost: u32,
@@ -45,6 +51,7 @@ impl KdfParams {
         match algo {
             KdfAlgo::Raw => parse_raw_kdf_params(bytes),
             KdfAlgo::Argon2id => parse_argon2id_kdf_params(bytes),
+            KdfAlgo::None => parse_none_kdf_params(bytes),
         }
     }
 }
@@ -105,6 +112,19 @@ pub struct Subkeys {
 }
 
 impl Subkeys {
+    pub(crate) fn unencrypted_placeholder() -> Self {
+        Self {
+            enc_key: [0; SUBKEY_LEN],
+            mac_key: [0; SUBKEY_LEN],
+            nonce_seed: [0; SUBKEY_LEN],
+            index_root_key: [0; SUBKEY_LEN],
+            index_shard_key: [0; SUBKEY_LEN],
+            dictionary_key: [0; SUBKEY_LEN],
+            dir_hint_key: [0; SUBKEY_LEN],
+            index_nonce_seed: [0; SUBKEY_LEN],
+        }
+    }
+
     pub fn derive(
         master_key: &MasterKey,
         archive_uuid: &[u8; 16],
@@ -156,6 +176,15 @@ impl HmacDomain {
             Self::BootstrapSidecar => BOOTSTRAP_SIDECAR_HMAC_DOMAIN,
         }
     }
+
+    fn digest_domain_bytes(self) -> &'static [u8] {
+        match self {
+            Self::CryptoHeader => CRYPTO_HEADER_DIGEST_DOMAIN,
+            Self::ManifestFooter => MANIFEST_FOOTER_DIGEST_DOMAIN,
+            Self::VolumeTrailer => VOLUME_TRAILER_DIGEST_DOMAIN,
+            Self::BootstrapSidecar => BOOTSTRAP_SIDECAR_DIGEST_DOMAIN,
+        }
+    }
 }
 
 pub fn compute_hmac(
@@ -197,6 +226,72 @@ pub fn verify_hmac(
         })
 }
 
+pub fn compute_integrity_tag(
+    domain: HmacDomain,
+    aead_algo: AeadAlgo,
+    mac_key: Option<&[u8; SUBKEY_LEN]>,
+    archive_uuid: &[u8; 16],
+    session_id: &[u8; 16],
+    covered_bytes: &[u8],
+) -> Result<[u8; SUBKEY_LEN], FormatError> {
+    if aead_algo.is_encrypted() {
+        return Ok(compute_hmac(
+            domain,
+            mac_key.ok_or(FormatError::KeyMaterialMismatch)?,
+            archive_uuid,
+            session_id,
+            covered_bytes,
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(domain.digest_domain_bytes());
+    hasher.update(archive_uuid);
+    hasher.update(session_id);
+    hasher.update(covered_bytes);
+    let digest = hasher.finalize();
+    let mut output = [0u8; SUBKEY_LEN];
+    output.copy_from_slice(&digest);
+    Ok(output)
+}
+
+pub fn verify_integrity_tag(
+    domain: HmacDomain,
+    aead_algo: AeadAlgo,
+    mac_key: Option<&[u8; SUBKEY_LEN]>,
+    archive_uuid: &[u8; 16],
+    session_id: &[u8; 16],
+    covered_bytes: &[u8],
+    expected_tag: &[u8],
+) -> Result<(), FormatError> {
+    if aead_algo.is_encrypted() {
+        return verify_hmac(
+            domain,
+            mac_key.ok_or(FormatError::KeyMaterialMismatch)?,
+            archive_uuid,
+            session_id,
+            covered_bytes,
+            expected_tag,
+        );
+    }
+
+    let actual = compute_integrity_tag(
+        domain,
+        aead_algo,
+        None,
+        archive_uuid,
+        session_id,
+        covered_bytes,
+    )?;
+    if expected_tag == actual {
+        Ok(())
+    } else {
+        Err(FormatError::IntegrityDigestMismatch {
+            structure: domain.structure_name(),
+        })
+    }
+}
+
 pub fn normalize_passphrase_nfc(passphrase: &str) -> Vec<u8> {
     passphrase.nfc().collect::<String>().into_bytes()
 }
@@ -236,6 +331,7 @@ pub fn aead_encrypt(
 ) -> Result<Vec<u8>, FormatError> {
     validate_nonce_len(algo, nonce)?;
     match algo {
+        AeadAlgo::None => Ok(plaintext.to_vec()),
         AeadAlgo::AesGcmSiv256 => {
             let cipher =
                 Aes256GcmSiv::new_from_slice(key).map_err(|_| FormatError::InvalidAeadKeyLength)?;
@@ -287,6 +383,7 @@ pub fn aead_decrypt(
 ) -> Result<Vec<u8>, FormatError> {
     validate_nonce_len(algo, nonce)?;
     match algo {
+        AeadAlgo::None => Ok(ciphertext_and_tag.to_vec()),
         AeadAlgo::AesGcmSiv256 => {
             let cipher =
                 Aes256GcmSiv::new_from_slice(key).map_err(|_| FormatError::InvalidAeadKeyLength)?;
@@ -397,6 +494,20 @@ fn parse_raw_kdf_params(bytes: &[u8]) -> Result<(KdfParams, usize), FormatError>
         });
     }
     Ok((KdfParams::Raw, RAW_KDF_PARAMS_LEN))
+}
+
+fn parse_none_kdf_params(bytes: &[u8]) -> Result<(KdfParams, usize), FormatError> {
+    if bytes.len() < NONE_KDF_PARAMS_LEN {
+        return Err(FormatError::TruncatedKdfParams);
+    }
+    let algo_tag = read_u16(bytes, 0)?;
+    if algo_tag != KdfAlgo::None as u16 {
+        return Err(FormatError::KdfAlgoTagMismatch {
+            expected: KdfAlgo::None as u16,
+            actual: algo_tag,
+        });
+    }
+    Ok((KdfParams::None, NONE_KDF_PARAMS_LEN))
 }
 
 fn parse_argon2id_kdf_params(bytes: &[u8]) -> Result<(KdfParams, usize), FormatError> {
@@ -596,6 +707,22 @@ mod tests {
         let (params, consumed) = KdfParams::parse(KdfAlgo::Raw, &0u16.to_le_bytes()).unwrap();
         assert_eq!(params, KdfParams::Raw);
         assert_eq!(consumed, 2);
+    }
+
+    #[test]
+    fn parses_none_kdf_params() {
+        let (params, consumed) =
+            KdfParams::parse(KdfAlgo::None, &(KdfAlgo::None as u16).to_le_bytes()).unwrap();
+        assert_eq!(params, KdfParams::None);
+        assert_eq!(consumed, 2);
+
+        assert_eq!(
+            KdfParams::parse(KdfAlgo::None, &(KdfAlgo::Raw as u16).to_le_bytes()).unwrap_err(),
+            FormatError::KdfAlgoTagMismatch {
+                expected: KdfAlgo::None as u16,
+                actual: KdfAlgo::Raw as u16,
+            }
+        );
     }
 
     #[test]
@@ -869,6 +996,60 @@ mod tests {
     }
 
     #[test]
+    fn computes_and_verifies_unkeyed_integrity_domains() {
+        let covered = b"covered bytes";
+        let tag = compute_integrity_tag(
+            HmacDomain::CryptoHeader,
+            AeadAlgo::None,
+            None,
+            &uuid(),
+            &session(),
+            covered,
+        )
+        .unwrap();
+
+        verify_integrity_tag(
+            HmacDomain::CryptoHeader,
+            AeadAlgo::None,
+            None,
+            &uuid(),
+            &session(),
+            covered,
+            &tag,
+        )
+        .unwrap();
+
+        assert_eq!(
+            verify_integrity_tag(
+                HmacDomain::ManifestFooter,
+                AeadAlgo::None,
+                None,
+                &uuid(),
+                &session(),
+                covered,
+                &tag,
+            )
+            .unwrap_err(),
+            FormatError::IntegrityDigestMismatch {
+                structure: "ManifestFooter"
+            }
+        );
+
+        assert_ne!(
+            tag,
+            compute_integrity_tag(
+                HmacDomain::ManifestFooter,
+                AeadAlgo::None,
+                None,
+                &uuid(),
+                &session(),
+                covered,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn hmac_sidecar_domain_vector_and_boundary_bytes_are_literal() {
         let key = [0x44; SUBKEY_LEN];
         let covered = b"covered bytes";
@@ -1035,6 +1216,19 @@ mod tests {
                 FormatError::AeadFailure
             );
         }
+    }
+
+    #[test]
+    fn aead_none_passes_plaintext_through() {
+        let ciphertext =
+            aead_encrypt(AeadAlgo::None, &[0; SUBKEY_LEN], &[], b"aad", b"plaintext").unwrap();
+        assert_eq!(ciphertext, b"plaintext");
+        assert_eq!(
+            aead_decrypt(AeadAlgo::None, &[0; SUBKEY_LEN], &[], b"aad", &ciphertext).unwrap(),
+            b"plaintext"
+        );
+        assert_eq!(AeadAlgo::None.nonce_len(), 0);
+        assert_eq!(AeadAlgo::None.tag_len(), 0);
     }
 
     #[test]

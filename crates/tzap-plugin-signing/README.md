@@ -1,10 +1,10 @@
 # tzap-plugin-signing
 
 `tzap-plugin-signing` adds RootAuth signing profiles for tzap archives. It is
-the companion crate for applications that want signed v41 RootAuth archives on
+the companion crate for applications that want signed v43 RootAuth archives on
 top of the standalone `tzap-core` archive foundation.
 
-The `ed25519_raw` profile implements the v41 optional Ed25519 RootAuth
+The `ed25519_raw` profile implements the v43 optional Ed25519 RootAuth
 authenticator (`authenticator_id = 0x0002`). The `x509_chain` profile adds an
 OpenSSL-backed certificate verifier (`authenticator_id = 0x0003`) for leaf
 certificates, optional intermediate chains, and trusted CA roots. Core provides
@@ -85,4 +85,4 @@ The `x509_chain` module provides:
 - Repository: <https://github.com/frankmanzhu/tzap>
 - Core crate: <https://crates.io/crates/tzap-core>
 - CLI crate: <https://crates.io/crates/tzap>
-- Format specification: <https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv41.md>
+- Format specification: <https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv43.md>

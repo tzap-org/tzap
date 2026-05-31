@@ -1,4 +1,4 @@
-//! Core implementation surface for the tzap v0.41 archive format.
+//! Core implementation surface for the tzap v0.43 archive format.
 //!
 //! This crate owns wire-format parsing, validation, crypto, compression, FEC,
 //! and archive read/write primitives. The CLI stays intentionally thin.
@@ -28,15 +28,21 @@ pub use format::{
 };
 pub use non_seekable_reader::{
     extract_non_seekable_stream_to_dir, extract_non_seekable_stream_to_dir_with_bootstrap_sidecar,
+    extract_unencrypted_non_seekable_stream_to_dir,
+    extract_unencrypted_non_seekable_stream_to_dir_with_bootstrap_sidecar,
     list_non_seekable_stream, list_non_seekable_stream_with_bootstrap_sidecar,
-    verify_non_seekable_stream, verify_non_seekable_stream_with_bootstrap_sidecar,
-    verify_non_seekable_stream_with_options, NonSeekableReaderOptions, SequentialExtractReport,
-    SequentialListReport, SequentialRootAuthStatus, SequentialVerifyReport,
+    list_unencrypted_non_seekable_stream,
+    list_unencrypted_non_seekable_stream_with_bootstrap_sidecar, verify_non_seekable_stream,
+    verify_non_seekable_stream_with_bootstrap_sidecar, verify_non_seekable_stream_with_options,
+    verify_unencrypted_non_seekable_stream_with_bootstrap_sidecar,
+    verify_unencrypted_non_seekable_stream_with_options, NonSeekableReaderOptions,
+    SequentialExtractReport, SequentialListReport, SequentialRootAuthStatus,
+    SequentialVerifyReport,
 };
 pub use reader::{
-    open_archive, open_archive_volumes, open_archive_with_bootstrap_sidecar,
-    open_non_seekable_archive, open_seekable_archive, open_seekable_archive_volumes,
-    open_seekable_archive_with_bootstrap_sidecar,
+    open_archive, open_archive_unencrypted, open_archive_volumes, open_archive_volumes_unencrypted,
+    open_archive_with_bootstrap_sidecar, open_non_seekable_archive, open_seekable_archive,
+    open_seekable_archive_volumes, open_seekable_archive_with_bootstrap_sidecar,
     open_seekable_archive_with_bootstrap_sidecar_options, public_no_key_verify_archive_with,
     public_no_key_verify_volumes_with, public_no_key_verify_volumes_with_options,
     sequential_extract_tar_stream, ArchiveContentVerification, ArchiveEntry, ArchiveIndexEntry,
@@ -51,10 +57,11 @@ pub use streaming_writer::{
 pub use tar_model::{MetadataDiagnostic, SafeExtractionOptions, TarEntryKind};
 pub use writer::{
     write_archive, write_archive_sources_to_sink, write_archive_sources_to_sink_ordered_parallel,
-    write_archive_sources_to_sink_single_pass, write_archive_with_dictionary,
-    write_archive_with_dictionary_and_kdf, write_archive_with_dictionary_and_root_auth,
-    write_archive_with_dictionary_kdf_and_root_auth, write_archive_with_kdf,
-    write_archive_with_root_auth, write_archive_with_root_auth_and_kdf, write_empty_archive,
-    ArchiveWriteSink, MemoryArchiveSink, RegularFile, RegularFileSource, RootAuthSigningRequest,
-    RootAuthWriterConfig, WriterOptions, WriterTimings, WrittenArchiveSummary,
+    write_archive_sources_to_sink_single_pass, write_archive_unencrypted,
+    write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
+    write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
+    write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
+    write_empty_archive, ArchiveWriteSink, MemoryArchiveSink, RegularFile, RegularFileSource,
+    RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions, WriterTimings,
+    WrittenArchiveSummary,
 };

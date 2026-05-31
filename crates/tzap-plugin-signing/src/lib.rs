@@ -1,7 +1,7 @@
 //! Signing profiles for tzap RootAuth.
 //!
 //! The plugin crate owns authenticator-profile behavior. `tzap-core` owns the
-//! v41 archive fields and computes the RootAuth signing input that these
+//! v43 archive fields and computes the RootAuth signing input that these
 //! profiles sign or verify.
 
 #![forbid(unsafe_code)]
