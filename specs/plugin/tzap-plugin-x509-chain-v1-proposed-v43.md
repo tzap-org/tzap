@@ -17,7 +17,7 @@ In scope:
 - `signer_identity_type = 2` for a DER X.509 leaf certificate;
 - the exact bytes written into `RootAuthFooterV1.authenticator_value`;
 - certificate-chain verification with caller-supplied trusted roots and/or
-  OpenSSL default trust roots;
+  explicitly requested OpenSSL default trust roots;
 - API and CLI outcome wording for full RootAuth and public no-key verification
   modes.
 
@@ -29,7 +29,8 @@ Not in scope:
 - Ed25519 authenticator behavior;
 - certificate enrollment, private-key storage, trust-store management,
   revocation fetching, OCSP, CRLs, timestamp-authority protocols, or a mandatory
-  document-signing EKU policy.
+  document-signing EKU policy. The v1 profile does define the minimal leaf
+  KeyUsage handling required for archive-signature use (§8).
 
 Those are core v43, deployment, or future-plugin responsibilities.
 
@@ -86,8 +87,11 @@ Readers MUST reject this profile unless `signer_identity_type = 2` and
 certificate public key is the verifier key for the RootAuth signature.
 
 Embedded certificates are not trust anchors. A verifier MUST require at least
-one caller-supplied trusted root or an explicit request to use the platform or
-OpenSSL default trust roots.
+one caller-supplied trusted root or an explicit request to use OpenSSL's
+configured default trust roots. This v1 profile does not define platform-native
+trust-root lookup as a separate authority source; an implementation that offers
+platform-native roots MUST expose and label that as deployment policy outside
+the default v1 profile.
 
 ## 5. Authenticator Value
 
@@ -189,8 +193,21 @@ metadata, certificate signatureAlgorithm fields, or provider configuration.
 | `sig_scheme` | Name | Required verification behavior |
 |---:|---|---|
 | 1 | `rsa-pkcs1-sha256` | RSASSA-PKCS1-v1_5 signature over SHA-256(`SIGNING_INPUT`) using a leaf RSA public key whose SubjectPublicKeyInfo algorithm is unconstrained `rsaEncryption`. The encoded signature length MUST equal the RSA modulus length in bytes. Readers MUST reject RSASSA-PSS-constrained public keys for this scheme. |
-| 2 | `ecdsa-sha256-der` | ECDSA signature over SHA-256(`SIGNING_INPUT`) using a leaf named-curve EC public key. Signature bytes are DER `Ecdsa-Sig-Value` (`SEQUENCE { r INTEGER, s INTEGER }`) and MUST be a single complete DER value. `r` and `s` MUST be positive, minimally encoded DER integers in the range `1..n-1`, where `n` is the curve order, and `s` MUST be low-S (`s <= n/2`). Readers MUST reject explicit-parameter EC keys, unknown curve orders, high-S signatures, and otherwise non-canonical DER. |
+| 2 | `ecdsa-sha256-der` | ECDSA signature over SHA-256(`SIGNING_INPUT`) using a leaf named-curve EC public key on one of the v1 allowed curves below. Signature bytes are DER `Ecdsa-Sig-Value` (`SEQUENCE { r INTEGER, s INTEGER }`) and MUST be a single complete DER value. `r` and `s` MUST be positive, minimally encoded DER integers in the range `1..n-1`, where `n` is the curve order, and `s` MUST be low-S (`s <= n/2`). Readers MUST reject explicit-parameter EC keys, unsupported named curves, high-S signatures, and otherwise non-canonical DER. |
 | 3 | `rsa-pss-sha256` | RSASSA-PSS signature over SHA-256(`SIGNING_INPUT`) using a leaf RSA public key, MGF1-SHA-256, salt length exactly 32 bytes, trailer field `0xBC`. The encoded signature length MUST equal the RSA modulus length in bytes. If the SubjectPublicKeyInfo algorithm is RSASSA-PSS and carries parameters, those parameters MUST exactly match this row; unconstrained `rsaEncryption` keys are also valid. |
+
+The v1 allowed ECDSA curves are exactly:
+
+| Curve | Common names / OID |
+|---|---|
+| NIST P-256 | `prime256v1`, `secp256r1`, OID `1.2.840.10045.3.1.7` |
+| NIST P-384 | `secp384r1`, OID `1.3.132.0.34` |
+| NIST P-521 | `secp521r1`, OID `1.3.132.0.35` |
+
+Readers MUST reject any other EC curve for `ecdsa-sha256-der`, even if the
+local crypto provider can verify it. Writers MUST reject unsupported EC private
+keys for this profile unless a future profile assigns a new scheme or curve
+registry.
 
 Writers MUST set a scheme compatible with the leaf public key and signing
 private key. Readers MUST reject a scheme/key mismatch, a signature whose length,
@@ -215,7 +232,7 @@ Core passes the profile:
 - exact `signer_identity_bytes`;
 - exact `authenticator_value`;
 - caller-supplied trusted root certificates, as DER;
-- whether OpenSSL default trust roots may be used;
+- whether OpenSSL default trust roots may be used by explicit request;
 - the chain-validation time policy and validation time. The default v1 policy is
   `verifier_current_time`, using the verifier's current clock at the time of
   verification.
@@ -256,6 +273,7 @@ After parsing, readers MUST:
    NOT be used as the chain-validation time for a successful v1 result unless a
    separate trusted timestamp profile or explicit deployment policy supplies
    independent evidence that binds the archive signature to that time.
+6. Enforce the v1 leaf KeyUsage rule in §8.
 
 RootAuth verification MUST fail if either signature verification or certificate
 path verification fails.
@@ -291,16 +309,28 @@ CLI, JSON, and API reports MUST label the time policy explicitly:
 `chain_time_basis = verifier_current_time`, the exact
 `chain_validation_time_unix_seconds`, the signer-claimed
 `signed_at_unix_seconds`, `trusted_timestamp = false`, and
-`revocation_checked = false`, unless a future profile or explicit deployment
-policy adds different evidence and labels it separately. Implementations MAY
-report whether the chain would also validate at `signed_at_unix_seconds`, but
-that diagnostic MUST NOT be used to upgrade a failed default-policy verification
-into a successful v1 RootAuth outcome.
+`revocation_checked = false`. Reports MUST also label
+`key_usage_policy = archive_signature_minimal` and `eku_policy = none` under the
+default v1 profile, unless a future profile or explicit deployment policy adds
+different evidence and labels it separately. Implementations MAY report whether
+the chain would also validate at `signed_at_unix_seconds`, but that diagnostic
+MUST NOT be used to upgrade a failed default-policy verification into a
+successful v1 RootAuth outcome.
 
-This v1 profile does not define a mandatory EKU or leaf KeyUsage policy beyond
-the certificate path validation performed by OpenSSL. Deployments that require a
-document-signing, code-signing, or private-purpose EKU must enforce that policy
-outside this profile or define a future stricter profile.
+This v1 profile enforces one minimal leaf KeyUsage rule because the leaf public
+key is used to verify an archive signature: if the leaf certificate contains a
+KeyUsage extension, that extension MUST permit either `digitalSignature` or
+`contentCommitment`/`nonRepudiation`; a certificate that has KeyUsage but only
+permits unrelated uses such as key encipherment MUST be rejected. If KeyUsage is
+absent, the v1 profile imposes no additional KeyUsage restriction beyond normal
+path validation.
+
+This v1 profile does not define a mandatory EKU policy. If an EKU extension is
+present, default v1 verification records it for diagnostics but does not require
+a document-signing, code-signing, or private-purpose OID. Deployments that
+require an EKU must enforce that policy outside this profile or define a future
+stricter profile, and reports MUST label that deployment policy separately from
+the default v1 outcome.
 
 ## 9. Outcomes
 
@@ -352,10 +382,14 @@ Successful verification SHOULD expose:
 - leaf certificate SHA-256 fingerprint;
 - verified chain subjects in OpenSSL chain order;
 - trust anchor subject when available;
+- `trust_store_policy = caller_roots`, `openssl_default_roots`, or
+  `caller_roots_plus_openssl_default_roots`;
 - `x509_time_policy = verifier_current_time` by default;
 - `chain_time_basis = verifier_current_time`;
 - `trusted_timestamp = false`;
-- `revocation_checked = false`.
+- `revocation_checked = false`;
+- `key_usage_policy = archive_signature_minimal`;
+- `eku_policy = none`.
 
 CLI and JSON output MUST label `signed_at_unix_seconds` as `signer_claimed` and
 MUST label the chain-validation time separately. They MUST NOT label a
@@ -372,11 +406,12 @@ claims come from an explicitly separate policy or future profile field.
 5. The profile recomputes and checks `chain_digest`.
 6. The profile builds `SIGNING_INPUT`.
 7. The profile verifies the signature with the leaf certificate public key.
-8. The profile verifies the certificate path with caller-approved trust roots at
+8. The profile enforces the leaf KeyUsage rule from §8.
+9. The profile verifies the certificate path with caller-approved trust roots at
    the selected chain-validation time.
-9. If verification succeeds and core is in full RootAuth verification mode,
+10. If verification succeeds and core is in full RootAuth verification mode,
    return `RootAuthContentVerified`.
-10. If verification succeeds and core is in public no-key mode, return
+11. If verification succeeds and core is in public no-key mode, return
     `PublicDataBlockCommitmentVerified`.
 
 ## 12. CLI Profile
@@ -392,14 +427,15 @@ For archive creation, the CLI profile maps:
 
 If `--x509-signature-scheme` is omitted, writers MUST choose
 `rsa-pkcs1-sha256` for unconstrained RSA keys and `ecdsa-sha256-der` for
-named-curve EC keys. Writers MUST use `rsa-pss-sha256` only when explicitly
-requested; a constrained RSASSA-PSS key without an explicit compatible scheme is
-rejected.
+allowed named-curve EC keys from §5.3. Writers MUST reject EC keys on curves
+outside the v1 allowed set unless an explicit future profile supports them.
+Writers MUST use `rsa-pss-sha256` only when explicitly requested; a constrained
+RSASSA-PSS key without an explicit compatible scheme is rejected.
 
 For verification, the CLI profile maps:
 
 - `--trusted-ca-cert FILE` to caller-supplied trusted roots;
-- `--trusted-system-roots` to OpenSSL default trust roots.
+- `--trusted-openssl-roots` to OpenSSL default trust roots.
 
 Unless a future CLI flag or deployment policy explicitly supplies a validation
 time with separate evidence, CLI verification uses verifier current time for
@@ -408,6 +444,11 @@ chain-validation time merely because it is present in the signed authenticator.
 
 Verification MUST reject a request that mixes Ed25519 trust options with X.509
 trust options in the same RootAuth verification operation.
+
+The CLI MUST NOT describe `--trusted-openssl-roots` as platform-native root
+validation. If a product wrapper adds a separate platform-native root option, it
+is outside this v1 profile and its reports MUST use a distinct trust-store
+policy label.
 
 `--public-no-key` with X.509 trust uses the same authenticator verification, but
 the resulting status is `public_data_block_commitment_verified` and must be
@@ -439,14 +480,20 @@ Partial operations may report root auth as deferred or unavailable.
    bytes.
 5. `UnsupportedIdentity`: unknown `signer_identity_type` with otherwise valid
    core footer wire checks.
-6. Missing trust policy: no caller-supplied trusted roots and no explicit system
-   roots request.
+6. Missing trust policy: no caller-supplied trusted roots and no explicit
+   OpenSSL-default-roots request.
+   Repeat with only `--trusted-openssl-roots` and verify success, when the chain
+   validates, reports `trust_store_policy = openssl_default_roots`; repeat with
+   both caller roots and OpenSSL defaults and verify
+   `trust_store_policy = caller_roots_plus_openssl_default_roots`.
 7. Stored footer `archive_root` differs from core recomputation: core rejects
    before profile success is possible.
 8. Signature schemes: valid RSA-PKCS1-SHA256 (`sig_scheme = 1`), valid
-   ECDSA-SHA256-DER (`sig_scheme = 2`), valid RSA-PSS-SHA256 with salt length 32
-   (`sig_scheme = 3`), and rejection when any of those signatures is verified
-   under another scheme.
+   ECDSA-SHA256-DER (`sig_scheme = 2`) on P-256, P-384, and P-521, valid
+   RSA-PSS-SHA256 with salt length 32 (`sig_scheme = 3`), and rejection when
+   any of those signatures is verified under another scheme. Include an EC key
+   on an unsupported named curve and verify readers and writers reject it even
+   when the local crypto provider supports that curve.
 9. Time labelling: under the default `verifier_current_time` policy, a chain
    that validates at `signed_at_unix_seconds` but is expired at current
    verification time MUST fail as `UntrustedChain`, while still reporting
@@ -454,3 +501,12 @@ Partial operations may report root auth as deferred or unavailable.
    only when an explicit future profile or deployment policy selects a different
    chain-validation time with separate evidence, and the report MUST label that
    non-default time basis separately.
+10. Leaf KeyUsage: a valid chain whose leaf KeyUsage contains
+    `digitalSignature` or `contentCommitment`/`nonRepudiation` succeeds; a leaf
+    with KeyUsage present but limited to unrelated uses such as key encipherment
+    fails; a leaf with no KeyUsage extension follows normal path validation and
+    reports `key_usage_policy = archive_signature_minimal`.
+11. EKU reporting: a leaf with no EKU, code-signing EKU, document-signing EKU,
+    or an unrelated EKU is handled the same under the default v1 profile, while
+    reports expose `eku_policy = none` and do not imply a document-signing or
+    freshness policy.

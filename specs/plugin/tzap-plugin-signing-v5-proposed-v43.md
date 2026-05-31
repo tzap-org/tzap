@@ -119,10 +119,24 @@ Supported `RootAuthFooterV1.signer_identity_type` values for this profile:
 |---:|---|---|
 | 0 | no embedded identity | supported, caller key required |
 | 1 | raw Ed25519 public key, 32 bytes | supported |
-| 2 | X.509 chain | reserved |
+| 2 | X.509 chain | unsupported for this Ed25519 profile |
+
+For type 0, `signer_identity_length` MUST equal 0 and
+`signer_identity_bytes` MUST be empty. Type 0 can verify only with a
+caller-supplied trusted Ed25519 key; without such a key the outcome is
+`UnsupportedIdentity`.
 
 For type 1, `signer_identity_length` MUST equal 32 and
-`signer_identity_bytes` MUST be the Ed25519 public key bytes.
+`signer_identity_bytes` MUST be the Ed25519 public key bytes. When the caller
+supplies a trusted Ed25519 key, that trusted key MUST byte-equal the embedded
+type-1 key before the profile may return `RootAuthContentVerified` or
+`PublicDataBlockCommitmentVerified`. A signature that verifies under a
+caller-supplied key while the footer embeds a different type-1 key is `Invalid`,
+because the signed `signer_identity_digest` names a different signer identity.
+
+Readers MUST treat every other `signer_identity_type`, including type 2, as
+`UnsupportedIdentity` for this profile even when a caller-supplied Ed25519 key
+is available.
 
 An embedded public key alone is not a trust anchor. Without a caller-supplied
 trusted key or trust policy, a valid embedded-key signature is self-consistent
@@ -180,18 +194,27 @@ authenticity.
 
 1. Core validates and recomputes v43 root-auth inputs.
 2. The profile parses `authenticator_value`.
-3. The profile selects a verification key:
-   - caller-supplied trusted key if provided;
-   - embedded raw Ed25519 key only for `SelfSignedConsistent`;
-   - otherwise `UnsupportedIdentity`.
-4. The profile builds `SIGNING_INPUT`.
-5. The profile verifies the Ed25519 signature using the strict profile.
-6. If verification fails, return `Invalid`.
-7. If verification succeeds with caller trust and core is in full RootAuth
+3. The profile validates `signer_identity_type` and
+   `signer_identity_length` as §5 defines. Unknown or unsupported identity types
+   return `UnsupportedIdentity`.
+4. The profile selects a verification key:
+   - for type 0, the caller-supplied trusted key if present, otherwise
+     `UnsupportedIdentity`;
+   - for type 1 with a caller-supplied trusted key, only that trusted key, and
+     only if it byte-equals `signer_identity_bytes`;
+   - for type 1 without caller trust, the embedded raw key only for a possible
+     `SelfSignedConsistent` result.
+5. If type 1 embeds a key and a caller-supplied trusted key is present but does
+   not byte-equal the embedded key, return `Invalid` before signature success is
+   possible.
+6. The profile builds `SIGNING_INPUT`.
+7. The profile verifies the Ed25519 signature using the strict profile.
+8. If verification fails, return `Invalid`.
+9. If verification succeeds with caller trust and core is in full RootAuth
    verification mode, return `RootAuthContentVerified`.
-8. If verification succeeds with caller trust and core is in public no-key
+10. If verification succeeds with caller trust and core is in public no-key
    mode, return `PublicDataBlockCommitmentVerified`.
-9. If verification succeeds only with an embedded untrusted key, return
+11. If verification succeeds only with an embedded untrusted key, return
    `SelfSignedConsistent`.
 
 ## 9. Partial Operations
@@ -214,7 +237,12 @@ Partial operations may report root auth as deferred or unavailable.
 3. `SelfSignedConsistent`: embedded raw public key, no caller trusted key.
 4. `Invalid`: flipped `archive_root`, wrong domain, wrong key, malformed
    signature value, non-canonical public key, non-canonical signature.
-5. `UnsupportedIdentity`: unknown `signer_identity_type` with otherwise valid
-   core footer wire checks.
-6. Stored footer `archive_root` differs from core recomputation: core rejects
+5. `UnsupportedIdentity`: unknown `signer_identity_type`, X.509 identity type,
+   or type 0 without a caller trusted key, with otherwise valid core footer wire
+   checks.
+6. Identity binding: type 0 with non-zero identity length is invalid; type 1
+   with a length other than 32 is invalid; type 1 with an embedded key different
+   from the caller-supplied trusted key is invalid even if the signature verifies
+   under the caller key.
+7. Stored footer `archive_root` differs from core recomputation: core rejects
    before profile success is possible.

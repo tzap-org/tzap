@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | **Format version** | 1 |
-| **Document version** | 0.43 / 2026-05-30.1 (optional encryption / password-optional; unified versioning) |
+| **Document version** | 0.43 / 2026-05-31.1 (optional encryption / password-optional; unified versioning) |
 | **Status** | Draft implementation target |
 | **Owner** | Frank Zhu |
 | **Maintainers** | Frank Zhu |
-| **Last updated** | 2026-05-30 |
+| **Last updated** | 2026-05-31 |
 | **Supersedes** | v0.1 … v0.40, v0.41, v0.42 |
 | **Superseded by** | None |
 | **Conflict rule** | This document is self-contained and supersedes all earlier tzap format drafts, including the unreleased v0.41 and v0.42 drafts. If it conflicts with any v0.1–v0.42 text, this v0.43 draft wins unless a later dated spec explicitly supersedes it. |
@@ -27,11 +27,12 @@ archives.
    protection mode*, selected by `aead_algo = None`, stores payload and metadata
    as plaintext. No passphrase, no keyfile, and no key schedule are required
    (§5, §6.1, §9, §13, §14). The previous "encrypt under a public all-zero key"
-   convenience path is removed; producing a no-secret archive now skips the
-   cryptography entirely rather than wasting it.
+   convenience path is removed; producing an explicitly no-encryption archive
+   now skips the cryptography entirely rather than wasting it.
 2. **Password is opt-in.** Confidentiality is requested explicitly via a
-   passphrase (Argon2id) or a raw keyfile (Raw KDF). With neither, the writer
-   produces an unencrypted archive (§13).
+   passphrase (Argon2id) or a raw keyfile (Raw KDF). Password-free archive
+   creation is an explicit plaintext protection-mode choice (`aead_algo = None`,
+   §13), not an accidental consequence of forgetting a secret option.
 3. **`OBJECT_TAG_LEN`.** Object sizing/padding math uses `OBJECT_TAG_LEN`, which
    is `AEAD_TAG_LEN` in an encryption mode and `0` in unencrypted mode (§6.1,
    §14). Unencrypted objects carry no per-object tag; integrity is per-block
@@ -83,18 +84,21 @@ locator`.
    (`aead_algo ≠ None`, §5.1), file contents, names, per-file metadata, and the
    random-access index are unreadable without the key. The outer
    container still reveals unavoidable traffic-analysis metadata: number
-   of volumes, total bytes per volume, block size, padded encrypted
-   object sizes, IndexRoot location/size, terminal CMRA size, and optional root-auth footer presence.
+   of volumes, total bytes per volume, block size, padded stored-object
+   sizes, IndexRoot location/size, terminal CMRA size, and optional root-auth footer presence.
    In **unencrypted mode** (`aead_algo = None`), confidentiality is explicitly
-   not provided: all contents and the index are readable by anyone. This is the
-   opt-in behavior chosen when no passphrase or keyfile is supplied; a password
-   is never required to create or read an archive.
+   not provided: all contents and the index are readable by anyone. This mode is
+   a deliberate password-free archive choice; a password is never required to
+   create or read an archive, but CLI writers MUST NOT enter plaintext mode by
+   accidental omission of all secret options (§26, §29.0).
 2. **Integrity.** In an encryption mode, modification, reorder, or substitution
    of an authenticated object is detected before that object's plaintext is
-   exposed (AEAD + keyed HMAC). In unencrypted mode, modification or corruption
-   is *detected* by per-block CRC32C, structural block-continuity rules, and the
-   unkeyed header/footer digests (§9), but this detection is not *authenticated*
-   — an actor who rewrites the bytes can recompute the CRCs and digests.
+   exposed (AEAD + keyed HMAC). In unencrypted mode, accidental corruption and
+   malformed rewrites are detected by per-block CRC32C, structural
+   block-continuity rules, and the unkeyed header/footer digests (§9), but this
+   detection is not authenticated: an actor who can rewrite archive bytes can
+   also recompute the CRCs and digests and produce a different valid unsigned
+   plaintext archive.
    Cryptographic tamper-evidence in unencrypted mode requires the optional root
    authentication signature (§30); readers MUST NOT report an unencrypted,
    unsigned archive as cryptographically authenticated. In both modes, archive
@@ -153,12 +157,14 @@ detection; replay attacks; loss of CryptoHeader or ManifestFooter copies;
 mid-stream writer crashes.
 
 Active modification is in scope for integrity detection and plaintext
-non-release for any object that fails mode-specific integrity validation, not for
-guaranteed repair. The unkeyed per-block CRC identifies accidental
-corruption and missing/erased shards for FEC, but an active attacker who
-can rewrite a BlockRecord and recompute its CRC can still cause object
-integrity failure and deny availability even when parity would have repaired an
-accidental error at the same location. Whole-archive truncation in
+non-release in encryption modes and in root-authenticated verification. For
+unsigned unencrypted archives, active modification is in scope only as
+malformed-byte detection; a complete rewrite with recomputed CRCs and unkeyed
+digests is not detectable and MUST NOT be reported as tamper-free. The unkeyed
+per-block CRC identifies accidental corruption and missing/erased shards for
+FEC, but an active attacker who can rewrite a BlockRecord and recompute its CRC
+can deny FEC availability and, for unsigned unencrypted archives, can create a
+different structurally valid plaintext object. Whole-archive truncation in
 non-seekable sequential mode is detected at terminal verification;
 any live output emitted before that point is provisional and must not be
 reported or committed as a clean extraction until terminal recovery and
@@ -242,6 +248,11 @@ replaced by unkeyed digests at the same offset and size (§9, §11, §12); and
 per-block `record_crc32c` (§10) provides corruption detection. A password is
 therefore optional: confidentiality is opt-in via a passphrase or keyfile (§13),
 and tamper-evidence is opt-in via root authentication (§30).
+Unsigned unencrypted archives are valid but not tamper-evident: a successful
+open, list, extract, or verify operation on such an archive proves only that the
+bytes are internally well-formed under the unkeyed corruption checks available
+to that operation. It does not prove that an active writer or attacker did not
+replace the archive with a different well-formed plaintext archive.
 
 Encryption/password and signing/root authentication are independent optional
 features. A conforming v0.43 archive may be any of these four combinations:
@@ -256,9 +267,10 @@ features. A conforming v0.43 archive may be any of these four combinations:
 Throughout this document, **mode-specific integrity verification** means the
 keyed HMAC/AEAD checks in an encryption mode, or the unkeyed header/footer
 digest checks, per-block CRC32C checks, block-continuity checks, and plaintext
-object validation in unencrypted mode. The unkeyed checks are corruption and
-binding checks only; root authentication is the only cryptographic
-tamper-evidence mechanism for unencrypted archives.
+object syntax validation in unencrypted mode. The unkeyed checks are
+corruption, layout, and identity-binding checks only; they are not active-tamper
+detection. Root authentication is the only cryptographic tamper-evidence
+mechanism for unencrypted archives.
 
 Readers MUST enforce these cross-field consistency rules from the CryptoHeader
 fixed fields before any object processing:
@@ -407,7 +419,8 @@ back to byte form for that plaintext.
    validation. In an encryption mode, tampering would already have failed
    AEAD; in unencrypted mode there is no AEAD, so this canonical-padding check
    (with per-block CRC32C and, when present, root authentication) is the
-   integrity gate. Either way a valid archive must use zero padding.
+   canonical object-validity gate. Either way a valid archive must use zero
+   padding.
 6. zstd payload = plaintext[0 .. payload_len].
 ```
 
@@ -871,8 +884,8 @@ in this section means simply "object": the same last-data-flag, kind, ordering,
 and continuity rules apply to plaintext payload envelopes and plaintext metadata
 objects. `record_crc32c` is mandatory in both modes and is the per-byte
 corruption-detection mechanism for plaintext objects; the structural
-block-continuity rules are the primary structural integrity mechanism when no
-AEAD is present.
+block-continuity rules are the primary structural validity mechanism when no
+AEAD is present. They do not authenticate plaintext against active rewrites.
 
 For a volume whose authenticated header/trailer identity establishes
 `volume_index = v` and `stripe_width = V`, every BlockRecord in that
@@ -1306,15 +1319,18 @@ mandatory before trusting flags, offsets, or lengths. In unencrypted mode
 `sidecar_hmac` is instead the unkeyed `sidecar_digest = SHA-256(b"tzap-sidecar-v43"
 || archive_uuid || session_id || all sidecar bytes before this field)` per §9;
 it is a corruption/identity check only, and authority for copied objects in
-unencrypted mode comes from the plaintext ManifestFooter digest plus root
-authentication when present, not from a keyed HMAC. The CRC covers the
+unencrypted mode comes from the plaintext ManifestFooter digest plus object
+syntax checks and, when present, root authentication; without root
+authentication these are still unkeyed checks only, not active-tamper
+authority. The CRC covers the
 `sidecar_hmac` bytes because it covers the first 124 header bytes; this
 is intentional and does not make the CRC an authentication mechanism.
 Authority for copied archive objects still comes from mode-specific
 ManifestFooter integrity plus object validation: HMAC plus AEAD verification of
 IndexRoot and any copied dictionary object in an encryption mode, or
 ManifestFooter digest, per-block CRC32C, suffix-padding/zstd exactness, and
-optional root authentication in unencrypted mode.
+optional root authentication in unencrypted mode. Without root authentication,
+the unencrypted sidecar path is corruption-checked only.
 Readers MUST verify that the sidecar `archive_uuid` and `session_id`
 match the VolumeHeader/CryptoHeader pair before using any sidecar bytes.
 Readers implementing this draft MUST reject `version != 1`.
@@ -3502,10 +3518,13 @@ succeeds.
 An active attacker who can modify a BlockRecord can also recompute its
 CRC32C, causing the reader to treat a poisoned shard as apparently
 intact rather than as an erasure. In that case FEC repair is not
-guaranteed to recover availability; the affected object is expected to
-fail mode-specific integrity verification before plaintext release. tzap's FEC is an
-availability feature for loss and accidental corruption, not a
-cryptographic tamper locator.
+guaranteed to recover availability. In an encryption mode, or in
+root-authenticated verification, the affected object or archive is expected to
+fail before authenticated plaintext success is reported. In unsigned
+unencrypted mode, however, a complete malicious rewrite with recomputed CRCs and
+digests can produce a different valid plaintext archive; readers MUST label
+that mode as corruption-checked only. tzap's FEC is an availability feature for
+loss and accidental corruption, not a cryptographic tamper locator.
 
 For each object, the writer splits encrypted bytes into
 `data_block_count` data blocks, derives that object's actual
@@ -3800,7 +3819,7 @@ compression, and per-sink writes are all independent.
 | Failure | Detection | Recovery |
 |---|---|---|
 | Bit-rot in block payload | record_crc32c | FEC repair |
-| Active block tamper with recomputed CRC | Mode-specific object integrity failure | Detected before plaintext release; FEC availability is not guaranteed |
+| Active block tamper with recomputed CRC | Encryption mode: mode-specific object integrity failure. Root-authenticated unencrypted mode: root-auth/full-content verification failure. Unsigned unencrypted mode: not reliably detectable if the rewrite remains structurally valid | Detected before authenticated plaintext success only in encryption or root-authenticated verification; unsigned unencrypted output is corruption-checked only and FEC availability is not guaranteed |
 | Any single volume lost (default mode) | block_index gap | FEC (if parity sized correctly) |
 | CryptoHeader corrupt in 1 volume | CMRA repairs before integrity verification, or integrity verification fails | Repair from same-volume CMRA; otherwise use another volume's copy |
 | ManifestFooter corrupt in 1 volume | CMRA repairs before integrity verification, or integrity verification fails | Repair from same-volume CMRA; otherwise use another volume's copy |
@@ -3823,20 +3842,22 @@ compression, and per-sink writes are all independent.
 
 ## 22. Security Analysis
 
-- File data, paths, per-file metadata, archive content hash, file count,
-  frame count, envelope count, tar size, and directory hints are inside
-  AEAD-protected encrypted objects.
+- In an encryption mode, file data, paths, per-file metadata, archive content
+  hash, file count, frame count, envelope count, tar size, and directory hints
+  are inside AEAD-protected encrypted objects. In unencrypted mode, the same
+  objects are plaintext and readable without a key.
 - The outer container necessarily leaks volume count, total volume sizes,
   block size, CryptoHeader parameters, IndexRoot location/size, and
-  padded encrypted object sizes. The authenticated plaintext
+  padded stored-object sizes. The authenticated plaintext
   VolumeTrailer also leaks `closed_at_ns`, the write-completion timestamp
   recorded by the writer.
 - Per-envelope padding masks exact packed-frame length within the chosen
   block-size granularity; it does not hide total archive size or object
   count from an observer who can see all volume bytes.
 - All plaintext-deriving bytes in an encryption mode are authenticated by AEAD
-  and/or HMAC; unencrypted-mode plaintext bytes are corruption-checked unless
-  root authentication is enabled.
+  and/or HMAC. Unencrypted-mode plaintext bytes are corruption-checked only
+  unless root authentication is enabled; unsigned unencrypted archives provide
+  no active-tamper evidence.
 - Non-seekable sequential readers may expose per-envelope-verified
   bytes before whole-archive terminal verification only as provisional
   output. Default filesystem extractors preserve the truncation
@@ -3857,9 +3878,13 @@ compression, and per-sink writes are all independent.
   data or parity shard and recompute the CRC so the reader does not mark
   that shard as an erasure. This can force the enclosing object to fail
   mode-specific integrity validation even when enough original parity would have
-  repaired an accidentally corrupted shard. This is an availability
-  denial, not a plaintext integrity bypass: readers MUST NOT release
-  plaintext until object authentication succeeds.
+  repaired an accidentally corrupted shard. In encryption modes and
+  root-authenticated verification this is an availability denial, not a
+  plaintext integrity bypass: readers MUST NOT report authenticated plaintext
+  success until object or root-auth verification succeeds. In unsigned
+  unencrypted mode, the same attacker can rewrite plaintext and recompute
+  unkeyed checks; readers MUST NOT describe successful parsing as active-tamper
+  detection.
 - `session_id` is bound into AEAD nonce derivation and AAD, preventing
   same-key/same-archive envelope or index replay across write sessions.
 - Directory-hint shard indexes are unique because they are AEAD counters
@@ -4010,7 +4035,7 @@ full-archive verification for hostile inputs.
 tzap create  [--volumes V | --volume-size 100M]
              [--volume-loss-tolerance N]
              [--unsafe-parity DATA:PARITY]
-             [--password-stdin] [--keyfile FILE]
+             [--password-stdin | --keyfile FILE | --no-encryption]
              [--compression-level 3]
              [--chunk-size 256K] [--envelope-size 1M] [--block-size 64K]
              [--files-per-shard 10000]
@@ -4031,6 +4056,15 @@ tzap info    ARCHIVE
 tzap recover [--password-stdin] [--keyfile FILE]
              [--bootstrap FILE] ARCHIVE...
 ```
+
+For creation, the three protection-mode selectors are mutually exclusive:
+`--password-stdin` selects encrypted Argon2id mode, `--keyfile FILE` selects
+encrypted Raw mode, and `--no-encryption` selects unencrypted mode. A
+non-interactive CLI invocation that supplies none of these selectors MUST reject
+before reading input bytes. An interactive UI MAY offer an explicit plaintext
+confirmation prompt instead of requiring the literal flag, but it MUST leave an
+auditable selection path and MUST NOT silently create an unencrypted archive
+because the user omitted all secret options.
 
 ---
 
@@ -4549,6 +4583,12 @@ Previously required regression cases retained from earlier drafts:
   execution. Mutate Argon2id fixed-prefix length, salt length,
   `t_cost = 0`, and `m_cost_kib < 8 × parallelism`; verify rejection
   before invoking Argon2id.
+- **CLI protection-mode selection**: create-mode invocations with
+  `--password-stdin`, `--keyfile`, and `--no-encryption` each produce the
+  expected `aead_algo`/`kdf_algo` pair. Supplying more than one selector rejects
+  before reading input bytes. A non-interactive create with none of the
+  selectors rejects rather than silently producing plaintext. Reading an
+  unencrypted archive still requires no password or keyfile.
 - **Argon2id passphrase canonicalization**: include vectors whose
   passphrase contains composed and decomposed Unicode forms, a trailing
   newline, an embedded NUL, and a leading U+FEFF character. Verify the
@@ -4801,10 +4841,13 @@ Previously required regression cases retained from earlier drafts:
 - **Parity-block corruption**: corrupt parity BlockRecord payloads and
   CRCs independently. Verify CRC-detected corruption is treated as an
   erasure and any unrepaired or incorrectly repaired object bytes still
-  fail mode-specific validation before plaintext release. Also tamper with a data
-  BlockRecord and recompute its unkeyed CRC; verify the reader does not
-  mis-release plaintext and reports mode-specific integrity failure rather than
-  claiming FEC availability.
+  fail authenticated validation before plaintext success is reported in an
+  encryption mode or root-authenticated verification. Also tamper with a data
+  BlockRecord and recompute its unkeyed CRC; verify encrypted-mode readers
+  report mode-specific integrity failure rather than claiming FEC availability,
+  signed unencrypted full RootAuth verification fails, and unsigned
+  unencrypted readers label any successful parse/extract as corruption-checked
+  plaintext only, not tamper-free content.
 - **Large tar member group**: one regular file larger than
   `envelope_target_size`; verify FileEntry.frame_count > 1 and random
   extraction streams the reconstructed tar member group correctly.
@@ -5048,9 +5091,17 @@ mode), a conformant v43 implementation MUST honor the protection mode (§5.1):
   every payload and metadata object as padded plaintext (§14, `OBJECT_TAG_LEN =
   0`); compute the unkeyed header/footer digests of §9; still compute every
   `record_crc32c`, FEC parity set, CMRA, locator, and — if requested — the root
-  authentication commitment exactly as in encryption mode.
+  authentication commitment exactly as in encryption mode. When root
+  authentication is absent, label the result as corruption-checked plaintext
+  only, never as tamper-evident.
 - **Writer, both modes:** use a single `aead_algo` for the whole archive,
   replicated identically in every volume's CryptoHeader; never mix modes.
+- **CLI writer, protection-mode selection:** require exactly one explicit
+  create-time protection-mode selector: passphrase (`Argon2id`), keyfile
+  (`Raw`), or no-encryption (`aead_algo = None`). `--password-stdin` and
+  `--keyfile` MUST be mutually exclusive, and neither may be combined with
+  `--no-encryption`. A non-interactive CLI create with no selector MUST reject
+  rather than silently producing plaintext.
 - **Reader, both modes:** determine the protection mode from `aead_algo` and
   enforce the §5.1 cross-field consistency rules before any object processing;
   in unencrypted mode verify the header/footer digests (§9), per-block CRC32C,
@@ -5059,7 +5110,8 @@ mode), a conformant v43 implementation MUST honor the protection mode (§5.1):
   unencrypted archive; it MAY report corruption-checked and, when root
   authentication verifies, root-auth/public-commitment states (§30).
 - **Both:** a password is never required; confidentiality is requested only via
-  a passphrase (`Argon2id`) or keyfile (`Raw`).
+  a passphrase (`Argon2id`) or keyfile (`Raw`), and password-free plaintext is
+  requested explicitly rather than inferred from missing secret inputs.
 
 A conformant writer:
 
