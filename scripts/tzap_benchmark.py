@@ -1488,6 +1488,12 @@ def fmt_seconds_with_stddev(value: float | None, stddev_value: float | None) -> 
     return f"{value:.3f}s +/- {stddev_value:.3f}s"
 
 
+def fmt_peak_rss(value: int | None) -> str:
+    if value is None:
+        return "n/a"
+    return fmt_size(value * 1024)
+
+
 def md_cell(value: object) -> str:
     return str(value).replace("|", "\\|")
 
@@ -1506,6 +1512,26 @@ def tool_sort_key(row: ResultRow) -> tuple[int, str]:
 
 def sorted_workflow_rows(rows: list[ResultRow]) -> list[ResultRow]:
     return sorted(rows, key=lambda row: (row.input_size_bytes, tool_sort_key(row)))
+
+
+def public_recovery_label(
+    tool: str,
+    scenario: str,
+    recovery_rows: list[RecoveryRow],
+    recovery_was_run: bool,
+) -> str:
+    if not recovery_was_run:
+        return "Not run"
+    if tool == "tzap":
+        matching = [row for row in recovery_rows if row.scenario == scenario]
+        if not matching:
+            return "Not run"
+        if any(row.status == "ok" for row in matching):
+            return "Recovered"
+        return "Failed"
+    if tool == "tar+zstd+age+par2":
+        return "External PAR2"
+    return "No repair path"
 
 
 def chart_title(title: str, subtitle: str, width: int = 960) -> list[str]:
@@ -1908,6 +1934,48 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
             f"- On the largest input here ({fmt_size(largest.input_size_bytes)}), "
             f"tzap restored the selected `{largest.selected_file_position}` file in "
             f"{fmt_seconds_label(largest.extract_one_s)} on average."
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Public Metrics",
+            "",
+            f"| Dataset | Files | Input size | Tool | Runs | Create | Verify/Test | {selected_restore_heading(rows)} | Full extract | Archive size | Peak RSS | Missing volume | Rotten payload |",
+            "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        ]
+    )
+    for row in sorted_workflow_rows(rows):
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    row.dataset,
+                    fmt_int(row.input_file_count),
+                    fmt_size(row.input_size_bytes),
+                    row.tool,
+                    fmt_int(row.runs),
+                    fmt_seconds_with_stddev(row.create_s, row.create_stddev_s),
+                    fmt_seconds_with_stddev(row.verify_s, row.verify_stddev_s),
+                    fmt_seconds_with_stddev(row.extract_one_s, row.extract_one_stddev_s),
+                    fmt_seconds_with_stddev(row.extract_all_s, row.extract_all_stddev_s),
+                    fmt_size(row.output_size_bytes),
+                    fmt_peak_rss(row.peak_rss_kib),
+                    public_recovery_label(
+                        row.tool,
+                        recovery_scenarios[0][0],
+                        recovery_rows,
+                        recovery_was_run,
+                    ),
+                    public_recovery_label(
+                        row.tool,
+                        recovery_scenarios[1][0],
+                        recovery_rows,
+                        recovery_was_run,
+                    ),
+                ]
+            )
+            + " |"
         )
 
     if charts:

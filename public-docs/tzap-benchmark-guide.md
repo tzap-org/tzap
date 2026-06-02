@@ -62,16 +62,32 @@ For public results, record:
 - command versions
 - exact commands
 
-## Metrics table template
+## Public metrics table
 
-| Data set | Files | Input size | Tool | Create | Verify/Test | Full extract | Single-file extract | Output size | Peak RSS |
-| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- |
-| size-1mb | 64 | 1 MB | tzap | TBD | TBD | TBD | TBD | TBD | TBD |
-| size-20mb | 64 | 20 MB | tzap | TBD | TBD | TBD | TBD | TBD | TBD |
-| size-1gb | 64 | 1 GB | tzap | TBD | TBD | TBD | TBD | TBD | TBD |
-| size-20gb | 64 | 20 GB | tzap | TBD | TBD | TBD | TBD | TBD | TBD |
+Lead public benchmark pages with a complete-workflow table, not a compression
+speed table. The headline should make the `tzap` strengths visible in one scan:
+verify after copy, selected-file restore, and recovery after ordinary archive
+damage.
 
-Use `n/a` where a tool does not provide a comparable built-in workflow.
+The current measured public snapshot is
+[`tzap-benchmark-results.md`](tzap-benchmark-results.md).
+
+Copy timing, size, and memory cells from generated `results.md`; do not fill
+them by hand. Use `n/a` where a tool does not provide a comparable built-in
+workflow.
+
+| Data set | Files | Input size | Tool / mode | Create | Verify/Test | Selected-file restore | Full extract | Output size | Peak RSS | Missing volume | Rotten payload |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| size-20gb | 64 | 20 GB | tzap encrypted archive with recovery options | TBD | TBD | TBD | TBD | TBD | TBD | Recovered | Recovered |
+| size-20gb | 64 | 20 GB | tar + zstd | TBD | TBD | TBD | TBD | TBD | TBD | No repair path | No repair path |
+| size-20gb | 64 | 20 GB | tar + zstd + age | TBD | TBD | TBD | TBD | TBD | TBD | No repair path | No repair path |
+| size-20gb | 64 | 20 GB | tar + zstd + age + PAR2 | TBD | TBD | TBD | TBD | TBD | TBD | External PAR2 | External PAR2 |
+| size-20gb | 64 | 20 GB | 7z password archive | TBD | TBD | TBD | TBD | TBD | TBD | No repair path | No repair path |
+| size-20gb | 64 | 20 GB | zip password archive | TBD | TBD | TBD | TBD | TBD | TBD | No repair path | No repair path |
+
+Use the same columns for `size-1mb`, `size-20mb`, and `size-1gb` rows in the
+full report. If the public page needs one compact table, lead with `size-20gb`
+and link to the generated CSV files for the complete size ladder.
 
 ## Benchmark runner
 
