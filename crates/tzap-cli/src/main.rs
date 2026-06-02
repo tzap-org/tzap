@@ -908,6 +908,7 @@ fn run(cli: Cli) -> Result<()> {
                             options,
                             root_auth,
                             root_auth_profile.as_ref(),
+                            force,
                         )?;
                         let summary_text = format!(
                             "created {} file(s), {} tar bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
@@ -934,6 +935,7 @@ fn run(cli: Cli) -> Result<()> {
                             options,
                             root_auth,
                             root_auth_profile.as_ref(),
+                            force,
                         )?;
                         let summary_text = format!(
                             "created 1 file(s), {} raw bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
@@ -966,6 +968,7 @@ fn run(cli: Cli) -> Result<()> {
                             options,
                             root_auth,
                             root_auth_profile.as_ref(),
+                            force,
                         )?;
                         let summary_text = format!(
                             "created 1 file(s), {} spooled raw bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
@@ -1096,7 +1099,7 @@ fn run(cli: Cli) -> Result<()> {
                 let core_writer = core_writer_started.elapsed();
 
                 let write_outputs_started = Instant::now();
-                write_archive_outputs(&output, &sink.volumes)?;
+                write_archive_outputs(&output, &sink.volumes, force)?;
                 if let Some(path) = bootstrap_out.as_deref() {
                     if sink.bootstrap_sidecar.is_empty() {
                         return Err(FormatError::WriterUnsupported(
@@ -1140,7 +1143,7 @@ fn run(cli: Cli) -> Result<()> {
             }
 
             let read_inputs_started = Instant::now();
-            let inputs = collect_inputs_from_specs(&input_specs)?;
+            let inputs = collect_input_files(&input_specs)?;
             let read_inputs = read_inputs_started.elapsed();
             let regular_files = inputs
                 .iter()
@@ -1233,7 +1236,7 @@ fn run(cli: Cli) -> Result<()> {
             }
 
             let write_outputs_started = Instant::now();
-            write_archive_outputs(&output, &archive.volumes)?;
+            write_archive_outputs(&output, &archive.volumes, force)?;
             if let Some(path) = bootstrap_out {
                 if archive.bootstrap_sidecar.is_empty() {
                     return Err(FormatError::WriterUnsupported(
@@ -1241,8 +1244,7 @@ fn run(cli: Cli) -> Result<()> {
                     )
                     .into());
                 }
-                fs::write(&path, &archive.bootstrap_sidecar)
-                    .with_context(|| format!("failed to write bootstrap sidecar {path}"))?;
+                write_bootstrap_output(&path, &archive.bootstrap_sidecar, force)?;
             }
             let write_outputs = write_outputs_started.elapsed();
             let summary = format!(
@@ -2040,10 +2042,18 @@ fn run(cli: Cli) -> Result<()> {
             let signing_key = generate_ed25519_signing_key();
             let secret_hex = format!("{}\n", encode_hex(&signing_key.to_bytes()));
             let public_hex = format!("{}\n", encode_hex(&signing_key.verifying_key().to_bytes()));
-            fs::write(&secret_output, secret_hex)
-                .with_context(|| format!("failed to write signing secret {secret_output}"))?;
-            fs::write(&public_output, public_hex)
-                .with_context(|| format!("failed to write signing public key {public_output}"))?;
+            write_atomic_output_file(
+                "signing secret",
+                Path::new(&secret_output),
+                secret_hex.as_bytes(),
+                force,
+            )?;
+            write_atomic_output_file(
+                "signing public key",
+                Path::new(&public_output),
+                public_hex.as_bytes(),
+                force,
+            )?;
             emit_success_summary(
                 quiet,
                 &format!("wrote signing keypair to {secret_output} and {public_output}"),
@@ -2458,10 +2468,6 @@ fn collect_input_files(specs: &[InputSpec]) -> Result<Vec<InputFile>> {
     Ok(out)
 }
 
-fn collect_inputs_from_specs(specs: &[InputSpec]) -> Result<Vec<InputFile>> {
-    collect_input_files(specs)
-}
-
 fn collect_one_input_spec(
     input: &Path,
     archive_path: &Path,
@@ -2603,16 +2609,22 @@ fn readonly_mode(_metadata: &fs::Metadata) -> u32 {
     0o644
 }
 
-fn write_archive_outputs(output: &str, volumes: &[Vec<u8>]) -> Result<()> {
+fn write_archive_outputs(output: &str, volumes: &[Vec<u8>], force: bool) -> Result<()> {
     if volumes.is_empty() {
         bail!("writer returned no volumes");
     }
     let output_paths = create_output_paths(output, volumes.len());
-    for (index, volume) in volumes.iter().enumerate() {
-        let path = &output_paths[index];
-        fs::write(path, volume)
-            .with_context(|| format!("failed to write archive volume {}", path.display()))?;
+    let mut temps = create_archive_output_temps(&output_paths)?;
+    for ((temp, output_path), volume) in temps.iter_mut().zip(&output_paths).zip(volumes) {
+        temp.as_file_mut().write_all(volume).with_context(|| {
+            format!(
+                "failed to write temporary archive volume for {}",
+                output_path.display()
+            )
+        })?;
     }
+    flush_archive_output_temps(&mut temps, &output_paths)?;
+    publish_archive_output_temps(temps, &output_paths, force)?;
     Ok(())
 }
 
@@ -2670,6 +2682,7 @@ fn write_tar_stdin_archive_output(
     options: WriterOptions,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     root_auth_profile: Option<&CreateRootAuthProfile>,
+    force: bool,
 ) -> Result<(StreamingTarWriterSummary, Vec<u8>)> {
     let stdin = io::stdin();
     let mut stdin_lock = stdin.lock();
@@ -2683,9 +2696,18 @@ fn write_tar_stdin_archive_output(
             options,
             Some(root_auth),
             Some(&mut authenticator),
+            force,
         );
     }
-    write_tar_stdin_archive_output_from_reader(output, &mut stdin_lock, key, options, None, None)
+    write_tar_stdin_archive_output_from_reader(
+        output,
+        &mut stdin_lock,
+        key,
+        options,
+        None,
+        None,
+        force,
+    )
 }
 
 fn write_tar_stdin_archive_output_from_reader<R: Read>(
@@ -2695,9 +2717,10 @@ fn write_tar_stdin_archive_output_from_reader<R: Read>(
     options: WriterOptions,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     authenticator: Option<&mut CliRootAuthAuthenticator<'_>>,
+    force: bool,
 ) -> Result<(StreamingTarWriterSummary, Vec<u8>)> {
     let volume_count = options.stripe_width as usize;
-    write_stdin_archive_output_with_sink(output, volume_count, |sink| {
+    write_stdin_archive_output_with_sink(output, volume_count, force, |sink| {
         write_tar_stream_archive_to_sink_with_kdf_and_root_auth(
             reader,
             &key.master_key,
@@ -2720,6 +2743,7 @@ fn write_raw_stdin_archive_output<R: Read>(
     options: WriterOptions,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     root_auth_profile: Option<&CreateRootAuthProfile>,
+    force: bool,
 ) -> Result<(StreamingRawWriterSummary, Vec<u8>)> {
     if let (Some(profile), Some(root_auth)) = (root_auth_profile, root_auth) {
         let mut authenticator =
@@ -2733,6 +2757,7 @@ fn write_raw_stdin_archive_output<R: Read>(
             options,
             Some(root_auth),
             Some(&mut authenticator),
+            force,
         );
     }
     write_raw_stdin_archive_output_from_reader(
@@ -2744,6 +2769,7 @@ fn write_raw_stdin_archive_output<R: Read>(
         options,
         None,
         None,
+        force,
     )
 }
 
@@ -2804,9 +2830,10 @@ fn write_raw_stdin_archive_output_from_reader<R: Read>(
     options: WriterOptions,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     authenticator: Option<&mut CliRootAuthAuthenticator<'_>>,
+    force: bool,
 ) -> Result<(StreamingRawWriterSummary, Vec<u8>)> {
     let volume_count = options.stripe_width as usize;
-    write_stdin_archive_output_with_sink(output, volume_count, |sink| {
+    write_stdin_archive_output_with_sink(output, volume_count, force, |sink| {
         write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth(
             reader,
             archive_path,
@@ -2824,6 +2851,7 @@ fn write_raw_stdin_archive_output_from_reader<R: Read>(
 fn write_stdin_archive_output_with_sink<T>(
     output: &str,
     volume_count: usize,
+    force: bool,
     write_archive: impl FnOnce(
         &mut PathBackedArchiveSink<'_>,
     ) -> std::result::Result<T, ArchiveWriteError>,
@@ -2832,7 +2860,22 @@ fn write_stdin_archive_output_with_sink<T>(
         bail!("writer returned no volumes");
     }
     let output_paths = create_output_paths(output, volume_count);
-    let mut temps = output_paths
+    let mut temps = create_archive_output_temps(&output_paths)?;
+    let (summary, bootstrap_sidecar) = {
+        let mut sink = PathBackedArchiveSink {
+            temps: temps.as_mut_slice(),
+            bootstrap_sidecar: Vec::new(),
+        };
+        let summary = write_archive(&mut sink)?;
+        (summary, sink.bootstrap_sidecar)
+    };
+    flush_archive_output_temps(&mut temps, &output_paths)?;
+    publish_archive_output_temps(temps, &output_paths, force)?;
+    Ok((summary, bootstrap_sidecar))
+}
+
+fn create_archive_output_temps(output_paths: &[PathBuf]) -> Result<Vec<tempfile::NamedTempFile>> {
+    output_paths
         .iter()
         .map(|output_path| {
             let parent = output_path
@@ -2850,16 +2893,14 @@ fn write_stdin_archive_output_with_sink<T>(
                     )
                 })
         })
-        .collect::<Result<Vec<_>>>()?;
-    let (summary, bootstrap_sidecar) = {
-        let mut sink = PathBackedArchiveSink {
-            temps: temps.as_mut_slice(),
-            bootstrap_sidecar: Vec::new(),
-        };
-        let summary = write_archive(&mut sink)?;
-        (summary, sink.bootstrap_sidecar)
-    };
-    for (temp, output_path) in temps.iter_mut().zip(&output_paths) {
+        .collect()
+}
+
+fn flush_archive_output_temps(
+    temps: &mut [tempfile::NamedTempFile],
+    output_paths: &[PathBuf],
+) -> Result<()> {
+    for (temp, output_path) in temps.iter_mut().zip(output_paths) {
         temp.as_file_mut().flush().with_context(|| {
             format!(
                 "failed to flush temporary archive for {}",
@@ -2873,7 +2914,15 @@ fn write_stdin_archive_output_with_sink<T>(
             )
         })?;
     }
+    Ok(())
+}
 
+fn publish_archive_output_temps(
+    temps: Vec<tempfile::NamedTempFile>,
+    output_paths: &[PathBuf],
+    force: bool,
+) -> Result<()> {
+    let volume_count = output_paths.len();
     let publish_order = if volume_count == 1 {
         vec![0]
     } else {
@@ -2886,7 +2935,12 @@ fn write_stdin_archive_output_with_sink<T>(
             .take()
             .ok_or_else(|| anyhow!("missing temporary archive volume {volume_index}"))?;
         let output_path = &output_paths[volume_index];
-        if let Err(error) = temp.persist(output_path) {
+        let publish_result = if force {
+            temp.persist(output_path)
+        } else {
+            temp.persist_noclobber(output_path)
+        };
+        if let Err(error) = publish_result {
             for path in &persisted_paths {
                 let _ = fs::remove_file(path);
             }
@@ -2895,14 +2949,11 @@ fn write_stdin_archive_output_with_sink<T>(
         }
         persisted_paths.push(output_path.clone());
     }
-    Ok((summary, bootstrap_sidecar))
+    Ok(())
 }
 
 fn write_bootstrap_output(path: &str, bytes: &[u8], force: bool) -> Result<()> {
-    if !force {
-        check_output_path_free("bootstrap output", Path::new(path))?;
-    }
-    fs::write(path, bytes).with_context(|| format!("failed to write bootstrap sidecar {path}"))
+    write_atomic_output_file("bootstrap output", Path::new(path), bytes, force)
 }
 
 fn reject_create_stdout_sentinels(output: &str, bootstrap_out: Option<&str>) -> Result<()> {
@@ -4412,16 +4463,49 @@ fn generate_ed25519_signing_key() -> SigningKey {
 }
 
 fn write_keyfile(path: &str, key_hex: &str, force: bool) -> Result<()> {
-    if !force && Path::new(path).exists() {
-        bail!("keyfile already exists: {path}; use --force to overwrite");
+    write_atomic_output_file("keyfile", Path::new(path), key_hex.as_bytes(), force)
+}
+
+fn write_atomic_output_file(label: &str, path: &Path, bytes: &[u8], force: bool) -> Result<()> {
+    if !force && path.exists() {
+        bail!(
+            "{label} already exists: {}; use --force to overwrite",
+            path.display()
+        );
     }
-    if force {
-        fs::write(path, key_hex).with_context(|| format!("failed to write keyfile {path}"))?;
-        return Ok(());
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .prefix(".tzap-write-")
+        .suffix(".partial")
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to create temporary {label} in {}", parent.display()))?;
+    temp.as_file_mut()
+        .write_all(bytes)
+        .with_context(|| format!("failed to write temporary {label} {}", path.display()))?;
+    temp.as_file_mut()
+        .flush()
+        .with_context(|| format!("failed to flush temporary {label} {}", path.display()))?;
+    temp.as_file_mut()
+        .sync_all()
+        .with_context(|| format!("failed to sync temporary {label} {}", path.display()))?;
+
+    let publish_result = if force {
+        temp.persist(path)
+    } else {
+        temp.persist_noclobber(path)
+    };
+    match publish_result {
+        Ok(_) => Ok(()),
+        Err(error) if !force && error.error.kind() == io::ErrorKind::AlreadyExists => bail!(
+            "{label} already exists: {}; use --force to overwrite",
+            path.display()
+        ),
+        Err(error) => Err(error.error)
+            .with_context(|| format!("failed to publish {label} {}", path.display())),
     }
-    fs::write(path, key_hex)
-        .map(|_| ())
-        .with_context(|| format!("failed to write keyfile {path}"))
 }
 
 fn load_ed25519_signing_key(path: &str) -> Result<SigningKey> {
@@ -5283,6 +5367,7 @@ mod tests {
             },
             Some(root_auth),
             Some(&mut authenticator),
+            false,
         )
         .unwrap_err();
 
@@ -5341,6 +5426,7 @@ mod tests {
                 },
                 Some(root_auth),
                 Some(&mut authenticator),
+                false,
             )
             .unwrap_err();
 

@@ -5623,6 +5623,12 @@ fn cli_keygen_writes_keyfile_output_with_force_semantics() {
     assert_eq!(written.len(), 65);
     assert_eq!(written.as_bytes()[64], b'\n');
     assert!(is_lower_hex_str(&written[..64]));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&keyfile).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -5636,6 +5642,34 @@ fn cli_keygen_writes_keyfile_output_with_force_semantics() {
         .args(["keygen", "--force", "--output", keyfile.to_str().unwrap()])
         .assert()
         .success();
+}
+
+#[test]
+fn cli_signing_keygen_writes_restrictive_secret_output() {
+    let temp = tempdir().unwrap();
+    let secret = temp.path().join("root.signing.hex");
+    let public = temp.path().join("root.public.hex");
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "signing-keygen",
+            "--secret-output",
+            secret.to_str().unwrap(),
+            "--public-output",
+            public.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read_to_string(&secret).unwrap().len(), 65);
+    assert_eq!(fs::read_to_string(&public).unwrap().len(), 65);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&secret).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }
 
 #[test]

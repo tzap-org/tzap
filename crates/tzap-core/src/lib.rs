@@ -17,8 +17,6 @@ pub mod wire;
 pub mod writer;
 
 mod raw_stream_profile;
-#[cfg(test)]
-mod streaming_volume_distributor;
 mod streaming_writer;
 
 pub use crypto::{HmacDomain, KdfParams, MasterKey, Subkeys};

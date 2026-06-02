@@ -198,12 +198,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
-name = "byteorder"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
-
-[[package]]
 name = "cc"
 version = "1.2.62"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1300,15 +1294,12 @@ dependencies = [
  "aes-gcm",
  "aes-gcm-siv",
  "argon2",
- "byteorder",
  "chacha20poly1305",
  "crc32c",
  "hex",
  "hkdf",
  "hmac",
- "rand",
  "sha2",
- "subtle",
  "tar",
  "tempfile",
  "thiserror",

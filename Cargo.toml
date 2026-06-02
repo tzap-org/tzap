@@ -23,7 +23,6 @@ aes-gcm = "0.10"
 aes-gcm-siv = "0.11"
 anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }
-byteorder = "1"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
 crc32c = "0.6"
@@ -34,7 +33,6 @@ hmac = "0.12"
 rand = "0.8"
 openssl = { version = "0.10", features = ["vendored"] }
 sha2 = "0.10"
-subtle = "2"
 tar = "0.4"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
