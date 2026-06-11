@@ -1,26 +1,26 @@
 class Tzap < Formula
   desc "Create, list, verify, and extract encrypted recoverable tzap archives"
   homepage "https://github.com/frankmanzhu/tzap"
-  version "0.1.3"
+  version "0.1.4"
   license "Apache-2.0"
 
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/frankmanzhu/tzap/releases/download/v#{version}/tzap-v#{version}-macos-aarch64.tar.gz"
-      sha256 "10c0dbce0dc46d4e42d2a4e9840c810620ab9b9587c114b800c24ce015ea1450"
+      sha256 "7c2d9152d1d3dc6a1a418c444fd13f8fd22ece82ff4174f226c89d3fa0e8c608"
     else
       url "https://github.com/frankmanzhu/tzap/releases/download/v#{version}/tzap-v#{version}-macos-x86_64.tar.gz"
-      sha256 "58cabe8f2a43b799971cc5a628fcf1b55932b84f4b8635e9eaf6e0fda8570aff"
+      sha256 "4988521bc5c631b6d20a4b45146d639114b5cc30c6ecf9c4271a6cd9c5cc0fe5"
     end
   end
 
   on_linux do
     if Hardware::CPU.intel?
       url "https://github.com/frankmanzhu/tzap/releases/download/v#{version}/tzap-v#{version}-linux-x86_64-musl.tar.gz"
-      sha256 "af488afdc142e91231eb02314ce4c5c94df6bd8fd8dcd271555f69e4c2507078"
+      sha256 "6308cecc571ad88257c02abea2401213b002079efcd7b6fcdf2f60ffe1f1d88b"
     else
       url "https://github.com/frankmanzhu/tzap/releases/download/v#{version}/tzap-v#{version}-linux-aarch64-musl.tar.gz"
-      sha256 "b990679c57829445e30d642a03b2ddf959f7fc8ea440481b67aa57df23f4cc4b"
+      sha256 "16af9753256426b6e1a341c0e7e24b21d74e296848fc1e808f68dc109f2fac74"
     end
   end
 
