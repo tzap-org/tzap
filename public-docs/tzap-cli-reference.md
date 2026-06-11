@@ -267,6 +267,8 @@ Useful flags:
 - `--trusted-ca-cert`: verify X.509 RootAuth with a trusted CA certificate
 - `--trusted-system-roots`: allow OpenSSL default trust roots for X.509 RootAuth
 - `--public-no-key`: verify public v43 RootAuth commitments without the archive key
+- `--write-repaired`: write repaired sibling archive copies after successful
+  key-holding verification when recoverable BlockRecord damage was found
 - `--bootstrap`: bootstrap sidecar path
 - `--jobs`: worker count for reader CPU work; defaults to the logical CPU count
   reported by the operating system

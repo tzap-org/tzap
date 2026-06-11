@@ -927,7 +927,7 @@ checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
 
 [[package]]
 name = "tzap-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "aes-gcm",
  "aes-gcm-siv",
@@ -958,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "tzap-plugin-signing"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ed25519-dalek",
  "openssl",

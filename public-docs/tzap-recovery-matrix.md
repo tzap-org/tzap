@@ -46,9 +46,38 @@ For users, the practical message is:
 - damage must stay within the affected object's repair budget
 - many damaged bytes clustered in the same protected object can exceed the
   budget even if the whole archive looks less than five percent damaged
+- recovery-enabled file-backed v43 archives can recover malformed physical
+  `VolumeHeader` and `CryptoHeader` copies from the terminal CMRA image before
+  trusting startup metadata in ordinary key-holding opens
+- CMRA header damage such as a bad `TZCR` byte is recoverable when a valid
+  locator copy supplies the decoder tuple, and malformed CMRA shard rows are
+  treated as erasures once the tuple establishes exact row boundaries
+- for file-backed v43 archives, once `tzap` has recovered the archive layout,
+  a malformed block slot such as a damaged `TZBK` marker or reserved
+  BlockRecord bytes is treated as a repair erasure, then validated after repair
 - after repair, authentication still has to pass before data is trusted
 
 The default CLI value is five percent.
+
+## Repair order
+
+Recovery is staged so the archive layout is repaired before file payloads are
+used:
+
+1. Locate a trusted layout authority from the physical headers, terminal CMRA,
+   locators, or an allowed bootstrap authority.
+2. Repair and validate critical metadata first: startup headers, CMRA
+   header/shards, terminal metadata, IndexRoot, index shards, directory hints,
+   and dictionary metadata when present.
+3. Build the archive map from the repaired and authenticated metadata: block
+   size, slot boundaries, object extents, parity classes, and file indexes.
+4. Repair payload objects within their own FEC budget, then authenticate,
+   decrypt, decompress, and release data only after validation succeeds.
+
+This ordering is implemented in the core reader APIs used by ordinary
+key-holding `tzap list`, `tzap verify`, and `tzap extract`, so downstream
+projects that use those APIs get the same critical-metadata-first recovery
+behavior.
 
 ## Payload and metadata coverage
 

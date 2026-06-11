@@ -3104,6 +3104,22 @@ struct ParsedSeekableReadAtVolume {
     crypto_end: u64,
 }
 
+struct ParsedOpenPrefix {
+    volume_header: VolumeHeader,
+    crypto_header: CryptoHeaderFixed,
+    crypto_header_bytes: Vec<u8>,
+    crypto_end: usize,
+    subkeys: Subkeys,
+}
+
+struct ParsedReadAtOpenPrefix {
+    volume_header: VolumeHeader,
+    crypto_header: CryptoHeaderFixed,
+    crypto_header_bytes: Vec<u8>,
+    crypto_end: u64,
+    subkeys: Subkeys,
+}
+
 fn parse_seekable_volume(
     bytes: &[u8],
     master_key: &MasterKey,
@@ -3117,6 +3133,88 @@ fn parse_seekable_volume(
         });
     }
 
+    let prefix = match parse_open_prefix(bytes, master_key) {
+        Ok(prefix) => prefix,
+        Err(prefix_err) => {
+            return parse_seekable_volume_from_recovered_terminal(bytes, master_key, options)
+                .or(Err(prefix_err));
+        }
+    };
+    let physical_crypto_header_bytes = prefix.crypto_header_bytes.clone();
+    match parse_seekable_volume_with_prefix(bytes, prefix, options) {
+        Ok(parsed) => Ok(parsed),
+        Err(prefix_err) => {
+            match parse_seekable_volume_from_recovered_terminal(bytes, master_key, options) {
+                Ok(recovered) if recovered.crypto_header_bytes == physical_crypto_header_bytes => {
+                    Ok(recovered)
+                }
+                Ok(_) | Err(_) => Err(prefix_err),
+            }
+        }
+    }
+}
+
+fn parse_seekable_volume_with_prefix(
+    bytes: &[u8],
+    prefix: ParsedOpenPrefix,
+    options: ReaderOptions,
+) -> Result<ParsedSeekableVolume, FormatError> {
+    let ParsedOpenPrefix {
+        volume_header,
+        crypto_header,
+        crypto_header_bytes,
+        crypto_end,
+        subkeys,
+    } = prefix;
+    let crypto_bytes = crypto_header_bytes.as_slice();
+
+    let terminal = locate_v41_terminal(
+        bytes,
+        KeyHoldingTerminalContext {
+            subkeys: &subkeys,
+            volume_header: &volume_header,
+            crypto_header: &crypto_header,
+            crypto_header_bytes: crypto_bytes,
+        },
+        options,
+    )?;
+    finish_parse_seekable_volume(
+        bytes,
+        volume_header,
+        crypto_header,
+        crypto_header_bytes,
+        crypto_end,
+        subkeys,
+        terminal,
+    )
+}
+
+fn parse_seekable_volume_from_recovered_terminal(
+    bytes: &[u8],
+    master_key: &MasterKey,
+    options: ReaderOptions,
+) -> Result<ParsedSeekableVolume, FormatError> {
+    let authority = locate_v41_terminal_authority(bytes, master_key, options)?;
+    let crypto_end = checked_add(
+        authority.volume_header.crypto_header_offset as usize,
+        authority.volume_header.crypto_header_length as usize,
+        "CryptoHeader",
+    )?;
+    finish_parse_seekable_volume(
+        bytes,
+        authority.volume_header,
+        authority.crypto_header,
+        authority.crypto_header_bytes,
+        crypto_end,
+        authority.subkeys,
+        authority.terminal,
+    )
+}
+
+fn parse_open_prefix(
+    bytes: &[u8],
+    master_key: &MasterKey,
+) -> Result<ParsedOpenPrefix, FormatError> {
     let volume_header = VolumeHeader::parse(slice(bytes, 0, VOLUME_HEADER_LEN, "archive")?)?;
     let crypto_start = volume_header.crypto_header_offset as usize;
     let crypto_len = volume_header.crypto_header_length as usize;
@@ -3145,17 +3243,25 @@ fn parse_seekable_volume(
         &parsed_crypto.extensions,
     )?;
     validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
+    let crypto_header = parsed_crypto.fixed.clone();
+    Ok(ParsedOpenPrefix {
+        volume_header,
+        crypto_header,
+        crypto_header_bytes: crypto_bytes.to_vec(),
+        crypto_end,
+        subkeys,
+    })
+}
 
-    let terminal = locate_v41_terminal(
-        bytes,
-        KeyHoldingTerminalContext {
-            subkeys: &subkeys,
-            volume_header: &volume_header,
-            crypto_header: &parsed_crypto.fixed,
-            crypto_header_bytes: crypto_bytes,
-        },
-        options,
-    )?;
+fn finish_parse_seekable_volume(
+    bytes: &[u8],
+    volume_header: VolumeHeader,
+    crypto_header: CryptoHeaderFixed,
+    crypto_header_bytes: Vec<u8>,
+    crypto_end: usize,
+    subkeys: Subkeys,
+    terminal: V41Terminal,
+) -> Result<ParsedSeekableVolume, FormatError> {
     let trailer_offset = to_usize(terminal.image.volume_trailer_offset, "VolumeTrailer")?;
     let volume_trailer = terminal.volume_trailer.clone();
     validate_trailer_identity(&volume_header, &volume_trailer)?;
@@ -3182,30 +3288,27 @@ fn parse_seekable_volume(
         ));
     }
     let manifest_bytes = &terminal.manifest_footer_bytes;
-    let (manifest_footer, manifest_footer_error) = match parse_valid_manifest_footer(
-        &volume_header,
-        &parsed_crypto.fixed,
-        &subkeys,
-        manifest_bytes,
-    ) {
-        Ok(footer) => (Some(footer), None),
-        Err(err) if manifest_footer_copy_error_is_recoverable(&err) => (None, Some(err)),
-        Err(err) => return Err(err),
-    };
+    let (manifest_footer, manifest_footer_error) =
+        match parse_valid_manifest_footer(&volume_header, &crypto_header, &subkeys, manifest_bytes)
+        {
+            Ok(footer) => (Some(footer), None),
+            Err(err) if manifest_footer_copy_error_is_recoverable(&err) => (None, Some(err)),
+            Err(err) => return Err(err),
+        };
 
     let block_region = parse_block_region(
         bytes,
         crypto_end,
         manifest_offset,
-        parsed_crypto.fixed.block_size as usize,
+        crypto_header.block_size as usize,
         &volume_header,
         &volume_trailer,
     )?;
 
     Ok(ParsedSeekableVolume {
         volume_header,
-        crypto_header: parsed_crypto.fixed,
-        crypto_header_bytes: crypto_bytes.to_vec(),
+        crypto_header,
+        crypto_header_bytes,
         subkeys,
         manifest_footer,
         manifest_footer_error,
@@ -3231,13 +3334,106 @@ fn parse_seekable_read_at_volume(
         });
     }
 
-    let volume_header_bytes = read_at_vec(reader.as_ref(), 0, VOLUME_HEADER_LEN, "archive")?;
+    let prefix = match parse_read_at_open_prefix(reader.as_ref(), master_key) {
+        Ok(prefix) => prefix,
+        Err(prefix_err) => {
+            return parse_seekable_read_at_volume_from_recovered_terminal(
+                reader,
+                observed_len,
+                master_key,
+                options,
+            )
+            .or(Err(prefix_err));
+        }
+    };
+    let physical_crypto_header_bytes = prefix.crypto_header_bytes.clone();
+    match parse_seekable_read_at_volume_with_prefix(reader.clone(), observed_len, prefix, options) {
+        Ok(parsed) => Ok(parsed),
+        Err(prefix_err) => match parse_seekable_read_at_volume_from_recovered_terminal(
+            reader,
+            observed_len,
+            master_key,
+            options,
+        ) {
+            Ok(recovered) if recovered.crypto_header_bytes == physical_crypto_header_bytes => {
+                Ok(recovered)
+            }
+            Ok(_) | Err(_) => Err(prefix_err),
+        },
+    }
+}
+
+fn parse_seekable_read_at_volume_with_prefix(
+    reader: Arc<dyn ArchiveReadAt>,
+    observed_len: u64,
+    prefix: ParsedReadAtOpenPrefix,
+    options: ReaderOptions,
+) -> Result<ParsedSeekableReadAtVolume, FormatError> {
+    let ParsedReadAtOpenPrefix {
+        volume_header,
+        crypto_header,
+        crypto_header_bytes,
+        crypto_end,
+        subkeys,
+    } = prefix;
+
+    let terminal = locate_v41_terminal_read_at(
+        reader.as_ref(),
+        observed_len,
+        KeyHoldingTerminalContext {
+            subkeys: &subkeys,
+            volume_header: &volume_header,
+            crypto_header: &crypto_header,
+            crypto_header_bytes: &crypto_header_bytes,
+        },
+        options,
+    )?;
+    finish_parse_seekable_read_at_volume(
+        reader,
+        volume_header,
+        crypto_header,
+        crypto_header_bytes,
+        crypto_end,
+        subkeys,
+        terminal,
+    )
+}
+
+fn parse_seekable_read_at_volume_from_recovered_terminal(
+    reader: Arc<dyn ArchiveReadAt>,
+    observed_len: u64,
+    master_key: &MasterKey,
+    options: ReaderOptions,
+) -> Result<ParsedSeekableReadAtVolume, FormatError> {
+    let authority =
+        locate_v41_terminal_authority_read_at(reader.as_ref(), observed_len, master_key, options)?;
+    let crypto_end = checked_u64_add(
+        authority.volume_header.crypto_header_offset as u64,
+        authority.volume_header.crypto_header_length as u64,
+        "CryptoHeader",
+    )?;
+    finish_parse_seekable_read_at_volume(
+        reader,
+        authority.volume_header,
+        authority.crypto_header,
+        authority.crypto_header_bytes,
+        crypto_end,
+        authority.subkeys,
+        authority.terminal,
+    )
+}
+
+fn parse_read_at_open_prefix(
+    reader: &dyn ArchiveReadAt,
+    master_key: &MasterKey,
+) -> Result<ParsedReadAtOpenPrefix, FormatError> {
+    let volume_header_bytes = read_at_vec(reader, 0, VOLUME_HEADER_LEN, "archive")?;
     let volume_header = VolumeHeader::parse(&volume_header_bytes)?;
     let crypto_start = volume_header.crypto_header_offset as u64;
     let crypto_len = volume_header.crypto_header_length as u64;
     let crypto_end = checked_u64_add(crypto_start, crypto_len, "CryptoHeader")?;
     let crypto_bytes = read_at_vec(
-        reader.as_ref(),
+        reader,
         crypto_start,
         to_usize(crypto_len, "CryptoHeader")?,
         "CryptoHeader",
@@ -3265,18 +3461,26 @@ fn parse_seekable_read_at_volume(
         &parsed_crypto.extensions,
     )?;
     validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
+    let crypto_header = parsed_crypto.fixed.clone();
+    drop(parsed_crypto);
+    Ok(ParsedReadAtOpenPrefix {
+        volume_header,
+        crypto_header,
+        crypto_header_bytes: crypto_bytes,
+        crypto_end,
+        subkeys,
+    })
+}
 
-    let terminal = locate_v41_terminal_read_at(
-        reader.as_ref(),
-        observed_len,
-        KeyHoldingTerminalContext {
-            subkeys: &subkeys,
-            volume_header: &volume_header,
-            crypto_header: &parsed_crypto.fixed,
-            crypto_header_bytes: &crypto_bytes,
-        },
-        options,
-    )?;
+fn finish_parse_seekable_read_at_volume(
+    reader: Arc<dyn ArchiveReadAt>,
+    volume_header: VolumeHeader,
+    crypto_header: CryptoHeaderFixed,
+    crypto_header_bytes: Vec<u8>,
+    crypto_end: u64,
+    subkeys: Subkeys,
+    terminal: V41Terminal,
+) -> Result<ParsedSeekableReadAtVolume, FormatError> {
     let volume_trailer = terminal.volume_trailer.clone();
     validate_trailer_identity(&volume_header, &volume_trailer)?;
 
@@ -3308,27 +3512,24 @@ fn parse_seekable_read_at_volume(
     validate_seekable_block_region_layout(
         crypto_end,
         manifest_offset,
-        parsed_crypto.fixed.block_size as usize,
+        crypto_header.block_size as usize,
         &volume_trailer,
     )?;
 
     let manifest_bytes = &terminal.manifest_footer_bytes;
-    let (manifest_footer, manifest_footer_error) = match parse_valid_manifest_footer(
-        &volume_header,
-        &parsed_crypto.fixed,
-        &subkeys,
-        manifest_bytes,
-    ) {
-        Ok(footer) => (Some(footer), None),
-        Err(err) if manifest_footer_copy_error_is_recoverable(&err) => (None, Some(err)),
-        Err(err) => return Err(err),
-    };
+    let (manifest_footer, manifest_footer_error) =
+        match parse_valid_manifest_footer(&volume_header, &crypto_header, &subkeys, manifest_bytes)
+        {
+            Ok(footer) => (Some(footer), None),
+            Err(err) if manifest_footer_copy_error_is_recoverable(&err) => (None, Some(err)),
+            Err(err) => return Err(err),
+        };
 
     Ok(ParsedSeekableReadAtVolume {
         reader,
         volume_header,
-        crypto_header: parsed_crypto.fixed,
-        crypto_header_bytes: crypto_bytes,
+        crypto_header,
+        crypto_header_bytes,
         subkeys,
         manifest_footer,
         manifest_footer_error,
@@ -3816,6 +4017,23 @@ struct PublicTerminalCandidate {
     cmra_length: u64,
 }
 
+#[derive(Debug)]
+struct RecoveredTerminalAuthority {
+    terminal: V41Terminal,
+    volume_header: VolumeHeader,
+    crypto_header: CryptoHeaderFixed,
+    crypto_header_bytes: Vec<u8>,
+    subkeys: Subkeys,
+}
+
+#[derive(Debug)]
+struct TerminalAuthorityCandidate {
+    authority: RecoveredTerminalAuthority,
+    anchor: usize,
+    cmra_offset: u64,
+    cmra_length: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CmraRecoveryMode {
     KeyHolding,
@@ -3885,6 +4103,126 @@ fn locate_v41_terminal_read_at(
     }
 
     choose_v41_terminal_candidate(candidates).map(|candidate| candidate.terminal)
+}
+
+fn locate_v41_terminal_authority(
+    bytes: &[u8],
+    master_key: &MasterKey,
+    options: ReaderOptions,
+) -> Result<RecoveredTerminalAuthority, FormatError> {
+    let mut candidates = Vec::new();
+    if bytes.len() >= CRITICAL_RECOVERY_LOCATOR_LEN {
+        let final_offset = bytes.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
+        collect_v41_locator_authority_candidate(
+            bytes,
+            final_offset,
+            0,
+            master_key,
+            &mut candidates,
+        );
+    }
+    if bytes.len() >= LOCATOR_PAIR_LEN {
+        let mirror_offset = bytes.len() - LOCATOR_PAIR_LEN;
+        collect_v41_locator_authority_candidate(
+            bytes,
+            mirror_offset,
+            1,
+            master_key,
+            &mut candidates,
+        );
+    }
+
+    if candidates.is_empty() {
+        let scan = max_critical_recovery_scan(options)?;
+        let scan_start = bytes.len().saturating_sub(scan);
+        let mut offset = bytes.len().saturating_sub(4);
+        while offset >= scan_start {
+            if bytes.get(offset..offset + 4) == Some(b"TZCL") {
+                collect_v41_locator_authority_candidate(
+                    bytes,
+                    offset,
+                    2,
+                    master_key,
+                    &mut candidates,
+                );
+            } else if bytes.get(offset..offset + 4) == Some(b"TZCR") {
+                if let Ok(candidate) =
+                    parse_locatorless_cmra_authority_candidate(bytes, offset, master_key)
+                {
+                    candidates.push(candidate);
+                }
+            }
+            if offset == 0 {
+                break;
+            }
+            offset -= 1;
+        }
+    }
+
+    choose_v41_terminal_authority_candidate(candidates).map(|candidate| candidate.authority)
+}
+
+fn locate_v41_terminal_authority_read_at(
+    reader: &dyn ArchiveReadAt,
+    len: u64,
+    master_key: &MasterKey,
+    options: ReaderOptions,
+) -> Result<RecoveredTerminalAuthority, FormatError> {
+    let mut candidates = Vec::new();
+    if len >= CRITICAL_RECOVERY_LOCATOR_LEN as u64 {
+        let final_offset = len - CRITICAL_RECOVERY_LOCATOR_LEN as u64;
+        collect_v41_locator_authority_candidate_read_at(
+            reader,
+            final_offset,
+            0,
+            master_key,
+            &mut candidates,
+        );
+    }
+    if len >= LOCATOR_PAIR_LEN as u64 {
+        let mirror_offset = len - LOCATOR_PAIR_LEN as u64;
+        collect_v41_locator_authority_candidate_read_at(
+            reader,
+            mirror_offset,
+            1,
+            master_key,
+            &mut candidates,
+        );
+    }
+
+    if candidates.is_empty() {
+        let scan = max_critical_recovery_scan(options)? as u64;
+        let scan_start = len.saturating_sub(scan);
+        let scan_len = to_usize(len.saturating_sub(scan_start), "CMRA scan")?;
+        let tail = read_at_vec(reader, scan_start, scan_len, "CMRA scan")?;
+        let mut offset = tail.len().saturating_sub(4);
+        while offset < tail.len() {
+            let absolute_offset = checked_u64_add(scan_start, offset as u64, "CMRA scan")?;
+            if tail.get(offset..offset + 4) == Some(b"TZCL") {
+                collect_v41_locator_authority_candidate_read_at(
+                    reader,
+                    absolute_offset,
+                    2,
+                    master_key,
+                    &mut candidates,
+                );
+            } else if tail.get(offset..offset + 4) == Some(b"TZCR") {
+                if let Ok(candidate) = parse_locatorless_cmra_authority_candidate_read_at(
+                    reader,
+                    absolute_offset,
+                    master_key,
+                ) {
+                    candidates.push(candidate);
+                }
+            }
+            if offset == 0 {
+                break;
+            }
+            offset -= 1;
+        }
+    }
+
+    choose_v41_terminal_authority_candidate(candidates).map(|candidate| candidate.authority)
 }
 
 fn locate_v41_terminal_candidate(
@@ -4035,6 +4373,57 @@ fn collect_v41_locator_candidate_read_at(
     }
 }
 
+fn collect_v41_locator_authority_candidate(
+    bytes: &[u8],
+    offset: usize,
+    expected_sequence: u32,
+    master_key: &MasterKey,
+    candidates: &mut Vec<TerminalAuthorityCandidate>,
+) {
+    let Some(raw) = bytes.get(offset..offset + CRITICAL_RECOVERY_LOCATOR_LEN) else {
+        return;
+    };
+    let Ok(locator) = CriticalRecoveryLocator::parse(raw) else {
+        return;
+    };
+    if expected_sequence <= 1 && locator.locator_sequence != expected_sequence {
+        return;
+    }
+    if let Ok(candidate) =
+        parse_locator_cmra_authority_candidate(bytes, offset, locator, master_key)
+    {
+        candidates.push(candidate);
+    }
+}
+
+fn collect_v41_locator_authority_candidate_read_at(
+    reader: &dyn ArchiveReadAt,
+    offset: u64,
+    expected_sequence: u32,
+    master_key: &MasterKey,
+    candidates: &mut Vec<TerminalAuthorityCandidate>,
+) {
+    let Ok(raw) = read_at_vec(
+        reader,
+        offset,
+        CRITICAL_RECOVERY_LOCATOR_LEN,
+        "CriticalRecoveryLocator",
+    ) else {
+        return;
+    };
+    let Ok(locator) = CriticalRecoveryLocator::parse(&raw) else {
+        return;
+    };
+    if expected_sequence <= 1 && locator.locator_sequence != expected_sequence {
+        return;
+    }
+    if let Ok(candidate) =
+        parse_locator_cmra_authority_candidate_read_at(reader, offset, locator, master_key)
+    {
+        candidates.push(candidate);
+    }
+}
+
 fn collect_v41_public_locator_candidate(
     bytes: &[u8],
     offset: usize,
@@ -4062,6 +4451,24 @@ fn collect_v41_public_locator_candidate(
 fn choose_v41_terminal_candidate(
     mut candidates: Vec<TerminalCandidate>,
 ) -> Result<TerminalCandidate, FormatError> {
+    candidates.sort_by_key(|candidate| candidate.anchor);
+    let winner = candidates.pop().ok_or(FormatError::InvalidArchive(
+        "no valid v41 CMRA candidate found",
+    ))?;
+    if let Some(previous) = candidates.last() {
+        if previous.anchor == winner.anchor
+            && (previous.cmra_offset != winner.cmra_offset
+                || previous.cmra_length != winner.cmra_length)
+        {
+            return Err(FormatError::InvalidArchive("ambiguous v41 CMRA candidates"));
+        }
+    }
+    Ok(winner)
+}
+
+fn choose_v41_terminal_authority_candidate(
+    mut candidates: Vec<TerminalAuthorityCandidate>,
+) -> Result<TerminalAuthorityCandidate, FormatError> {
     candidates.sort_by_key(|candidate| candidate.anchor);
     let winner = candidates.pop().ok_or(FormatError::InvalidArchive(
         "no valid v41 CMRA candidate found",
@@ -4128,7 +4535,8 @@ fn parse_locator_cmra_candidate(
         Some(CmraIdentityHints::from(locator)),
         &recovered.image,
     )?;
-    let terminal = validate_recovered_terminal(recovered.image, recovered.tuple, bytes, context)?;
+    let terminal =
+        validate_recovered_terminal(recovered.image, recovered.tuple, bytes, context, false)?;
     Ok(TerminalCandidate {
         terminal,
         anchor: locator_offset
@@ -4174,8 +4582,13 @@ fn parse_locator_cmra_candidate_read_at(
         Some(CmraIdentityHints::from(locator)),
         &recovered.image,
     )?;
-    let terminal =
-        validate_recovered_terminal_read_at(recovered.image, recovered.tuple, reader, context)?;
+    let terminal = validate_recovered_terminal_read_at(
+        recovered.image,
+        recovered.tuple,
+        reader,
+        context,
+        false,
+    )?;
     Ok(TerminalCandidate {
         terminal,
         anchor: to_usize(
@@ -4189,6 +4602,102 @@ fn parse_locator_cmra_candidate_read_at(
         locator_sequence: Some(locator.locator_sequence),
         cmra_offset: locator.cmra_offset,
         cmra_length: recovered.cmra_length,
+    })
+}
+
+fn parse_locator_cmra_authority_candidate(
+    bytes: &[u8],
+    locator_offset: usize,
+    locator: CriticalRecoveryLocator,
+    master_key: &MasterKey,
+) -> Result<TerminalAuthorityCandidate, FormatError> {
+    let tuple = CmraDecoderTuple::from(locator);
+    validate_cmra_decoder_tuple(tuple)?;
+    let expected_cmra_length = cmra_serialized_length(tuple)?;
+    if locator.cmra_length as u64 != expected_cmra_length {
+        return Err(FormatError::InvalidArchive("locator CMRA length mismatch"));
+    }
+    validate_locator_position(locator_offset, locator)?;
+    let recovered = recover_cmra(
+        bytes,
+        locator.cmra_offset,
+        Some(tuple),
+        CmraRecoveryMode::KeyHolding,
+    )?;
+    if recovered.tuple != tuple {
+        return Err(FormatError::InvalidArchive("CMRA decoder tuple mismatch"));
+    }
+    if expected_cmra_length != recovered.cmra_length {
+        return Err(FormatError::InvalidArchive("locator CMRA length mismatch"));
+    }
+    validate_locator_image_boundary(locator, &recovered.image)?;
+    validate_cmra_identity_hints(
+        recovered.header_hints,
+        Some(CmraIdentityHints::from(locator)),
+        &recovered.image,
+    )?;
+    let cmra_length = recovered.cmra_length;
+    let authority =
+        validate_recovered_terminal_authority(recovered.image, recovered.tuple, master_key, false)?;
+    Ok(TerminalAuthorityCandidate {
+        authority,
+        anchor: locator_offset
+            .checked_add(CRITICAL_RECOVERY_LOCATOR_LEN)
+            .ok_or(FormatError::InvalidArchive("locator anchor overflow"))?,
+        cmra_offset: locator.cmra_offset,
+        cmra_length,
+    })
+}
+
+fn parse_locator_cmra_authority_candidate_read_at(
+    reader: &dyn ArchiveReadAt,
+    locator_offset: u64,
+    locator: CriticalRecoveryLocator,
+    master_key: &MasterKey,
+) -> Result<TerminalAuthorityCandidate, FormatError> {
+    let tuple = CmraDecoderTuple::from(locator);
+    validate_cmra_decoder_tuple(tuple)?;
+    let expected_cmra_length = cmra_serialized_length(tuple)?;
+    if locator.cmra_length as u64 != expected_cmra_length {
+        return Err(FormatError::InvalidArchive("locator CMRA length mismatch"));
+    }
+    validate_locator_position(
+        to_usize(locator_offset, "CriticalRecoveryLocator")?,
+        locator,
+    )?;
+    let recovered = recover_cmra_read_at(
+        reader,
+        locator.cmra_offset,
+        Some(tuple),
+        CmraRecoveryMode::KeyHolding,
+    )?;
+    if recovered.tuple != tuple {
+        return Err(FormatError::InvalidArchive("CMRA decoder tuple mismatch"));
+    }
+    if expected_cmra_length != recovered.cmra_length {
+        return Err(FormatError::InvalidArchive("locator CMRA length mismatch"));
+    }
+    validate_locator_image_boundary(locator, &recovered.image)?;
+    validate_cmra_identity_hints(
+        recovered.header_hints,
+        Some(CmraIdentityHints::from(locator)),
+        &recovered.image,
+    )?;
+    let cmra_length = recovered.cmra_length;
+    let authority =
+        validate_recovered_terminal_authority(recovered.image, recovered.tuple, master_key, false)?;
+    Ok(TerminalAuthorityCandidate {
+        authority,
+        anchor: to_usize(
+            checked_u64_add(
+                locator_offset,
+                CRITICAL_RECOVERY_LOCATOR_LEN as u64,
+                "locator anchor overflow",
+            )?,
+            "locator anchor overflow",
+        )?,
+        cmra_offset: locator.cmra_offset,
+        cmra_length,
     })
 }
 
@@ -4224,8 +4733,13 @@ fn parse_public_locator_cmra_candidate(
         Some(CmraIdentityHints::from(locator)),
         &recovered.image,
     )?;
-    let terminal =
-        validate_recovered_public_terminal(recovered.image, bytes, volume_header, crypto_header)?;
+    let terminal = validate_recovered_public_terminal(
+        recovered.image,
+        bytes,
+        volume_header,
+        crypto_header,
+        false,
+    )?;
     Ok(PublicTerminalCandidate {
         terminal,
         anchor: locator_offset
@@ -4264,7 +4778,8 @@ fn parse_locatorless_cmra_candidate(
         ));
     }
     validate_cmra_identity_hints(recovered.header_hints, None, &recovered.image)?;
-    let terminal = validate_recovered_terminal(recovered.image, recovered.tuple, bytes, context)?;
+    let terminal =
+        validate_recovered_terminal(recovered.image, recovered.tuple, bytes, context, true)?;
     Ok(TerminalCandidate {
         terminal,
         anchor: cmra_offset
@@ -4299,8 +4814,13 @@ fn parse_locatorless_cmra_candidate_read_at(
         ));
     }
     validate_cmra_identity_hints(recovered.header_hints, None, &recovered.image)?;
-    let terminal =
-        validate_recovered_terminal_read_at(recovered.image, recovered.tuple, reader, context)?;
+    let terminal = validate_recovered_terminal_read_at(
+        recovered.image,
+        recovered.tuple,
+        reader,
+        context,
+        true,
+    )?;
     Ok(TerminalCandidate {
         terminal,
         anchor: to_usize(
@@ -4310,6 +4830,84 @@ fn parse_locatorless_cmra_candidate_read_at(
         locator_sequence: None,
         cmra_offset,
         cmra_length: recovered.cmra_length,
+    })
+}
+
+fn parse_locatorless_cmra_authority_candidate(
+    bytes: &[u8],
+    cmra_offset: usize,
+    master_key: &MasterKey,
+) -> Result<TerminalAuthorityCandidate, FormatError> {
+    let recovered = recover_cmra(
+        bytes,
+        cmra_offset as u64,
+        None,
+        CmraRecoveryMode::KeyHolding,
+    )?;
+    if recovered.image.body_bytes_before_cmra != cmra_offset as u64 {
+        return Err(FormatError::InvalidArchive(
+            "locatorless CMRA boundary mismatch",
+        ));
+    }
+    if recovered
+        .image
+        .volume_trailer_offset
+        .checked_add(VOLUME_TRAILER_LEN as u64)
+        .ok_or(FormatError::InvalidArchive("CMRA boundary overflow"))?
+        != cmra_offset as u64
+    {
+        return Err(FormatError::InvalidArchive(
+            "locatorless trailer boundary mismatch",
+        ));
+    }
+    validate_cmra_identity_hints(recovered.header_hints, None, &recovered.image)?;
+    let cmra_length = recovered.cmra_length;
+    let authority =
+        validate_recovered_terminal_authority(recovered.image, recovered.tuple, master_key, true)?;
+    Ok(TerminalAuthorityCandidate {
+        authority,
+        anchor: cmra_offset
+            .checked_add(to_usize(cmra_length, "CMRA")?)
+            .ok_or(FormatError::InvalidArchive("CMRA anchor overflow"))?,
+        cmra_offset: cmra_offset as u64,
+        cmra_length,
+    })
+}
+
+fn parse_locatorless_cmra_authority_candidate_read_at(
+    reader: &dyn ArchiveReadAt,
+    cmra_offset: u64,
+    master_key: &MasterKey,
+) -> Result<TerminalAuthorityCandidate, FormatError> {
+    let recovered = recover_cmra_read_at(reader, cmra_offset, None, CmraRecoveryMode::KeyHolding)?;
+    if recovered.image.body_bytes_before_cmra != cmra_offset {
+        return Err(FormatError::InvalidArchive(
+            "locatorless CMRA boundary mismatch",
+        ));
+    }
+    if recovered
+        .image
+        .volume_trailer_offset
+        .checked_add(VOLUME_TRAILER_LEN as u64)
+        .ok_or(FormatError::InvalidArchive("CMRA boundary overflow"))?
+        != cmra_offset
+    {
+        return Err(FormatError::InvalidArchive(
+            "locatorless trailer boundary mismatch",
+        ));
+    }
+    validate_cmra_identity_hints(recovered.header_hints, None, &recovered.image)?;
+    let cmra_length = recovered.cmra_length;
+    let authority =
+        validate_recovered_terminal_authority(recovered.image, recovered.tuple, master_key, true)?;
+    Ok(TerminalAuthorityCandidate {
+        authority,
+        anchor: to_usize(
+            checked_u64_add(cmra_offset, cmra_length, "CMRA anchor overflow")?,
+            "CMRA anchor overflow",
+        )?,
+        cmra_offset,
+        cmra_length,
     })
 }
 
@@ -4342,8 +4940,13 @@ fn parse_public_locatorless_cmra_candidate(
         ));
     }
     validate_cmra_identity_hints(recovered.header_hints, None, &recovered.image)?;
-    let terminal =
-        validate_recovered_public_terminal(recovered.image, bytes, volume_header, crypto_header)?;
+    let terminal = validate_recovered_public_terminal(
+        recovered.image,
+        bytes,
+        volume_header,
+        crypto_header,
+        true,
+    )?;
     Ok(PublicTerminalCandidate {
         terminal,
         anchor: cmra_offset
@@ -4491,12 +5094,7 @@ fn recover_cmra_header_tuple(
             CmraDecoderTuple::from(header),
             Some(CmraIdentityHints::from(header)),
         ),
-        (
-            Err(FormatError::BadCrc {
-                structure: "CriticalMetadataRecoveryHeader",
-            }),
-            Some(tuple),
-        ) => (tuple, None),
+        (Err(_), Some(tuple)) => (tuple, None),
         (Err(err), _) => return Err(err),
     })
 }
@@ -4519,13 +5117,7 @@ fn recover_cmra_from_bytes(
             CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN + shard_size,
             "CriticalMetadataRecoveryShard",
         )?;
-        let shard = match CriticalMetadataRecoveryShard::parse(raw, shard_size) {
-            Ok(shard) => Some(shard),
-            Err(FormatError::BadCrc {
-                structure: "CriticalMetadataRecoveryShard",
-            }) => None,
-            Err(err) => return Err(err),
-        };
+        let shard = CriticalMetadataRecoveryShard::parse(raw, shard_size).ok();
         if let Some(shard) = shard {
             validate_cmra_shard(&shard, idx, tuple)?;
             if shard.shard_role == 0 {
@@ -4909,15 +5501,88 @@ fn sha256_region(image: &CriticalMetadataImage, region_type: u16) -> Result<[u8;
     ))
 }
 
+fn validate_recovered_terminal_authority(
+    image: CriticalMetadataImage,
+    tuple: CmraDecoderTuple,
+    master_key: &MasterKey,
+    require_cmra_boundary_magic: bool,
+) -> Result<RecoveredTerminalAuthority, FormatError> {
+    let volume_header_region = image
+        .region(1)
+        .ok_or(FormatError::InvalidArchive("missing VolumeHeader region"))?;
+    let volume_header = VolumeHeader::parse(&volume_header_region.bytes)?;
+    let crypto_region = image
+        .region(2)
+        .ok_or(FormatError::InvalidArchive("missing CryptoHeader region"))?;
+    let crypto_header_bytes = crypto_region.bytes.clone();
+    let parsed_crypto = CryptoHeader::parse(&crypto_header_bytes, image.crypto_header_length)?;
+    let subkeys = subkeys_for_open(
+        Some(master_key),
+        parsed_crypto.fixed.aead_algo,
+        &volume_header.archive_uuid,
+        &volume_header.session_id,
+    )?;
+    verify_integrity_tag(
+        HmacDomain::CryptoHeader,
+        parsed_crypto.fixed.aead_algo,
+        Some(&subkeys.mac_key),
+        &volume_header.archive_uuid,
+        &volume_header.session_id,
+        parsed_crypto.hmac_covered_bytes,
+        &parsed_crypto.header_hmac,
+    )?;
+    parsed_crypto.validate_extension_semantics()?;
+    validate_seekable_supported_volume(
+        &volume_header,
+        &parsed_crypto.fixed,
+        &parsed_crypto.extensions,
+    )?;
+    validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
+    let crypto_header = parsed_crypto.fixed.clone();
+    if crypto_header.bit_rot_buffer_pct == 0 {
+        return Err(FormatError::InvalidArchive(
+            "CMRA startup recovery requires a nonzero bit-rot budget",
+        ));
+    }
+    drop(parsed_crypto);
+
+    let terminal = validate_recovered_terminal_inner(
+        image,
+        tuple,
+        require_cmra_boundary_magic,
+        true,
+        KeyHoldingTerminalContext {
+            subkeys: &subkeys,
+            volume_header: &volume_header,
+            crypto_header: &crypto_header,
+            crypto_header_bytes: &crypto_header_bytes,
+        },
+    )?;
+    Ok(RecoveredTerminalAuthority {
+        terminal,
+        volume_header,
+        crypto_header,
+        crypto_header_bytes,
+        subkeys,
+    })
+}
+
 fn validate_recovered_terminal(
     image: CriticalMetadataImage,
     tuple: CmraDecoderTuple,
     bytes: &[u8],
     context: KeyHoldingTerminalContext<'_>,
+    require_cmra_boundary_magic: bool,
 ) -> Result<V41Terminal, FormatError> {
     let cmra_offset = to_usize(image.body_bytes_before_cmra, "CMRA")?;
     let cmra_boundary_magic_ok = bytes.get(cmra_offset..cmra_offset + 4) == Some(b"TZCR");
-    validate_recovered_terminal_inner(image, tuple, cmra_boundary_magic_ok, context)
+    validate_recovered_terminal_inner(
+        image,
+        tuple,
+        require_cmra_boundary_magic,
+        cmra_boundary_magic_ok,
+        context,
+    )
 }
 
 fn validate_recovered_terminal_read_at(
@@ -4925,15 +5590,23 @@ fn validate_recovered_terminal_read_at(
     tuple: CmraDecoderTuple,
     reader: &dyn ArchiveReadAt,
     context: KeyHoldingTerminalContext<'_>,
+    require_cmra_boundary_magic: bool,
 ) -> Result<V41Terminal, FormatError> {
     let mut magic = [0u8; 4];
     reader.read_exact_at(image.body_bytes_before_cmra, &mut magic)?;
-    validate_recovered_terminal_inner(image, tuple, magic == *b"TZCR", context)
+    validate_recovered_terminal_inner(
+        image,
+        tuple,
+        require_cmra_boundary_magic,
+        magic == *b"TZCR",
+        context,
+    )
 }
 
 fn validate_recovered_terminal_inner(
     image: CriticalMetadataImage,
     tuple: CmraDecoderTuple,
+    require_cmra_boundary_magic: bool,
     cmra_boundary_magic_ok: bool,
     context: KeyHoldingTerminalContext<'_>,
 ) -> Result<V41Terminal, FormatError> {
@@ -5038,7 +5711,7 @@ fn validate_recovered_terminal_inner(
     validate_trailer_identity(volume_header, &trailer)?;
     validate_v41_trailer_equations(&image, &trailer)?;
 
-    if !cmra_boundary_magic_ok {
+    if require_cmra_boundary_magic && !cmra_boundary_magic_ok {
         return Err(FormatError::InvalidArchive("CMRA is not at image boundary"));
     }
 
@@ -5058,6 +5731,7 @@ fn validate_recovered_public_terminal(
     bytes: &[u8],
     volume_header: &VolumeHeader,
     crypto_header: &CryptoHeaderFixed,
+    require_cmra_boundary_magic: bool,
 ) -> Result<V41PublicTerminal, FormatError> {
     if image.layout_flags & 0x0000_0001 == 0 {
         return Err(FormatError::ReaderUnsupported(
@@ -5110,7 +5784,7 @@ fn validate_recovered_public_terminal(
     validate_v41_public_trailer_profile(&image, &trailer)?;
 
     let cmra_offset = to_usize(image.body_bytes_before_cmra, "CMRA")?;
-    if bytes.get(cmra_offset..cmra_offset + 4) != Some(b"TZCR") {
+    if require_cmra_boundary_magic && bytes.get(cmra_offset..cmra_offset + 4) != Some(b"TZCR") {
         return Err(FormatError::InvalidArchive("CMRA is not at image boundary"));
     }
 
@@ -5995,6 +6669,10 @@ pub(crate) fn block_record_error_is_recoverable_erasure(error: &FormatError) -> 
     matches!(
         error,
         FormatError::BadCrc {
+            structure: "BlockRecord",
+        } | FormatError::BadMagic {
+            structure: "BlockRecord",
+        } | FormatError::NonZeroReserved {
             structure: "BlockRecord",
         }
     )
@@ -7919,7 +8597,7 @@ mod tests {
     }
 
     #[test]
-    fn locator_based_cmra_recovery_only_ignores_header_crc_failures() {
+    fn locator_based_cmra_recovery_treats_header_damage_as_recoverable() {
         let archive = write_archive_with_root_auth(
             &[RegularFile::new("cmra-header.txt", b"header fallback")],
             &master_key(),
@@ -7946,10 +8624,10 @@ mod tests {
 
         let mut bad_magic = archive.bytes.clone();
         bad_magic[final_locator.cmra_offset as usize] ^= 0x55;
-        assert_eq!(
-            public_no_key_verify_archive_with(&bad_magic, |_, _| Ok(true)).unwrap_err(),
-            FormatError::InvalidArchive("no valid v41 public CMRA candidate found")
-        );
+        public_no_key_verify_archive_with(&bad_magic, |footer, archive_root| {
+            Ok(footer.authenticator_value == archive_root.as_slice())
+        })
+        .unwrap();
 
         let mut bad_hint = archive.bytes.clone();
         bad_hint[crc_offset] ^= 0xAA;
@@ -7969,6 +8647,188 @@ mod tests {
             public_no_key_verify_archive_with(&bad_hint, |_, _| Ok(true)).unwrap_err(),
             FormatError::InvalidArchive("no valid v41 public CMRA candidate found")
         );
+    }
+
+    #[test]
+    fn recovers_physical_volume_header_magic_from_cmra_authority() {
+        let payload = b"front header authority".to_vec();
+        let archive = write_archive(
+            &[RegularFile::new("volume-header.txt", &payload)],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+
+        let mut corrupted = archive.bytes;
+        corrupted[0] ^= 0x55;
+
+        let opened = open_archive(&corrupted, &master_key()).unwrap();
+        assert_eq!(
+            opened.extract_file("volume-header.txt").unwrap(),
+            Some(payload)
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn recovers_crc_valid_physical_volume_index_from_cmra_authority() {
+        let payload = b"crc-valid wrong volume index".to_vec();
+        let mut options = small_block_recovery_options();
+        options.stripe_width = 2;
+        options.volume_loss_tolerance = 0;
+        let archive = write_archive(
+            &[RegularFile::new("volume-index.txt", &payload)],
+            &master_key(),
+            options,
+        )
+        .unwrap();
+
+        let mut corrupted = archive.volumes[0].clone();
+        let mut header = VolumeHeader::parse(&corrupted[..VOLUME_HEADER_LEN]).unwrap();
+        assert_eq!(header.volume_index, 0);
+        header.volume_index = 1;
+        corrupted[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
+        assert_eq!(
+            VolumeHeader::parse(&corrupted[..VOLUME_HEADER_LEN])
+                .unwrap()
+                .volume_index,
+            1
+        );
+
+        let opened = open_archive_volumes(
+            &[corrupted.as_slice(), archive.volumes[1].as_slice()],
+            &master_key(),
+        )
+        .unwrap();
+        assert_eq!(opened.volume_header.volume_index, 0);
+        assert_eq!(
+            opened.extract_file("volume-index.txt").unwrap(),
+            Some(payload)
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn recovers_physical_crypto_header_magic_from_cmra_authority() {
+        let payload = b"crypto header authority".to_vec();
+        let archive = write_archive(
+            &[RegularFile::new("crypto-header.txt", &payload)],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+        let crypto_offset = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN])
+            .unwrap()
+            .crypto_header_offset;
+
+        let mut corrupted = archive.bytes;
+        corrupted[crypto_offset as usize] ^= 0x55;
+
+        let opened = open_archive(&corrupted, &master_key()).unwrap();
+        assert_eq!(
+            opened.extract_file("crypto-header.txt").unwrap(),
+            Some(payload)
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn read_at_api_recovers_physical_header_magic_from_cmra_authority() {
+        let payload = b"read-at header authority".to_vec();
+        let archive = write_archive(
+            &[RegularFile::new("read-at-header.txt", &payload)],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+
+        let mut corrupted = archive.bytes;
+        corrupted[0] ^= 0x55;
+
+        let opened = open_seekable_archive(corrupted, &master_key()).unwrap();
+        assert_eq!(
+            opened.extract_file("read-at-header.txt").unwrap(),
+            Some(payload)
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn read_at_api_recovers_crc_valid_physical_volume_index_from_cmra_authority() {
+        let payload = b"read-at crc-valid wrong volume index".to_vec();
+        let mut options = small_block_recovery_options();
+        options.stripe_width = 2;
+        options.volume_loss_tolerance = 0;
+        let archive = write_archive(
+            &[RegularFile::new("read-at-volume-index.txt", &payload)],
+            &master_key(),
+            options,
+        )
+        .unwrap();
+
+        let mut corrupted = archive.volumes[0].clone();
+        let mut header = VolumeHeader::parse(&corrupted[..VOLUME_HEADER_LEN]).unwrap();
+        assert_eq!(header.volume_index, 0);
+        header.volume_index = 1;
+        corrupted[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
+
+        let opened = open_seekable_archive_volumes(
+            vec![corrupted, archive.volumes[1].clone()],
+            &master_key(),
+        )
+        .unwrap();
+        assert_eq!(opened.volume_header.volume_index, 0);
+        assert_eq!(
+            opened.extract_file("read-at-volume-index.txt").unwrap(),
+            Some(payload)
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn recovers_cmra_header_magic_from_locator_tuple() {
+        let payload = b"cmra header authority".to_vec();
+        let archive = write_archive(
+            &[RegularFile::new("cmra-header-magic.txt", &payload)],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+        let locator = final_recovery_locator(&archive.bytes);
+
+        let mut corrupted = archive.bytes;
+        corrupted[locator.cmra_offset as usize] ^= 0x55;
+
+        let opened = open_archive(&corrupted, &master_key()).unwrap();
+        assert_eq!(
+            opened.extract_file("cmra-header-magic.txt").unwrap(),
+            Some(payload)
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn recovers_cmra_shard_magic_as_erasure() {
+        let payload = b"cmra shard authority".to_vec();
+        let archive = write_archive(
+            &[RegularFile::new("cmra-shard-magic.txt", &payload)],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+        let locator = final_recovery_locator(&archive.bytes);
+        let first_shard_offset =
+            locator.cmra_offset as usize + CRITICAL_METADATA_RECOVERY_HEADER_LEN;
+
+        let mut corrupted = archive.bytes;
+        corrupted[first_shard_offset] ^= 0x55;
+
+        let opened = open_archive(&corrupted, &master_key()).unwrap();
+        assert_eq!(
+            opened.extract_file("cmra-shard-magic.txt").unwrap(),
+            Some(payload)
+        );
+        opened.verify().unwrap();
     }
 
     #[test]
@@ -8379,11 +9239,11 @@ mod tests {
     }
 
     #[test]
-    fn seekable_open_rejects_in_bounds_noncanonical_crypto_header_offset() {
+    fn seekable_open_recovers_physical_noncanonical_crypto_header_offset() {
         let archive = write_archive(
             &[RegularFile::new("offset.txt", b"offset")],
             &master_key(),
-            single_stream_options(),
+            small_block_recovery_options(),
         )
         .unwrap();
         let mut mutated = archive.bytes;
@@ -8391,10 +9251,16 @@ mod tests {
         header.crypto_header_offset = VOLUME_HEADER_LEN as u32 + 1;
         mutated[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
 
+        let opened = open_archive(&mutated, &master_key()).unwrap();
         assert_eq!(
-            open_archive(&mutated, &master_key()).unwrap_err(),
-            FormatError::NonCanonicalCryptoHeaderOffset(VOLUME_HEADER_LEN as u32 + 1)
+            opened.volume_header.crypto_header_offset,
+            VOLUME_HEADER_LEN as u32
         );
+        assert_eq!(
+            opened.extract_file("offset.txt").unwrap(),
+            Some(b"offset".to_vec())
+        );
+        opened.verify().unwrap();
     }
 
     #[test]
@@ -11607,7 +12473,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_odd_block_size_before_fec_repair() {
+    fn recovers_physical_odd_block_size_from_cmra_authority() {
         let archive = write_archive(
             &[RegularFile::new("odd-block.txt", b"payload")],
             &master_key(),
@@ -11619,16 +12485,20 @@ mod tests {
         let block_size_offset = volume_header.crypto_header_offset as usize + 24;
         malformed[block_size_offset..block_size_offset + 4].copy_from_slice(&4097u32.to_le_bytes());
 
+        let opened = open_archive(&malformed, &master_key()).unwrap();
+        assert_ne!(opened.crypto_header.block_size, 4097);
         assert_eq!(
-            open_archive(&malformed, &master_key()).unwrap_err(),
-            FormatError::OddBlockSize(4097)
+            opened.extract_file("odd-block.txt").unwrap(),
+            Some(b"payload".to_vec())
         );
+        opened.verify().unwrap();
     }
 
     #[test]
-    fn rejects_structurally_malformed_block_records_instead_of_repairing() {
+    fn repairs_structurally_malformed_payload_block_slots() {
+        let payload = pseudo_random_bytes(12_000);
         let archive = write_archive(
-            &[RegularFile::new("structural-block.txt", b"payload")],
+            &[RegularFile::new("structural-block.bin", &payload)],
             &master_key(),
             small_block_recovery_options(),
         )
@@ -11638,20 +12508,74 @@ mod tests {
         let mut bad_magic = archive.bytes.clone();
         corrupt_block_record_magic_at_slot(&mut bad_magic, payload_slot);
         assert_eq!(
-            open_archive(&bad_magic, &master_key()).unwrap_err(),
-            FormatError::BadMagic {
-                structure: "BlockRecord"
-            }
+            open_archive(&bad_magic, &master_key())
+                .unwrap()
+                .extract_file("structural-block.bin")
+                .unwrap(),
+            Some(payload.clone())
         );
 
         let mut bad_reserved = archive.bytes;
         corrupt_block_record_reserved_at_slot(&mut bad_reserved, payload_slot);
         assert_eq!(
-            open_archive(&bad_reserved, &master_key()).unwrap_err(),
-            FormatError::NonZeroReserved {
-                structure: "BlockRecord"
-            }
+            open_archive(&bad_reserved, &master_key())
+                .unwrap()
+                .extract_file("structural-block.bin")
+                .unwrap(),
+            Some(payload)
         );
+    }
+
+    #[test]
+    fn repair_patches_restore_structurally_malformed_payload_block_slot() {
+        let payload = pseudo_random_bytes(12_000);
+        let archive = write_archive(
+            &[RegularFile::new("structural-patch.bin", &payload)],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+        let payload_slot = first_payload_data_run_slots(&archive.bytes)[0];
+        let mut corrupted = archive.bytes.clone();
+        corrupt_block_record_magic_at_slot(&mut corrupted, payload_slot);
+
+        let opened = open_seekable_archive(corrupted.clone(), &master_key()).unwrap();
+        opened.verify().unwrap();
+        assert_eq!(
+            opened.extract_file("structural-patch.bin").unwrap(),
+            Some(payload)
+        );
+        let patches = opened.repair_patches().unwrap();
+        assert_eq!(patches.len(), 1);
+        apply_repair_patches(&mut corrupted, &patches);
+
+        let repaired = open_seekable_archive(corrupted, &master_key()).unwrap();
+        repaired.verify().unwrap();
+        assert!(repaired.repair_patches().unwrap().is_empty());
+    }
+
+    #[test]
+    fn repairs_structurally_malformed_index_root_block_slot() {
+        let archive = write_archive(
+            &[RegularFile::new(
+                "structural-index-root.txt",
+                b"metadata repair",
+            )],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+        let index_root_slot =
+            first_block_record_slot_with_kind(&archive.bytes, BlockKind::IndexRootData).unwrap();
+        let mut corrupted = archive.bytes;
+        corrupt_block_record_magic_at_slot(&mut corrupted, index_root_slot);
+
+        let opened = open_archive(&corrupted, &master_key()).unwrap();
+        assert_eq!(
+            opened.extract_file("structural-index-root.txt").unwrap(),
+            Some(b"metadata repair".to_vec())
+        );
+        opened.verify().unwrap();
     }
 
     #[test]
@@ -11977,16 +12901,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_same_key_crypto_header_splice_with_session_mismatch() {
+    fn recovers_physical_crypto_header_splice_from_cmra_authority() {
         let base = WriterOptions {
             archive_uuid: Some([0x11; 16]),
             session_id: Some([0x22; 16]),
-            ..single_stream_options()
+            ..small_block_recovery_options()
         };
         let same_archive = WriterOptions {
             archive_uuid: Some([0x11; 16]),
             session_id: Some([0x33; 16]),
-            ..single_stream_options()
+            ..small_block_recovery_options()
         };
 
         let first = write_archive(
@@ -12013,12 +12937,16 @@ mod tests {
         let mut spliced = first.bytes.clone();
         spliced[crypto_start..crypto_end].copy_from_slice(&second.bytes[crypto_start..crypto_end]);
 
+        let opened = open_archive(&spliced, &master_key()).unwrap();
         assert_eq!(
-            open_archive(&spliced, &master_key()).unwrap_err(),
-            FormatError::HmacMismatch {
-                structure: "CryptoHeader"
-            }
+            opened.crypto_header_bytes,
+            first.bytes[crypto_start..crypto_end].to_vec()
         );
+        assert_eq!(
+            opened.extract_file("splice.txt").unwrap(),
+            Some(b"same shape".to_vec())
+        );
+        opened.verify().unwrap();
     }
 
     #[test]

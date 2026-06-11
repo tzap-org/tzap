@@ -190,6 +190,33 @@ fn corrupt_first_record_payload_crc_of_kind(volume: &mut [u8], kind: BlockKind) 
     panic!("no {kind:?} record found to corrupt");
 }
 
+fn corrupt_first_record_magic_of_kind(volume: &mut [u8], kind: BlockKind) {
+    let volume_header = VolumeHeader::parse(&volume[..VOLUME_HEADER_LEN]).unwrap();
+    let crypto_start = volume_header.crypto_header_offset as usize;
+    let crypto_end = crypto_start + volume_header.crypto_header_length as usize;
+    let crypto_header = CryptoHeader::parse(
+        &volume[crypto_start..crypto_end],
+        volume_header.crypto_header_length,
+    )
+    .unwrap();
+    let block_size = crypto_header.fixed.block_size as usize;
+    let record_len = block_size + BLOCK_RECORD_FRAMING_LEN;
+    let locator = CriticalRecoveryLocator::parse(&volume[volume.len() - 128..]).unwrap();
+    let trailer_offset = locator.volume_trailer_offset as usize;
+    let trailer =
+        VolumeTrailer::parse(&volume[trailer_offset..trailer_offset + VOLUME_TRAILER_LEN]).unwrap();
+    let manifest_offset = trailer.manifest_footer_offset as usize;
+
+    for offset in (crypto_end..manifest_offset).step_by(record_len) {
+        let record = BlockRecord::parse(&volume[offset..offset + record_len], block_size).unwrap();
+        if record.kind == kind {
+            volume[offset] ^= 0x55;
+            return;
+        }
+    }
+    panic!("no {kind:?} record found to corrupt");
+}
+
 fn zero_deterministic_payload_blocks(
     volume_paths: &[PathBuf],
     corruption_pct: usize,
@@ -2288,6 +2315,8 @@ fn cli_plaintext_header_digest_corruption_is_corrupt_archive_not_wrong_key() {
         .args([
             "create",
             "--no-encryption",
+            "--bit-rot-buffer-pct",
+            "0",
             "-o",
             archive.to_str().unwrap(),
             input.to_str().unwrap(),
@@ -2888,6 +2917,106 @@ fn cli_verify_write_repaired_writes_sibling_for_crc_erased_payload_block() {
             "--keyfile",
             keyfile.to_str().unwrap(),
             repaired.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK (1 volume(s), 1 file(s))"));
+}
+
+#[test]
+fn cli_verify_write_repaired_writes_sibling_for_malformed_payload_block_slot() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("payload.bin");
+    let archive = temp.path().join("sample.tzap");
+    let repaired = temp.path().join("sample.repaired.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    let payload = (0..12_000)
+        .map(|idx| ((idx * 41 + 7) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&input, payload).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let mut archive_bytes = fs::read(&archive).unwrap();
+    corrupt_first_record_magic_of_kind(&mut archive_bytes, BlockKind::PayloadData);
+    fs::write(&archive, archive_bytes).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "--write-repaired",
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK (1 volume(s), 1 file(s))"))
+        .stdout(predicate::str::contains("wrote repaired volume copy"))
+        .stdout(predicate::str::contains("sample.repaired.tzap"));
+
+    assert!(repaired.exists());
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            repaired.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK (1 volume(s), 1 file(s))"));
+}
+
+#[test]
+fn cli_verify_recovers_malformed_volume_header_from_cmra() {
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input = temp.path().join("payload.bin");
+    let archive = temp.path().join("sample.tzap");
+
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    fs::write(&input, b"front header recovery").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let mut archive_bytes = fs::read(&archive).unwrap();
+    archive_bytes[0] ^= 0x55;
+    fs::write(&archive, archive_bytes).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            archive.to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -3780,6 +3909,8 @@ fn cli_reports_corrupt_header_magic() {
             "create",
             "--keyfile",
             keyfile.to_str().unwrap(),
+            "--bit-rot-buffer-pct",
+            "0",
             "-o",
             archive.to_str().unwrap(),
             input.to_str().unwrap(),
@@ -3932,6 +4063,8 @@ fn cli_reports_unsupported_revision_with_stable_category_and_exit_code() {
             "create",
             "--keyfile",
             keyfile.to_str().unwrap(),
+            "--bit-rot-buffer-pct",
+            "0",
             "-o",
             archive.to_str().unwrap(),
             input.to_str().unwrap(),

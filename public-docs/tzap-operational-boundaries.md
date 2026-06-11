@@ -268,10 +268,28 @@ Operational shape:
 - Public no-key verification still needs a complete volume set and validates
   public RootAuth data-block commitments rather than providing keyed extraction.
 
+Recovery order for the core file-backed key-holding reader is:
+
+1. Locate enough layout authority from physical startup metadata, terminal CMRA,
+   locators, or an allowed bootstrap authority.
+2. Repair and validate critical metadata before trusting payload locations:
+   startup headers, CMRA rows, terminal metadata, IndexRoot, index shards,
+   directory hints, and dictionary metadata when present.
+3. Build the archive map from the repaired metadata, including block size, slot
+   boundaries, object extents, parity classes, and file indexes.
+4. Repair the main payload objects within their object-local FEC budget, then
+   authenticate/decrypt/decompress before data is returned or written.
+
+This sequencing lives in `tzap-core`, not only the CLI wrapper. Downstream
+projects using the normal key-holding open, verify, list, extract, and
+file-backed `ArchiveReadAt` APIs benefit from the same repair behavior.
+
 ## Verify repaired copies
 
 Key-holding `tzap verify` can write repaired sibling copies for volumes that
-contain recoverable BlockRecord CRC damage:
+contain recoverable BlockRecord damage. For file-backed v43 inputs, this
+includes CRC failures and malformed fixed slots such as a damaged `TZBK` marker
+or reserved BlockRecord bytes after `tzap` has recovered the archive layout:
 
 ```sh
 tzap verify --keyfile project.key --write-repaired archive.tzap
@@ -547,15 +565,20 @@ the bytes are identical, and does not expose a duplicate-copy recovery mode.
 
 Recovery modes in the current CLI/API are:
 
-- Default strict open: all supplied headers, CryptoHeaders, and trailers must
-  authenticate and match their stripe position; at least one ManifestFooter
-  authority must authenticate for random-access bootstrap; BlockRecords must be
-  structurally valid and match their stripe position; duplicate volume indexes
-  reject.
+- Default strict open: recovery-enabled file-backed key-holding inputs recover
+  startup metadata from terminal CMRA before trusting physical `VolumeHeader` or
+  `CryptoHeader` copies; zero-budget archives keep strict physical-prefix error
+  reporting. At least one terminal or CMRA-recovered ManifestFooter authority
+  must authenticate for random-access bootstrap; BlockRecords must match their
+  stripe position, and malformed known fixed slots are treated as repair
+  erasures within the configured FEC budget; duplicate volume indexes reject.
 - Missing-volume recovery: automatic only when the number of omitted volumes is
   no greater than `volume_loss_tolerance` and the per-object FEC records can
   repair the missing shards.
-- Bit-rot repair: CRC-failed BlockRecords are treated as erasures and repaired
+- Bit-rot repair: damaged physical headers on recovery-enabled archives, CMRA
+  header/row slots, CRC-failed BlockRecords, and malformed known fixed
+  BlockRecord slots are treated as erasures when an authenticated or CRC-valid
+  recovery authority establishes the expected slot boundaries. Repair succeeds
   only while the affected object stays within its parity budget. Authenticated
   payload tamper with a recomputed CRC still fails AEAD/HMAC before plaintext is
   released.

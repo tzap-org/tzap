@@ -862,9 +862,19 @@ field itself is excluded.
 BlockRecord kind values 0 through 9 are defined above. Values 10 through
 255 are reserved for future use. Writers MUST NOT emit reserved kind
 values; readers MUST reject any BlockRecord with a `kind` outside
-0 through 9. Writers MUST set `magic = b"TZBK"`; readers MUST reject any
-BlockRecord whose magic field differs before using its kind, flags,
-block index, payload, or CRC result for object assembly.
+0 through 9. Writers MUST set `magic = b"TZBK"`. Unless the fixed-slot
+erasure rule below applies, readers MUST reject any BlockRecord whose magic
+field differs before using its kind, flags, block index, payload, or CRC result
+for object assembly.
+When a reader has already established exact BlockRecord slot boundaries from
+recovered/authenticated terminal metadata, a bootstrap authority, or an
+equivalent trusted fixed-slot source, a slot whose BlockRecord magic or
+reserved bytes are invalid MUST instead be treated as an erasure for that
+slot. The repaired BlockRecord bytes MUST then satisfy all normal BlockRecord
+structure, CRC, kind, flag, block-index, FEC, and mode-specific object
+authentication checks before the shard is trusted or released. This
+fixed-slot erasure rule does not apply while scanning a self-delimiting stream
+whose next slot boundary is not yet known.
 
 Writers MUST set all reserved `BlockRecord.flags` bits to zero. Readers
 MUST reject a BlockRecord with any reserved flag bit set; in v0.43 this
@@ -3833,7 +3843,7 @@ compression, and per-sink writes are all independent.
 | Adversarial volume splice | session_id mismatch | Detected; rejected |
 | IndexRoot block extent known but unrecoverable | High parity usually saves it | If exhausted, recovery mode |
 | Index Shard S unrecoverable | Shard FEC exhausted | Files in shard S lose random-access; sequential extract still works |
-| CMRA shard corruption within parity budget | CMRA CRC/FEC repair succeeds | Recovered critical bytes still require mode-specific integrity and root-auth checks |
+| CMRA header or shard-slot corruption within parity budget | Locator/header tuple recovery plus CMRA CRC/FEC repair succeeds | Recovered critical bytes still require mode-specific integrity and root-auth checks |
 | CMRA decoder envelopes all corrupt | No valid CMRA header, locator, or trusted external decoder tuple | Critical recovery unavailable for that volume |
 | Root-auth footer unknown selector | Wire validation passes but no verifier supports selector | Root auth unavailable, not malformed footer |
 | Public no-key missing data BlockRecord | Public observation set incomplete | Public no-key verification fails or returns explicit incomplete result |
@@ -4179,7 +4189,8 @@ High-priority v0.43 critical-recovery and root-auth regression cases:
    `max_critical_recovery_scan`; recovery succeeds with a diagnostic. Repeat
    with the only candidate just beyond `max_critical_recovery_scan`; readers do
    not scan far enough to accept it.
-7. Corrupt CMRA shards up to `parity_shard_count`; recovery succeeds.
+7. Corrupt CMRA shard slots up to `parity_shard_count`, including `TZCS`
+   magic or reserved bytes; recovery succeeds.
 8. Corrupt CMRA shards beyond `parity_shard_count`; reader fails clearly or
    uses an explicitly requested authenticated fallback.
 9. Modify CMRA bytes and recompute unkeyed CRCs; HMAC/root-auth checks reject.
@@ -4279,12 +4290,13 @@ High-priority v0.43 critical-recovery and root-auth regression cases:
     objects or data-leaf state and provides no external trusted API source;
     root auth is reported unavailable, and an operation requiring root auth
     fails.
-40. Corrupt only `CriticalMetadataRecoveryHeader.header_crc32c` while leaving a
-    final or mirror locator with a matching duplicated decoder tuple; recovery
-    succeeds from the locator and reports the header-CRC diagnostic. Corrupt
-    the header and both locators with no external trusted API source; CMRA
-    recovery fails clearly rather than claiming parity can recover the decoder
-    envelope.
+40. Corrupt only `CriticalMetadataRecoveryHeader` bytes, such as `TZCR` magic,
+    reserved bytes, tuple bytes, identity hints, or `header_crc32c`, while
+    leaving a final or mirror locator with a matching duplicated decoder tuple;
+    recovery succeeds from the locator and treats the 116-byte header as an
+    unusable header slot. Corrupt the header and both locators with no external
+    trusted API source; CMRA recovery fails clearly rather than claiming parity
+    can recover the decoder envelope.
 41. Mutate each `CriticalMetadataImageV1` layout field, including
     `block_count`, `block_records_length`, `manifest_footer_offset`,
     `manifest_footer_length`, `root_auth_footer_offset`,
@@ -5409,12 +5421,13 @@ A conformant reader:
     and `expected_volume_size` as advisory metadata only; FrameEntry,
     EnvelopeEntry, and authenticated trailer/footer offsets remain
     authoritative.
-19. Rejects BlockRecords with magic other than `TZBK`, reserved flag bits
-    set, unknown `kind` values, non-zero reserved bytes, bit 0 set on
-    parity blocks, bit 0 missing from an encrypted object's last data
-    block, or bit 0 set on a non-final data block; within each encrypted
-    object's data-block run, requires exactly one bit-0 flag and requires
-    it on the final data block.
+19. Rejects BlockRecords with magic other than `TZBK` or non-zero reserved
+    bytes unless a trusted fixed slot lets the reader mark that slot as an
+    erasure for later FEC repair. Rejects reserved flag bits set, unknown
+    `kind` values, bit 0 set on parity blocks, bit 0 missing from an encrypted
+    object's last data block, or bit 0 set on a non-final data block; within
+    each encrypted object's data-block run, requires exactly one bit-0 flag and
+    requires it on the final data block.
 20. For sequential extraction, derives each payload envelope AEAD counter
     from a local contiguous counter starting at 0 and incremented only
     after a complete payload envelope authenticates. Infers each
@@ -6045,13 +6058,12 @@ contains the tuple needed to locate shard rows and recover the image.
 
 Readers MUST NOT use fields from a `CriticalMetadataRecoveryHeader` unless
 `magic = b"TZCR"`, `version = 1`, `fec_algo = 1`, `_reserved` is all zero, and
-`header_crc32c` validates. A header with an invalid CRC is not a decoder
-envelope, but it does not by itself make a locator-based CMRA candidate
+`header_crc32c` validates. A header that fails any of those checks is not a
+decoder envelope, but it does not by itself make a locator-based CMRA candidate
 unrecoverable. When a valid `CriticalRecoveryLocator` supplies the duplicated
-decoder tuple, a reader MAY decode the CMRA by treating the first 116 bytes as
+decoder tuple, a reader MUST decode the CMRA by treating the first 116 bytes as
 an unusable header slot and using only the locator's duplicated decoder fields.
-In that mode, shard rows still begin immediately after the 116-byte header
-slot, and `cmra_header_crc_failed_recovered_from_locator` SHOULD be reported.
+In that mode, shard rows still begin immediately after the 116-byte header slot.
 
 `CriticalMetadataRecoveryShard` has a 16-byte header followed by exactly
 `shard_size` payload bytes. `shard_crc32c` is CRC32C over bytes 0 through 11 of
@@ -6060,11 +6072,14 @@ the shard header, followed by all `shard_size` payload bytes, excluding the
 padding bytes are covered by the CRC and MUST be zero. A reader MUST reject a
 shard whose `shard_payload_length` exceeds `shard_size`.
 
-Readers MUST reject a `CriticalMetadataRecoveryShard` unless
-`magic = b"TZCS"`, `shard_role` is `0` or `1`, `_reserved = 0`, and
-`shard_crc32c` validates. A CRC-valid shard with an unknown role, non-zero
-reserved byte, or non-canonical payload length is not an erasure candidate; it
-is a malformed CMRA candidate.
+After a bounded decoder tuple has established exact CMRA shard-row boundaries,
+readers MUST treat any row whose `CriticalMetadataRecoveryShard` fails structure
+or CRC checks as an erasure for that row. This includes damaged `TZCS` magic,
+unknown `shard_role`, non-zero reserved byte, non-canonical payload length, or
+bad `shard_crc32c`. The repaired image bytes MUST still satisfy
+`CriticalMetadataImageV1` CRC, SHA-256, region digest, offset/length, and
+mode-specific terminal authentication checks before any recovered critical bytes
+are trusted.
 
 The decoder tuple bounds in §30.6, including `image_length >= critical_image_min`,
 `data_shard_count >= 1`, and checked arithmetic, MUST be satisfied before a
@@ -6397,7 +6412,8 @@ byte range, `RootAuthFooterV1` bytes, observed data-block root, or
 candidate result.
 
 After obtaining a bounded CMRA decoder tuple from a CRC-valid
-`CriticalMetadataRecoveryHeader` or a CRC-valid `CriticalRecoveryLocator`,
+`CriticalMetadataRecoveryHeader`, a CRC-valid `CriticalRecoveryLocator`, or an
+explicit external trusted API source,
 readers validate:
 
 ```text
@@ -6471,9 +6487,9 @@ CRC-valid `CriticalMetadataRecoveryHeader`, a CRC-valid final locator, a
 CRC-valid mirror locator, or an explicit external trusted API source that
 supplies the same decoder tuple outside the on-disk v43 archive. The parity
 count and the `cmra_min_parity_shard_count` conformance rule cover CMRA
-shard/data-image erasures after such a decoder envelope is available. They do
-not promise recovery if all decoder envelopes for the volume are corrupt,
-missing, or mutually inconsistent.
+header-slot, shard-row, and data-image erasures after such a decoder envelope is
+available. They do not promise recovery if all decoder envelopes for the volume
+are corrupt, missing, or mutually inconsistent.
 
 ### 30.7 Minimal RootAuthFooterV1
 
@@ -7537,6 +7553,22 @@ Seekable v43 open order:
 
 FEC repairs candidate bytes. HMAC, AEAD, and root auth decide whether candidate
 bytes are trustworthy.
+
+This ordering is intentionally critical-metadata-first. A reader MUST NOT use
+payload object FEC as the first repair step when the layout authority is still
+untrusted or unavailable. It first establishes and validates startup metadata,
+terminal metadata, and index metadata; only then may it use the resulting
+object extents and parity classes to repair payload objects. Repaired payload
+bytes remain untrusted until the object's mode-specific authentication,
+decryption, depadding, and decompression checks succeed.
+
+For key-holding file-backed opens, if the physical `VolumeHeader` or
+`CryptoHeader` copy cannot establish the startup layout, a recovery-enabled
+reader MUST be able to use an accepted terminal CMRA authority as the startup
+authority before trusting those physical copies. This startup-authority fallback
+is required only after the recovered `CryptoHeader.bit_rot_buffer_pct` is
+non-zero and the CMRA parity lower bound in §30.6 is satisfied; zero-budget
+archives MAY preserve strict physical-prefix error reporting.
 
 ### 30.13 Non-seekable and Sequential v43
 
