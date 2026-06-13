@@ -43,9 +43,10 @@ pub use reader::{
     open_seekable_archive_volumes, open_seekable_archive_with_bootstrap_sidecar,
     open_seekable_archive_with_bootstrap_sidecar_options, public_no_key_verify_archive_with,
     public_no_key_verify_volumes_with, public_no_key_verify_volumes_with_options,
-    sequential_extract_tar_stream, ArchiveContentVerification, ArchiveEntry, ArchiveIndexEntry,
-    ArchiveReadAt, ArchiveRepairPatch, OpenedArchive, PublicNoKeyDiagnostic,
-    PublicNoKeyVerification, ReaderOptions, RootAuthDiagnostic, RootAuthVerification,
+    sequential_extract_tar_stream, ArchiveContentVerification, ArchiveEntry,
+    ArchiveExtractProgressSink, ArchiveIndexEntry, ArchiveReadAt, ArchiveRepairPatch,
+    OpenedArchive, PublicNoKeyDiagnostic, PublicNoKeyVerification, ReaderOptions,
+    RootAuthDiagnostic, RootAuthVerification,
 };
 pub use streaming_writer::{
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth, write_tar_stream_archive,
@@ -55,11 +56,14 @@ pub use streaming_writer::{
 pub use tar_model::{MetadataDiagnostic, SafeExtractionOptions, TarEntryKind};
 pub use writer::{
     write_archive, write_archive_sources_to_sink, write_archive_sources_to_sink_ordered_parallel,
-    write_archive_sources_to_sink_single_pass, write_archive_unencrypted,
+    write_archive_sources_to_sink_ordered_parallel_with_progress,
+    write_archive_sources_to_sink_single_pass,
+    write_archive_sources_to_sink_single_pass_with_progress,
+    write_archive_sources_to_sink_with_progress, write_archive_unencrypted,
     write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
     write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
     write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
-    write_empty_archive, ArchiveWriteSink, MemoryArchiveSink, RegularFile, RegularFileSource,
-    RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions, WriterTimings,
-    WrittenArchiveSummary,
+    write_empty_archive, ArchiveWriteProgressSink, ArchiveWriteSink, MemoryArchiveSink,
+    RegularFile, RegularFileSource, RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions,
+    WriterTimings, WrittenArchiveSummary,
 };

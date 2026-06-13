@@ -208,6 +208,25 @@ pub struct ExtractedArchiveMember {
     pub diagnostics: Vec<MetadataDiagnostic>,
 }
 
+/// Receives logical regular-file bytes while the archive reader extracts data.
+///
+/// Callbacks report uncompressed member payload bytes after they are accepted by
+/// the destination writer. Each selected file is capped by its authenticated
+/// `file_data_size`.
+pub trait ArchiveExtractProgressSink {
+    /// Reports newly extracted payload bytes for one archive member.
+    fn file_bytes_extracted(&mut self, archive_path: &str, bytes: u64);
+}
+
+impl<F> ArchiveExtractProgressSink for F
+where
+    F: FnMut(&str, u64),
+{
+    fn file_bytes_extracted(&mut self, archive_path: &str, bytes: u64) {
+        self(archive_path, bytes);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenedArchive {
     options: ReaderOptions,
@@ -357,6 +376,59 @@ struct LocatedIndexFile {
     shard: IndexShard,
     file_index: usize,
     start: u64,
+}
+
+struct ExtractProgressWriter<'a, W> {
+    inner: &'a mut W,
+    archive_path: &'a str,
+    file_data_size: u64,
+    reported_bytes: u64,
+    progress: &'a mut dyn ArchiveExtractProgressSink,
+}
+
+impl<'a, W> ExtractProgressWriter<'a, W> {
+    fn new(
+        inner: &'a mut W,
+        archive_path: &'a str,
+        file_data_size: u64,
+        progress: &'a mut dyn ArchiveExtractProgressSink,
+    ) -> Self {
+        Self {
+            inner,
+            archive_path,
+            file_data_size,
+            reported_bytes: 0,
+            progress,
+        }
+    }
+
+    fn report(&mut self, bytes: u64) {
+        if bytes == 0 || self.file_data_size == 0 {
+            return;
+        }
+        let capped_next = self
+            .reported_bytes
+            .saturating_add(bytes)
+            .min(self.file_data_size);
+        let delta = capped_next.saturating_sub(self.reported_bytes);
+        if delta == 0 {
+            return;
+        }
+        self.reported_bytes = capped_next;
+        self.progress.file_bytes_extracted(self.archive_path, delta);
+    }
+}
+
+impl<W: Write> Write for ExtractProgressWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.report(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 struct DecodedTarMemberGroupReader<'a> {
@@ -1513,6 +1585,27 @@ impl OpenedArchive {
             .transpose()
     }
 
+    /// Stream regular-file payload bytes for `path` into `writer` while
+    /// reporting extracted logical payload bytes.
+    pub fn extract_file_to_writer_with_progress<W: Write>(
+        &self,
+        path: &str,
+        writer: &mut W,
+        progress: &mut dyn ArchiveExtractProgressSink,
+    ) -> Result<Option<Vec<MetadataDiagnostic>>, ExtractError> {
+        let normalized = normalize_lookup_file_path(path, self.crypto_header.max_path_length)?;
+        self.locate_index_file(&normalized)?
+            .map(|located| {
+                self.stream_loaded_file_to_writer_with_progress(
+                    &located.shard,
+                    located.file_index,
+                    writer,
+                    progress,
+                )
+            })
+            .transpose()
+    }
+
     pub fn extract_member(
         &self,
         path: &str,
@@ -2354,6 +2447,35 @@ impl OpenedArchive {
             file.tar_member_group_size,
             self.crypto_header.max_path_length,
             writer,
+        )
+    }
+
+    fn stream_loaded_file_to_writer_with_progress<W: Write>(
+        &self,
+        shard: &IndexShard,
+        file_index: usize,
+        writer: &mut W,
+        progress: &mut dyn ArchiveExtractProgressSink,
+    ) -> Result<Vec<MetadataDiagnostic>, ExtractError> {
+        let file = shard
+            .files
+            .get(file_index)
+            .ok_or(FormatError::InvalidArchive("FileEntry index out of bounds"))?;
+        self.validate_total_extraction_size(file.file_data_size)?;
+        let expected_path = shard
+            .file_path(file_index)
+            .ok_or(FormatError::InvalidArchive("FileEntry path is missing"))?;
+        let archive_path = utf8_path(expected_path)?;
+        let mut progress_writer =
+            ExtractProgressWriter::new(writer, &archive_path, file.file_data_size, progress);
+        let mut reader = DecodedTarMemberGroupReader::new(self, shard, file)?;
+        stream_regular_tar_member_group_to_writer(
+            &mut reader,
+            expected_path,
+            file.file_data_size,
+            file.tar_member_group_size,
+            self.crypto_header.max_path_length,
+            &mut progress_writer,
         )
     }
 
@@ -9611,6 +9733,64 @@ mod tests {
             writer.max_write,
             options.chunk_size
         );
+    }
+
+    #[test]
+    fn extract_file_to_writer_with_progress_reports_payload_bytes() {
+        struct ChunkRecorder {
+            total: usize,
+        }
+
+        impl std::io::Write for ChunkRecorder {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.total += buf.len();
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let payload = pseudo_random_bytes(128 * 1024);
+        let options = WriterOptions {
+            block_size: 4096,
+            chunk_size: 4096,
+            envelope_target_size: 8192,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            fec_data_shards: 4,
+            fec_parity_shards: 0,
+            index_fec_data_shards: 4,
+            index_fec_parity_shards: 0,
+            index_root_fec_data_shards: 4,
+            index_root_fec_parity_shards: 0,
+            ..WriterOptions::default()
+        };
+        let archive = write_archive(
+            &[RegularFile::new("large.bin", &payload)],
+            &master_key(),
+            options,
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let mut writer = ChunkRecorder { total: 0 };
+        let mut progress_events = Vec::new();
+        let mut progress = |archive_path: &str, bytes: u64| {
+            progress_events.push((archive_path.to_owned(), bytes));
+        };
+
+        opened
+            .extract_file_to_writer_with_progress("large.bin", &mut writer, &mut progress)
+            .unwrap()
+            .unwrap();
+
+        let reported_bytes = progress_events.iter().map(|(_, bytes)| *bytes).sum::<u64>();
+        assert_eq!(writer.total, payload.len());
+        assert_eq!(reported_bytes, payload.len() as u64);
+        assert!(progress_events.len() > 1);
+        assert!(progress_events.iter().all(|(path, _)| path == "large.bin"));
     }
 
     #[test]

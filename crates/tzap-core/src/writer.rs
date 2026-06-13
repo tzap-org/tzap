@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -195,6 +197,119 @@ impl RegularFileSource for RegularFile<'_> {
     fn open(&self) -> Result<Box<dyn Read + '_>, ArchiveWriteError> {
         Ok(Box::new(Cursor::new(self.contents)))
     }
+}
+
+/// Receives source-byte progress while the archive writer consumes file data.
+///
+/// The writer may open source files multiple times when planning or replanning
+/// an archive. Progress callbacks report each archive member's logical source
+/// bytes at most once, capped by [`RegularFileSource::file_data_size`].
+pub trait ArchiveWriteProgressSink {
+    /// Reports newly consumed source bytes for one archive member.
+    fn source_bytes_read(&mut self, archive_path: &str, bytes: u64);
+}
+
+impl<F> ArchiveWriteProgressSink for F
+where
+    F: FnMut(&str, u64),
+{
+    fn source_bytes_read(&mut self, archive_path: &str, bytes: u64) {
+        self(archive_path, bytes);
+    }
+}
+
+struct SourceProgressState<'a> {
+    sink: &'a mut dyn ArchiveWriteProgressSink,
+    reported_by_path: BTreeMap<String, u64>,
+}
+
+impl<'a> SourceProgressState<'a> {
+    fn new(sink: &'a mut dyn ArchiveWriteProgressSink) -> Self {
+        Self {
+            sink,
+            reported_by_path: BTreeMap::new(),
+        }
+    }
+
+    fn record(&mut self, archive_path: &str, bytes: u64, file_data_size: u64) {
+        if bytes == 0 || file_data_size == 0 {
+            return;
+        }
+        let reported = self
+            .reported_by_path
+            .entry(archive_path.to_owned())
+            .or_default();
+        let capped_next = reported.saturating_add(bytes).min(file_data_size);
+        let delta = capped_next.saturating_sub(*reported);
+        if delta == 0 {
+            return;
+        }
+        *reported = capped_next;
+        self.sink.source_bytes_read(archive_path, delta);
+    }
+}
+
+struct ProgressRegularFileSource<'a, S> {
+    inner: &'a S,
+    state: Rc<RefCell<SourceProgressState<'a>>>,
+}
+
+impl<S: RegularFileSource> RegularFileSource for ProgressRegularFileSource<'_, S> {
+    fn archive_path(&self) -> &str {
+        self.inner.archive_path()
+    }
+
+    fn file_data_size(&self) -> u64 {
+        self.inner.file_data_size()
+    }
+
+    fn mode(&self) -> u32 {
+        self.inner.mode()
+    }
+
+    fn mtime(&self) -> u64 {
+        self.inner.mtime()
+    }
+
+    fn open(&self) -> Result<Box<dyn Read + '_>, ArchiveWriteError> {
+        Ok(Box::new(SourceProgressReader {
+            inner: self.inner.open()?,
+            archive_path: self.inner.archive_path().to_owned(),
+            file_data_size: self.inner.file_data_size(),
+            state: Rc::clone(&self.state),
+        }))
+    }
+}
+
+struct SourceProgressReader<'a> {
+    inner: Box<dyn Read + 'a>,
+    archive_path: String,
+    file_data_size: u64,
+    state: Rc<RefCell<SourceProgressState<'a>>>,
+}
+
+impl Read for SourceProgressReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let bytes = self.inner.read(buf)?;
+        self.state
+            .borrow_mut()
+            .record(&self.archive_path, bytes as u64, self.file_data_size);
+        Ok(bytes)
+    }
+}
+
+fn progress_sources<'a, S: RegularFileSource>(
+    files: &'a [S],
+    sink: &'a mut dyn ArchiveWriteProgressSink,
+) -> Vec<ProgressRegularFileSource<'a, S>> {
+    let state = Rc::new(RefCell::new(SourceProgressState::new(sink)));
+    files
+        .iter()
+        .map(|inner| ProgressRegularFileSource {
+            inner,
+            state: Rc::clone(&state),
+        })
+        .collect()
 }
 
 /// Streaming destination for archive volumes and optional bootstrap sidecar.
@@ -717,6 +832,35 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn write_archive_sources_to_sink_with_progress<S, O>(
+    files: &[S],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    dictionary: Option<&[u8]>,
+    kdf_params: &KdfParams,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    sink: &mut O,
+    progress: &mut dyn ArchiveWriteProgressSink,
+) -> Result<WrittenArchiveSummary, ArchiveWriteError>
+where
+    S: RegularFileSource,
+    O: ArchiveWriteSink,
+{
+    let progress_files = progress_sources(files, progress);
+    write_archive_stream_inner(
+        &progress_files,
+        master_key,
+        options,
+        dictionary,
+        kdf_params,
+        root_auth,
+        authenticator,
+        sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn write_archive_sources_to_sink_single_pass<S, O>(
     files: &[S],
     master_key: &MasterKey,
@@ -758,6 +902,33 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn write_archive_sources_to_sink_single_pass_with_progress<S, O>(
+    files: &[S],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    kdf_params: &KdfParams,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    sink: &mut O,
+    progress: &mut dyn ArchiveWriteProgressSink,
+) -> Result<WrittenArchiveSummary, ArchiveWriteError>
+where
+    S: RegularFileSource,
+    O: ArchiveWriteSink,
+{
+    let progress_files = progress_sources(files, progress);
+    write_archive_sources_to_sink_single_pass(
+        &progress_files,
+        master_key,
+        options,
+        kdf_params,
+        root_auth,
+        authenticator,
+        sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn write_archive_sources_to_sink_ordered_parallel<S, O>(
     files: &[S],
     master_key: &MasterKey,
@@ -773,6 +944,33 @@ where
 {
     write_ordered_parallel_archive_to_sink(
         files,
+        master_key,
+        options,
+        kdf_params,
+        root_auth,
+        authenticator,
+        sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_archive_sources_to_sink_ordered_parallel_with_progress<S, O>(
+    files: &[S],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    kdf_params: &KdfParams,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    sink: &mut O,
+    progress: &mut dyn ArchiveWriteProgressSink,
+) -> Result<WrittenArchiveSummary, ArchiveWriteError>
+where
+    S: RegularFileSource,
+    O: ArchiveWriteSink,
+{
+    let progress_files = progress_sources(files, progress);
+    write_ordered_parallel_archive_to_sink(
+        &progress_files,
         master_key,
         options,
         kdf_params,
@@ -6824,6 +7022,59 @@ mod tests {
             sink.bootstrap_sidecar_bytes
         );
         assert!(sink.max_write_len <= 128 * 1024);
+    }
+
+    #[test]
+    fn sink_writer_progress_reports_source_bytes_during_multi_pass_write() {
+        let file_size = 512 * 1024;
+        let stats = Rc::new(RefCell::new(GeneratedSourceStats::default()));
+        let file = GeneratedFileSource {
+            path: "large/generated.bin",
+            len: file_size,
+            stats: Rc::clone(&stats),
+        };
+        let master_key = MasterKey::from_raw_key(&[4u8; 32]).unwrap();
+        let options = WriterOptions {
+            block_size: MIN_BLOCK_SIZE,
+            chunk_size: 16 * 1024,
+            envelope_target_size: 64 * 1024,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            fec_parity_shards: 0,
+            index_fec_parity_shards: 0,
+            index_root_fec_parity_shards: 0,
+            ..WriterOptions::default()
+        };
+        let mut sink = MemoryArchiveSink::default();
+        let mut progress_events = Vec::new();
+        let mut progress = |archive_path: &str, bytes: u64| {
+            progress_events.push((archive_path.to_owned(), bytes));
+        };
+
+        let summary = write_archive_sources_to_sink_with_progress(
+            &[file],
+            &master_key,
+            options,
+            None,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+            &mut progress,
+        )
+        .unwrap();
+
+        let reported_bytes = progress_events.iter().map(|(_, bytes)| *bytes).sum::<u64>();
+        let stats = stats.borrow();
+        assert!(stats.open_count > 1);
+        assert_eq!(reported_bytes, file_size as u64);
+        assert!(progress_events.len() > 1);
+        assert!(progress_events
+            .iter()
+            .all(|(path, _)| path == "large/generated.bin"));
+        assert_eq!(summary.volume_count, 1);
+        assert!(!sink.volumes.is_empty());
     }
 
     #[derive(Default)]
