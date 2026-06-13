@@ -295,6 +295,8 @@ jobs:
           RUBY
 
       - name: Test formula
+        env:
+          HOMEBREW_NO_SANDBOX_LINUX: 1
         run: |
           brew uninstall --force tzap || true
           brew untap frankmanzhu/tzap-release-test || true
