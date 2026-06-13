@@ -157,12 +157,12 @@ fn public_reference_file_exists_and_covers_commands() {
     assert!(root_readme.contains("public-docs/tzap-installation.md"));
     assert!(root_readme.contains("public-docs/tzap-security-model.md"));
     assert!(root_readme.contains("public-docs/tzap-recovery-matrix.md"));
-    assert!(root_readme.contains("public-docs/tzap-benchmark-guide.md"));
+    assert!(root_readme.contains("public-docs/tzap-benchmark-results.md"));
     assert!(root_readme.contains("public-docs/tzap-development.md"));
     assert!(cli_readme.contains("public-docs/tzap-cli-reference.md"));
     assert!(cli_readme.contains("public-docs/tzap-security-model.md"));
     assert!(cli_readme.contains("public-docs/tzap-recovery-matrix.md"));
-    assert!(cli_readme.contains("public-docs/tzap-benchmark-guide.md"));
+    assert!(cli_readme.contains("public-docs/tzap-benchmark-results.md"));
     assert!(gitignore.contains("/docs/"));
     assert!(gitignore.contains("/implementation-docs/"));
     assert!(!gitignore.contains("/public-docs/"));

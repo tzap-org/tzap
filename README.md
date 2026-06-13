@@ -106,8 +106,8 @@ See the [recovery matrix](public-docs/tzap-recovery-matrix.md) for the simple
   checked, how keys work, and how safe restores behave.
 - [Recovery matrix](public-docs/tzap-recovery-matrix.md): bit rot, damaged
   blocks, missing volumes, and user actions.
-- [Benchmark guide](public-docs/tzap-benchmark-guide.md): reproducible create,
-  verify, extract, selected-file restore, and recovery benchmarks.
+- [Benchmark results](public-docs/tzap-benchmark-results.md): measured create,
+  verify, extract, selected-file restore, and recovery performance.
 - [CLI reference](public-docs/tzap-cli-reference.md): every command, option, and
   exit label.
 - [Operational boundaries](public-docs/tzap-operational-boundaries.md): concrete

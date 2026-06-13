@@ -144,7 +144,7 @@ archive data; raw-key archives require the original 32-byte key.
 
 - Security model: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-security-model.md>
 - Recovery matrix: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-recovery-matrix.md>
-- Benchmark guide: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-benchmark-guide.md>
+- Benchmark results: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-benchmark-results.md>
 - CLI reference: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-cli-reference.md>
 - Operational boundaries: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-operational-boundaries.md>
 
