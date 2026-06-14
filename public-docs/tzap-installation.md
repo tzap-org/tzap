@@ -5,8 +5,8 @@ This document collects install paths and release artifact details for `tzap`.
 ## Homebrew
 
 ```sh
-brew tap tzap-org/tzap https://github.com/tzap-org/tzap
-brew install tzap-org/tzap/tzap
+brew tap tzap-org/tzap
+brew install tzap
 ```
 
 ## crates.io

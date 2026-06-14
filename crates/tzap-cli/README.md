@@ -30,8 +30,8 @@ enough.
 From Homebrew:
 
 ```sh
-brew tap tzap-org/tzap https://github.com/tzap-org/tzap
-brew install tzap-org/tzap/tzap
+brew tap tzap-org/tzap
+brew install tzap
 ```
 
 From crates.io:
