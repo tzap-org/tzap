@@ -7,20 +7,20 @@ class Tzap < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/tzap-org/tzap/releases/download/v#{version}/tzap-v#{version}-macos-aarch64.tar.gz"
-      sha256 "2ad74efd82707284291c3475f5a16518c5799d9073cdb114c52de55084a0f378"
+      sha256 "d5cf07a54200f111f4738425093433d1cb36dfb29213434fc3ab96f1c6dccbdd"
     else
       url "https://github.com/tzap-org/tzap/releases/download/v#{version}/tzap-v#{version}-macos-x86_64.tar.gz"
-      sha256 "b78653d3e814b6c1fd6785f93bad262007244120951a27973cc2b9e487a22f92"
+      sha256 "9001a83b15b73d5651bfae3132452a28d3bddc2d35a5842f5210785e8822e29c"
     end
   end
 
   on_linux do
     if Hardware::CPU.intel?
       url "https://github.com/tzap-org/tzap/releases/download/v#{version}/tzap-v#{version}-linux-x86_64-musl.tar.gz"
-      sha256 "61a0e71a515e52f1be728b2301248945c488eb52b05b405965224a8514095f2d"
+      sha256 "c62e90a6fe0334d2bd759e90a506d70478ca83c1f4f3e9a536b209e9abbd45a5"
     else
       url "https://github.com/tzap-org/tzap/releases/download/v#{version}/tzap-v#{version}-linux-aarch64-musl.tar.gz"
-      sha256 "46e7ea562cbca2c67bcfb640c18c65ffa3c9297cbbf7ea1e480bbe03b3dd11e4"
+      sha256 "f7ff08e9c6507addaf3806771e9f051d20ba05c2267d5d16a645253cdb7d93f0"
     end
   end
 
