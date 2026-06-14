@@ -82,7 +82,7 @@ The `x509_chain` module provides:
 
 ## More Information
 
-- Repository: <https://github.com/frankmanzhu/tzap>
+- Repository: <https://github.com/tzap-org/tzap>
 - Core crate: <https://crates.io/crates/tzap-core>
 - CLI crate: <https://crates.io/crates/tzap>
-- Format specification: <https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv43.md>
+- Format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv43.md>

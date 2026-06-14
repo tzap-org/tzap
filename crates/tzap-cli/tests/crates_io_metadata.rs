@@ -175,7 +175,7 @@ fn package_readmes_render_without_workspace_paths() {
             "package README should use publish-safe links"
         );
         assert!(
-            readme.contains("https://github.com/frankmanzhu/tzap"),
+            readme.contains("https://github.com/tzap-org/tzap"),
             "package README should link to the repository"
         );
     }
@@ -231,7 +231,7 @@ fn public_package_docs_do_not_link_private_docs() {
     let root_manifest = read_workspace_file("Cargo.toml");
 
     assert!(root_manifest.contains(
-        "documentation = \"https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv43.md\""
+        "documentation = \"https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv43.md\""
     ));
     assert!(root_readme.contains("specs/tzap-format-revisedv43.md"));
     assert!(root_readme.contains("public-docs/tzap-cli-reference.md"));

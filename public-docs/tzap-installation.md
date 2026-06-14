@@ -5,8 +5,8 @@ This document collects install paths and release artifact details for `tzap`.
 ## Homebrew
 
 ```sh
-brew tap frankmanzhu/tzap https://github.com/frankmanzhu/tzap
-brew install frankmanzhu/tzap/tzap
+brew tap tzap-org/tzap https://github.com/tzap-org/tzap
+brew install tzap-org/tzap/tzap
 ```
 
 ## crates.io
@@ -32,7 +32,7 @@ target/release/tzap
 ## From GitHub
 
 ```sh
-cargo install --git https://github.com/frankmanzhu/tzap tzap
+cargo install --git https://github.com/tzap-org/tzap tzap
 ```
 
 ## From GitHub release assets
@@ -65,7 +65,7 @@ else
 fi
 # On Windows, pick the ".zip" artifact name from the table below.
 curl -L -o tzap.tar.gz \
-  "https://github.com/frankmanzhu/tzap/releases/download/${VERSION}/${ASSET}"
+  "https://github.com/tzap-org/tzap/releases/download/${VERSION}/${ASSET}"
 tar -xzf tzap.tar.gz
 chmod +x tzap
 ./tzap --version

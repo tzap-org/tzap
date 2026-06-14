@@ -30,8 +30,8 @@ enough.
 From Homebrew:
 
 ```sh
-brew tap frankmanzhu/tzap https://github.com/frankmanzhu/tzap
-brew install frankmanzhu/tzap/tzap
+brew tap tzap-org/tzap https://github.com/tzap-org/tzap
+brew install tzap-org/tzap/tzap
 ```
 
 From crates.io:
@@ -142,15 +142,15 @@ archive data; raw-key archives require the original 32-byte key.
 
 ## Trust material
 
-- Security model: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-security-model.md>
-- Recovery matrix: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-recovery-matrix.md>
-- Benchmark results: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-benchmark-results.md>
-- CLI reference: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-cli-reference.md>
-- Operational boundaries: <https://github.com/frankmanzhu/tzap/blob/main/public-docs/tzap-operational-boundaries.md>
+- Security model: <https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-security-model.md>
+- Recovery matrix: <https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-recovery-matrix.md>
+- Benchmark results: <https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-benchmark-results.md>
+- CLI reference: <https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-cli-reference.md>
+- Operational boundaries: <https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-operational-boundaries.md>
 
 ## More information
 
-- Repository: <https://github.com/frankmanzhu/tzap>
-- Format specification: <https://github.com/frankmanzhu/tzap/blob/main/specs/tzap-format-revisedv43.md>
+- Repository: <https://github.com/tzap-org/tzap>
+- Format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv43.md>
 - Library crate: <https://crates.io/crates/tzap-core>
 - Signing plugin crate: <https://crates.io/crates/tzap-plugin-signing>

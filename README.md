@@ -1,9 +1,9 @@
 # tzap - the only open source archive you need
 
-[![CI](https://github.com/frankmanzhu/tzap/actions/workflows/ci.yml/badge.svg)](https://github.com/frankmanzhu/tzap/actions/workflows/ci.yml)
-[![Release](https://github.com/frankmanzhu/tzap/actions/workflows/release.yml/badge.svg)](https://github.com/frankmanzhu/tzap/actions/workflows/release.yml)
-[![Release version](https://img.shields.io/github/v/release/frankmanzhu/tzap?include_prereleases&label=release)](https://github.com/frankmanzhu/tzap/releases)
-[![Downloads](https://img.shields.io/github/downloads/frankmanzhu/tzap/total)](https://github.com/frankmanzhu/tzap/releases)
+[![CI](https://github.com/tzap-org/tzap/actions/workflows/ci.yml/badge.svg)](https://github.com/tzap-org/tzap/actions/workflows/ci.yml)
+[![Release](https://github.com/tzap-org/tzap/actions/workflows/release.yml/badge.svg)](https://github.com/tzap-org/tzap/actions/workflows/release.yml)
+[![Release version](https://img.shields.io/github/v/release/tzap-org/tzap?include_prereleases&label=release)](https://github.com/tzap-org/tzap/releases)
+[![Downloads](https://img.shields.io/github/downloads/tzap-org/tzap/total)](https://github.com/tzap-org/tzap/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 Backups should survive real life.
