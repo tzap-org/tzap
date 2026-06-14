@@ -169,6 +169,8 @@ fn release_workflow_uploads_checksum_artifacts() {
         &workflow,
         &["homebrew:", "needs: build", "brew install --formula"],
     );
+    assert!(workflow.contains("tzap-org/tzap-release-test"));
+    assert!(!workflow.contains("frankmanzhu/tzap-release-test"));
     assert!(workflow.contains("HOMEBREW_NO_SANDBOX_LINUX: 1"));
     assert_contains_in_order(
         &workflow,

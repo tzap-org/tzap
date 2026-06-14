@@ -299,12 +299,12 @@ jobs:
           HOMEBREW_NO_SANDBOX_LINUX: 1
         run: |
           brew uninstall --force tzap || true
-          brew untap frankmanzhu/tzap-release-test || true
-          brew tap-new --no-git frankmanzhu/tzap-release-test
-          TAP_DIR="$(brew --repository frankmanzhu/tzap-release-test)"
+          brew untap tzap-org/tzap-release-test || true
+          brew tap-new --no-git tzap-org/tzap-release-test
+          TAP_DIR="$(brew --repository tzap-org/tzap-release-test)"
           cp Formula/tzap.rb "$TAP_DIR/Formula/tzap.rb"
-          brew install --formula frankmanzhu/tzap-release-test/tzap
-          brew test frankmanzhu/tzap-release-test/tzap
+          brew install --formula tzap-org/tzap-release-test/tzap
+          brew test tzap-org/tzap-release-test/tzap
 
   publish:
     name: Publish GitHub release
