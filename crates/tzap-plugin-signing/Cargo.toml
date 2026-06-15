@@ -18,5 +18,8 @@ openssl.workspace = true
 sha2.workspace = true
 tzap-core = { path = "../tzap-core", version = "0.1.7" }
 
+[target.'cfg(not(windows))'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }
+
 [dev-dependencies]
 rand.workspace = true

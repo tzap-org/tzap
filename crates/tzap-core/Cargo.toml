@@ -30,6 +30,9 @@ zeroize.workspace = true
 zstd.workspace = true
 zstd-safe.workspace = true
 
+[target.'cfg(not(windows))'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }
+
 [dev-dependencies]
 hex.workspace = true
 tempfile.workspace = true
