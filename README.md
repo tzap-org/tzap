@@ -26,8 +26,8 @@ checksums, parity files, split-volume naming, and restore logic.
 - **It gets you one file fast.** Pull a photo, contract, source file, or record
   out of a giant archive without restoring the whole thing first.
 - **It is seriously quick.** In the public 1 GB / 6000-file benchmark, `tzap`
-  created archives faster than `tar + zstd`, `7z`, and `zip`; even encrypted
-  and authenticated with the default 5% bit-rot buffer, create time stayed near
+  created/extracted archives faster than `tar + zstd`, `7z`, and `zip`; even encrypted
+  and authenticated with the default 5% bit-rot buffer, create/extract time stayed near
   the plaintext fast path. See the
   [benchmark results](public-docs/tzap-benchmark-results.md).
 - **It keeps big archives manageable.** Split archives into practical volume
