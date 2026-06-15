@@ -25,6 +25,11 @@ checksums, parity files, split-volume naming, and restore logic.
   cloud copies, and cold archives are part of the design.
 - **It gets you one file fast.** Pull a photo, contract, source file, or record
   out of a giant archive without restoring the whole thing first.
+- **It is seriously quick.** In the public 1 GB / 6000-file benchmark, `tzap`
+  created archives faster than `tar + zstd`, `7z`, and `zip`; even encrypted
+  and authenticated with the default 5% bit-rot buffer, create time stayed near
+  the plaintext fast path. See the
+  [benchmark results](public-docs/tzap-benchmark-results.md).
 - **It keeps big archives manageable.** Split archives into practical volume
   files for drives, discs, object storage, or offline sets.
 - **It is open source and inspectable.** The Rust implementation, format spec,
