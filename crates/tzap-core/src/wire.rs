@@ -574,14 +574,23 @@ impl BlockRecord {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = vec![0u8; self.payload.len() + BLOCK_RECORD_FRAMING_LEN];
+        Self::to_bytes_from_parts(self.block_index, self.kind, self.flags, &self.payload)
+    }
+
+    pub(crate) fn to_bytes_from_parts(
+        block_index: u64,
+        kind: BlockKind,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = vec![0u8; payload.len() + BLOCK_RECORD_FRAMING_LEN];
         bytes[0..4].copy_from_slice(&TZBK_MAGIC);
-        write_u64(&mut bytes, 4, self.block_index);
-        bytes[12] = self.kind as u8;
-        bytes[13] = self.flags;
-        bytes[16..16 + self.payload.len()].copy_from_slice(&self.payload);
-        let crc = crc32c(&bytes[..16 + self.payload.len()]);
-        let crc_offset = 16 + self.payload.len();
+        write_u64(&mut bytes, 4, block_index);
+        bytes[12] = kind as u8;
+        bytes[13] = flags;
+        bytes[16..16 + payload.len()].copy_from_slice(payload);
+        let crc = crc32c(&bytes[..16 + payload.len()]);
+        let crc_offset = 16 + payload.len();
         write_u32(&mut bytes, crc_offset, crc);
         bytes
     }

@@ -31,9 +31,24 @@ DEFAULT_WORK_DIR = REPO_ROOT / "target" / "tzap-bench"
 BENCH_PASSWORD = "tzap-benchmark-password"
 BYTES_PER_MB = 1024 * 1024
 BYTES_PER_GB = 1024 * BYTES_PER_MB
-TOOL_ORDER = ["tzap", "tar+zstd", "tar+zstd+age", "tar+zstd+age+par2", "7z", "zip"]
+TZAP_NO_PASSWORD_NO_BITROT_ID = "tzap-no-password-no-bitrot"
+TZAP_NO_PASSWORD_NO_BITROT_NAME = "tzap no-password/no-bitrot"
+RECOVERED_LABEL = "\u2705 Recovered"
+NO_REPAIR_LABEL = "\u274c No repair path"
+EXTERNAL_PAR2_LABEL = "\u2705 External PAR2"
+FAILED_RECOVERY_LABEL = "\u274c Failed"
+TOOL_ORDER = [
+    "tzap",
+    TZAP_NO_PASSWORD_NO_BITROT_NAME,
+    "tar+zstd",
+    "tar+zstd+age",
+    "tar+zstd+age+par2",
+    "7z",
+    "zip",
+]
 TOOL_COLORS = {
     "tzap": "#0f766e",
+    TZAP_NO_PASSWORD_NO_BITROT_NAME: "#0891b2",
     "tar+zstd": "#2563eb",
     "tar+zstd+age": "#d97706",
     "tar+zstd+age+par2": "#7c3aed",
@@ -41,6 +56,15 @@ TOOL_COLORS = {
     "zip": "#be185d",
 }
 PROGRESS_LOG_PATH: Path | None = None
+
+
+def tool_display_name(tool: str) -> str:
+    return {
+        TZAP_NO_PASSWORD_NO_BITROT_ID: TZAP_NO_PASSWORD_NO_BITROT_NAME,
+        "tar-zstd": "tar+zstd",
+        "tar-zstd-age": "tar+zstd+age",
+        "tar-zstd-age-par2": "tar+zstd+age+par2",
+    }.get(tool, tool)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,7 +96,6 @@ class DatasetSpec:
 @dataclasses.dataclass
 class Measurement:
     seconds: float | None = None
-    peak_rss_kib: int | None = None
     note: str = ""
 
 
@@ -94,7 +117,6 @@ class ResultRow:
     extract_one_s: float | None = None
     extract_one_stddev_s: float | None = None
     output_size_bytes: int | None = None
-    peak_rss_kib: int | None = None
     status: str = "ok"
     notes: str = ""
 
@@ -129,7 +151,6 @@ class RawResultRow:
     extract_all_s: float | None = None
     extract_one_s: float | None = None
     output_size_bytes: int | None = None
-    peak_rss_kib: int | None = None
     status: str = "ok"
     notes: str = ""
 
@@ -153,7 +174,6 @@ class CommandRunner:
         self.log_dir = log_dir
         self.quiet = quiet
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.gnu_time = find_gnu_time()
 
     def run(
         self,
@@ -165,17 +185,6 @@ class CommandRunner:
     ) -> Measurement:
         safe_label = label.replace("/", "_").replace(" ", "_")
         log_path = self.log_dir / f"{safe_label}.log"
-        time_path = self.log_dir / f"{safe_label}.time"
-        timed_command = command
-        if self.gnu_time is not None:
-            timed_command = [
-                str(self.gnu_time),
-                "-f",
-                "peak_rss_kib=%M",
-                "-o",
-                str(time_path),
-                *command,
-            ]
 
         emit_progress(f"start {label}; detail log: {log_path}", self.quiet)
         emit_progress(
@@ -187,7 +196,7 @@ class CommandRunner:
             log.write(("\n$ " + shell_join(command) + "\n").encode())
             stdout = subprocess.DEVNULL if stdout_to_null else log
             completed = subprocess.run(
-                timed_command,
+                command,
                 cwd=cwd,
                 stdout=stdout,
                 stderr=log,
@@ -204,7 +213,7 @@ class CommandRunner:
             )
 
         emit_progress(f"done {label} in {seconds:.3f}s; detail log: {log_path}", self.quiet)
-        return Measurement(seconds=seconds, peak_rss_kib=parse_peak_rss(time_path))
+        return Measurement(seconds=seconds)
 
 
 def configure_progress_log(path: Path) -> None:
@@ -253,36 +262,6 @@ def shell_quote(path_or_text: object) -> str:
     import shlex
 
     return shlex.quote(str(path_or_text))
-
-
-def find_gnu_time() -> Path | None:
-    for candidate in ("gtime", "/usr/bin/time"):
-        found = shutil.which(candidate) if "/" not in candidate else candidate
-        if not found:
-            continue
-        try:
-            probe = subprocess.run(
-                [found, "--version"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-        except OSError:
-            continue
-        if "GNU" in (probe.stdout + probe.stderr):
-            return Path(found)
-    return None
-
-
-def parse_peak_rss(path: Path) -> int | None:
-    if not path.exists():
-        return None
-    for line in path.read_text(errors="replace").splitlines():
-        if line.startswith("peak_rss_kib="):
-            value = line.split("=", 1)[1].strip()
-            return int(value) if value.isdigit() else None
-    return None
 
 
 def parse_size(value: str) -> int:
@@ -606,11 +585,6 @@ def par2_archive_set_size(archive: Path) -> int:
     return path_size(archive) + sum(path_size(path) for path in par2_files_for_archive(archive))
 
 
-def max_rss(*measurements: Measurement) -> int | None:
-    values = [m.peak_rss_kib for m in measurements if m.peak_rss_kib is not None]
-    return max(values) if values else None
-
-
 def run_tzap(
     runner: CommandRunner,
     tzap: Path,
@@ -671,7 +645,73 @@ def run_tzap(
         extract_all_s=extract_all.seconds,
         extract_one_s=extract_one.seconds,
         output_size_bytes=output_size,
-        peak_rss_kib=max_rss(create, verify, extract_all, extract_one),
+    )
+
+
+def run_tzap_no_password_no_bitrot(
+    runner: CommandRunner,
+    tzap: Path,
+    data_root: Path,
+    output_root: Path,
+    restore_root: Path,
+    dataset: DatasetSpec,
+    _config: BenchmarkConfig,
+) -> ResultRow:
+    archive = output_root / f"{dataset.name}-tzap-no-password-no-bitrot.tzap"
+    restore = restore_root / f"{dataset.name}-tzap-no-password-no-bitrot"
+    remove_path(archive)
+    remove_path(restore)
+
+    create = runner.run(
+        f"{dataset.name}/tzap-no-password-no-bitrot-create",
+        [
+            str(tzap),
+            "create",
+            "--no-encryption",
+            "--bit-rot-buffer-pct",
+            "0",
+            "-o",
+            str(archive),
+            dataset.name,
+        ],
+        cwd=data_root,
+    )
+    verify = runner.run(
+        f"{dataset.name}/tzap-no-password-no-bitrot-verify",
+        [str(tzap), "verify", str(archive)],
+        cwd=data_root,
+    )
+    extract_all = runner.run(
+        f"{dataset.name}/tzap-no-password-no-bitrot-extract-all",
+        [str(tzap), "extract", "-C", str(restore), str(archive)],
+        cwd=data_root,
+    )
+    extract_one = runner.run(
+        f"{dataset.name}/tzap-no-password-no-bitrot-extract-one",
+        [
+            str(tzap),
+            "extract",
+            "--stdout",
+            str(archive),
+            f"{dataset.name}/{dataset.selected_relative_path}",
+        ],
+        cwd=data_root,
+        stdout_to_null=True,
+    )
+    output_size = path_size(archive)
+    remove_many([archive, restore])
+    return ResultRow(
+        dataset=dataset.name,
+        input_file_count=dataset.file_count,
+        input_size_bytes=dataset.total_size_bytes,
+        selected_file_position=dataset.selected_file_position,
+        selected_relative_path=dataset.selected_relative_path,
+        tool=TZAP_NO_PASSWORD_NO_BITROT_NAME,
+        create_s=create.seconds,
+        verify_s=verify.seconds,
+        extract_all_s=extract_all.seconds,
+        extract_one_s=extract_one.seconds,
+        output_size_bytes=output_size,
     )
 
 
@@ -730,7 +770,6 @@ def run_tar_zstd(
         extract_all_s=extract_all.seconds,
         extract_one_s=extract_one.seconds,
         output_size_bytes=output_size,
-        peak_rss_kib=max_rss(create, verify, extract_all, extract_one),
     )
 
 
@@ -815,7 +854,6 @@ def run_tar_zstd_age(
         extract_all_s=extract_all.seconds,
         extract_one_s=extract_one.seconds,
         output_size_bytes=output_size,
-        peak_rss_kib=max_rss(create, verify, extract_all, extract_one),
     )
 
 
@@ -896,7 +934,6 @@ def run_tar_zstd_age_par2(
         extract_all_s=extract_all.seconds,
         extract_one_s=extract_one.seconds,
         output_size_bytes=output_size,
-        peak_rss_kib=max_rss(create_archive, create_par2, verify, extract_all, extract_one),
         notes=f"PAR2 redundancy {config.par2_redundancy_pct}%",
     )
 
@@ -967,7 +1004,6 @@ def run_7z(
         extract_all_s=extract_all.seconds,
         extract_one_s=extract_one.seconds,
         output_size_bytes=output_size,
-        peak_rss_kib=max_rss(create, verify, extract_all, extract_one),
     )
 
 
@@ -1025,7 +1061,6 @@ def run_zip(
         extract_all_s=extract_all.seconds,
         extract_one_s=extract_one.seconds,
         output_size_bytes=output_size,
-        peak_rss_kib=max_rss(create, verify, extract_all, extract_one),
         notes="zip -P is a familiar baseline, not a modern encryption recommendation",
     )
 
@@ -1238,7 +1273,7 @@ def skip_row(dataset: DatasetSpec, tool: str, reason: str) -> ResultRow:
         input_size_bytes=dataset.total_size_bytes,
         selected_file_position=dataset.selected_file_position,
         selected_relative_path=dataset.selected_relative_path,
-        tool=tool,
+        tool=tool_display_name(tool),
         status="skipped",
         notes=reason,
     )
@@ -1251,7 +1286,7 @@ def failed_row(dataset: DatasetSpec, tool: str, reason: str) -> ResultRow:
         input_size_bytes=dataset.total_size_bytes,
         selected_file_position=dataset.selected_file_position,
         selected_relative_path=dataset.selected_relative_path,
-        tool=tool,
+        tool=tool_display_name(tool),
         status="failed",
         notes=reason,
     )
@@ -1282,7 +1317,6 @@ def raw_result(run_index: int, row: ResultRow) -> RawResultRow:
         extract_all_s=row.extract_all_s,
         extract_one_s=row.extract_one_s,
         output_size_bytes=row.output_size_bytes,
-        peak_rss_kib=row.peak_rss_kib,
         status=row.status,
         notes=row.notes,
     )
@@ -1350,7 +1384,6 @@ def summarize_result_rows(rows: list[ResultRow]) -> ResultRow:
     verify_values = numeric_values(ok_rows, "verify_s")
     extract_all_values = numeric_values(ok_rows, "extract_all_s")
     extract_one_values = numeric_values(ok_rows, "extract_one_s")
-    rss_values = [row.peak_rss_kib for row in ok_rows if row.peak_rss_kib is not None]
     return ResultRow(
         dataset=first.dataset,
         input_file_count=first.input_file_count,
@@ -1368,7 +1401,6 @@ def summarize_result_rows(rows: list[ResultRow]) -> ResultRow:
         extract_one_s=mean(extract_one_values),
         extract_one_stddev_s=stddev(extract_one_values),
         output_size_bytes=ok_rows[-1].output_size_bytes,
-        peak_rss_kib=max(rss_values) if rss_values else None,
         status=status,
         notes="; ".join(notes),
     )
@@ -1480,20 +1512,6 @@ def fmt_seconds_label(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.3f}s"
 
 
-def fmt_seconds_with_stddev(value: float | None, stddev_value: float | None) -> str:
-    if value is None:
-        return "n/a"
-    if stddev_value is None:
-        return f"{value:.3f}s"
-    return f"{value:.3f}s +/- {stddev_value:.3f}s"
-
-
-def fmt_peak_rss(value: int | None) -> str:
-    if value is None:
-        return "n/a"
-    return fmt_size(value * 1024)
-
-
 def md_cell(value: object) -> str:
     return str(value).replace("|", "\\|")
 
@@ -1527,11 +1545,11 @@ def public_recovery_label(
         if not matching:
             return "Not run"
         if any(row.status == "ok" for row in matching):
-            return "Recovered"
-        return "Failed"
+            return RECOVERED_LABEL
+        return FAILED_RECOVERY_LABEL
     if tool == "tar+zstd+age+par2":
-        return "External PAR2"
-    return "No repair path"
+        return EXTERNAL_PAR2_LABEL
+    return NO_REPAIR_LABEL
 
 
 def chart_title(title: str, subtitle: str, width: int = 960) -> list[str]:
@@ -1555,106 +1573,89 @@ def write_selected_restore_chart(path: Path, rows: list[ResultRow]) -> None:
         return
 
     datasets = sorted({row.input_size_bytes for row in workflow_rows})
-    tools = [tool for tool in TOOL_ORDER if any(row.tool == tool for row in workflow_rows)]
-    max_y = max(row.extract_one_s or 0.0 for row in workflow_rows) * 1.25
-    max_y = max(max_y, 0.001)
-    width, height = 960, 520
-    left, right, top, bottom = 86, 216, 96, 88
+    single_dataset = len(datasets) == 1
+    chart_rows = sorted(
+        workflow_rows,
+        key=lambda row: (
+            row.input_size_bytes if not single_dataset else 0,
+            row.extract_one_s or 0.0,
+            tool_sort_key(row),
+        ),
+    )
+    max_x = max(row.extract_one_s or 0.0 for row in chart_rows) * 1.35
+    max_x = max(max_x, 0.001)
+    width = 1200
+    row_h = 34
+    top, bottom = 106, 72
+    left, right = 280, 180
+    height = max(420, top + len(chart_rows) * row_h + bottom)
     plot_w = width - left - right
-    plot_h = height - top - bottom
-
-    def x_pos(input_size: int) -> float:
-        if len(datasets) == 1:
-            return left + plot_w / 2
-        index = datasets.index(input_size)
-        return left + (plot_w * index / (len(datasets) - 1))
-
-    def y_pos(seconds: float) -> float:
-        return top + plot_h - (seconds / max_y * plot_h)
 
     chart_heading = selected_restore_heading(workflow_rows)
     positions = sorted(
         {row.selected_file_position for row in workflow_rows if row.selected_file_position}
     )
     position = positions[0] if len(positions) == 1 else "configured"
-    subtitle = f"Selected member: {position} generated file. Lower is better."
+    if single_dataset:
+        subtitle = (
+            f"{fmt_size(datasets[0])} input, selected {position} generated file. "
+            "Lower is better."
+        )
+    else:
+        subtitle = f"Selected member: {position} generated file. Lower is better."
     lines = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
         *chart_title(
-            f"{chart_heading} from archive",
+            f"{chart_heading} by tool",
             subtitle,
             width,
         ),
-        f'<line x1="{left}" y1="{top + plot_h}" x2="{left + plot_w}" y2="{top + plot_h}" stroke="#d1d5db"/>',
-        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_h}" stroke="#d1d5db"/>',
     ]
 
     for tick in range(5):
-        value = max_y * tick / 4
-        y = y_pos(value)
+        value = max_x * tick / 4
+        x = left + value / max_x * plot_w
         lines.extend(
             [
-                f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_w}" y2="{y:.1f}" stroke="#eef2f7"/>',
-                f'<text x="{left - 12}" y="{y + 4:.1f}" text-anchor="end" '
+                f'<line x1="{x:.1f}" y1="{top - 12}" x2="{x:.1f}" y2="{height - bottom + 10}" stroke="#eef2f7"/>',
+                f'<text x="{x:.1f}" y="{height - bottom + 34}" text-anchor="middle" '
                 'font-family="Arial, sans-serif" font-size="12" '
                 f'fill="#6b7280">{value:.3f}s</text>',
             ]
         )
 
-    for input_size in datasets:
-        x = x_pos(input_size)
+    lines.append(
+        f'<line x1="{left}" y1="{height - bottom + 10}" x2="{left + plot_w}" y2="{height - bottom + 10}" stroke="#d1d5db"/>'
+    )
+
+    for index, row in enumerate(chart_rows):
+        value = row.extract_one_s or 0.0
+        bar_w = max(3.0, value / max_x * plot_w)
+        y = top + index * row_h
+        bar_y = y + 7
+        label = row.tool if single_dataset else f"{fmt_size(row.input_size_bytes)} / {row.tool}"
+        color = TOOL_COLORS.get(row.tool, "#111827")
+        value_inside = bar_w > 96
+        value_x = left + bar_w - 10 if value_inside else left + bar_w + 10
+        value_anchor = "end" if value_inside else "start"
+        value_fill = "#ffffff" if value_inside else "#111827"
         lines.extend(
             [
-                f'<line x1="{x:.1f}" y1="{top + plot_h}" x2="{x:.1f}" y2="{top + plot_h + 6}" stroke="#d1d5db"/>',
-                f'<text x="{x:.1f}" y="{top + plot_h + 28}" text-anchor="middle" '
+                f'<text x="{left - 14}" y="{bar_y + 15}" text-anchor="end" '
                 'font-family="Arial, sans-serif" font-size="13" '
-                f'fill="#374151">{fmt_size(input_size)}</text>',
-            ]
-        )
-
-    row_lookup = {(row.tool, row.input_size_bytes): row for row in workflow_rows}
-    for tool in tools:
-        color = TOOL_COLORS.get(tool, "#111827")
-        points: list[tuple[float, float, float]] = []
-        for input_size in datasets:
-            row = row_lookup.get((tool, input_size))
-            if row is None or row.extract_one_s is None:
-                continue
-            points.append((x_pos(input_size), y_pos(row.extract_one_s), row.extract_one_s))
-        if len(points) >= 2:
-            point_text = " ".join(f"{x:.1f},{y:.1f}" for x, y, _ in points)
-            lines.append(
-                f'<polyline points="{point_text}" fill="none" stroke="{color}" '
-                'stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>'
-            )
-        for x, y, value in points:
-            lines.extend(
-                [
-                    f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" fill="{color}" stroke="#ffffff" stroke-width="2"/>',
-                    f'<text x="{x:.1f}" y="{y - 10:.1f}" text-anchor="middle" '
-                    'font-family="Arial, sans-serif" font-size="11" '
-                    f'fill="#374151">{value:.3f}s</text>',
-                ]
-            )
-
-    legend_x = left + plot_w + 32
-    legend_y = top + 12
-    for index, tool in enumerate(tools):
-        y = legend_y + index * 28
-        color = TOOL_COLORS.get(tool, "#111827")
-        lines.extend(
-            [
-                f'<rect x="{legend_x}" y="{y - 10}" width="16" height="16" rx="4" fill="{color}"/>',
-                f'<text x="{legend_x + 24}" y="{y + 3}" font-family="Arial, sans-serif" '
-                f'font-size="13" fill="#374151">{svg_text(tool)}</text>',
+                f'fill="#374151">{svg_text(label)}</text>',
+                f'<rect x="{left}" y="{bar_y}" width="{bar_w:.1f}" height="20" rx="5" fill="{color}"/>',
+                f'<text x="{value_x:.1f}" y="{bar_y + 15}" text-anchor="{value_anchor}" '
+                'font-family="Arial, sans-serif" font-size="12" font-weight="700" '
+                f'fill="{value_fill}">{fmt_seconds_label(value)}</text>',
             ]
         )
 
     lines.extend(
         [
-            f'<text x="{left + plot_w / 2:.0f}" y="{height - 22}" text-anchor="middle" '
-            'font-family="Arial, sans-serif" font-size="13" fill="#6b7280">Input size</text>',
+            f'<text x="{left + plot_w / 2:.0f}" y="{height - 18}" text-anchor="middle" '
+            'font-family="Arial, sans-serif" font-size="13" fill="#6b7280">Average selected-file restore time</text>',
             "</svg>",
         ]
     )
@@ -1853,7 +1854,7 @@ def largest_tzap_row(rows: list[ResultRow]) -> ResultRow | None:
     tzap_rows = [
         row
         for row in rows
-        if row.tool == "tzap" and row.status == "ok" and row.extract_one_s is not None
+        if row.tool.startswith("tzap") and row.status == "ok" and row.extract_one_s is not None
     ]
     return max(tzap_rows, key=lambda row: row.input_size_bytes, default=None)
 
@@ -1892,7 +1893,13 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
     largest = largest_tzap_row(rows)
     recovery_cases = len([row for row in recovery_rows if row.status == "ok"])
     recovery_was_run = bool(recovery_rows)
-    recovery_competitors = ["tar+zstd", "tar+zstd+age", "7z", "zip"]
+    recovery_competitors = [
+        TZAP_NO_PASSWORD_NO_BITROT_NAME,
+        "tar+zstd",
+        "tar+zstd+age",
+        "7z",
+        "zip",
+    ]
     recovery_scenarios = [
         ("missing volume within tolerance", "Missing volume"),
         ("damaged payload block within bit-rot budget", "Rotten payload bytes"),
@@ -1904,8 +1911,11 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
         fmt_int(count) for count in sorted({row.input_file_count for row in rows})
     )
     config_meta = meta.get("benchmark_config", {})
+    report_date = str(meta.get("timestamp", "")).split("T", 1)[0] or "unknown"
     lines = [
         "# tzap Benchmark Results",
+        "",
+        f"Report date: {report_date}.",
         "",
         "Human-readable benchmark report generated by `scripts/tzap_benchmark.py`.",
         "",
@@ -1914,14 +1924,14 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
         f"- Normal workflow timings use `{meta['runs']}` timed runs per tool and data set.",
         f"- Recovery proof cases use `{meta.get('recovery_runs', 1)}` timed run per data set and scenario.",
         f"- Input sizes in this report: {size_ladder}. Exact bytes stay in the raw CSV files.",
-        "- Time columns show average +/- standard deviation.",
+        "- Time columns show the average measured seconds. Standard deviations stay in the CSV and JSON audit files.",
         "- tar+zstd+age+par2 is included in normal workflow timings and size accounting; dedicated PAR2 repair scenarios are tracked separately from this tzap recovery scorecard.",
     ]
     if recovery_was_run:
         lines.extend(
             [
                 f"- tzap recovered all `{recovery_cases}` tested damage cases in this run.",
-                "- tar+zstd, tar+zstd+age, 7z, and zip are marked failed for these recovery cases because they had no repair-data path for missing or overwritten archive data in this benchmark.",
+                "- Tools without repair data are marked as having no repair path for missing or overwritten archive data in this benchmark.",
             ]
         )
     else:
@@ -1941,8 +1951,8 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
             "",
             "## Public Metrics",
             "",
-            f"| Dataset | Files | Input size | Tool | Runs | Create | Verify/Test | {selected_restore_heading(rows)} | Full extract | Archive size | Peak RSS | Missing volume | Rotten payload |",
-            "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+            f"| Dataset | Files | Input size | Tool | Runs | Create | Verify/Test | {selected_restore_heading(rows)} | Full extract | Archive size | Missing volume | Rotten payload |",
+            "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
         ]
     )
     for row in sorted_workflow_rows(rows):
@@ -1955,12 +1965,11 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
                     fmt_size(row.input_size_bytes),
                     row.tool,
                     fmt_int(row.runs),
-                    fmt_seconds_with_stddev(row.create_s, row.create_stddev_s),
-                    fmt_seconds_with_stddev(row.verify_s, row.verify_stddev_s),
-                    fmt_seconds_with_stddev(row.extract_one_s, row.extract_one_stddev_s),
-                    fmt_seconds_with_stddev(row.extract_all_s, row.extract_all_stddev_s),
+                    fmt_seconds_label(row.create_s),
+                    fmt_seconds_label(row.verify_s),
+                    fmt_seconds_label(row.extract_one_s),
+                    fmt_seconds_label(row.extract_all_s),
                     fmt_size(row.output_size_bytes),
-                    fmt_peak_rss(row.peak_rss_kib),
                     public_recovery_label(
                         row.tool,
                         recovery_scenarios[0][0],
@@ -1997,12 +2006,12 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
         if not matching:
             tzap_labels.append("Not run")
         elif any(row.status == "ok" for row in matching):
-            tzap_labels.append("Recovered")
+            tzap_labels.append(RECOVERED_LABEL)
         else:
-            tzap_labels.append("Failed")
+            tzap_labels.append(FAILED_RECOVERY_LABEL)
     lines.append(f"| tzap | {tzap_labels[0]} | {tzap_labels[1]} |")
     for tool in recovery_competitors:
-        label = "Failed" if recovery_was_run else "Not run"
+        label = NO_REPAIR_LABEL if recovery_was_run else "Not run"
         lines.append(f"| {tool} | {label} | {label} |")
 
     lines.extend(
@@ -2013,6 +2022,7 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
             "| Tool | Mode used in this benchmark | Recovery data? |",
             "| --- | --- | --- |",
             "| tzap | Encrypted, authenticated archive with tzap recovery options for recovery tests | Yes |",
+            "| tzap no-password/no-bitrot | Plaintext archive with `--no-encryption --bit-rot-buffer-pct 0` | No |",
             "| tar+zstd | tar stream compressed with zstd | No |",
             "| tar+zstd+age | tar stream compressed with zstd, then encrypted with age | No |",
             f"| tar+zstd+age+par2 | tar stream compressed with zstd, encrypted with age, then protected by PAR2 recovery files (`-r{config_meta.get('par2_redundancy_pct', '5')}`) | External PAR2 |",
@@ -2042,10 +2052,10 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
                     fmt_size(row.input_size_bytes),
                     row.tool,
                     fmt_int(row.runs),
-                    fmt_seconds_with_stddev(row.create_s, row.create_stddev_s),
-                    fmt_seconds_with_stddev(row.verify_s, row.verify_stddev_s),
-                    fmt_seconds_with_stddev(row.extract_all_s, row.extract_all_stddev_s),
-                    fmt_seconds_with_stddev(row.extract_one_s, row.extract_one_stddev_s),
+                    fmt_seconds_label(row.create_s),
+                    fmt_seconds_label(row.verify_s),
+                    fmt_seconds_label(row.extract_all_s),
+                    fmt_seconds_label(row.extract_one_s),
                     fmt_size(row.output_size_bytes),
                     row.status,
                 ]
@@ -2071,12 +2081,10 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
                     fmt_size(row.input_size_bytes),
                     row.scenario,
                     fmt_int(row.runs),
-                    fmt_seconds_with_stddev(row.create_s, row.create_stddev_s),
-                    fmt_seconds_with_stddev(
-                        row.recover_verify_s, row.recover_verify_stddev_s
-                    ),
+                    fmt_seconds_label(row.create_s),
+                    fmt_seconds_label(row.recover_verify_s),
                     fmt_size(row.output_size_bytes),
-                    "Recovered" if row.status == "ok" else row.status,
+                    RECOVERED_LABEL if row.status == "ok" else row.status,
                 ]
             )
             + " |"
@@ -2126,6 +2134,12 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
             "tzap verify --keyfile bench.key ARCHIVE.tzap",
             "tzap extract --keyfile bench.key -C RESTORE_DIR ARCHIVE.tzap",
             "tzap extract --keyfile bench.key --stdout ARCHIVE.tzap SELECTED_FILE > /dev/null",
+            "",
+            "tzap create --no-encryption --bit-rot-buffer-pct 0 -o ARCHIVE.tzap DATASET",
+            "tzap verify ARCHIVE.tzap",
+            "tzap extract -C RESTORE_DIR ARCHIVE.tzap",
+            "tzap extract --stdout ARCHIVE.tzap SELECTED_FILE > /dev/null",
+            "",
             f"tzap create --keyfile bench.key --volumes {config_meta.get('missing_volume_count', 3)} --volume-loss-tolerance {config_meta.get('missing_volume_loss_tolerance', 1)} -o RECOVERY.tzap DATASET",
             "# Damaged-payload recovery below the large-data threshold",
             f"tzap create --keyfile bench.key --bit-rot-buffer-pct {config_meta.get('bitrot_buffer_pct', '5')} --block-size {config_meta.get('bitrot_small_block_size', '4K')} --chunk-size {config_meta.get('bitrot_small_chunk_size', '4K')} --envelope-size {config_meta.get('bitrot_envelope_size', '1M')} -o BITROT.tzap DATASET",
@@ -2195,7 +2209,15 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
 
 def parse_tools(value: str) -> list[str]:
     tools = [item.strip() for item in value.split(",") if item.strip()]
-    valid = {"tzap", "tar-zstd", "tar-zstd-age", "tar-zstd-age-par2", "7z", "zip"}
+    valid = {
+        "tzap",
+        TZAP_NO_PASSWORD_NO_BITROT_ID,
+        "tar-zstd",
+        "tar-zstd-age",
+        "tar-zstd-age-par2",
+        "7z",
+        "zip",
+    }
     unknown = sorted(set(tools) - valid)
     if unknown:
         raise argparse.ArgumentTypeError(f"unknown tools: {', '.join(unknown)}")
@@ -2216,6 +2238,7 @@ def tool_runner(tool: str) -> Callable[..., ResultRow]:
 def missing_tool_reason(tool: str) -> str | None:
     requirements = {
         "tzap": [],
+        TZAP_NO_PASSWORD_NO_BITROT_ID: [],
         "tar-zstd": ["tar", "zstd", "bash"],
         "tar-zstd-age": ["tar", "zstd", "age", "age-keygen", "bash"],
         "tar-zstd-age-par2": ["tar", "zstd", "age", "age-keygen", "par2", "bash"],
@@ -2316,13 +2339,15 @@ def add_version_probe(
 
 def collect_tool_versions(tools: list[str], tzap: Path) -> list[dict[str, str | None]]:
     probes: dict[str, dict[str, object]] = {}
-    if "tzap" in tools:
+    tzap_tools = {"tzap", TZAP_NO_PASSWORD_NO_BITROT_ID}
+    if any(tool in tzap_tools for tool in tools):
+        used_by = ", ".join(tool for tool in tools if tool in tzap_tools)
         add_version_probe(
             probes,
             command="tzap",
             executable=str(tzap),
             args=["--version"],
-            used_by="tzap",
+            used_by=used_by,
         )
     tar_zstd_tools = {"tar-zstd", "tar-zstd-age", "tar-zstd-age-par2"}
     if any(tool in tar_zstd_tools for tool in tools):
@@ -2436,8 +2461,13 @@ def main() -> int:
     parser.add_argument(
         "--tools",
         type=parse_tools,
-        default=parse_tools("tzap,tar-zstd,tar-zstd-age,tar-zstd-age-par2,7z,zip"),
-        help="comma-separated tools: tzap,tar-zstd,tar-zstd-age,tar-zstd-age-par2,7z,zip",
+        default=parse_tools(
+            f"tzap,{TZAP_NO_PASSWORD_NO_BITROT_ID},tar-zstd,tar-zstd-age,tar-zstd-age-par2,7z,zip"
+        ),
+        help=(
+            "comma-separated tools: "
+            f"tzap,{TZAP_NO_PASSWORD_NO_BITROT_ID},tar-zstd,tar-zstd-age,tar-zstd-age-par2,7z,zip"
+        ),
     )
     parser.add_argument(
         "--datasets",
@@ -2610,6 +2640,16 @@ def main() -> int:
                             dataset,
                             config,
                         )
+                    elif tool == TZAP_NO_PASSWORD_NO_BITROT_ID:
+                        row = run_tzap_no_password_no_bitrot(
+                            runner,
+                            tzap,
+                            data_root,
+                            output_root,
+                            restore_root,
+                            dataset,
+                            config,
+                        )
                     else:
                         row = tool_runner(tool)(
                             runner,
@@ -2683,7 +2723,6 @@ def main() -> int:
         "dataset_sizes_bytes": {
             dataset.name: dataset.total_size_bytes for dataset in datasets
         },
-        "gnu_time": str(runner.gnu_time) if runner.gnu_time else None,
         "tool_versions": collect_tool_versions(args.tools, tzap),
     }
     (result_root / "metadata.json").write_text(json.dumps(meta, indent=2) + "\n")
@@ -2698,11 +2737,6 @@ def main() -> int:
     emit_progress(f"wrote {result_root / 'raw-results.csv'}", args.quiet)
     emit_progress(f"wrote {result_root / 'raw-recovery.csv'}", args.quiet)
     emit_progress(f"wrote {result_root / 'results.md'}", args.quiet)
-    if runner.gnu_time is None:
-        emit_progress(
-            "peak RSS blank: GNU time was not found (install gtime on macOS)",
-            args.quiet,
-        )
     emit_progress("benchmark complete", args.quiet)
     return 0
 

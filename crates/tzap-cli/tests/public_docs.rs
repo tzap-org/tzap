@@ -125,7 +125,9 @@ fn public_reference_file_exists_and_covers_commands() {
     assert!(benchmarks.contains("--runs 30"));
     assert!(benchmarks.contains("--recovery-runs 1"));
     assert!(benchmarks.contains("--file-count 64"));
+    assert!(benchmarks.contains("--file-count 6000"));
     assert!(benchmarks.contains("--dataset-sizes 1MB,20MB,1GB,20GB"));
+    assert!(benchmarks.contains("--dataset-sizes 1GB"));
     assert!(benchmarks.contains("--selected-file-position last"));
     assert!(benchmarks.contains("--benchmark-password tzap-benchmark-password"));
     assert!(benchmarks.contains("--par2-redundancy-pct 5"));
@@ -134,7 +136,8 @@ fn public_reference_file_exists_and_covers_commands() {
     assert!(benchmarks.contains("--bitrot-corruption-bytes 4096"));
     assert!(benchmarks.contains("Command-line benchmark knobs"));
     assert!(benchmarks.contains("first-file bias"));
-    assert!(benchmarks.contains("average `+/-` standard deviation"));
+    assert!(benchmarks.contains("average timing cells without `+/-` standard"));
+    assert!(benchmarks.contains("tzap-no-password-no-bitrot"));
     assert!(benchmarks.contains("human-size columns"));
     assert!(benchmarks.contains("charts/*.svg"));
     assert!(benchmarks.contains("repair-data path"));
@@ -144,9 +147,10 @@ fn public_reference_file_exists_and_covers_commands() {
     assert!(benchmarks.contains("`7z` | LZMA2 archive with password"));
     assert!(benchmarks.contains("20 GB uses `--block-size 64K"));
     assert!(benchmark_results.contains("tzap Benchmark Results"));
-    assert!(benchmark_results.contains("2.08s"));
-    assert!(benchmark_results.contains("0.010s +/- 0.000s"));
-    assert!(benchmark_results.contains("Recovered | Recovered"));
+    assert!(benchmark_results.contains("2.68x faster"));
+    assert!(benchmark_results.contains("0.752s"));
+    assert!(benchmark_results.contains("0.016s"));
+    assert!(benchmark_results.contains("✅ Recovered"));
     assert!(workspace_root().join("scripts/tzap_benchmark.py").is_file());
     assert!(installation.contains("From GitHub release assets"));
     assert!(development.contains("Project layout"));

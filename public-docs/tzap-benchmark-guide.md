@@ -9,11 +9,13 @@ set, and tool versions that produced them.
 `tzap` should be benchmarked on the workflows users actually care about:
 
 - create an archive
+- create an archive with the default recovery margin
+- create an archive with no recovery margin for a pure seekable-format speed
+  comparison
 - verify an archive after copying
 - extract the full archive
 - extract one file from a large archive
 - archive size on disk
-- memory use during create, verify, and extract
 - recovery after damaged blocks
 - recovery after a missing volume
 
@@ -25,17 +27,22 @@ The most important `tzap` story is not only "how fast does it compress?" It is:
 
 Use tools people already know:
 
+- `tzap`
+- `tzap no-password/no-bitrot`
 - `tar + zstd`
 - `tar + zstd + age`
 - `tar + zstd + age + par2`
 - `7z`
 - `zip`
-- `tzap`
 
-`tar + zstd` is a speed and compression baseline. `tar + zstd + age` is the
-closest simple encrypted pipeline. `tar + zstd + age + par2` adds an external
-repair-data baseline with a configurable redundancy percentage. `7z` and `zip`
-are familiar archive tools for normal users.
+`tzap` is the normal encrypted/authenticated archive mode. `tzap
+no-password/no-bitrot` is the plaintext fast path with
+`--no-encryption --bit-rot-buffer-pct 0`, useful for showing the cost of the
+seekable format without password or Reed-Solomon parity work. `tar + zstd` is
+a speed and compression baseline. `tar + zstd + age` is the closest simple
+encrypted pipeline. `tar + zstd + age + par2` adds an external repair-data
+baseline with a configurable redundancy percentage. `7z` and `zip` are
+familiar archive tools for normal users.
 
 ## Data sets
 
@@ -72,22 +79,103 @@ damage.
 The current measured public snapshot is
 [`tzap-benchmark-results.md`](tzap-benchmark-results.md).
 
-Copy timing, size, and memory cells from generated `results.md`; do not fill
-them by hand. Use `n/a` where a tool does not provide a comparable built-in
-workflow.
+Copy timing and size cells from generated `results.md`; do not fill them by
+hand. Use `n/a` where a tool does not provide a comparable built-in workflow.
 
-| Data set | Files | Input size | Tool / mode | Create | Verify/Test | Selected-file restore | Full extract | Output size | Peak RSS | Missing volume | Rotten payload |
-| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| size-20gb | 64 | 20 GB | tzap encrypted archive with recovery options | TBD | TBD | TBD | TBD | TBD | TBD | Recovered | Recovered |
-| size-20gb | 64 | 20 GB | tar + zstd | TBD | TBD | TBD | TBD | TBD | TBD | No repair path | No repair path |
-| size-20gb | 64 | 20 GB | tar + zstd + age | TBD | TBD | TBD | TBD | TBD | TBD | No repair path | No repair path |
-| size-20gb | 64 | 20 GB | tar + zstd + age + PAR2 | TBD | TBD | TBD | TBD | TBD | TBD | External PAR2 | External PAR2 |
-| size-20gb | 64 | 20 GB | 7z password archive | TBD | TBD | TBD | TBD | TBD | TBD | No repair path | No repair path |
-| size-20gb | 64 | 20 GB | zip password archive | TBD | TBD | TBD | TBD | TBD | TBD | No repair path | No repair path |
+| Data set | Files | Input size | Tool / mode | Create | Verify/Test | Selected-file restore | Full extract | Output size | Missing volume | Rotten payload |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| size-1gb | 6000 | 1 GB | tzap encrypted archive with recovery options | TBD | TBD | TBD | TBD | TBD | ✅ Recovered | ✅ Recovered |
+| size-1gb | 6000 | 1 GB | tzap no-password/no-bitrot | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path |
+| size-1gb | 6000 | 1 GB | tar + zstd | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path |
+| size-1gb | 6000 | 1 GB | tar + zstd + age | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path |
+| size-1gb | 6000 | 1 GB | tar + zstd + age + PAR2 | TBD | TBD | TBD | TBD | TBD | ✅ External PAR2 | ✅ External PAR2 |
+| size-1gb | 6000 | 1 GB | 7z password archive | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path |
+| size-1gb | 6000 | 1 GB | zip password archive | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path |
 
-Use the same columns for `size-1mb`, `size-20mb`, and `size-1gb` rows in the
-full report. If the public page needs one compact table, lead with `size-20gb`
-and link to the generated CSV files for the complete size ladder.
+Use the same columns for other tiers when running a full size ladder, such as
+`size-1mb`, `size-20mb`, `size-1gb`, and `size-20gb`. If the public page needs
+one compact table, lead with the current measured snapshot and link to the
+generated CSV files for the complete benchmark bundle.
+
+## Create-speed snapshots
+
+Use a create-speed snapshot when the public claim is specifically about create
+throughput. This is secondary to the complete-workflow table above, but it is a
+good way to show that `tzap` can create a random-seekable archive quickly, even
+when compared with a plain `tar | zstd` stream.
+
+Publish at least these rows:
+
+| Tool / mode | Command shape | Why it is included |
+| --- | --- | --- |
+| `tzap` no encryption, default bit-rot buffer | `tzap create --no-encryption` | Shows normal single-volume plaintext create speed with the default 5% bit-rot recovery margin |
+| `tzap` no encryption, no recovery margin | `tzap create --no-encryption --bit-rot-buffer-pct 0` | Shows pure random-seekable format overhead with zero Reed-Solomon parity shards |
+| `tar | zstd` | `tar -cf - ... | zstd -3 -T0` | Speed and compression-size baseline |
+
+Keep the compression level matched. `tzap create` defaults to
+`--compression-level 3`; the stream baseline should use `zstd -3`. If any row
+uses a non-default compression level, put the level in the command shape.
+
+For public numbers, record:
+
+- exact input bytes and file count
+- exact output bytes for every row
+- `tzap --version`
+- `zstd --version`
+- operating system and architecture
+- `hyperfine` warmup/run count
+- whether `tzap` was built with release settings
+- whether the `tzap` outputs verified successfully
+
+After writer or performance-sensitive dependency changes, rerun the
+create-speed snapshot before publishing a create-speed claim. Rerun the full
+workflow benchmark before replacing the complete-workflow table.
+
+Example create-speed benchmark shape:
+
+Create or copy the benchmark corpus into `$CORPUS` before running the timed
+commands, and publish the corpus generation command or source alongside the
+result.
+
+```sh
+cargo build --release -p tzap
+TZAP=target/release/tzap
+BENCH_ROOT=target/tzap-create-speed
+CORPUS="$BENCH_ROOT/corpus"
+OUT="$BENCH_ROOT/results"
+mkdir -p "$OUT"
+
+hyperfine --warmup 1 --runs 7 \
+  --prepare "rm -f '$OUT/tzap-default.tzap' '$OUT/tzap-no-recovery.tzap' '$OUT/tar-zstd.tar.zst'" \
+  --export-json "$OUT/hyperfine-create-speed.json" \
+  "$TZAP create --quiet --no-encryption -o '$OUT/tzap-default.tzap' '$CORPUS'" \
+  "$TZAP create --quiet --no-encryption --bit-rot-buffer-pct 0 -o '$OUT/tzap-no-recovery.tzap' '$CORPUS'" \
+  "tar -cf - -C '$BENCH_ROOT' corpus | zstd -3 -T0 -q -o '$OUT/tar-zstd.tar.zst'"
+```
+
+`hyperfine --prepare` removes prior outputs before each timed command, so the
+final benchmark directory may only contain the last command's output. After the
+timed run, recreate each output once outside `hyperfine`, verify the `tzap`
+archives, and record exact byte sizes:
+
+```sh
+rm -f "$OUT/tzap-default.tzap" "$OUT/tzap-no-recovery.tzap" "$OUT/tar-zstd.tar.zst"
+"$TZAP" create --quiet --no-encryption -o "$OUT/tzap-default.tzap" "$CORPUS"
+"$TZAP" create --quiet --no-encryption --bit-rot-buffer-pct 0 -o "$OUT/tzap-no-recovery.tzap" "$CORPUS"
+tar -cf - -C "$BENCH_ROOT" corpus | zstd -3 -T0 -q -o "$OUT/tar-zstd.tar.zst"
+"$TZAP" verify "$OUT/tzap-default.tzap"
+"$TZAP" verify "$OUT/tzap-no-recovery.tzap"
+```
+
+Create-speed wording should be direct but bounded:
+
+> On this machine and corpus, `tzap` created a no-encryption, no-recovery-margin
+> random-seekable archive faster than the measured `tar | zstd -3 -T0` stream
+> baseline.
+
+Do not describe this as a compression-ratio win unless the output-size table
+also supports that. In the current public snapshot, `tar | zstd` produced the
+smallest file while `tzap` created the seekable archive faster.
 
 ## Benchmark runner
 
@@ -128,20 +216,24 @@ resolved executable paths and version strings for `tzap`, `tar`, `zstd`, `age`,
 `7z` or `7zz`, `zip`, and `unzip` when those tools are selected.
 
 `results.md` is the human-facing report. It should prefer human-size columns,
-short interpretation, charts, and average `+/-` standard deviation timing.
-Keep exact bytes, selected-file path, and detailed per-run data in the CSV and
-JSON files instead of making the marketing report hard to scan.
+short interpretation, charts, and average timing cells without `+/-` standard
+deviation text. Keep exact bytes, selected-file path, standard deviations, and
+detailed per-run data in the CSV and JSON files instead of making the
+marketing report hard to scan.
 
-The recovery scorecard should be direct for non-technical readers: `tzap`
-recovered the tested missing-volume and rotten-payload cases; `tar + zstd`,
-`tar + zstd + age`, `7z`, and `zip` fail those recovery cases because they do
-not have a repair-data path in this benchmark.
+The recovery scorecard should be direct for non-technical readers: use
+`✅ Recovered` when `tzap` recovers the tested missing-volume and
+rotten-payload cases, use `❌ No repair path` when a baseline has no repair
+data in this benchmark, and use `✅ External PAR2` when recovery depends on
+separate PAR2 files. This keeps the repair-data path visible in the status
+cell itself.
 
 State the tool mode explicitly in the report:
 
 | Tool | Mode used |
 | --- | --- |
 | `tzap` | Encrypted, authenticated archive; recovery options enabled only for recovery tests |
+| `tzap no-password/no-bitrot` | Plaintext archive with `--no-encryption --bit-rot-buffer-pct 0` |
 | `tar + zstd` | tar stream compressed with zstd, not encrypted |
 | `tar + zstd + age` | tar stream compressed with zstd, then encrypted with age |
 | `tar + zstd + age + par2` | tar stream compressed with zstd, encrypted with age, then protected by PAR2 recovery files |
@@ -176,16 +268,46 @@ python3 scripts/tzap_benchmark.py \
   --bitrot-envelope-size 1M \
   --bitrot-corruption-bytes 4096 \
   --par2-redundancy-pct 5 \
-  --tools tzap,tar-zstd,tar-zstd-age,tar-zstd-age-par2,7z,zip
+  --tools tzap,tzap-no-password-no-bitrot,tar-zstd,tar-zstd-age,tar-zstd-age-par2,7z,zip
+```
+
+The current public many-file snapshot uses the same runner, pinned to the 1 GB
+tier with 6000 generated files:
+
+```sh
+python3 scripts/tzap_benchmark.py \
+  --profile standard \
+  --datasets size-1gb \
+  --runs 3 \
+  --recovery-runs 1 \
+  --file-count 6000 \
+  --dataset-sizes 1GB \
+  --selected-file-position last \
+  --benchmark-password tzap-benchmark-password \
+  --recovery-volumes 3 \
+  --recovery-volume-loss-tolerance 1 \
+  --recovery-omit-volume-index 1 \
+  --bitrot-buffer-pct 5 \
+  --bitrot-small-block-size 4K \
+  --bitrot-small-chunk-size 4K \
+  --bitrot-large-threshold 10GB \
+  --bitrot-large-block-size 64K \
+  --bitrot-large-chunk-size 256K \
+  --bitrot-envelope-size 1M \
+  --bitrot-corruption-bytes 4096 \
+  --par2-redundancy-pct 5 \
+  --tools tzap,tzap-no-password-no-bitrot,tar-zstd,tar-zstd-age,tar-zstd-age-par2,7z,zip
 ```
 
 The standard profile defaults to 64 files in every data set and targets 1 MB,
 20 MB, 1 GB, and 20 GB total input sizes. Pinning `--file-count` and
 `--dataset-sizes` in the public command keeps "number of files" from becoming a
 hidden benchmark variable while giving normal readers sizes they understand.
-The normal create/extract rows use `tzap create` defaults, including the
-input-size-based payload layout. The damaged-payload recovery proof below keeps
-explicit block/chunk/envelope flags so the corruption site is deterministic.
+The normal encrypted `tzap` create/extract row uses `tzap create` defaults,
+including the input-size-based payload layout. The no-password/no-bitrot row
+uses `--no-encryption --bit-rot-buffer-pct 0` to show the seekable fast path.
+The damaged-payload recovery proof below keeps explicit block/chunk/envelope
+flags so the corruption site is deterministic.
 Thirty normal workflow runs is the default for this profile when `--runs` is
 omitted. One recovery proof run is the default when `--recovery-runs` is
 omitted.
@@ -213,7 +335,7 @@ python3 scripts/tzap_benchmark.py \
   --dataset-sizes 1MB,20MB,1GB,20GB \
   --selected-file-position last \
   --par2-redundancy-pct 5 \
-  --tools tzap,tar-zstd,tar-zstd-age,tar-zstd-age-par2,7z,zip
+  --tools tzap,tzap-no-password-no-bitrot,tar-zstd,tar-zstd-age,tar-zstd-age-par2,7z,zip
 ```
 
 ## Command-line benchmark knobs
@@ -253,8 +375,7 @@ These inputs make the recovery claim concrete: the sheet records exactly what
 kind of "rotten bits" or missing media was simulated.
 
 Missing comparison tools are recorded as skipped rows instead of failing the
-whole run. Peak RSS is recorded when GNU `time` is available; on macOS, install
-`gtime` if memory columns matter.
+whole run.
 
 ## Example command shape
 
@@ -311,6 +432,9 @@ Good phrasing:
 
 > On this machine and data set, `tzap` restored one selected file without
 > scanning unrelated payload data.
+
+> On this machine and corpus, `tzap` created a random-seekable archive faster
+> than the measured `tar | zstd` stream baseline.
 
 Avoid vague phrasing such as "always faster" or "best compression." `tzap` is
 designed to combine encryption, verification, recovery, and random-access

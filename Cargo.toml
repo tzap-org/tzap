@@ -32,7 +32,7 @@ hkdf = "0.12"
 hmac = "0.12"
 rand = "0.8"
 openssl = { version = "0.10", features = ["vendored"] }
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] }
 tar = "0.4"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }

@@ -587,7 +587,7 @@ struct WriterEmissionState {
     volume_headers: Vec<[u8; VOLUME_HEADER_LEN]>,
     bytes_written: Vec<u64>,
     record_counts: Vec<u64>,
-    data_leaf_hashes: Vec<(u64, [u8; 32])>,
+    data_leaf_hashes: Option<Vec<(u64, [u8; 32])>>,
     next_block_index: u64,
 }
 
@@ -1520,8 +1520,14 @@ where
         &session_id,
         kdf_params,
     )?;
-    let emission_state =
-        begin_writer_emission_state(sink, options, &crypto_header, archive_uuid, session_id)?;
+    let emission_state = begin_writer_emission_state(
+        sink,
+        options,
+        &crypto_header,
+        archive_uuid,
+        session_id,
+        root_auth.is_some(),
+    )?;
 
     let mut writer = StreamingArchiveWriter {
         sink,
@@ -1575,11 +1581,22 @@ struct OrderedEnvelopeJob {
     envelope_index: u64,
     plaintext: Vec<u8>,
     extent: ObjectExtent,
+    collect_data_leaf_hashes: bool,
 }
 
 struct OrderedEnvelopeResult {
     envelope_index: u64,
-    records: Vec<BlockRecord>,
+    records: OrderedEnvelopeRecords,
+}
+
+enum OrderedEnvelopeRecords {
+    Materialized(Vec<BlockRecord>),
+    Serialized(Vec<SerializedBlockRecord>),
+}
+
+struct SerializedBlockRecord {
+    block_index: u64,
+    bytes: Vec<u8>,
 }
 
 struct OrderedParallelState {
@@ -1658,8 +1675,14 @@ where
         &session_id,
         kdf_params,
     )?;
-    let mut emission_state =
-        begin_writer_emission_state(sink, options, &crypto_header, archive_uuid, session_id)?;
+    let mut emission_state = begin_writer_emission_state(
+        sink,
+        options,
+        &crypto_header,
+        archive_uuid,
+        session_id,
+        root_auth.is_some(),
+    )?;
 
     let emit_payload_started = Instant::now();
     let mut ordered = OrderedParallelState::new(files.len());
@@ -1934,8 +1957,14 @@ where
         &session_id,
         kdf_params,
     )?;
-    let mut emission_state =
-        begin_writer_emission_state(sink, options, &crypto_header, archive_uuid, session_id)?;
+    let mut emission_state = begin_writer_emission_state(
+        sink,
+        options,
+        &crypto_header,
+        archive_uuid,
+        session_id,
+        root_auth.is_some(),
+    )?;
 
     let emit_payload_started = Instant::now();
     let mut ordered = OrderedParallelState::new(0);
@@ -2453,6 +2482,7 @@ fn flush_ordered_parallel_envelope<O: ArchiveWriteSink>(
         envelope_index: ordered.envelope.envelope_index,
         plaintext: std::mem::take(&mut ordered.envelope.plaintext),
         extent,
+        collect_data_leaf_hashes: emission_state.data_leaf_hashes.is_some(),
     };
     ordered.envelope.envelope_index =
         checked_u64_add(ordered.envelope.envelope_index, 1, "EnvelopeEntry")?;
@@ -2567,28 +2597,41 @@ fn build_ordered_envelope_result(
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
 ) -> Result<OrderedEnvelopeResult, ArchiveWriteError> {
+    let context = ObjectEncryptionContext {
+        key: &subkeys.enc_key,
+        nonce_seed: &subkeys.nonce_seed,
+        domain: b"envelope",
+        counter: job.envelope_index,
+        data_kind: BlockKind::PayloadData,
+        parity_kind: BlockKind::PayloadParity,
+        data_shard_max: options.fec_data_shards,
+        class_parity_shard_max: options.fec_parity_shards,
+        archive_uuid: &archive_uuid,
+        session_id: &session_id,
+    };
+    if job.extent.parity_block_count == 0 && !job.collect_data_leaf_hashes {
+        return Ok(OrderedEnvelopeResult {
+            envelope_index: job.envelope_index,
+            records: OrderedEnvelopeRecords::Serialized(serialize_zero_parity_encrypted_object(
+                &job.plaintext,
+                context,
+                job.extent,
+                options,
+            )?),
+        });
+    }
+
     let mut local_next_block_index = job.extent.first_block_index;
     let object = encrypt_object(
         &job.plaintext,
-        ObjectEncryptionContext {
-            key: &subkeys.enc_key,
-            nonce_seed: &subkeys.nonce_seed,
-            domain: b"envelope",
-            counter: job.envelope_index,
-            data_kind: BlockKind::PayloadData,
-            parity_kind: BlockKind::PayloadParity,
-            data_shard_max: options.fec_data_shards,
-            class_parity_shard_max: options.fec_parity_shards,
-            archive_uuid: &archive_uuid,
-            session_id: &session_id,
-        },
+        context,
         &mut local_next_block_index,
         options,
     )?;
     validate_planned_extent(&object, job.extent)?;
     Ok(OrderedEnvelopeResult {
         envelope_index: job.envelope_index,
-        records: object.records,
+        records: OrderedEnvelopeRecords::Materialized(object.records),
     })
 }
 
@@ -2598,15 +2641,30 @@ fn emit_ordered_envelope_result<O: ArchiveWriteSink>(
     options: WriterOptions,
     emission_state: &mut WriterEmissionState,
 ) -> Result<(), ArchiveWriteError> {
-    for record in &result.records {
-        emit_block_record(
-            sink,
-            options,
-            &mut emission_state.bytes_written,
-            &mut emission_state.record_counts,
-            &mut emission_state.data_leaf_hashes,
-            record,
-        )?;
+    match result.records {
+        OrderedEnvelopeRecords::Materialized(records) => {
+            for record in &records {
+                emit_block_record(
+                    sink,
+                    options,
+                    &mut emission_state.bytes_written,
+                    &mut emission_state.record_counts,
+                    &mut emission_state.data_leaf_hashes,
+                    record,
+                )?;
+            }
+        }
+        OrderedEnvelopeRecords::Serialized(records) => {
+            for record in &records {
+                emit_serialized_block_record(
+                    sink,
+                    options,
+                    &mut emission_state.bytes_written,
+                    &mut emission_state.record_counts,
+                    record,
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -2631,6 +2689,7 @@ fn begin_writer_emission_state<O: ArchiveWriteSink>(
     crypto_header: &[u8],
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
+    collect_data_leaf_hashes: bool,
 ) -> Result<WriterEmissionState, ArchiveWriteError> {
     let volume_count = usize::try_from(options.stripe_width)
         .map_err(|_| FormatError::WriterUnsupported("stripe_width"))?;
@@ -2640,7 +2699,7 @@ fn begin_writer_emission_state<O: ArchiveWriteSink>(
         volume_headers: Vec::with_capacity(volume_count),
         bytes_written: vec![0u64; volume_count],
         record_counts: vec![0u64; volume_count],
-        data_leaf_hashes: Vec::new(),
+        data_leaf_hashes: collect_data_leaf_hashes.then(Vec::new),
         next_block_index: 0,
     };
 
@@ -3235,6 +3294,7 @@ where
         &plan.crypto_header,
         plan.archive_uuid,
         plan.session_id,
+        root_auth.is_some(),
     )?;
 
     let emit_payload_started = Instant::now();
@@ -3400,7 +3460,9 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
                     shard_entries: &plan.shard_entries,
                     payload_objects: &plan.payload_objects,
                     directory_hint_entries: &plan.directory_hint_entries,
-                    data_leaf_hashes: &state.data_leaf_hashes,
+                    data_leaf_hashes: state.data_leaf_hashes.as_deref().ok_or(
+                        FormatError::WriterInvariant("missing root-auth data leaf hashes"),
+                    )?,
                 },
             )?)
         }
@@ -3573,7 +3635,7 @@ fn emit_encrypted_object<O: ArchiveWriteSink>(
     sink: &mut O,
     bytes_written: &mut [u64],
     record_counts: &mut [u64],
-    data_leaf_hashes: &mut Vec<(u64, [u8; 32])>,
+    data_leaf_hashes: &mut Option<Vec<(u64, [u8; 32])>>,
 ) -> Result<EncryptedObject, ArchiveWriteError> {
     let object = encrypt_object(
         payload,
@@ -3615,7 +3677,7 @@ fn emit_block_record<O: ArchiveWriteSink>(
     options: WriterOptions,
     bytes_written: &mut [u64],
     record_counts: &mut [u64],
-    data_leaf_hashes: &mut Vec<(u64, [u8; 32])>,
+    data_leaf_hashes: &mut Option<Vec<(u64, [u8; 32])>>,
     record: &BlockRecord,
 ) -> Result<(), ArchiveWriteError> {
     let volume_index = (record.block_index % options.stripe_width as u64) as usize;
@@ -3628,17 +3690,38 @@ fn emit_block_record<O: ArchiveWriteSink>(
     )?;
     record_counts[volume_index] =
         checked_u64_add(record_counts[volume_index], 1, "BlockRecord count")?;
-    if record.kind.is_data() {
-        data_leaf_hashes.push((
-            record.block_index,
-            data_block_merkle_leaf_hash(
+    if let Some(data_leaf_hashes) = data_leaf_hashes.as_mut() {
+        if record.kind.is_data() {
+            data_leaf_hashes.push((
                 record.block_index,
-                record.kind,
-                record.flags,
-                &record.payload,
-            ),
-        ));
+                data_block_merkle_leaf_hash(
+                    record.block_index,
+                    record.kind,
+                    record.flags,
+                    &record.payload,
+                ),
+            ));
+        }
     }
+    Ok(())
+}
+
+fn emit_serialized_block_record<O: ArchiveWriteSink>(
+    sink: &mut O,
+    options: WriterOptions,
+    bytes_written: &mut [u64],
+    record_counts: &mut [u64],
+    record: &SerializedBlockRecord,
+) -> Result<(), ArchiveWriteError> {
+    let volume_index = (record.block_index % options.stripe_width as u64) as usize;
+    sink.write_volume(volume_index, &record.bytes)?;
+    bytes_written[volume_index] = checked_u64_add(
+        bytes_written[volume_index],
+        record.bytes.len() as u64,
+        "BlockRecord",
+    )?;
+    record_counts[volume_index] =
+        checked_u64_add(record_counts[volume_index], 1, "BlockRecord count")?;
     Ok(())
 }
 
@@ -3652,7 +3735,7 @@ fn emit_payload_stream<S, O>(
     sink: &mut O,
     bytes_written: &mut [u64],
     record_counts: &mut [u64],
-    data_leaf_hashes: &mut Vec<(u64, [u8; 32])>,
+    data_leaf_hashes: &mut Option<Vec<(u64, [u8; 32])>>,
 ) -> Result<(), ArchiveWriteError>
 where
     S: RegularFileSource,
@@ -3786,7 +3869,7 @@ fn append_payload_frame_to_emit<O: ArchiveWriteSink>(
     sink: &mut O,
     bytes_written: &mut [u64],
     record_counts: &mut [u64],
-    data_leaf_hashes: &mut Vec<(u64, [u8; 32])>,
+    data_leaf_hashes: &mut Option<Vec<(u64, [u8; 32])>>,
 ) -> Result<(), ArchiveWriteError> {
     let next_len = checked_usize_add(envelope.plaintext.len(), frame.len(), "payload")?;
     if !envelope.plaintext.is_empty()
@@ -3856,7 +3939,7 @@ fn flush_payload_envelope_emit<O: ArchiveWriteSink>(
     sink: &mut O,
     bytes_written: &mut [u64],
     record_counts: &mut [u64],
-    data_leaf_hashes: &mut Vec<(u64, [u8; 32])>,
+    data_leaf_hashes: &mut Option<Vec<(u64, [u8; 32])>>,
 ) -> Result<(), ArchiveWriteError> {
     let expected = plan
         .payload_objects
@@ -4942,22 +5025,7 @@ fn encrypt_object(
     options: WriterOptions,
 ) -> Result<EncryptedObject, FormatError> {
     let block_size = options.block_size as usize;
-    let padded = suffix_pad_for_aead(payload, options.aead_algo.tag_len(), block_size)?;
-    let nonce = derive_nonce(
-        context.nonce_seed,
-        context.domain,
-        context.archive_uuid,
-        context.session_id,
-        context.counter,
-        options.aead_algo.nonce_len(),
-    )?;
-    let aad = build_aad(
-        context.domain,
-        context.archive_uuid,
-        context.session_id,
-        context.counter,
-    )?;
-    let encrypted = aead_encrypt(options.aead_algo, context.key, &nonce, &aad, &padded)?;
+    let encrypted = encrypt_object_payload(payload, context, options)?;
     if encrypted.len() % block_size != 0 {
         return Err(FormatError::WriterInvariant(
             "encrypted object is not block aligned",
@@ -5036,6 +5104,94 @@ fn encrypt_object(
         encrypted_size,
         records,
     })
+}
+
+fn serialize_zero_parity_encrypted_object(
+    payload: &[u8],
+    context: ObjectEncryptionContext<'_>,
+    expected_extent: ObjectExtent,
+    options: WriterOptions,
+) -> Result<Vec<SerializedBlockRecord>, FormatError> {
+    let planned = plan_encrypted_object(
+        payload.len(),
+        context.data_shard_max,
+        context.class_parity_shard_max,
+        options,
+    )?;
+    if planned.parity_block_count != 0 || expected_extent.parity_block_count != 0 {
+        return Err(FormatError::WriterInvariant(
+            "zero-parity serialization received a parity object",
+        ));
+    }
+    if planned.data_block_count != expected_extent.data_block_count
+        || planned.encrypted_size != expected_extent.encrypted_size
+    {
+        return Err(FormatError::WriterInvariant(
+            "encrypted object did not match planned sizing",
+        ));
+    }
+
+    let block_size = options.block_size as usize;
+    let encrypted = encrypt_object_payload(payload, context, options)?;
+    if encrypted.len() != expected_extent.encrypted_size as usize
+        || encrypted.len() % block_size != 0
+    {
+        return Err(FormatError::WriterInvariant(
+            "encrypted object did not match planned sizing",
+        ));
+    }
+    let data_block_count = encrypted.len() / block_size;
+    if data_block_count == 0 || data_block_count != expected_extent.data_block_count as usize {
+        return Err(FormatError::WriterInvariant(
+            "encrypted object did not match planned sizing",
+        ));
+    }
+
+    let mut records = Vec::with_capacity(data_block_count);
+    for (index, chunk) in encrypted.chunks(block_size).enumerate() {
+        let block_index = checked_u64_add(
+            expected_extent.first_block_index,
+            index as u64,
+            "BlockRecord",
+        )?;
+        let flags = if index + 1 == data_block_count {
+            0x01
+        } else {
+            0
+        };
+        records.push(SerializedBlockRecord {
+            block_index,
+            bytes: BlockRecord::to_bytes_from_parts(block_index, context.data_kind, flags, chunk),
+        });
+    }
+    Ok(records)
+}
+
+fn encrypt_object_payload(
+    payload: &[u8],
+    context: ObjectEncryptionContext<'_>,
+    options: WriterOptions,
+) -> Result<Vec<u8>, FormatError> {
+    let block_size = options.block_size as usize;
+    let padded = suffix_pad_for_aead(payload, options.aead_algo.tag_len(), block_size)?;
+    if matches!(options.aead_algo, AeadAlgo::None) {
+        return Ok(padded);
+    }
+    let nonce = derive_nonce(
+        context.nonce_seed,
+        context.domain,
+        context.archive_uuid,
+        context.session_id,
+        context.counter,
+        options.aead_algo.nonce_len(),
+    )?;
+    let aad = build_aad(
+        context.domain,
+        context.archive_uuid,
+        context.session_id,
+        context.counter,
+    )?;
+    aead_encrypt(options.aead_algo, context.key, &nonce, &aad, &padded)
 }
 
 fn validate_planned_object(
@@ -6199,6 +6355,115 @@ mod tests {
         assert_eq!(options.bit_rot_buffer_pct, 5);
         assert_eq!(options.jobs, default_jobs());
         assert!(options.jobs >= 1);
+    }
+
+    #[test]
+    fn emission_state_collects_data_leaf_hashes_only_for_root_auth() {
+        let options = single_volume_metadata_test_options();
+        let archive_uuid = [1u8; 16];
+        let session_id = [2u8; 16];
+        let crypto_header = b"test crypto header";
+
+        let mut unsigned_sink = MemoryArchiveSink::default();
+        let unsigned = begin_writer_emission_state(
+            &mut unsigned_sink,
+            options,
+            crypto_header,
+            archive_uuid,
+            session_id,
+            false,
+        )
+        .unwrap();
+        assert!(unsigned.data_leaf_hashes.is_none());
+
+        let mut signed_sink = MemoryArchiveSink::default();
+        let signed = begin_writer_emission_state(
+            &mut signed_sink,
+            options,
+            crypto_header,
+            archive_uuid,
+            session_id,
+            true,
+        )
+        .unwrap();
+        assert_eq!(signed.data_leaf_hashes.as_deref(), Some([].as_slice()));
+    }
+
+    #[test]
+    fn ordered_envelope_serializes_zero_parity_without_root_auth_leaf_collection() {
+        let options = plan_writer_options(WriterOptions {
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            aead_algo: AeadAlgo::None,
+            ..WriterOptions::default()
+        })
+        .unwrap();
+        let payload = b"fast path payload".to_vec();
+        let extent = ObjectExtent::new(
+            11,
+            plan_encrypted_object(
+                payload.len(),
+                options.fec_data_shards,
+                options.fec_parity_shards,
+                options,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(extent.parity_block_count, 0);
+        let subkeys = Subkeys::unencrypted_placeholder();
+
+        let result = build_ordered_envelope_result(
+            OrderedEnvelopeJob {
+                envelope_index: 3,
+                plaintext: payload.clone(),
+                extent,
+                collect_data_leaf_hashes: false,
+            },
+            &subkeys,
+            options,
+            [1u8; 16],
+            [2u8; 16],
+        )
+        .unwrap();
+
+        match result.records {
+            OrderedEnvelopeRecords::Serialized(records) => {
+                assert_eq!(records.len(), extent.data_block_count as usize);
+                let parsed =
+                    BlockRecord::parse(&records[0].bytes, options.block_size as usize).unwrap();
+                assert_eq!(parsed.block_index, extent.first_block_index);
+                assert_eq!(parsed.kind, BlockKind::PayloadData);
+                assert!(parsed.is_last_data());
+            }
+            OrderedEnvelopeRecords::Materialized(_) => {
+                panic!("zero-parity unsigned envelope should use serialized records")
+            }
+        }
+
+        let result = build_ordered_envelope_result(
+            OrderedEnvelopeJob {
+                envelope_index: 3,
+                plaintext: payload,
+                extent,
+                collect_data_leaf_hashes: true,
+            },
+            &subkeys,
+            options,
+            [1u8; 16],
+            [2u8; 16],
+        )
+        .unwrap();
+
+        match result.records {
+            OrderedEnvelopeRecords::Materialized(records) => {
+                assert_eq!(records.len(), extent.data_block_count as usize);
+            }
+            OrderedEnvelopeRecords::Serialized(_) => {
+                panic!("root-auth leaf collection requires materialized records")
+            }
+        }
     }
 
     #[test]
