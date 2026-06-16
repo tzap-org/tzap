@@ -611,6 +611,12 @@ enum Command {
         public_no_key: bool,
 
         #[arg(
+            long = "fast",
+            help = "Verify readable archive content with repair-on-demand parity reads, but skip RootAuth and recovery-margin checks."
+        )]
+        fast: bool,
+
+        #[arg(
             long = "bootstrap",
             value_name = "FILE",
             help = "Use bootstrap sidecar FILE for single-volume archive input."
@@ -1652,6 +1658,7 @@ fn run(cli: Cli) -> Result<()> {
             trusted_ca_cert,
             trusted_system_roots,
             public_no_key,
+            fast,
             bootstrap,
             json,
             write_repaired,
@@ -1662,10 +1669,32 @@ fn run(cli: Cli) -> Result<()> {
                 .first()
                 .ok_or_else(|| anyhow!("at least one archive volume is required"))?;
             let archive_paths = archives.to_vec();
+            if let Err(err) = validate_fast_verify_options(
+                fast,
+                public_no_key,
+                trusted_public_key.is_some(),
+                !trusted_ca_cert.is_empty(),
+                trusted_system_roots,
+                write_repaired,
+            ) {
+                if json {
+                    emit_verify_json_error(&archive_paths, None, None, &err)?;
+                }
+                return Err(err);
+            }
             if archives.iter().any(|path| path == "-") {
                 if write_repaired {
                     let err = anyhow!(FormatError::ReaderUnsupported(
                         "--write-repaired is not supported for archive stdin",
+                    ));
+                    if json {
+                        emit_verify_json_error(&archive_paths, None, None, &err)?;
+                    }
+                    return Err(err);
+                }
+                if fast {
+                    let err = anyhow!(UsageError(
+                        "--fast requires seekable archive paths; archive stdin uses full non-seekable verification",
                     ));
                     if json {
                         emit_verify_json_error(&archive_paths, None, None, &err)?;
@@ -1786,8 +1815,8 @@ fn run(cli: Cli) -> Result<()> {
                 emit_success_stdout(
                     quiet,
                     &format!(
-                        "-: OK non-seekable stream ({} volume(s), {} file(s))",
-                        report.total_volumes, report.file_count
+                        "{} ({} volume(s), {} file(s))",
+                        "-: OK non-seekable stream", report.total_volumes, report.file_count
                     ),
                 )?;
                 return Ok(());
@@ -1887,33 +1916,43 @@ fn run(cli: Cli) -> Result<()> {
             };
             let archive_paths = opened_selection.paths;
             let opened = opened_selection.opened;
-            let result = opened
-                .verify_content()
-                .with_context(|| format!("failed to verify archive {first}"));
+            let result = if fast {
+                opened
+                    .verify_content_fast()
+                    .with_context(|| format!("failed to fast-verify archive {first}"))
+            } else {
+                opened
+                    .verify_content()
+                    .with_context(|| format!("failed to verify archive {first}"))
+            };
             let volume_count = opened.manifest_footer.total_volumes;
             let file_count = opened.index_root.header.file_count;
             match result {
                 Ok(content_verification) => {
-                    let root_auth = match verify_opened_root_auth(
-                        &opened,
-                        &content_verification,
-                        trusted_public_key.as_deref(),
-                        &trusted_ca_cert,
-                        trusted_system_roots,
-                    )
-                    .with_context(|| format!("failed to verify RootAuth for {first}"))
-                    {
-                        Ok(root_auth) => root_auth,
-                        Err(err) => {
-                            if json {
-                                emit_verify_json_error(
-                                    &archive_paths,
-                                    Some(volume_count as u64),
-                                    Some(file_count),
-                                    &err,
-                                )?;
+                    let root_auth = if fast {
+                        None
+                    } else {
+                        match verify_opened_root_auth(
+                            &opened,
+                            &content_verification,
+                            trusted_public_key.as_deref(),
+                            &trusted_ca_cert,
+                            trusted_system_roots,
+                        )
+                        .with_context(|| format!("failed to verify RootAuth for {first}"))
+                        {
+                            Ok(root_auth) => root_auth,
+                            Err(err) => {
+                                if json {
+                                    emit_verify_json_error(
+                                        &archive_paths,
+                                        Some(volume_count as u64),
+                                        Some(file_count),
+                                        &err,
+                                    )?;
+                                }
+                                return Err(err);
                             }
-                            return Err(err);
                         }
                     };
                     let entries = opened.list_files()?;
@@ -1940,12 +1979,21 @@ fn run(cli: Cli) -> Result<()> {
                         let mut payload = json!({
                             "ok": true,
                             "archives": &archive_paths,
-                            "verification_mode": "key-holding",
+                            "verification_mode": if fast { "fast" } else { "key-holding" },
                             "volume_count": volume_count,
                             "file_count": file_count,
                         });
                         if let Some(root_auth) = &root_auth {
                             payload["root_auth"] = root_auth_json(root_auth);
+                        } else if fast {
+                            let diagnostics = fast_verify_diagnostic_labels(&opened);
+                            payload["diagnostics"] = json!(diagnostics);
+                            if opened.root_auth_footer.is_some() {
+                                payload["root_auth"] = json!({
+                                    "status": "root_auth_deferred_full_archive_scan_required",
+                                    "diagnostics": ["root_auth_deferred_full_archive_scan_required"],
+                                });
+                            }
                         }
                         if write_repaired {
                             payload["repaired_outputs"] = json!(repaired_outputs
@@ -1967,11 +2015,16 @@ fn run(cli: Cli) -> Result<()> {
                     emit_success_stdout(
                         quiet,
                         &format!(
-                            "{}: OK ({} volume(s), {} file(s))",
-                            first, volume_count, file_count
+                            "{}: OK{} ({} volume(s), {} file(s))",
+                            first,
+                            if fast { " fast" } else { "" },
+                            volume_count,
+                            file_count
                         ),
                     )?;
-                    if let Some(root_auth) = &root_auth {
+                    if fast {
+                        emit_fast_verify_diagnostics_stdout(quiet, &opened)?;
+                    } else if let Some(root_auth) = &root_auth {
                         emit_root_auth_stdout(quiet, root_auth)?;
                     }
                     if write_repaired {
@@ -2201,6 +2254,32 @@ fn resolve_jobs(jobs: Option<usize>) -> Result<usize> {
         return Err(UsageError("--jobs must be at least 1").into());
     }
     Ok(jobs)
+}
+
+fn validate_fast_verify_options(
+    fast: bool,
+    public_no_key: bool,
+    has_trusted_public_key: bool,
+    has_trusted_ca_cert: bool,
+    trusted_system_roots: bool,
+    write_repaired: bool,
+) -> Result<()> {
+    if !fast {
+        return Ok(());
+    }
+    if public_no_key {
+        return Err(UsageError("--fast cannot be combined with --public-no-key").into());
+    }
+    if has_trusted_public_key || has_trusted_ca_cert || trusted_system_roots {
+        return Err(UsageError(
+            "--fast cannot be combined with RootAuth trust options; omit --fast for full RootAuth verification",
+        )
+        .into());
+    }
+    if write_repaired {
+        return Err(UsageError("--fast cannot be combined with --write-repaired").into());
+    }
+    Ok(())
 }
 
 fn reader_options(jobs: usize) -> ReaderOptions {
@@ -4317,6 +4396,31 @@ fn emit_root_auth_diagnostics_stdout(
 ) -> io::Result<()> {
     for diagnostic in &verification.diagnostics {
         emit_success_stdout(quiet, &format!("root-auth: {}", diagnostic.label()))?;
+    }
+    Ok(())
+}
+
+fn fast_verify_diagnostic_labels(opened: &OpenedArchive) -> Vec<&'static str> {
+    let mut diagnostics = Vec::new();
+    if opened.fast_verify_defers_payload_semantics() {
+        diagnostics.push("payload_semantics_deferred");
+    }
+    if opened.root_auth_footer.is_some() {
+        diagnostics.push("root_auth_deferred_full_archive_scan_required");
+    }
+    if opened.crypto_header.fec_parity_shards > 0
+        || opened.crypto_header.index_fec_parity_shards > 0
+        || opened.crypto_header.index_root_fec_parity_shards > 0
+        || opened.manifest_footer.index_root_parity_block_count > 0
+    {
+        diagnostics.push("recovery_margin_unchecked");
+    }
+    diagnostics
+}
+
+fn emit_fast_verify_diagnostics_stdout(quiet: bool, opened: &OpenedArchive) -> io::Result<()> {
+    for diagnostic in fast_verify_diagnostic_labels(opened) {
+        emit_success_stdout(quiet, &format!("fast-verify: {diagnostic}"))?;
     }
     Ok(())
 }

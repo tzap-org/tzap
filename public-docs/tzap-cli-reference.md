@@ -249,6 +249,7 @@ tzap verify --keyfile project.key project.vol000.tzap
 printf '%s\n' "$TZAP_PASSPHRASE" | tzap verify --password-stdin project.tzap
 
 tzap verify --json --keyfile project.key backup.vol001.tzap
+tzap verify --fast backup.tzap
 tzap verify --keyfile project.key --trusted-public-key root.public.hex backup.tzap
 tzap verify --keyfile project.key --trusted-ca-cert root-ca.pem backup.tzap
 tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap
@@ -267,6 +268,12 @@ Useful flags:
 - `--trusted-ca-cert`: verify X.509 RootAuth with a trusted CA certificate
 - `--trusted-system-roots`: allow OpenSSL default trust roots for X.509 RootAuth
 - `--public-no-key`: verify public v43 RootAuth commitments without the archive key
+- `--fast`: use the seekable archive fast-verification path. For plaintext,
+  unsigned, dictionary-free archives with no recovery parity, this verifies
+  metadata and payload block-record integrity without decompressing the payload
+  and reports `payload_semantics_deferred`. For other seekable archives, it
+  verifies readable archive content with repair-on-demand parity reads, but skips
+  RootAuth and recovery-margin checks
 - `--write-repaired`: write repaired sibling archive copies after successful
   key-holding verification when recoverable BlockRecord damage was found
 - `--bootstrap`: bootstrap sidecar path
@@ -283,6 +290,16 @@ Notes:
 - Key-holding verification opens archive files through the core file-backed
   random-access reader, then intentionally walks the payload and metadata needed
   to validate the full archive.
+- Fast verification is available only for seekable archive paths, not archive
+  stdin. For plaintext, unsigned, dictionary-free archives with no recovery
+  parity, it validates metadata and payload BlockRecord integrity without
+  decompressing the payload, and reports `payload_semantics_deferred`. For other
+  seekable archives, fast verification uses the readable-content path but does
+  not perform full RootAuth recomputation, trust-source verification, eager
+  parity-margin inspection, or repair-copy output. Its JSON and text output use
+  `verification_mode = "fast"` / `OK fast`; signed archives report
+  `root_auth_deferred_full_archive_scan_required` instead of
+  `root_auth_content_verified`.
 - Public no-key verification requires `--public-no-key` plus one trust source:
   `--trusted-public-key`, `--trusted-ca-cert`, or `--trusted-system-roots`.
   It does not use archive key material or bootstrap sidecars, and reports the

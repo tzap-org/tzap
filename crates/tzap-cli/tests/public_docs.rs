@@ -117,8 +117,12 @@ fn public_reference_file_exists_and_covers_commands() {
     assert!(benchmarks.contains("Selected-file restore"));
     assert!(benchmarks.contains("Missing volume"));
     assert!(benchmarks.contains("Rotten payload"));
+    assert!(benchmarks.contains("Repair data rot"));
     assert!(benchmarks.contains("No repair path"));
+    assert!(benchmarks.contains("No repair data"));
+    assert!(benchmarks.contains("Archive-native"));
     assert!(benchmarks.contains("External PAR2"));
+    assert!(benchmarks.contains("Sidecar risk"));
     assert!(benchmarks.contains("scripts/tzap_benchmark.py"));
     assert!(benchmarks.contains("size-20mb"));
     assert!(benchmarks.contains("size-20gb"));
@@ -129,6 +133,8 @@ fn public_reference_file_exists_and_covers_commands() {
     assert!(benchmarks.contains("--dataset-sizes 1MB,20MB,1GB,20GB"));
     assert!(benchmarks.contains("--dataset-sizes 1GB"));
     assert!(benchmarks.contains("--selected-file-position last"));
+    assert!(benchmarks.contains("--selected-file-index 4000"));
+    assert!(benchmarks.contains("--tzap-verify-fast"));
     assert!(benchmarks.contains("--benchmark-password tzap-benchmark-password"));
     assert!(benchmarks.contains("--par2-redundancy-pct 5"));
     assert!(benchmarks.contains("--quiet"));
@@ -147,9 +153,13 @@ fn public_reference_file_exists_and_covers_commands() {
     assert!(benchmarks.contains("`7z` | LZMA2 archive with password"));
     assert!(benchmarks.contains("20 GB uses `--block-size 64K"));
     assert!(benchmark_results.contains("tzap Benchmark Results"));
-    assert!(benchmark_results.contains("2.68x faster"));
-    assert!(benchmark_results.contains("0.752s"));
-    assert!(benchmark_results.contains("0.016s"));
+    assert!(benchmark_results.contains("2.24x faster"));
+    assert!(benchmark_results.contains("0.910s"));
+    assert!(benchmark_results.contains("0.012s"));
+    assert!(benchmark_results.contains("--selected-file-index 4000"));
+    assert!(benchmark_results.contains("tzap verify --fast --keyfile bench.key"));
+    assert!(benchmark_results.contains("Repair data rot"));
+    assert!(benchmark_results.contains("❌ Sidecar risk"));
     assert!(benchmark_results.contains("✅ Recovered"));
     assert!(workspace_root().join("scripts/tzap_benchmark.py").is_file());
     assert!(installation.contains("From GitHub release assets"));

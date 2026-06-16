@@ -37,6 +37,9 @@ RECOVERED_LABEL = "\u2705 Recovered"
 NO_REPAIR_LABEL = "\u274c No repair path"
 EXTERNAL_PAR2_LABEL = "\u2705 External PAR2"
 FAILED_RECOVERY_LABEL = "\u274c Failed"
+ARCHIVE_NATIVE_LABEL = "\u2705 Archive-native"
+SIDECAR_RISK_LABEL = "\u274c Sidecar risk"
+NO_REPAIR_DATA_LABEL = "\u274c No repair data"
 TOOL_ORDER = [
     "tzap",
     TZAP_NO_PASSWORD_NO_BITROT_NAME,
@@ -70,6 +73,7 @@ def tool_display_name(tool: str) -> str:
 @dataclasses.dataclass(frozen=True)
 class BenchmarkConfig:
     benchmark_password: str
+    tzap_verify_fast: bool
     par2_redundancy_pct: str
     missing_volume_count: int
     missing_volume_loss_tolerance: int
@@ -351,9 +355,21 @@ def directory_stats(path: Path) -> tuple[int, int]:
     return len(files), sum(child.stat().st_size for child in files)
 
 
-def selected_file_index(file_count: int, position: str) -> int:
+def selected_file_position_label(position: str, selected_index: int | None) -> str:
+    if selected_index is not None:
+        return f"index-{selected_index}"
+    return position
+
+
+def selected_file_index(file_count: int, position: str, selected_index: int | None) -> int:
     if file_count <= 0:
         raise ValueError("file_count must be positive")
+    if selected_index is not None:
+        if selected_index < 0 or selected_index >= file_count:
+            raise ValueError(
+                f"selected file index {selected_index} is outside the generated file range 0..{file_count - 1}"
+            )
+        return selected_index
     if position == "first":
         return 0
     if position == "middle":
@@ -363,8 +379,10 @@ def selected_file_index(file_count: int, position: str) -> int:
     raise ValueError(f"unknown selected file position: {position}")
 
 
-def selected_file_relative_path(file_count: int, position: str) -> str:
-    return f"files/file-{selected_file_index(file_count, position):05d}.bin"
+def selected_file_relative_path(
+    file_count: int, position: str, selected_index: int | None
+) -> str:
+    return f"files/file-{selected_file_index(file_count, position, selected_index):05d}.bin"
 
 
 def should_report_file_progress(index: int, file_count: int) -> bool:
@@ -381,6 +399,7 @@ def create_same_count_dataset(
     file_count: int,
     file_size: int,
     selected_position: str,
+    selected_index: int | None,
     quiet: bool,
 ) -> DatasetSpec:
     dataset_root = root / name
@@ -405,8 +424,10 @@ def create_same_count_dataset(
     emit_progress(f"generated {name}: {fmt_size(total)}", quiet)
     return DatasetSpec(
         name=name,
-        selected_relative_path=selected_file_relative_path(file_count, selected_position),
-        selected_file_position=selected_position,
+        selected_relative_path=selected_file_relative_path(
+            file_count, selected_position, selected_index
+        ),
+        selected_file_position=selected_file_position_label(selected_position, selected_index),
         file_count=count,
         total_size_bytes=total,
     )
@@ -418,6 +439,7 @@ def create_fixed_total_dataset(
     file_count: int,
     total_size: int,
     selected_position: str,
+    selected_index: int | None,
     quiet: bool,
 ) -> DatasetSpec:
     file_size, remainder = divmod(total_size, file_count)
@@ -448,8 +470,10 @@ def create_fixed_total_dataset(
     emit_progress(f"generated {name}: {fmt_size(total)}", quiet)
     return DatasetSpec(
         name=name,
-        selected_relative_path=selected_file_relative_path(file_count, selected_position),
-        selected_file_position=selected_position,
+        selected_relative_path=selected_file_relative_path(
+            file_count, selected_position, selected_index
+        ),
+        selected_file_position=selected_file_position_label(selected_position, selected_index),
         file_count=count,
         total_size_bytes=total,
     )
@@ -460,6 +484,7 @@ def create_datasets(
     profile: str,
     wanted_datasets: set[str] | None = None,
     selected_position: str = "last",
+    selected_index: int | None = None,
     file_count_override: int | None = None,
     fixed_total_sizes: list[int] | None = None,
     same_count_file_sizes: list[int] | None = None,
@@ -484,7 +509,9 @@ def create_datasets(
             ]
         )
         return [
-            create_same_count_dataset(root, name, file_count, file_size, selected_position, quiet)
+            create_same_count_dataset(
+                root, name, file_count, file_size, selected_position, selected_index, quiet
+            )
             for name, file_size in per_file_sizes
             if wanted(name)
         ]
@@ -516,13 +543,17 @@ def create_datasets(
             ]
         )
         return [
-            create_same_count_dataset(root, name, file_count, file_size, selected_position, quiet)
+            create_same_count_dataset(
+                root, name, file_count, file_size, selected_position, selected_index, quiet
+            )
             for name, file_size in per_file_sizes
             if wanted(name)
         ]
 
     return [
-        create_fixed_total_dataset(root, name, file_count, total_size, selected_position, quiet)
+        create_fixed_total_dataset(
+            root, name, file_count, total_size, selected_position, selected_index, quiet
+        )
         for name, total_size in total_sizes
         if wanted(name)
     ]
@@ -592,7 +623,7 @@ def run_tzap(
     output_root: Path,
     restore_root: Path,
     dataset: DatasetSpec,
-    _config: BenchmarkConfig,
+    config: BenchmarkConfig,
 ) -> ResultRow:
     archive = output_root / f"{dataset.name}.tzap"
     key = output_root / "bench.key"
@@ -609,7 +640,14 @@ def run_tzap(
     )
     verify = runner.run(
         f"{dataset.name}/tzap-verify",
-        [str(tzap), "verify", "--keyfile", str(key), str(archive)],
+        [
+            str(tzap),
+            "verify",
+            *(["--fast"] if config.tzap_verify_fast else []),
+            "--keyfile",
+            str(key),
+            str(archive),
+        ],
         cwd=data_root,
     )
     extract_all = runner.run(
@@ -645,6 +683,7 @@ def run_tzap(
         extract_all_s=extract_all.seconds,
         extract_one_s=extract_one.seconds,
         output_size_bytes=output_size,
+        notes="tzap verify --fast" if config.tzap_verify_fast else "",
     )
 
 
@@ -655,7 +694,7 @@ def run_tzap_no_password_no_bitrot(
     output_root: Path,
     restore_root: Path,
     dataset: DatasetSpec,
-    _config: BenchmarkConfig,
+    config: BenchmarkConfig,
 ) -> ResultRow:
     archive = output_root / f"{dataset.name}-tzap-no-password-no-bitrot.tzap"
     restore = restore_root / f"{dataset.name}-tzap-no-password-no-bitrot"
@@ -678,7 +717,12 @@ def run_tzap_no_password_no_bitrot(
     )
     verify = runner.run(
         f"{dataset.name}/tzap-no-password-no-bitrot-verify",
-        [str(tzap), "verify", str(archive)],
+        [
+            str(tzap),
+            "verify",
+            *(["--fast"] if config.tzap_verify_fast else []),
+            str(archive),
+        ],
         cwd=data_root,
     )
     extract_all = runner.run(
@@ -712,6 +756,7 @@ def run_tzap_no_password_no_bitrot(
         extract_all_s=extract_all.seconds,
         extract_one_s=extract_one.seconds,
         output_size_bytes=output_size,
+        notes="tzap verify --fast" if config.tzap_verify_fast else "",
     )
 
 
@@ -1552,6 +1597,16 @@ def public_recovery_label(
     return NO_REPAIR_LABEL
 
 
+def public_repair_data_label(tool: str, recovery_was_run: bool) -> str:
+    if not recovery_was_run:
+        return "Not run"
+    if tool == "tzap":
+        return ARCHIVE_NATIVE_LABEL
+    if tool == "tar+zstd+age+par2":
+        return SIDECAR_RISK_LABEL
+    return NO_REPAIR_DATA_LABEL
+
+
 def chart_title(title: str, subtitle: str, width: int = 960) -> list[str]:
     return [
         f'<text x="{width / 2:.0f}" y="42" text-anchor="middle" '
@@ -1893,6 +1948,17 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
     largest = largest_tzap_row(rows)
     recovery_cases = len([row for row in recovery_rows if row.status == "ok"])
     recovery_was_run = bool(recovery_rows)
+    config_meta = meta.get("benchmark_config", {})
+    tzap_verify_command = (
+        "tzap verify --fast --keyfile bench.key ARCHIVE.tzap"
+        if config_meta.get("tzap_verify_fast")
+        else "tzap verify --keyfile bench.key ARCHIVE.tzap"
+    )
+    tzap_no_key_verify_command = (
+        "tzap verify --fast ARCHIVE.tzap"
+        if config_meta.get("tzap_verify_fast")
+        else "tzap verify ARCHIVE.tzap"
+    )
     recovery_competitors = [
         TZAP_NO_PASSWORD_NO_BITROT_NAME,
         "tar+zstd",
@@ -1910,7 +1976,6 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
     file_counts = ", ".join(
         fmt_int(count) for count in sorted({row.input_file_count for row in rows})
     )
-    config_meta = meta.get("benchmark_config", {})
     report_date = str(meta.get("timestamp", "")).split("T", 1)[0] or "unknown"
     lines = [
         "# tzap Benchmark Results",
@@ -1932,6 +1997,7 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
             [
                 f"- tzap recovered all `{recovery_cases}` tested damage cases in this run.",
                 "- Tools without repair data are marked as having no repair path for missing or overwritten archive data in this benchmark.",
+                "- The repair-data column distinguishes archive-native recovery data from external sidecar repair risk.",
             ]
         )
     else:
@@ -1942,7 +2008,7 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
     if largest is not None:
         lines.append(
             f"- On the largest input here ({fmt_size(largest.input_size_bytes)}), "
-            f"tzap restored the selected `{largest.selected_file_position}` file in "
+            f"{largest.tool} restored the selected `{largest.selected_file_position}` file in "
             f"{fmt_seconds_label(largest.extract_one_s)} on average."
         )
 
@@ -1951,8 +2017,8 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
             "",
             "## Public Metrics",
             "",
-            f"| Dataset | Files | Input size | Tool | Runs | Create | Verify/Test | {selected_restore_heading(rows)} | Full extract | Archive size | Missing volume | Rotten payload |",
-            "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+            f"| Dataset | Files | Input size | Tool | Runs | Create | Verify/Test | {selected_restore_heading(rows)} | Full extract | Archive size | Missing volume | Rotten payload | Repair data rot |",
+            "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
         ]
     )
     for row in sorted_workflow_rows(rows):
@@ -1982,6 +2048,7 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
                         recovery_rows,
                         recovery_was_run,
                     ),
+                    public_repair_data_label(row.tool, recovery_was_run),
                 ]
             )
             + " |"
@@ -1996,8 +2063,8 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
         [
             "## Recovery Scorecard",
             "",
-            "| Tool | Missing volume | Rotten payload bytes |",
-            "| --- | --- | --- |",
+            "| Tool | Missing volume | Rotten payload bytes | Repair data rot |",
+            "| --- | --- | --- | --- |",
         ]
     )
     tzap_labels = []
@@ -2009,10 +2076,14 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
             tzap_labels.append(RECOVERED_LABEL)
         else:
             tzap_labels.append(FAILED_RECOVERY_LABEL)
-    lines.append(f"| tzap | {tzap_labels[0]} | {tzap_labels[1]} |")
+    lines.append(
+        f"| tzap | {tzap_labels[0]} | {tzap_labels[1]} | "
+        f"{public_repair_data_label('tzap', recovery_was_run)} |"
+    )
     for tool in recovery_competitors:
         label = NO_REPAIR_LABEL if recovery_was_run else "Not run"
-        lines.append(f"| {tool} | {label} | {label} |")
+        repair_data_label = public_repair_data_label(tool, recovery_was_run)
+        lines.append(f"| {tool} | {label} | {label} | {repair_data_label} |")
 
     lines.extend(
         [
@@ -2131,12 +2202,12 @@ def write_markdown(path: Path, rows: list[ResultRow], recovery_rows: list[Recove
             "```sh",
             "tzap keygen --output bench.key",
             "tzap create --keyfile bench.key -o ARCHIVE.tzap DATASET",
-            "tzap verify --keyfile bench.key ARCHIVE.tzap",
+            tzap_verify_command,
             "tzap extract --keyfile bench.key -C RESTORE_DIR ARCHIVE.tzap",
             "tzap extract --keyfile bench.key --stdout ARCHIVE.tzap SELECTED_FILE > /dev/null",
             "",
             "tzap create --no-encryption --bit-rot-buffer-pct 0 -o ARCHIVE.tzap DATASET",
-            "tzap verify ARCHIVE.tzap",
+            tzap_no_key_verify_command,
             "tzap extract -C RESTORE_DIR ARCHIVE.tzap",
             "tzap extract --stdout ARCHIVE.tzap SELECTED_FILE > /dev/null",
             "",
@@ -2497,6 +2568,17 @@ def main() -> int:
         help="which generated file to use for selected-file restore timings; public runs should use last",
     )
     parser.add_argument(
+        "--selected-file-index",
+        type=int,
+        default=None,
+        help="zero-based generated file index to use for selected-file restore timings",
+    )
+    parser.add_argument(
+        "--tzap-verify-fast",
+        action="store_true",
+        help="use `tzap verify --fast` for normal tzap workflow verify timings",
+    )
+    parser.add_argument(
         "--benchmark-password",
         default=BENCH_PASSWORD,
         help="fixed password used for zip and 7z password-mode baselines",
@@ -2524,6 +2606,8 @@ def main() -> int:
         raise SystemExit("--recovery-runs must be at least 1")
     if args.file_count is not None and args.file_count < 1:
         raise SystemExit("--file-count must be at least 1")
+    if args.selected_file_index is not None and args.selected_file_index < 0:
+        raise SystemExit("--selected-file-index must be at least 0")
     fixed_total_sizes = (
         parse_size_list(args.dataset_sizes, "--dataset-sizes")
         if args.dataset_sizes is not None
@@ -2540,6 +2624,7 @@ def main() -> int:
         raise SystemExit("--same-count-file-sizes is only valid with --profile smoke or large")
     config = BenchmarkConfig(
         benchmark_password=args.benchmark_password,
+        tzap_verify_fast=args.tzap_verify_fast,
         par2_redundancy_pct=str(args.par2_redundancy_pct),
         missing_volume_count=args.recovery_volumes,
         missing_volume_loss_tolerance=args.recovery_volume_loss_tolerance,
@@ -2587,6 +2672,7 @@ def main() -> int:
         args.profile,
         wanted_datasets,
         args.selected_file_position,
+        args.selected_file_index,
         args.file_count,
         fixed_total_sizes,
         same_count_file_sizes,
@@ -2709,7 +2795,8 @@ def main() -> int:
         "tzap": str(tzap),
         "runs": args.runs,
         "recovery_runs": args.recovery_runs,
-        "selected_file_position": args.selected_file_position,
+        "selected_file_position": datasets[0].selected_file_position,
+        "selected_file_index": args.selected_file_index,
         "file_count_override": args.file_count,
         "fixed_total_sizes_bytes": fixed_total_sizes,
         "same_count_file_sizes_bytes": same_count_file_sizes,

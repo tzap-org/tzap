@@ -248,6 +248,13 @@ pub struct OpenedArchive {
 #[derive(Debug)]
 pub struct ArchiveContentVerification<'a> {
     archive: &'a OpenedArchive,
+    mode: ContentVerificationMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentVerificationMode {
+    Full,
+    Fast,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1650,16 +1657,93 @@ impl OpenedArchive {
     }
 
     pub fn verify_content(&self) -> Result<ArchiveContentVerification<'_>, FormatError> {
+        self.verify_content_with_parity_policy(ParityReadPolicy::Always)
+    }
+
+    pub fn verify_content_fast(&self) -> Result<ArchiveContentVerification<'_>, FormatError> {
+        if self.fast_verify_defers_payload_semantics() {
+            self.verify_payload_record_integrity_only()?;
+            return Ok(ArchiveContentVerification {
+                archive: self,
+                mode: ContentVerificationMode::Fast,
+            });
+        }
+        self.verify_content_with_parity_policy(ParityReadPolicy::RepairOnly)
+    }
+
+    pub fn fast_verify_defers_payload_semantics(&self) -> bool {
+        self.root_auth_footer.is_none()
+            && self.crypto_header.has_dictionary == 0
+            && !self.crypto_header.aead_algo.is_encrypted()
+            && self.crypto_header.fec_parity_shards == 0
+            && self.crypto_header.index_fec_parity_shards == 0
+            && self.crypto_header.index_root_fec_parity_shards == 0
+            && self.manifest_footer.index_root_parity_block_count == 0
+    }
+
+    fn verify_payload_record_integrity_only(&self) -> Result<(), FormatError> {
+        let tables = self.load_payload_index_tables()?;
+        let block_provider = self.block_provider();
+        let block_size = self.crypto_header.block_size as u64;
+        for envelope in tables.envelopes.values() {
+            if envelope.parity_block_count != 0 {
+                return Err(FormatError::InvalidArchive(
+                    "fast payload record scan requires zero parity",
+                ));
+            }
+            let expected_encrypted_size = checked_u64_mul(
+                envelope.data_block_count as u64,
+                block_size,
+                "payload envelope encrypted size",
+            )?;
+            if envelope.encrypted_size as u64 != expected_encrypted_size {
+                return Err(FormatError::InvalidArchive(
+                    "payload envelope encrypted_size mismatch",
+                ));
+            }
+            for offset in 0..envelope.data_block_count {
+                let block_index =
+                    checked_u64_add(envelope.first_block_index, offset as u64, "payload")?;
+                let record = block_provider
+                    .block(block_index)?
+                    .ok_or(FormatError::InvalidArchive("payload data block is missing"))?;
+                if record.kind != BlockKind::PayloadData {
+                    return Err(FormatError::InvalidArchive(
+                        "payload data block has unexpected kind",
+                    ));
+                }
+                let should_be_last = offset + 1 == envelope.data_block_count;
+                if record.is_last_data() != should_be_last {
+                    return Err(FormatError::InvalidArchive(
+                        "payload last-data flag is not on the final data block",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_content_with_parity_policy(
+        &self,
+        parity_policy: ParityReadPolicy,
+    ) -> Result<ArchiveContentVerification<'_>, FormatError> {
         let tables = self.load_payload_index_tables()?;
         let streamed = self.scan_seekable_payload(
             &tables,
             u64::MAX,
             NoopTarStreamObserver,
             true,
-            ParityReadPolicy::Always,
+            parity_policy,
         )?;
         self.validate_streamed_payload_summary(&tables, &streamed, false, true)?;
-        Ok(ArchiveContentVerification { archive: self })
+        let mode = match parity_policy {
+            ParityReadPolicy::Always => ContentVerificationMode::Full,
+            ParityReadPolicy::RepairOnly => ContentVerificationMode::Fast,
+        };
+        Ok(ArchiveContentVerification {
+            archive: self,
+            mode,
+        })
     }
 
     pub fn repair_patches(&self) -> Result<Vec<ArchiveRepairPatch>, FormatError> {
@@ -2247,6 +2331,11 @@ impl OpenedArchive {
         if !std::ptr::eq(content_verification.archive, self) {
             return Err(FormatError::InvalidArchive(
                 "content verification does not match archive",
+            ));
+        }
+        if content_verification.mode != ContentVerificationMode::Full {
+            return Err(FormatError::ReaderUnsupported(
+                "RootAuth verification requires full archive content verification",
             ));
         }
         let footer = self
@@ -8287,9 +8376,9 @@ mod tests {
         NonSeekableReaderOptions, SequentialRootAuthStatus,
     };
     use crate::writer::{
-        write_archive, write_archive_with_dictionary, write_archive_with_kdf,
-        write_archive_with_root_auth, RegularFile, RootAuthSigningRequest, RootAuthWriterConfig,
-        WriterOptions,
+        write_archive, write_archive_unencrypted, write_archive_with_dictionary,
+        write_archive_with_kdf, write_archive_with_root_auth, RegularFile, RootAuthSigningRequest,
+        RootAuthWriterConfig, WriterOptions,
     };
 
     fn master_key() -> MasterKey {
@@ -8578,6 +8667,34 @@ mod tests {
                 RootAuthDiagnostic::RecoveryMarginNotRootAuthenticated,
                 RootAuthDiagnostic::RecoveryMarginUnchecked,
             ]
+        );
+    }
+
+    #[test]
+    fn root_auth_rejects_fast_content_verification_token() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("signed.txt", b"root-auth payload")],
+            &master_key(),
+            single_stream_options(),
+            RootAuthWriterConfig {
+                authenticator_id: 0x7777,
+                signer_identity_type: 1,
+                signer_identity: b"test signer",
+                authenticator_value_length: 32,
+            },
+            |request| Ok(request.archive_root.to_vec()),
+        )
+        .unwrap();
+
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let content_verification = opened.verify_content_fast().unwrap();
+        assert_eq!(
+            opened
+                .verify_root_auth_with_verified_content(&content_verification, |_, _| Ok(true))
+                .unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "RootAuth verification requires full archive content verification"
+            )
         );
     }
 
@@ -9880,6 +9997,42 @@ mod tests {
             Some(b"hello sidecar".to_vec())
         );
         opened.verify().unwrap();
+    }
+
+    #[test]
+    fn fast_verify_plaintext_zero_recovery_defers_payload_semantics() {
+        let options = WriterOptions {
+            aead_algo: AeadAlgo::None,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            ..single_stream_options()
+        };
+        let archive = write_archive_unencrypted(
+            &[RegularFile::new(
+                "payload.txt",
+                b"payload bytes large enough to produce a zstd frame",
+            )],
+            options,
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let tables = opened.load_payload_index_tables().unwrap();
+        let first_envelope = tables.envelopes.values().next().unwrap();
+        let volume_header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_end = VOLUME_HEADER_LEN + volume_header.crypto_header_length as usize;
+        let record_len = opened.crypto_header.block_size as usize + BLOCK_RECORD_FRAMING_LEN;
+        let payload_offset = crypto_end + first_envelope.first_block_index as usize * record_len;
+
+        let mut tampered = archive.bytes.clone();
+        tampered[payload_offset + 16] ^= 0x01;
+        let crc_offset = payload_offset + 16 + opened.crypto_header.block_size as usize;
+        let crc = crc32c::crc32c(&tampered[payload_offset..crc_offset]);
+        tampered[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
+
+        let tampered_opened = open_archive(&tampered, &master_key()).unwrap();
+        assert!(tampered_opened.fast_verify_defers_payload_semantics());
+        tampered_opened.verify_content_fast().unwrap();
+        assert!(tampered_opened.verify_content().is_err());
     }
 
     #[test]

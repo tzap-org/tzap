@@ -6399,7 +6399,7 @@ mod tests {
             ..WriterOptions::default()
         })
         .unwrap();
-        let payload = b"fast path payload".to_vec();
+        let payload = deterministic_bytes(options.block_size as usize * 2 + 17);
         let extent = ObjectExtent::new(
             11,
             plan_encrypted_object(
@@ -6412,6 +6412,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(extent.parity_block_count, 0);
+        assert_eq!(extent.data_block_count, 3);
         let subkeys = Subkeys::unencrypted_placeholder();
 
         let result = build_ordered_envelope_result(
@@ -6435,7 +6436,12 @@ mod tests {
                     BlockRecord::parse(&records[0].bytes, options.block_size as usize).unwrap();
                 assert_eq!(parsed.block_index, extent.first_block_index);
                 assert_eq!(parsed.kind, BlockKind::PayloadData);
-                assert!(parsed.is_last_data());
+                assert!(!parsed.is_last_data());
+                let last =
+                    BlockRecord::parse(&records[2].bytes, options.block_size as usize).unwrap();
+                assert_eq!(last.block_index, extent.first_block_index + 2);
+                assert_eq!(last.kind, BlockKind::PayloadData);
+                assert!(last.is_last_data());
             }
             OrderedEnvelopeRecords::Materialized(_) => {
                 panic!("zero-parity unsigned envelope should use serialized records")
@@ -6464,6 +6470,84 @@ mod tests {
                 panic!("root-auth leaf collection requires materialized records")
             }
         }
+    }
+
+    #[test]
+    fn ordered_envelope_serializes_encrypted_zero_parity_like_materialized_path() {
+        let options = plan_writer_options(WriterOptions {
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            aead_algo: AeadAlgo::AesGcmSiv256,
+            ..WriterOptions::default()
+        })
+        .unwrap();
+        let payload = deterministic_bytes(options.block_size as usize * 2 + 17);
+        let extent = ObjectExtent::new(
+            29,
+            plan_encrypted_object(
+                payload.len(),
+                options.fec_data_shards,
+                options.fec_parity_shards,
+                options,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(extent.parity_block_count, 0);
+        assert_eq!(extent.data_block_count, 3);
+        let archive_uuid = [3u8; 16];
+        let session_id = [4u8; 16];
+        let master_key = MasterKey::from_raw_key(&[0x5a; 32]).unwrap();
+        let subkeys = Subkeys::derive(&master_key, &archive_uuid, &session_id).unwrap();
+
+        let serialized = build_ordered_envelope_result(
+            OrderedEnvelopeJob {
+                envelope_index: 7,
+                plaintext: payload.clone(),
+                extent,
+                collect_data_leaf_hashes: false,
+            },
+            &subkeys,
+            options,
+            archive_uuid,
+            session_id,
+        )
+        .unwrap();
+        let serialized_bytes = match serialized.records {
+            OrderedEnvelopeRecords::Serialized(records) => records
+                .into_iter()
+                .map(|record| record.bytes)
+                .collect::<Vec<_>>(),
+            OrderedEnvelopeRecords::Materialized(_) => {
+                panic!("zero-parity encrypted envelope should use serialized records")
+            }
+        };
+
+        let materialized = build_ordered_envelope_result(
+            OrderedEnvelopeJob {
+                envelope_index: 7,
+                plaintext: payload,
+                extent,
+                collect_data_leaf_hashes: true,
+            },
+            &subkeys,
+            options,
+            archive_uuid,
+            session_id,
+        )
+        .unwrap();
+        let materialized_bytes = match materialized.records {
+            OrderedEnvelopeRecords::Materialized(records) => records
+                .iter()
+                .map(BlockRecord::to_bytes)
+                .collect::<Vec<_>>(),
+            OrderedEnvelopeRecords::Serialized(_) => {
+                panic!("root-auth leaf collection requires materialized records")
+            }
+        };
+
+        assert_eq!(serialized_bytes, materialized_bytes);
     }
 
     #[test]

@@ -534,6 +534,7 @@ fn cli_verify_help_includes_examples_and_flags() {
     assert!(stdout.contains("--trusted-ca-cert <FILE>"));
     assert!(stdout.contains("--trusted-system-roots"));
     assert!(stdout.contains("--public-no-key"));
+    assert!(stdout.contains("--fast"));
     assert!(stdout.contains("--bootstrap"));
     assert!(stdout.contains("--json"));
     assert!(stdout.contains("--jobs <N>"));
@@ -773,6 +774,191 @@ fn cli_no_encryption_rejects_mixed_key_sources_and_public_no_key_rejects_keys() 
             "--public-no-key cannot be combined",
         ))
         .stderr(predicate::str::contains("--keyfile"));
+}
+
+#[test]
+fn cli_verify_fast_plaintext_zero_recovery_reports_payload_semantics_deferred() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("fast-plaintext.tzap");
+    let input = temp.path().join("fast-plaintext.txt");
+    fs::write(&input, b"fast plaintext zero recovery payload\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--no-encryption",
+            "--bit-rot-buffer-pct",
+            "0",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["verify", "--fast", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK fast"))
+        .stdout(predicate::str::contains("payload_semantics_deferred"));
+}
+
+#[test]
+fn cli_verify_fast_reports_distinct_stdout_and_json() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("fast.tzap");
+    let input = temp.path().join("fast.txt");
+
+    fs::write(&input, b"fast verify payload\n").unwrap();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--no-encryption",
+            "--bit-rot-buffer-pct",
+            "0",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["verify", "--fast", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK fast"))
+        .stdout(predicate::str::contains("root-auth: OK").not());
+
+    let json_output = Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["verify", "--json", "--fast", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&json_output).unwrap();
+    assert_eq!(value.get("ok").unwrap().as_bool(), Some(true));
+    assert_eq!(
+        value.get("verification_mode").unwrap().as_str(),
+        Some("fast")
+    );
+    assert_eq!(value.get("file_count").unwrap().as_u64(), Some(1));
+    assert!(value
+        .get("diagnostics")
+        .and_then(|diagnostics| diagnostics.as_array())
+        .unwrap()
+        .iter()
+        .any(|diagnostic| diagnostic.as_str() == Some("payload_semantics_deferred")));
+    assert!(value.get("root_auth").is_none());
+}
+
+#[test]
+fn cli_verify_fast_signed_archive_reports_root_auth_deferred() {
+    let temp = tempdir().unwrap();
+    let signing_secret = temp.path().join("root.signing.hex");
+    let signing_public = temp.path().join("root.public.hex");
+    let output = temp.path().join("signed-fast.tzap");
+    let input = temp.path().join("signed-fast.txt");
+
+    fs::write(&input, b"signed fast payload\n").unwrap();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "signing-keygen",
+            "--secret-output",
+            signing_secret.to_str().unwrap(),
+            "--public-output",
+            signing_public.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--no-encryption",
+            "--signing-key",
+            signing_secret.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let stdout = Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["verify", "--fast", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&stdout);
+    assert!(stdout.contains("OK fast"));
+    assert!(stdout.contains("root_auth_deferred_full_archive_scan_required"));
+    assert!(!stdout.contains("root-auth: OK"));
+}
+
+#[test]
+fn cli_verify_fast_rejects_archive_stdin() {
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["verify", "--fast", "-"])
+        .write_stdin("")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--fast requires seekable archive paths",
+        ));
+}
+
+#[test]
+fn cli_verify_fast_rejects_full_root_auth_and_repair_options() {
+    let temp = tempdir().unwrap();
+    let public_key = temp.path().join("root.public.hex");
+    let archive = temp.path().join("missing.tzap");
+
+    fs::write(&public_key, "00".repeat(32)).unwrap();
+
+    for args in [
+        vec![
+            "verify",
+            "--fast",
+            "--trusted-public-key",
+            public_key.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ],
+        vec![
+            "verify",
+            "--fast",
+            "--public-no-key",
+            "--trusted-public-key",
+            public_key.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ],
+        vec![
+            "verify",
+            "--fast",
+            "--write-repaired",
+            archive.to_str().unwrap(),
+        ],
+    ] {
+        Command::cargo_bin("tzap")
+            .unwrap()
+            .args(args)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("--fast cannot be combined"));
+    }
 }
 
 #[test]

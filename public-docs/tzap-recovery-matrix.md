@@ -96,6 +96,18 @@ v0.43 protects the main archive pieces users expect:
 That means recovery is not only for file contents. It also helps the archive
 find, list, verify, and restore data after ordinary storage damage.
 
+## Archive-native repair data
+
+`tzap` recovery data is part of the archive package. It is not a separate
+sidecar that must be kept healthy independently of the archive. Within the
+chosen recovery budget, v0.43 readers repair critical metadata first, then
+payload objects, then authenticate the repaired result before releasing data.
+
+External repair schemes such as PAR2 can be useful comparison baselines, but
+their recovery files are also storage objects. If those sidecar files are lost
+or bit-rotted beyond the remaining usable recovery packets, the original stream
+archive can lose its recovery path.
+
 ## Common commands
 
 Create a three-volume archive that can survive one missing volume:

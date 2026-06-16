@@ -82,15 +82,15 @@ The current measured public snapshot is
 Copy timing and size cells from generated `results.md`; do not fill them by
 hand. Use `n/a` where a tool does not provide a comparable built-in workflow.
 
-| Data set | Files | Input size | Tool / mode | Create | Verify/Test | Selected-file restore | Full extract | Output size | Missing volume | Rotten payload |
-| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| size-1gb | 6000 | 1 GB | tzap encrypted archive with recovery options | TBD | TBD | TBD | TBD | TBD | ✅ Recovered | ✅ Recovered |
-| size-1gb | 6000 | 1 GB | tzap no-password/no-bitrot | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path |
-| size-1gb | 6000 | 1 GB | tar + zstd | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path |
-| size-1gb | 6000 | 1 GB | tar + zstd + age | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path |
-| size-1gb | 6000 | 1 GB | tar + zstd + age + PAR2 | TBD | TBD | TBD | TBD | TBD | ✅ External PAR2 | ✅ External PAR2 |
-| size-1gb | 6000 | 1 GB | 7z password archive | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path |
-| size-1gb | 6000 | 1 GB | zip password archive | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path |
+| Data set | Files | Input size | Tool / mode | Create | Verify/Test | Selected-file restore | Full extract | Output size | Missing volume | Rotten payload | Repair data rot |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| size-1gb | 6000 | 1 GB | tzap encrypted archive with recovery options | TBD | TBD | TBD | TBD | TBD | ✅ Recovered | ✅ Recovered | ✅ Archive-native |
+| size-1gb | 6000 | 1 GB | tzap no-password/no-bitrot | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path | ❌ No repair data |
+| size-1gb | 6000 | 1 GB | tar + zstd | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path | ❌ No repair data |
+| size-1gb | 6000 | 1 GB | tar + zstd + age | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path | ❌ No repair data |
+| size-1gb | 6000 | 1 GB | tar + zstd + age + PAR2 | TBD | TBD | TBD | TBD | TBD | ✅ External PAR2 | ✅ External PAR2 | ❌ Sidecar risk |
+| size-1gb | 6000 | 1 GB | 7z password archive | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path | ❌ No repair data |
+| size-1gb | 6000 | 1 GB | zip password archive | TBD | TBD | TBD | TBD | TBD | ❌ No repair path | ❌ No repair path | ❌ No repair data |
 
 Use the same columns for other tiers when running a full size ladder, such as
 `size-1mb`, `size-20mb`, `size-1gb`, and `size-20gb`. If the public page needs
@@ -226,7 +226,12 @@ The recovery scorecard should be direct for non-technical readers: use
 rotten-payload cases, use `❌ No repair path` when a baseline has no repair
 data in this benchmark, and use `✅ External PAR2` when recovery depends on
 separate PAR2 files. This keeps the repair-data path visible in the status
-cell itself.
+cell itself. When explaining the PAR2 baseline, state that the reported size
+includes the encrypted stream archive plus external PAR2 files, and that those
+sidecar files must also survive; lost or badly bit-rotted PAR2 files can remove
+the external recovery path. Use `✅ Archive-native` in the repair-data column
+for recoverable `tzap` rows, `❌ Sidecar risk` for PAR2 sidecar repair, and
+`❌ No repair data` when the tool has no repair data in this benchmark.
 
 State the tool mode explicitly in the report:
 
@@ -242,7 +247,9 @@ State the tool mode explicitly in the report:
 
 `age` is encryption, not parity or recovery. It is included as a simple modern
 encrypted-stream baseline. The PAR2 variant keeps the same stream shape but
-adds external repair data.
+adds external repair data. Contrast that with `tzap`, where recovery data is
+archive-native and protects payload objects plus critical metadata structures
+within the chosen recovery budget.
 
 Run the publishable local comparison set with the benchmark shape pinned on the
 command line:
@@ -255,6 +262,7 @@ python3 scripts/tzap_benchmark.py \
   --file-count 64 \
   --dataset-sizes 1MB,20MB,1GB,20GB \
   --selected-file-position last \
+  --tzap-verify-fast \
   --benchmark-password tzap-benchmark-password \
   --recovery-volumes 3 \
   --recovery-volume-loss-tolerance 1 \
@@ -282,7 +290,8 @@ python3 scripts/tzap_benchmark.py \
   --recovery-runs 1 \
   --file-count 6000 \
   --dataset-sizes 1GB \
-  --selected-file-position last \
+  --selected-file-index 4000 \
+  --tzap-verify-fast \
   --benchmark-password tzap-benchmark-password \
   --recovery-volumes 3 \
   --recovery-volume-loss-tolerance 1 \
@@ -311,10 +320,12 @@ flags so the corruption site is deterministic.
 Thirty normal workflow runs is the default for this profile when `--runs` is
 omitted. One recovery proof run is the default when `--recovery-runs` is
 omitted.
-Selected-file restore defaults to the last generated file. Keep
-`--selected-file-position last` for public results so the test avoids
-first-file bias. The runner also supports `first` and `middle` for diagnosis,
-but first-file numbers should not be used as the headline comparison.
+Selected-file restore defaults to the last generated file. Use
+`--selected-file-index 4000` for the current 1 GB / 6000-file public snapshot
+so the test avoids both first-file and last-file edge effects. The runner also
+supports `first`, `middle`, and `last` through `--selected-file-position` for
+diagnosis, but first-file numbers should not be used as the headline
+comparison.
 The 20 GB tier needs substantial free disk space because the harness creates
 source data, archives, restored outputs, recovery archives, and logs.
 At startup the runner prints the durable progress log path and the `tail -f`
@@ -334,6 +345,7 @@ python3 scripts/tzap_benchmark.py \
   --file-count 64 \
   --dataset-sizes 1MB,20MB,1GB,20GB \
   --selected-file-position last \
+  --tzap-verify-fast \
   --par2-redundancy-pct 5 \
   --tools tzap,tzap-no-password-no-bitrot,tar-zstd,tar-zstd-age,tar-zstd-age-par2,7z,zip
 ```
@@ -349,6 +361,8 @@ Python source:
 | `--dataset-sizes` | Total input sizes for the standard profile |
 | `--same-count-file-sizes` | Per-file sizes for smoke/large same-count profiles |
 | `--selected-file-position` | First, middle, or last generated member used for selected-file restore |
+| `--selected-file-index` | Zero-based generated member index used for selected-file restore |
+| `--tzap-verify-fast` | Use `tzap verify --fast` for normal tzap workflow verify timings |
 | `--benchmark-password` | Fixed password used by the zip and 7z password-mode baselines |
 | `--par2-redundancy-pct` | PAR2 redundancy percentage for the `tar-zstd-age-par2` baseline |
 | `--quiet` | Suppress the console mirror while still writing `logs/benchmark-progress.log` |
@@ -391,7 +405,7 @@ Create and verify:
 ```sh
 $TZAP keygen --output bench.key
 /usr/bin/time -p $TZAP create --keyfile bench.key -o data.tzap ./data
-/usr/bin/time -p $TZAP verify --keyfile bench.key data.tzap
+/usr/bin/time -p $TZAP verify --fast --keyfile bench.key data.tzap
 ```
 
 Extract all files:
