@@ -322,9 +322,9 @@ omitted. One recovery proof run is the default when `--recovery-runs` is
 omitted.
 Selected-file restore defaults to the last generated file. Use
 `--selected-file-index 4000` for the current 1 GB / 6000-file public snapshot
-so the test avoids both first-file and last-file edge effects. The runner also
-supports `first`, `middle`, and `last` through `--selected-file-position` for
-diagnosis, but first-file numbers should not be used as the headline
+so the test avoids both first-file bias and last-file edge effects. The runner
+also supports `first`, `middle`, and `last` through `--selected-file-position`
+for diagnosis, but first-file numbers should not be used as the headline
 comparison.
 The 20 GB tier needs substantial free disk space because the harness creates
 source data, archives, restored outputs, recovery archives, and logs.
