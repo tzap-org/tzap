@@ -75,5 +75,6 @@ RootAuth or public no-key verification.
 ## More Information
 
 - Repository: <https://github.com/tzap-org/tzap>
-- Format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv43.md>
+- Implemented format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv43.md>
+- Draft v44 target specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv44.md>
 - CLI crate: <https://crates.io/crates/tzap>

@@ -85,4 +85,6 @@ The `x509_chain` module provides:
 - Repository: <https://github.com/tzap-org/tzap>
 - Core crate: <https://crates.io/crates/tzap-core>
 - CLI crate: <https://crates.io/crates/tzap>
-- Format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv43.md>
+- Implemented format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv43.md>
+- Draft v44 Ed25519 RootAuth spec: <https://github.com/tzap-org/tzap/blob/main/specs/plugin/tzap-plugin-signing-v6-proposed-v44.md>
+- Draft v44 X.509 RootAuth spec: <https://github.com/tzap-org/tzap/blob/main/specs/plugin/tzap-plugin-x509-chain-v2-proposed-v44.md>

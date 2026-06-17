@@ -3,11 +3,12 @@
 Specification for the first recipient key-wrap plugin profile for tzap v44
 archives with `KdfAlgo::RecipientWrap`.
 
-Status: v44 implementation target for the RecipientWrap key-wrap profile. A
-dedicated `tzap-plugin-keywrap` crate may host this profile, but the
-`--encrypt-to-cert` CLI semantics below are part of the v44 RecipientWrap target.
-Targets `specs/tzap-format-revisedv44.md`, especially `KeyWrapTableV1` and
-`RecipientRecordV1`.
+Status: proposed v44 implementation target for the RecipientWrap key-wrap
+profile. The current released v43 core/CLI do not implement `RecipientWrap` or
+`--encrypt-to-cert`. A dedicated `tzap-plugin-keywrap` crate may host this
+profile, and the `--encrypt-to-cert` CLI semantics below describe the v44 target
+behavior. Targets `specs/tzap-format-revisedv44.md`, especially
+`KeyWrapTableV1` and `RecipientRecordV1`.
 
 ## 1. Scope
 
@@ -292,13 +293,13 @@ record targeting the same private key as a hard failure.
 
 ## 12. CLI/API Wording
 
-Suggested create flags:
+Target create flags:
 
 ```text
 tzap create --encrypt-to-cert bob-device.pem --encrypt-to-cert ops.pem -o backup.tzap ./data
 ```
 
-Suggested extract behavior:
+Target extract behavior:
 
 ```text
 tzap extract backup.tzap -C restored

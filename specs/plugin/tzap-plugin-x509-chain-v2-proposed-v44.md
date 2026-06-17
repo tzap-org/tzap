@@ -3,11 +3,11 @@
 Specification for the optional X.509 certificate-chain authenticator profile for
 tzap v44 root authentication.
 
-Status: implementation target for the current `tzap-plugin-signing::x509_chain`
-module and tzap CLI X.509 RootAuth flags. Targets
-`specs/tzap-format-revisedv44.md` and
-`root_auth_spec_id` as the 20 ASCII bytes `tzap-root-auth-v0.44` followed by
-four zero bytes.
+Status: proposed v44 implementation target for a future
+`tzap-plugin-signing::x509_chain` update and matching tzap CLI X.509 RootAuth
+flags. It is not a statement of the current released v43 crate behavior. Targets
+`specs/tzap-format-revisedv44.md` and `root_auth_spec_id` as the 20 ASCII bytes
+`tzap-root-auth-v0.44` followed by four zero bytes.
 This v2 document keeps the v1 X.509 authenticator wire profile and updates its
 core contract for v44 archive-root inputs.
 
