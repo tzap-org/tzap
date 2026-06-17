@@ -21,7 +21,7 @@ use crate::reader::{
     parse_terminal_material_read_at, required_object_parity, total_extraction_size_cap,
     v41_terminal_tail_cap, validate_crypto_class_parity_exactness, validate_reader_options,
     ArchiveEntry, ArchiveReadAt, KeyHoldingTerminalContext, NonSeekableBootstrapMaterial,
-    OpenedArchive, ReaderOptions, StreamedArchiveOpenParts,
+    OpenedArchive, ReaderOptions, StreamedArchiveOpenParts, startup_block_records_start,
 };
 use crate::tar_model::{
     NoopTarStreamObserver, SafeExtractionOptions, TarStreamFilesystemRestoreObserver,
@@ -494,6 +494,26 @@ where
     parsed_crypto.validate_extension_semantics()?;
     reject_unsupported_raw_stream_profile(&parsed_crypto.extensions)?;
     validate_crypto_class_parity_exactness(&crypto_header)?;
+    let mut stream_cursor = checked_u64_add(
+        VOLUME_HEADER_LEN as u64,
+        volume_header.crypto_header_length as u64,
+        "CryptoHeader",
+    )?;
+    let block_records_start = startup_block_records_start(
+        &volume_header,
+        &parsed_crypto.kdf_params,
+        |start, length| {
+            if stream_cursor != start {
+                return Err(FormatError::InvalidArchive(
+                    "KeyWrapTableV1 does not start at stream cursor",
+                ));
+            }
+            let mut key_wrap_table_bytes = vec![0u8; length];
+            read_exact_stream(&mut reader, &mut key_wrap_table_bytes, "KeyWrapTableV1")?;
+            stream_cursor = checked_u64_add(stream_cursor, length as u64, "KeyWrapTableV1")?;
+            Ok(key_wrap_table_bytes)
+        },
+    )?;
     let bootstrap = bootstrap_sidecar
         .map(|sidecar| {
             parse_non_seekable_bootstrap_material(sidecar, &volume_header, &crypto_header, &subkeys)
@@ -510,9 +530,7 @@ where
     let record_len = block_size
         .checked_add(BLOCK_RECORD_FRAMING_LEN)
         .ok_or(FormatError::InvalidArchive("BlockRecord length overflow"))?;
-    let mut stream_offset = (VOLUME_HEADER_LEN as u64)
-        .checked_add(volume_header.crypto_header_length as u64)
-        .ok_or(FormatError::InvalidArchive("stream offset overflow"))?;
+    let mut stream_offset = block_records_start;
     let mut observed_block_count = 0u64;
     let mut metadata_seen = false;
     let mut pending = PendingLiveEnvelope::default();

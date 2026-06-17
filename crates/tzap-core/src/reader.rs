@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 
 use crate::compression::{decompress_exact_zstd_frame, validate_exact_zstd_frame};
 use crate::crypto::{
-    decrypt_padded_aead_object, verify_integrity_tag, AeadObjectContext, HmacDomain, MasterKey,
-    Subkeys,
+    decrypt_padded_aead_object, verify_integrity_tag, AeadObjectContext, HmacDomain, KdfParams,
+    MasterKey, Subkeys,
 };
 use crate::fec::{encode_parity_gf16, repair_data_gf16};
 use crate::format::{
@@ -19,7 +19,7 @@ use crate::format::{
     CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, IMAGE_CRC_LEN,
     LOCATOR_PAIR_LEN, MANIFEST_FOOTER_LEN, READER_MAX_CMRA_PARITY_PCT,
     READER_MAX_CRYPTO_HEADER_LEN, READER_MAX_ROOT_AUTH_FOOTER_LEN, SERIALIZED_REGION_HEADER_LEN,
-    VOLUME_FORMAT_REV, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
     VolumeFormatRevision,
 };
 use crate::metadata::{
@@ -45,7 +45,8 @@ use crate::tar_model::{
 use crate::wire::{
     BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage, CriticalMetadataRecoveryHeader,
     CriticalMetadataRecoveryShard, CriticalRecoveryLocator, CryptoHeader, CryptoHeaderFixed,
-    ExtensionTlv, ManifestFooter, RootAuthFooterV1, VolumeHeader, VolumeTrailer,
+    ExtensionTlv, KeyWrapTableV1, ManifestFooter, RootAuthFooterV1, VolumeHeader, VolumeTrailer,
+    compute_key_wrap_table_digest,
 };
 
 const TRAILER_HMAC_COVERED_LEN: usize = 96;
@@ -455,7 +456,7 @@ struct DecodedTarMemberGroupReader<'a> {
 struct SeekableVolumeSource {
     reader: Arc<dyn ArchiveReadAt>,
     volume_index: u32,
-    crypto_end: u64,
+    block_records_start: u64,
     block_count: u64,
     record_len: u64,
     block_size: usize,
@@ -465,7 +466,7 @@ impl std::fmt::Debug for SeekableVolumeSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SeekableVolumeSource")
             .field("volume_index", &self.volume_index)
-            .field("crypto_end", &self.crypto_end)
+            .field("block_records_start", &self.block_records_start)
             .field("block_count", &self.block_count)
             .field("record_len", &self.record_len)
             .field("block_size", &self.block_size)
@@ -560,7 +561,7 @@ impl SeekableBlockSource {
 
 impl SeekableVolumeSource {
     fn record_offset(&self, slot: u64) -> Result<u64, FormatError> {
-        self.crypto_end
+        self.block_records_start
             .checked_add(checked_u64_mul(
                 slot,
                 self.record_len,
@@ -1137,7 +1138,7 @@ impl OpenedArchive {
             let source = SeekableVolumeSource {
                 reader: parsed.reader.clone(),
                 volume_index: parsed.volume_header.volume_index,
-                crypto_end: parsed.crypto_end,
+                block_records_start: parsed.block_records_start,
                 block_count: parsed.volume_trailer.block_count,
                 record_len,
                 block_size: parsed.crypto_header.block_size as usize,
@@ -1328,7 +1329,6 @@ impl OpenedArchive {
         parse_volume_format_dispatch(&volume_header)?;
         let crypto_start = volume_header.crypto_header_offset as usize;
         let crypto_len = volume_header.crypto_header_length as usize;
-        let crypto_end = checked_add(crypto_start, crypto_len, "CryptoHeader")?;
         let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
         let parsed_crypto = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length)?;
         let subkeys = subkeys_for_open(
@@ -1359,10 +1359,18 @@ impl OpenedArchive {
             &subkeys,
         )?;
         sidecar.require_sections_for(sidecar_use, &parsed_crypto.fixed)?;
+        let block_records_start = startup_block_records_start(
+            &volume_header,
+            &parsed_crypto.kdf_params,
+            |start, length| {
+                let start = to_usize(start, "KeyWrapTableV1")?;
+                Ok(slice(bytes, start, length, "KeyWrapTableV1")?.to_vec())
+            },
+        )?;
 
         let (mut blocks, terminal_offset, observed_block_count) = parse_stream_block_prefix(
             bytes,
-            crypto_end,
+            to_usize(block_records_start, "BlockRecord")?,
             parsed_crypto.fixed.block_size as usize,
             &volume_header,
         )?;
@@ -3309,6 +3317,7 @@ struct ParsedSeekableVolume {
     manifest_footer_error: Option<FormatError>,
     root_auth_footer: Option<RootAuthFooterV1>,
     root_auth_footer_bytes: Option<Vec<u8>>,
+    block_records_start: u64,
     volume_trailer: VolumeTrailer,
     blocks: BTreeMap<u64, BlockRecord>,
     erased_block_indices: BTreeSet<u64>,
@@ -3325,14 +3334,14 @@ struct ParsedSeekableReadAtVolume {
     root_auth_footer: Option<RootAuthFooterV1>,
     root_auth_footer_bytes: Option<Vec<u8>>,
     volume_trailer: VolumeTrailer,
-    crypto_end: u64,
+    block_records_start: u64,
 }
 
 struct ParsedOpenPrefix {
     volume_header: VolumeHeader,
     crypto_header: CryptoHeaderFixed,
     crypto_header_bytes: Vec<u8>,
-    crypto_end: usize,
+    block_records_start: u64,
     subkeys: Subkeys,
 }
 
@@ -3340,8 +3349,55 @@ struct ParsedReadAtOpenPrefix {
     volume_header: VolumeHeader,
     crypto_header: CryptoHeaderFixed,
     crypto_header_bytes: Vec<u8>,
-    crypto_end: u64,
+    block_records_start: u64,
     subkeys: Subkeys,
+}
+
+pub(crate) fn startup_block_records_start(
+    volume_header: &VolumeHeader,
+    kdf_params: &KdfParams,
+    mut read_key_wrap_table: impl FnMut(u64, usize) -> Result<Vec<u8>, FormatError>,
+) -> Result<u64, FormatError> {
+    let crypto_end = checked_u64_add(
+        volume_header.crypto_header_offset as u64,
+        volume_header.crypto_header_length as u64,
+        "CryptoHeader",
+    )?;
+    if volume_header.volume_format_rev == VOLUME_FORMAT_REV_44 {
+        let &KdfParams::RecipientWrap {
+            key_wrap_table_length,
+            key_wrap_table_record_count,
+            key_wrap_table_digest,
+            ..
+        } = kdf_params
+        else {
+            return Ok(crypto_end);
+        };
+        let key_wrap_table_length_usize =
+            to_usize(key_wrap_table_length, "KeyWrapTableV1 length")?;
+        let key_wrap_table_bytes = read_key_wrap_table(crypto_end, key_wrap_table_length_usize)?;
+        let key_wrap_table = KeyWrapTableV1::parse(
+            &key_wrap_table_bytes,
+            &volume_header.archive_uuid,
+            &volume_header.session_id,
+            key_wrap_table_length,
+            key_wrap_table_record_count,
+        )?;
+        if compute_key_wrap_table_digest(key_wrap_table_length, &key_wrap_table_bytes) !=
+            key_wrap_table_digest
+        {
+            return Err(FormatError::IntegrityDigestMismatch {
+                structure: "KeyWrapTableV1",
+            });
+        }
+        checked_u64_add(crypto_end, key_wrap_table.table_length as u64, "KeyWrapTableV1")
+    } else if matches!(kdf_params, KdfParams::RecipientWrap { .. }) {
+        Err(FormatError::InvalidArchive(
+            "RecipientWrap KdfParams require volume_format_rev 44",
+        ))
+    } else {
+        Ok(crypto_end)
+    }
 }
 
 fn parse_seekable_volume(
@@ -3390,7 +3446,7 @@ fn parse_seekable_volume_with_prefix(
         volume_header,
         crypto_header,
         crypto_header_bytes,
-        crypto_end,
+        block_records_start,
         subkeys,
     } = prefix;
     let crypto_bytes = crypto_header_bytes.as_slice();
@@ -3410,7 +3466,7 @@ fn parse_seekable_volume_with_prefix(
         volume_header,
         crypto_header,
         crypto_header_bytes,
-        crypto_end,
+        block_records_start,
         subkeys,
         terminal,
     )
@@ -3423,17 +3479,20 @@ fn parse_seekable_volume_from_recovered_terminal(
 ) -> Result<ParsedSeekableVolume, FormatError> {
     let authority = locate_v41_terminal_authority(bytes, master_key, options)?;
     parse_volume_format_dispatch(&authority.volume_header)?;
-    let crypto_end = checked_add(
-        authority.volume_header.crypto_header_offset as usize,
-        authority.volume_header.crypto_header_length as usize,
-        "CryptoHeader",
+    let block_records_start = startup_block_records_start(
+        &authority.volume_header,
+        &authority.kdf_params,
+        |start, length| {
+            let start = to_usize(start, "KeyWrapTableV1")?;
+            Ok(slice(bytes, start, length, "KeyWrapTableV1")?.to_vec())
+        },
     )?;
     finish_parse_seekable_volume(
         bytes,
         authority.volume_header,
         authority.crypto_header,
         authority.crypto_header_bytes,
-        crypto_end,
+        block_records_start,
         authority.subkeys,
         authority.terminal,
     )
@@ -3447,7 +3506,6 @@ fn parse_open_prefix(
     parse_volume_format_dispatch(&volume_header)?;
     let crypto_start = volume_header.crypto_header_offset as usize;
     let crypto_len = volume_header.crypto_header_length as usize;
-    let crypto_end = checked_add(crypto_start, crypto_len, "CryptoHeader")?;
     let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
     let parsed_crypto = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length)?;
     let subkeys = subkeys_for_open(
@@ -3473,12 +3531,20 @@ fn parse_open_prefix(
         &parsed_crypto.extensions,
     )?;
     validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
+    let block_records_start = startup_block_records_start(
+        &volume_header,
+        &parsed_crypto.kdf_params,
+        |start, length| {
+            let start = to_usize(start, "KeyWrapTableV1")?;
+            Ok(slice(bytes, start, length, "KeyWrapTableV1")?.to_vec())
+        },
+    )?;
     let crypto_header = parsed_crypto.fixed.clone();
     Ok(ParsedOpenPrefix {
         volume_header,
         crypto_header,
         crypto_header_bytes: crypto_bytes.to_vec(),
-        crypto_end,
+        block_records_start,
         subkeys,
     })
 }
@@ -3488,7 +3554,7 @@ fn finish_parse_seekable_volume(
     volume_header: VolumeHeader,
     crypto_header: CryptoHeaderFixed,
     crypto_header_bytes: Vec<u8>,
-    crypto_end: usize,
+    block_records_start: u64,
     subkeys: Subkeys,
     terminal: V41Terminal,
 ) -> Result<ParsedSeekableVolume, FormatError> {
@@ -3528,7 +3594,7 @@ fn finish_parse_seekable_volume(
 
     let block_region = parse_block_region(
         bytes,
-        crypto_end,
+        to_usize(block_records_start, "BlockRecord")?,
         manifest_offset,
         crypto_header.block_size as usize,
         &volume_header,
@@ -3544,6 +3610,7 @@ fn finish_parse_seekable_volume(
         manifest_footer_error,
         root_auth_footer: terminal.root_auth_footer,
         root_auth_footer_bytes: terminal.root_auth_footer_bytes,
+        block_records_start,
         volume_trailer,
         blocks: block_region.blocks,
         erased_block_indices: block_region.erased_block_indices,
@@ -3606,7 +3673,7 @@ fn parse_seekable_read_at_volume_with_prefix(
         volume_header,
         crypto_header,
         crypto_header_bytes,
-        crypto_end,
+        block_records_start,
         subkeys,
     } = prefix;
 
@@ -3626,7 +3693,7 @@ fn parse_seekable_read_at_volume_with_prefix(
         volume_header,
         crypto_header,
         crypto_header_bytes,
-        crypto_end,
+        block_records_start,
         subkeys,
         terminal,
     )
@@ -3641,17 +3708,17 @@ fn parse_seekable_read_at_volume_from_recovered_terminal(
     let authority =
         locate_v41_terminal_authority_read_at(reader.as_ref(), observed_len, master_key, options)?;
     parse_volume_format_dispatch(&authority.volume_header)?;
-    let crypto_end = checked_u64_add(
-        authority.volume_header.crypto_header_offset as u64,
-        authority.volume_header.crypto_header_length as u64,
-        "CryptoHeader",
+    let block_records_start = startup_block_records_start(
+        &authority.volume_header,
+        &authority.kdf_params,
+        |start, length| read_at_vec(reader.as_ref(), start, length, "KeyWrapTableV1"),
     )?;
     finish_parse_seekable_read_at_volume(
         reader,
         authority.volume_header,
         authority.crypto_header,
         authority.crypto_header_bytes,
-        crypto_end,
+        block_records_start,
         authority.subkeys,
         authority.terminal,
     )
@@ -3666,7 +3733,6 @@ fn parse_read_at_open_prefix(
     parse_volume_format_dispatch(&volume_header)?;
     let crypto_start = volume_header.crypto_header_offset as u64;
     let crypto_len = volume_header.crypto_header_length as u64;
-    let crypto_end = checked_u64_add(crypto_start, crypto_len, "CryptoHeader")?;
     let crypto_bytes = read_at_vec(
         reader,
         crypto_start,
@@ -3697,13 +3763,18 @@ fn parse_read_at_open_prefix(
         &parsed_crypto.extensions,
     )?;
     validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
+    let block_records_start = startup_block_records_start(
+        &volume_header,
+        &parsed_crypto.kdf_params,
+        |start, length| read_at_vec(reader, start, length, "KeyWrapTableV1"),
+    )?;
     let crypto_header = parsed_crypto.fixed.clone();
     drop(parsed_crypto);
     Ok(ParsedReadAtOpenPrefix {
         volume_header,
         crypto_header,
         crypto_header_bytes: crypto_bytes,
-        crypto_end,
+        block_records_start,
         subkeys,
     })
 }
@@ -3713,7 +3784,7 @@ fn finish_parse_seekable_read_at_volume(
     volume_header: VolumeHeader,
     crypto_header: CryptoHeaderFixed,
     crypto_header_bytes: Vec<u8>,
-    crypto_end: u64,
+    block_records_start: u64,
     subkeys: Subkeys,
     terminal: V41Terminal,
 ) -> Result<ParsedSeekableReadAtVolume, FormatError> {
@@ -3746,7 +3817,7 @@ fn finish_parse_seekable_read_at_volume(
         ));
     }
     validate_seekable_block_region_layout(
-        crypto_end,
+        block_records_start,
         manifest_offset,
         crypto_header.block_size as usize,
         &volume_trailer,
@@ -3772,7 +3843,7 @@ fn finish_parse_seekable_read_at_volume(
         root_auth_footer: terminal.root_auth_footer,
         root_auth_footer_bytes: terminal.root_auth_footer_bytes,
         volume_trailer,
-        crypto_end,
+        block_records_start,
     })
 }
 
@@ -4262,6 +4333,7 @@ struct RecoveredTerminalAuthority {
     crypto_header: CryptoHeaderFixed,
     crypto_header_bytes: Vec<u8>,
     subkeys: Subkeys,
+    kdf_params: KdfParams,
 }
 
 #[derive(Debug)]
@@ -5754,6 +5826,7 @@ fn validate_recovered_terminal_authority(
         .ok_or(FormatError::InvalidArchive("missing CryptoHeader region"))?;
     let crypto_header_bytes = crypto_region.bytes.clone();
     let parsed_crypto = CryptoHeader::parse(&crypto_header_bytes, image.crypto_header_length)?;
+    let kdf_params = parsed_crypto.kdf_params.clone();
     let subkeys = subkeys_for_open(
         Some(master_key),
         parsed_crypto.fixed.aead_algo,
@@ -5803,6 +5876,7 @@ fn validate_recovered_terminal_authority(
         crypto_header,
         crypto_header_bytes,
         subkeys,
+        kdf_params,
     })
 }
 
@@ -7187,7 +7261,6 @@ fn sequential_extract_tar_stream_with_options(
     let volume_header = VolumeHeader::parse(slice(bytes, 0, VOLUME_HEADER_LEN, "archive")?)?;
     let crypto_start = volume_header.crypto_header_offset as usize;
     let crypto_len = volume_header.crypto_header_length as usize;
-    let crypto_end = checked_add(crypto_start, crypto_len, "CryptoHeader")?;
     let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
     let parsed_crypto = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length)?;
     let subkeys = subkeys_for_open(
@@ -7213,12 +7286,20 @@ fn sequential_extract_tar_stream_with_options(
         &parsed_crypto.extensions,
     )?;
     validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
+    let block_records_start = startup_block_records_start(
+        &volume_header,
+        &parsed_crypto.kdf_params,
+        |start, length| {
+            let start = to_usize(start, "KeyWrapTableV1")?;
+            Ok(slice(bytes, start, length, "KeyWrapTableV1")?.to_vec())
+        },
+    )?;
 
     let block_size = parsed_crypto.fixed.block_size as usize;
     let record_len = block_size
         .checked_add(BLOCK_RECORD_FRAMING_LEN)
         .ok_or(FormatError::InvalidArchive("BlockRecord length overflow"))?;
-    let mut offset = crypto_end;
+    let mut offset = to_usize(block_records_start, "BlockRecord")?;
     let mut observed_block_count = 0u64;
     let mut metadata_seen = false;
     let mut pending = PendingSequentialEnvelope::default();

@@ -12,7 +12,8 @@ use aes_gcm_siv::aead::{Aead, KeyInit as AeadKeyInit, Payload};
 
 use crate::format::{
     AeadAlgo, FormatError, KdfAlgo, MASTER_KEY_LEN, READER_MAX_ARGON2ID_M_COST_KIB,
-    READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST, SUBKEY_LEN,
+    READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST,
+    READER_MAX_KEY_WRAP_TABLE_LEN, READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS, SUBKEY_LEN,
     VOLUME_FORMAT_REV_43, VOLUME_FORMAT_REV_44,
 };
 use crate::padding::{depad_suffix_padding, suffix_pad_for_aead};
@@ -36,8 +37,10 @@ const BOOTSTRAP_SIDECAR_DIGEST_DOMAIN_V44: &[u8] = b"tzap-sidecar-v44";
 const RAW_KDF_PARAMS_LEN: usize = 2;
 const NONE_KDF_PARAMS_LEN: usize = 2;
 const ARGON2ID_FIXED_PARAMS_LEN: usize = 16;
+const RECIPIENT_WRAP_KDF_PARAMS_LEN: usize = 46;
 const ARGON2ID_MIN_SALT_LEN: u16 = 8;
 const ARGON2ID_MAX_SALT_LEN: u16 = 64;
+const RECIPIENT_WRAP_TABLE_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KdfParams {
@@ -49,6 +52,12 @@ pub enum KdfParams {
         parallelism: u32,
         salt: Vec<u8>,
     },
+    RecipientWrap {
+        key_wrap_table_length: u32,
+        key_wrap_table_record_count: u32,
+        key_wrap_table_version: u16,
+        key_wrap_table_digest: [u8; 32],
+    },
 }
 
 impl KdfParams {
@@ -57,6 +66,7 @@ impl KdfParams {
             KdfAlgo::Raw => parse_raw_kdf_params(bytes),
             KdfAlgo::Argon2id => parse_argon2id_kdf_params(bytes),
             KdfAlgo::None => parse_none_kdf_params(bytes),
+            KdfAlgo::RecipientWrap => parse_recipient_wrap_kdf_params(bytes),
         }
     }
 }
@@ -581,6 +591,61 @@ fn parse_argon2id_kdf_params(bytes: &[u8]) -> Result<(KdfParams, usize), FormatE
     ))
 }
 
+fn parse_recipient_wrap_kdf_params(bytes: &[u8]) -> Result<(KdfParams, usize), FormatError> {
+    if bytes.len() < RECIPIENT_WRAP_KDF_PARAMS_LEN {
+        return Err(FormatError::TruncatedKdfParams);
+    }
+    let algo_tag = read_u16(bytes, 0)?;
+    if algo_tag != KdfAlgo::RecipientWrap as u16 {
+        return Err(FormatError::KdfAlgoTagMismatch {
+            expected: KdfAlgo::RecipientWrap as u16,
+            actual: algo_tag,
+        });
+    }
+    let key_wrap_table_length = read_u32(bytes, 2)?;
+    let key_wrap_table_record_count = read_u32(bytes, 6)?;
+    let table_version = read_u16(bytes, 10)?;
+    if key_wrap_table_length == 0 {
+        return Err(FormatError::InvalidKdfParams(
+            "recipient-wrap key_wrap_table_length must be non-zero",
+        ));
+    }
+    if key_wrap_table_length > READER_MAX_KEY_WRAP_TABLE_LEN {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "KeyWrapTableV1 length",
+            cap: READER_MAX_KEY_WRAP_TABLE_LEN as u64,
+            actual: key_wrap_table_length as u64,
+        });
+    }
+    if key_wrap_table_record_count > READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "KeyWrapTableV1 recipient_record_count",
+            cap: READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS as u64,
+            actual: key_wrap_table_record_count as u64,
+        });
+    }
+    if table_version != RECIPIENT_WRAP_TABLE_VERSION {
+        return Err(FormatError::InvalidKdfParams("recipient-wrap table version must be 1"));
+    }
+    let reserved = read_u16(bytes, 12)?;
+    if reserved != 0 {
+        return Err(FormatError::InvalidKdfParams(
+            "recipient-wrap reserved bytes must be zero",
+        ));
+    }
+    let mut key_wrap_table_digest = [0u8; 32];
+    key_wrap_table_digest.copy_from_slice(&bytes[14..RECIPIENT_WRAP_KDF_PARAMS_LEN]);
+    Ok((
+        KdfParams::RecipientWrap {
+            key_wrap_table_length,
+            key_wrap_table_record_count,
+            key_wrap_table_version: table_version,
+            key_wrap_table_digest,
+        },
+        RECIPIENT_WRAP_KDF_PARAMS_LEN,
+    ))
+}
+
 fn validate_argon2id_bounds(
     t_cost: u32,
     m_cost_kib: u32,
@@ -769,6 +834,88 @@ mod tests {
                 parallelism: 1,
                 salt: b"12345678".to_vec()
             }
+        );
+    }
+
+    #[test]
+    fn parses_recipient_wrap_kdf_params() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(KdfAlgo::RecipientWrap as u16).to_le_bytes());
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&[0xaau8; 32]);
+
+        let (params, consumed) = KdfParams::parse(KdfAlgo::RecipientWrap, &bytes).unwrap();
+        assert_eq!(consumed, 46);
+        assert_eq!(
+            params,
+            KdfParams::RecipientWrap {
+                key_wrap_table_length: 16,
+                key_wrap_table_record_count: 4,
+                key_wrap_table_version: 1,
+                key_wrap_table_digest: [0xaau8; 32]
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_recipient_wrap_kdf_params_fields() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(KdfAlgo::RecipientWrap as u16).to_le_bytes());
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&[0xaau8; 32]);
+        assert_eq!(
+            KdfParams::parse(KdfAlgo::RecipientWrap, &bytes).unwrap_err(),
+            FormatError::InvalidKdfParams("recipient-wrap table version must be 1")
+        );
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(KdfAlgo::RecipientWrap as u16).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 32]);
+        assert_eq!(
+            KdfParams::parse(KdfAlgo::RecipientWrap, &bytes).unwrap_err(),
+            FormatError::InvalidKdfParams("recipient-wrap key_wrap_table_length must be non-zero"),
+        );
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(KdfAlgo::RecipientWrap as u16).to_le_bytes());
+        bytes.extend_from_slice(&(READER_MAX_KEY_WRAP_TABLE_LEN + 1).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 32]);
+        assert_eq!(
+            KdfParams::parse(KdfAlgo::RecipientWrap, &bytes).unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "KeyWrapTableV1 length",
+                cap: READER_MAX_KEY_WRAP_TABLE_LEN as u64,
+                actual: (READER_MAX_KEY_WRAP_TABLE_LEN + 1) as u64,
+            },
+        );
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(KdfAlgo::RecipientWrap as u16).to_le_bytes());
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&(READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS + 1).to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 32]);
+        assert_eq!(
+            KdfParams::parse(KdfAlgo::RecipientWrap, &bytes).unwrap_err(),
+            FormatError::ReaderResourceLimitExceeded {
+                field: "KeyWrapTableV1 recipient_record_count",
+                cap: READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS as u64,
+                actual: (READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS + 1) as u64,
+            },
         );
     }
 

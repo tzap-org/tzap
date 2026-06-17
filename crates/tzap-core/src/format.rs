@@ -22,6 +22,8 @@ pub const LOCATOR_PAIR_LEN: usize = CRITICAL_RECOVERY_LOCATOR_LEN * 2;
 pub const READER_MAX_ROOT_AUTH_FOOTER_LEN: u32 = 160 * 1024;
 pub const READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN: u32 = 16 * 1024;
 pub const READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN: u32 = 128 * 1024;
+pub const READER_MAX_KEY_WRAP_TABLE_LEN: u32 = 1024 * 1024;
+pub const READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS: u32 = 4096;
 pub const READER_MAX_CMRA_PARITY_PCT: u32 = 100;
 pub const BOOTSTRAP_SIDECAR_HEADER_LEN: usize = 128;
 pub const BLOCK_RECORD_FRAMING_LEN: usize = 20;
@@ -168,6 +170,7 @@ pub enum KdfAlgo {
     Raw = 0,
     Argon2id = 1,
     None = 2,
+    RecipientWrap = 3,
 }
 
 impl TryFrom<u16> for KdfAlgo {
@@ -178,6 +181,7 @@ impl TryFrom<u16> for KdfAlgo {
             0 => Ok(Self::Raw),
             1 => Ok(Self::Argon2id),
             2 => Ok(Self::None),
+            3 => Ok(Self::RecipientWrap),
             other => Err(FormatError::UnknownKdfAlgo(other)),
         }
     }

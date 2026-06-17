@@ -1,4 +1,5 @@
 use crc32c::crc32c;
+use sha2::{Digest, Sha256};
 
 use crate::crypto::KdfParams;
 use crate::format::{
@@ -10,6 +11,7 @@ use crate::format::{
     MANIFEST_FOOTER_LEN, READER_MAX_BLOCK_SIZE, READER_MAX_CHUNK_SIZE,
     READER_MAX_CRYPTO_HEADER_LEN, READER_MAX_ENVELOPE_TARGET_SIZE, READER_MAX_FEC_CLASS_SHARDS,
     READER_MAX_INDEX_FEC_CLASS_SHARDS, READER_MAX_INDEX_ROOT_FEC_CLASS_SHARDS,
+    READER_MAX_KEY_WRAP_TABLE_LEN, READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS,
     READER_MAX_PATH_LENGTH, READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN,
     READER_MAX_ROOT_AUTH_FOOTER_LEN, READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN,
     READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, READER_MAX_STRIPE_WIDTH, ROOT_AUTH_FOOTER_FIXED_LEN,
@@ -31,6 +33,7 @@ const TZMI_MAGIC: [u8; 4] = *b"TZMI";
 const TZCR_MAGIC: [u8; 4] = *b"TZCR";
 const TZCS_MAGIC: [u8; 4] = *b"TZCS";
 const TZCL_MAGIC: [u8; 4] = *b"TZCL";
+const TZKW_MAGIC: [u8; 4] = *b"TZKW";
 
 const BLOCK_LAST_DATA_FLAG: u8 = 0x01;
 const BLOCK_RESERVED_FLAGS: u8 = !BLOCK_LAST_DATA_FLAG;
@@ -40,6 +43,11 @@ const SIDECAR_INDEX_ROOT_PRESENT: u32 = 0x02;
 const SIDECAR_DICTIONARY_PRESENT: u32 = 0x04;
 const SIDECAR_KNOWN_FLAGS: u32 =
     SIDECAR_MANIFEST_PRESENT | SIDECAR_INDEX_ROOT_PRESENT | SIDECAR_DICTIONARY_PRESENT;
+
+const KEY_WRAP_TABLE_DIGEST_DOMAIN_V44: &[u8] = b"tzap-key-wrap-table-v44\0";
+const KEY_WRAP_TABLE_VERSION: u16 = 1;
+const KEY_WRAP_TABLE_HEADER_LEN: usize = 96;
+const KEY_WRAP_RECORD_HEADER_LEN: usize = 68;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeHeader {
@@ -212,7 +220,10 @@ impl CryptoHeaderFixed {
         }
         match (self.aead_algo, self.kdf_algo) {
             (AeadAlgo::None, KdfAlgo::None) => {}
-            (aead_algo, KdfAlgo::Raw | KdfAlgo::Argon2id) if aead_algo.is_encrypted() => {}
+            (
+                aead_algo,
+                KdfAlgo::Raw | KdfAlgo::Argon2id | KdfAlgo::RecipientWrap,
+            ) if aead_algo.is_encrypted() => {}
             _ => {
                 return Err(FormatError::InvalidProtectionMode {
                     aead_algo: self.aead_algo,
@@ -483,6 +494,271 @@ pub struct CryptoHeader<'a> {
     pub extensions: Vec<ExtensionTlv<'a>>,
     pub header_hmac: [u8; 32],
     pub hmac_covered_bytes: &'a [u8],
+}
+
+pub fn compute_key_wrap_table_digest(
+    key_wrap_table_length: u32,
+    key_wrap_table_bytes: &[u8],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(KEY_WRAP_TABLE_DIGEST_DOMAIN_V44);
+    hasher.update(&key_wrap_table_length.to_le_bytes());
+    hasher.update(key_wrap_table_bytes);
+    let digest = hasher.finalize();
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&digest);
+    output
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyWrapTableV1 {
+    pub version: u16,
+    pub volume_format_rev: u16,
+    pub table_length: u32,
+    pub flags: u32,
+    pub archive_uuid: [u8; 16],
+    pub session_id: [u8; 16],
+    pub recipient_record_count: u32,
+    pub records_offset: u32,
+    pub records_length: u32,
+    pub recipient_records: Vec<RecipientRecordV1>,
+}
+
+impl KeyWrapTableV1 {
+    pub fn parse(
+        bytes: &[u8],
+        archive_uuid: &[u8; 16],
+        session_id: &[u8; 16],
+        key_wrap_table_length: u32,
+        key_wrap_table_record_count: u32,
+    ) -> Result<Self, FormatError> {
+        expect_magic("KeyWrapTableV1", TZKW_MAGIC, &bytes[0..4])?;
+        if bytes.len() > READER_MAX_KEY_WRAP_TABLE_LEN as usize {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "KeyWrapTableV1 length",
+                cap: READER_MAX_KEY_WRAP_TABLE_LEN as u64,
+                actual: bytes.len() as u64,
+            });
+        }
+        if bytes.len() < KEY_WRAP_TABLE_HEADER_LEN {
+            return Err(FormatError::InvalidLength {
+                structure: "KeyWrapTableV1",
+                expected: KEY_WRAP_TABLE_HEADER_LEN,
+                actual: bytes.len(),
+            });
+        }
+
+        let header_length = read_u32(bytes, 12)?;
+        if header_length != KEY_WRAP_TABLE_HEADER_LEN as u32 {
+            return Err(FormatError::InvalidArchive("KeyWrapTableV1 header_length must be 96"));
+        }
+        let version = read_u16(bytes, 4)?;
+        if version != KEY_WRAP_TABLE_VERSION {
+            return Err(FormatError::InvalidArchive("KeyWrapTableV1 version must be 1"));
+        }
+        let volume_format_rev = read_u16(bytes, 6)?;
+        if volume_format_rev != VOLUME_FORMAT_REV_44 {
+            return Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 volume_format_rev must be 44",
+            ));
+        }
+
+        let declared_length = read_u32(bytes, 8)?;
+        if declared_length != key_wrap_table_length {
+            return Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 length does not match KdfParams",
+            ));
+        }
+        if declared_length as usize != bytes.len() {
+            return Err(FormatError::InvalidLength {
+                structure: "KeyWrapTableV1",
+                expected: declared_length as usize,
+                actual: bytes.len(),
+            });
+        }
+
+        let flags = read_u32(bytes, 16)?;
+        if flags != 0 {
+            return Err(FormatError::NonZeroReserved {
+                structure: "KeyWrapTableV1",
+            });
+        }
+
+        let table_archive_uuid = read_array_16(bytes, 20)?;
+        if table_archive_uuid != *archive_uuid {
+            return Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 archive_uuid does not match CryptoHeader",
+            ));
+        }
+        let table_session_id = read_array_16(bytes, 36)?;
+        if table_session_id != *session_id {
+            return Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 session_id does not match CryptoHeader",
+            ));
+        }
+
+        let recipient_record_count = read_u32(bytes, 52)?;
+        if recipient_record_count > READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "KeyWrapTableV1 recipient_record_count",
+                cap: READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS as u64,
+                actual: recipient_record_count as u64,
+            });
+        }
+        if recipient_record_count != key_wrap_table_record_count {
+            return Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 recipient_record_count does not match KdfParams",
+            ));
+        }
+
+        let records_offset = read_u32(bytes, 56)?;
+        let records_length = read_u32(bytes, 60)?;
+        if records_offset != KEY_WRAP_TABLE_HEADER_LEN as u32 {
+            return Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 records_offset must be 96",
+            ));
+        }
+        let records_end = records_offset
+            .checked_add(records_length)
+            .ok_or(FormatError::InvalidArchive(
+                "KeyWrapTableV1 records_offset + records_length overflow",
+            ))?;
+        if records_end != declared_length {
+            return Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 records_offset and records_length are inconsistent",
+            ));
+        }
+        expect_zero("KeyWrapTableV1", &bytes[64..96])?;
+
+        let mut recipient_records = Vec::with_capacity(recipient_record_count as usize);
+        let mut cursor = records_offset as usize;
+        for _ in 0..recipient_record_count {
+            let (record, consumed) = RecipientRecordV1::parse(&bytes[cursor..])?;
+            cursor += consumed;
+            recipient_records.push(record);
+        }
+        if cursor != declared_length as usize {
+            return Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 has trailing record bytes",
+            ));
+        }
+
+        Ok(Self {
+            version,
+            volume_format_rev,
+            table_length: declared_length,
+            flags,
+            archive_uuid: table_archive_uuid,
+            session_id: table_session_id,
+            recipient_record_count,
+            records_offset,
+            records_length,
+            recipient_records,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipientRecordV1 {
+    pub record_length: u32,
+    pub profile_id: u16,
+    pub recipient_identity_type: u16,
+    pub flags: u32,
+    pub recipient_identity_length: u32,
+    pub profile_payload_length: u32,
+    pub recipient_identity_digest: [u8; 32],
+    pub recipient_identity_bytes: Vec<u8>,
+    pub profile_payload_bytes: Vec<u8>,
+}
+
+impl RecipientRecordV1 {
+    pub fn parse(bytes: &[u8]) -> Result<(Self, usize), FormatError> {
+        if bytes.len() < KEY_WRAP_RECORD_HEADER_LEN {
+            return Err(FormatError::InvalidLength {
+                structure: "RecipientRecordV1",
+                expected: KEY_WRAP_RECORD_HEADER_LEN,
+                actual: bytes.len(),
+            });
+        }
+
+        let record_length = read_u32(bytes, 0)?;
+        let record_length = usize::try_from(record_length).map_err(|_| {
+            FormatError::InvalidArchive("RecipientRecordV1 record_length overflows memory")
+        })?;
+        if record_length < KEY_WRAP_RECORD_HEADER_LEN {
+            return Err(FormatError::InvalidArchive(
+                "RecipientRecordV1 record_length is too small",
+            ));
+        }
+        if record_length > bytes.len() {
+            return Err(FormatError::InvalidLength {
+                structure: "RecipientRecordV1",
+                expected: record_length,
+                actual: bytes.len(),
+            });
+        }
+
+        let profile_id = read_u16(bytes, 4)?;
+        let recipient_identity_type = read_u16(bytes, 6)?;
+        let flags = read_u32(bytes, 8)?;
+        if flags != 0 {
+            return Err(FormatError::NonZeroReserved {
+                structure: "RecipientRecordV1",
+            });
+        }
+        let recipient_identity_length = read_u32(bytes, 12)?;
+        let profile_payload_length = read_u32(bytes, 16)?;
+        let recipient_identity_length = usize::try_from(recipient_identity_length)
+            .map_err(|_| FormatError::InvalidArchive("RecipientRecordV1 identity length"))?;
+        let profile_payload_length = usize::try_from(profile_payload_length)
+            .map_err(|_| FormatError::InvalidArchive("RecipientRecordV1 payload length"))?;
+        let expected_length = KEY_WRAP_RECORD_HEADER_LEN
+            .checked_add(recipient_identity_length)
+            .and_then(|value| value.checked_add(profile_payload_length))
+            .ok_or(FormatError::InvalidArchive(
+                "RecipientRecordV1 length arithmetic overflow",
+            ))?;
+        if record_length != expected_length {
+            return Err(FormatError::InvalidArchive(
+                "RecipientRecordV1 length is inconsistent with payload sizes",
+            ));
+        }
+
+        let mut recipient_identity_digest = [0u8; 32];
+        recipient_identity_digest.copy_from_slice(&bytes[20..52]);
+        expect_zero("RecipientRecordV1", &bytes[52..68])?;
+
+        let identity_start = KEY_WRAP_RECORD_HEADER_LEN;
+        let identity_end = identity_start + recipient_identity_length;
+        let payload_end = identity_end + profile_payload_length;
+        let recipient_identity_bytes = bytes[identity_start..identity_end].to_vec();
+        let profile_payload_bytes = bytes[identity_end..payload_end].to_vec();
+
+        let mut digest = Sha256::new();
+        digest.update(&recipient_identity_bytes);
+        let mut expected_digest = [0u8; 32];
+        expected_digest.copy_from_slice(&digest.finalize());
+        if recipient_identity_digest != expected_digest {
+            return Err(FormatError::InvalidArchive(
+                "RecipientRecordV1 recipient_identity_digest mismatch",
+            ));
+        }
+
+        Ok((
+            Self {
+                record_length: expected_length as u32,
+                profile_id,
+                recipient_identity_type,
+                flags,
+                recipient_identity_length: recipient_identity_length as u32,
+                profile_payload_length: profile_payload_length as u32,
+                recipient_identity_digest,
+                recipient_identity_bytes,
+                profile_payload_bytes,
+            },
+            record_length,
+        ))
+    }
 }
 
 impl<'a> CryptoHeader<'a> {
@@ -1777,6 +2053,7 @@ fn write_i64(bytes: &mut [u8], offset: usize, value: i64) {
 mod tests {
     use super::*;
     use crate::format::CRYPTO_HEADER_HMAC_LEN;
+    use sha2::{Digest, Sha256};
 
     fn uuid() -> [u8; 16] {
         [0x11; 16]
@@ -1823,6 +2100,56 @@ mod tests {
             max_path_length: 4096,
             expected_volume_size: 0,
         }
+    }
+
+    fn recipient_record_bytes() -> Vec<u8> {
+        recipient_record_bytes_with_profile_and_payload(1, b"alice", b"profile")
+    }
+
+    fn recipient_record_bytes_with_profile_and_payload(
+        profile_id: u16,
+        identity: &[u8],
+        profile_payload: &[u8],
+    ) -> Vec<u8> {
+        let mut digest = Sha256::new();
+        digest.update(identity);
+        let identity_digest = digest.finalize();
+
+        let mut bytes = vec![0u8; KEY_WRAP_RECORD_HEADER_LEN];
+        let record_length = KEY_WRAP_RECORD_HEADER_LEN
+            .checked_add(identity.len())
+            .and_then(|value| value.checked_add(profile_payload.len()))
+            .unwrap() as u32;
+        write_u16(&mut bytes, 4, profile_id);
+        write_u16(&mut bytes, 6, 2);
+        write_u32(&mut bytes, 12, identity.len() as u32);
+        write_u32(&mut bytes, 16, profile_payload.len() as u32);
+        bytes[20..52].copy_from_slice(&identity_digest);
+        bytes.extend_from_slice(identity);
+        bytes.extend_from_slice(profile_payload);
+        write_u32(&mut bytes, 0, record_length);
+        bytes
+    }
+
+    fn key_wrap_table_bytes() -> (Vec<u8>, u32) {
+        let mut records = recipient_record_bytes();
+        let record_count = 1u32;
+        let records_length = records.len() as u32;
+        let table_length = KEY_WRAP_TABLE_HEADER_LEN as u32 + records_length;
+
+        let mut bytes = vec![0u8; KEY_WRAP_TABLE_HEADER_LEN];
+        bytes[0..4].copy_from_slice(&TZKW_MAGIC);
+        write_u16(&mut bytes, 4, KEY_WRAP_TABLE_VERSION);
+        write_u16(&mut bytes, 6, VOLUME_FORMAT_REV_44);
+        write_u32(&mut bytes, 8, table_length);
+        write_u32(&mut bytes, 12, KEY_WRAP_TABLE_HEADER_LEN as u32);
+        bytes[20..36].copy_from_slice(&uuid());
+        bytes[36..52].copy_from_slice(&session());
+        write_u32(&mut bytes, 52, record_count);
+        write_u32(&mut bytes, 56, KEY_WRAP_TABLE_HEADER_LEN as u32);
+        write_u32(&mut bytes, 60, records_length);
+        bytes.extend(records);
+        (bytes, table_length)
     }
 
     fn raw_crypto_header_bytes() -> Vec<u8> {
@@ -2077,6 +2404,141 @@ mod tests {
     }
 
     #[test]
+    fn key_wrap_table_round_trips_with_record_digest_checks() {
+        let (table_bytes, table_length) = key_wrap_table_bytes();
+        let parsed = KeyWrapTableV1::parse(
+            &table_bytes,
+            &uuid(),
+            &session(),
+            table_length,
+            1,
+        )
+        .unwrap();
+        assert_eq!(parsed.table_length, table_length);
+        assert_eq!(parsed.recipient_records.len(), 1);
+        assert_eq!(parsed.recipient_records[0].recipient_identity_bytes, b"alice");
+
+        let (record, consumed) = RecipientRecordV1::parse(&table_bytes[96..]).unwrap();
+        assert_eq!(record.profile_id, 1);
+        assert_eq!(record.recipient_identity_type, 2);
+        assert_eq!(record.profile_payload_bytes, b"profile");
+        assert_eq!(record.recipient_identity_length as usize, b"alice".len());
+        assert_eq!(record.profile_payload_length as usize, b"profile".len());
+        assert_eq!(consumed, table_bytes.len() - 96);
+
+        let digest = compute_key_wrap_table_digest(table_length, &table_bytes);
+        let mut expected = Sha256::new();
+        expected.update(KEY_WRAP_TABLE_DIGEST_DOMAIN_V44);
+        expected.update(&table_length.to_le_bytes());
+        expected.update(&table_bytes);
+        let expected = expected.finalize();
+        assert_eq!(digest, expected[..].try_into().unwrap());
+    }
+
+    #[test]
+    fn key_wrap_table_parse_rejects_table_record_count_and_length_mismatch() {
+        let (table_bytes, table_length) = key_wrap_table_bytes();
+        let parsed = KeyWrapTableV1::parse(&table_bytes, &uuid(), &session(), table_length, 2);
+        assert_eq!(
+            parsed.unwrap_err(),
+            FormatError::InvalidArchive(
+                "KeyWrapTableV1 recipient_record_count does not match KdfParams"
+            )
+        );
+
+        let mut bad = table_bytes.clone();
+        write_u32(&mut bad, 8, table_length + 1);
+        assert_eq!(
+            KeyWrapTableV1::parse(&bad, &uuid(), &session(), table_length, 1),
+            Err(FormatError::InvalidLength {
+                structure: "KeyWrapTableV1",
+                expected: (table_length + 1) as usize,
+                actual: bad.len(),
+            })
+        );
+    }
+
+    #[test]
+    fn key_wrap_table_parse_rejects_magic_version_revision_and_reserved_fields() {
+        let (table_bytes, table_length) = key_wrap_table_bytes();
+
+        let mut bad_magic = table_bytes.clone();
+        bad_magic[0] = b'X';
+        assert_eq!(
+            KeyWrapTableV1::parse(&bad_magic, &uuid(), &session(), table_length, 1),
+            Err(FormatError::BadMagic {
+                structure: "KeyWrapTableV1"
+            })
+        );
+
+        let mut bad_version = table_bytes.clone();
+        write_u16(&mut bad_version, 4, 2);
+        assert_eq!(
+            KeyWrapTableV1::parse(&bad_version, &uuid(), &session(), table_length, 1),
+            Err(FormatError::InvalidArchive("KeyWrapTableV1 version must be 1"))
+        );
+
+        let mut bad_revision = table_bytes.clone();
+        write_u16(&mut bad_revision, 6, VOLUME_FORMAT_REV_43);
+        assert_eq!(
+            KeyWrapTableV1::parse(&bad_revision, &uuid(), &session(), table_length, 1),
+            Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 volume_format_rev must be 44"
+            ))
+        );
+
+        let mut bad_reserved = table_bytes.clone();
+        bad_reserved[64] = 1;
+        assert_eq!(
+            KeyWrapTableV1::parse(&bad_reserved, &uuid(), &session(), table_length, 1),
+            Err(FormatError::NonZeroReserved {
+                structure: "KeyWrapTableV1"
+            })
+        );
+
+        let mut bad_header_length = table_bytes.clone();
+        write_u32(&mut bad_header_length, 12, 97);
+        assert_eq!(
+            KeyWrapTableV1::parse(&bad_header_length, &uuid(), &session(), table_length, 1),
+            Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 header_length must be 96"
+            ))
+        );
+    }
+
+    #[test]
+    fn key_wrap_records_reject_invalid_digest_and_record_length() {
+        let table = recipient_record_bytes();
+        let (record, _) = RecipientRecordV1::parse(&table).unwrap();
+        assert_eq!(record.recipient_identity_length as usize, b"alice".len());
+
+        let mut bad_digest = table.clone();
+        bad_digest[20] ^= 1;
+        assert_eq!(
+            RecipientRecordV1::parse(&bad_digest).unwrap_err(),
+            FormatError::InvalidArchive("RecipientRecordV1 recipient_identity_digest mismatch")
+        );
+
+        let mut bad_len = table.clone();
+        write_u32(&mut bad_len, 0, 12);
+        assert_eq!(
+            RecipientRecordV1::parse(&bad_len).unwrap_err(),
+            FormatError::InvalidArchive("RecipientRecordV1 record_length is too small")
+        );
+    }
+
+    #[test]
+    fn key_wrap_records_parse_unknown_profile_id() {
+        let mut table =
+            recipient_record_bytes_with_profile_and_payload(0xBEEF, b"charlie", b"payload");
+        let (record, consumed) = RecipientRecordV1::parse(&table).unwrap();
+        assert_eq!(record.profile_id, 0xBEEF);
+        assert_eq!(record.recipient_identity_bytes, b"charlie");
+        assert_eq!(record.profile_payload_bytes, b"payload");
+        assert_eq!(consumed, table.len());
+    }
+
+    #[test]
     fn crypto_header_fixed_validates_v43_protection_mode_pairs() {
         let mut header = crypto_fixed();
         header.aead_algo = AeadAlgo::None;
@@ -2104,6 +2566,22 @@ mod tests {
                 kdf_algo: KdfAlgo::None,
             }
         );
+
+        let mut header = crypto_fixed();
+        header.aead_algo = AeadAlgo::None;
+        header.kdf_algo = KdfAlgo::RecipientWrap;
+        assert_eq!(
+            header.validate_supported_profile().unwrap_err(),
+            FormatError::InvalidProtectionMode {
+                aead_algo: AeadAlgo::None,
+                kdf_algo: KdfAlgo::RecipientWrap,
+            }
+        );
+
+        let mut header = crypto_fixed();
+        header.aead_algo = AeadAlgo::AesGcmSiv256;
+        header.kdf_algo = KdfAlgo::RecipientWrap;
+        header.validate_supported_profile().unwrap();
     }
 
     #[test]

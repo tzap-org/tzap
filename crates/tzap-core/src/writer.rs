@@ -4131,10 +4131,13 @@ fn build_crypto_header(
         KdfParams::None => KdfAlgo::None,
         KdfParams::Raw => KdfAlgo::Raw,
         KdfParams::Argon2id { .. } => KdfAlgo::Argon2id,
+        KdfParams::RecipientWrap { .. } => KdfAlgo::RecipientWrap,
     };
     match (options.aead_algo, kdf_algo) {
         (AeadAlgo::None, KdfAlgo::None) => {}
-        (aead_algo, KdfAlgo::Raw | KdfAlgo::Argon2id) if aead_algo.is_encrypted() => {}
+        (aead_algo, KdfAlgo::Raw | KdfAlgo::Argon2id | KdfAlgo::RecipientWrap)
+            if aead_algo.is_encrypted() =>
+        {}
         _ => {
             return Err(FormatError::InvalidProtectionMode {
                 aead_algo: options.aead_algo,
@@ -4228,6 +4231,19 @@ fn serialize_kdf_params(params: &KdfParams) -> Result<Vec<u8>, FormatError> {
             bytes.extend_from_slice(&parallelism.to_le_bytes());
             bytes.extend_from_slice(&salt_len.to_le_bytes());
             bytes.extend_from_slice(salt);
+        }
+        KdfParams::RecipientWrap {
+            key_wrap_table_length,
+            key_wrap_table_record_count,
+            key_wrap_table_version,
+            key_wrap_table_digest,
+        } => {
+            bytes.extend_from_slice(&(KdfAlgo::RecipientWrap as u16).to_le_bytes());
+            bytes.extend_from_slice(&key_wrap_table_length.to_le_bytes());
+            bytes.extend_from_slice(&key_wrap_table_record_count.to_le_bytes());
+            bytes.extend_from_slice(&key_wrap_table_version.to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(key_wrap_table_digest);
         }
     }
     Ok(bytes)
@@ -7197,6 +7213,25 @@ mod tests {
             .unwrap_err(),
             FormatError::InvalidKdfParams("m_cost_kib requirement overflow")
         );
+    }
+
+    #[test]
+    fn recipient_wrap_kdf_serialization() {
+        let params = KdfParams::RecipientWrap {
+            key_wrap_table_length: 16,
+            key_wrap_table_record_count: 4,
+            key_wrap_table_version: 1,
+            key_wrap_table_digest: [0xaau8; 32],
+        };
+        let serialized = serialize_kdf_params(&params).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(KdfAlgo::RecipientWrap as u16).to_le_bytes());
+        expected.extend_from_slice(&16u32.to_le_bytes());
+        expected.extend_from_slice(&4u32.to_le_bytes());
+        expected.extend_from_slice(&1u16.to_le_bytes());
+        expected.extend_from_slice(&0u16.to_le_bytes());
+        expected.extend_from_slice(&[0xaau8; 32]);
+        assert_eq!(serialized, expected);
     }
 
     #[test]
