@@ -4,8 +4,7 @@ This folder is the working evidence set for v43 and RootAuth signing-plugin
 compliance. The root README stays product-facing; this folder carries the
 review map, verification gates, and audit notes.
 
-The folder name is intentionally `implmentation-docs/traceability` because that
-is the path requested for this pass.
+The folder name is `public-docs/traceability`.
 
 ## Claim boundary
 
