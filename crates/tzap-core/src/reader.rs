@@ -5594,6 +5594,8 @@ fn validate_critical_metadata_image(
     mode: CmraRecoveryMode,
 ) -> Result<(), FormatError> {
     let root_auth_present = image.layout_flags & 0x0000_0001 != 0;
+    let key_wrap_region = image.region(6);
+    let key_wrap_present = key_wrap_region.is_some();
     if image.volume_header_offset != 0
         || image.volume_header_length != VOLUME_HEADER_LEN as u32
         || image.crypto_header_offset != VOLUME_HEADER_LEN as u64
@@ -5648,13 +5650,26 @@ fn validate_critical_metadata_image(
             }
         }
     }
-    if image.block_records_offset
-        != image
-            .crypto_header_offset
-            .checked_add(image.crypto_header_length as u64)
+    let crypto_header_end = image
+        .crypto_header_offset
+        .checked_add(image.crypto_header_length as u64)
+        .ok_or(FormatError::InvalidArchive("CryptoHeader boundary overflow"))?;
+    let expected_block_records_offset = if let Some(key_wrap_region) = key_wrap_region {
+        if key_wrap_region.offset != crypto_header_end || key_wrap_region.bytes.is_empty() {
+            return Err(FormatError::InvalidArchive(
+                "CriticalMetadataImage key-wrap region is malformed",
+            ));
+        }
+        key_wrap_region
+            .offset
+            .checked_add(key_wrap_region.bytes.len() as u64)
             .ok_or(FormatError::InvalidArchive(
-                "CryptoHeader boundary overflow",
+                "KeyWrapTableV1 boundary overflow",
             ))?
+    } else {
+        crypto_header_end
+    };
+    if image.block_records_offset != expected_block_records_offset
         || image.manifest_footer_offset
             != image
                 .block_records_offset
@@ -5692,10 +5707,11 @@ fn validate_critical_metadata_image(
             "CriticalMetadataImage unsigned terminal equations are invalid",
         ));
     }
-    let expected_types: &[u16] = if root_auth_present {
-        &[1, 2, 3, 4, 5]
-    } else {
-        &[1, 2, 3, 5]
+    let expected_types: &[u16] = match (key_wrap_present, root_auth_present) {
+        (false, false) => &[1, 2, 3, 5],
+        (false, true) => &[1, 2, 3, 4, 5],
+        (true, false) => &[1, 2, 6, 3, 5],
+        (true, true) => &[1, 2, 6, 3, 4, 5],
     };
     if image.regions.len() != expected_types.len()
         || image
@@ -5726,6 +5742,11 @@ fn validate_critical_metadata_image(
         image.manifest_footer_offset,
         image.manifest_footer_length,
     )?;
+    if let Some(region) = key_wrap_region {
+        let region_length = u32::try_from(region.bytes.len())
+            .map_err(|_| FormatError::InvalidArchive("KeyWrapTableV1 length does not fit in u32"))?;
+        validate_image_region(image, 6, region.offset, region_length)?;
+    }
     if root_auth_present {
         validate_image_region(
             image,

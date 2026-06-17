@@ -3,6 +3,7 @@ members = [
     "crates/tzap-cli",
     "crates/tzap-core",
     "crates/tzap-plugin-signing",
+    "crates/tzap-plugin-keywrap",
 ]
 resolver = "2"
 

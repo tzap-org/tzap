@@ -63,7 +63,8 @@ pub use writer::{
     write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
     write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
     write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
-    write_empty_archive, ArchiveWriteProgressSink, ArchiveWriteSink, MemoryArchiveSink,
+    write_empty_archive, ArchiveWriteProgressSink, ArchiveWriteSink, KeyWrapRecordSource,
+    MemoryArchiveSink,
     RegularFile, RegularFileSource, RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions,
     WriterTimings, WrittenArchiveSummary,
 };

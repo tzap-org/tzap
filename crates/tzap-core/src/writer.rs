@@ -690,6 +690,8 @@ struct WriterPlan {
     directory_hint_objects: Vec<PlannedDirectoryHintObject>,
     directory_hint_entries: Vec<DirectoryHintShardEntry>,
     root_auth_footer_length: Option<u32>,
+    key_wrap_table: Option<Vec<u8>>,
+    block_records_offset: u64,
     total_block_count: u64,
 }
 
@@ -760,6 +762,7 @@ pub fn write_archive(
         &KdfParams::Raw,
         None,
         None,
+        None,
     )
 }
 
@@ -777,6 +780,7 @@ pub fn write_archive_unencrypted(
         &KdfParams::None,
         None,
         None,
+        None,
     )
 }
 
@@ -786,7 +790,7 @@ pub fn write_archive_with_kdf(
     options: WriterOptions,
     kdf_params: &KdfParams,
 ) -> Result<WrittenArchive, FormatError> {
-    write_archive_inner(files, master_key, options, None, kdf_params, None, None)
+    write_archive_inner(files, master_key, options, None, kdf_params, None, None, None)
 }
 
 pub fn write_archive_with_root_auth<F>(
@@ -807,6 +811,7 @@ where
         &KdfParams::Raw,
         Some(root_auth),
         Some(&mut authenticator),
+        None,
     )
 }
 
@@ -829,6 +834,7 @@ where
         kdf_params,
         Some(root_auth),
         Some(&mut authenticator),
+        None,
     )
 }
 
@@ -851,6 +857,7 @@ where
         &KdfParams::Raw,
         Some(root_auth),
         Some(&mut authenticator),
+        None,
     )
 }
 
@@ -874,6 +881,7 @@ where
         kdf_params,
         Some(root_auth),
         Some(&mut authenticator),
+        None,
     )
 }
 
@@ -904,6 +912,7 @@ pub fn write_archive_with_dictionary(
         options,
         Some(dictionary),
         &KdfParams::Raw,
+        None,
         None,
         None,
     )
@@ -937,6 +946,7 @@ pub fn write_archive_with_dictionary_and_kdf(
         options,
         Some(dictionary),
         kdf_params,
+        None,
         None,
         None,
     )
@@ -1126,6 +1136,7 @@ fn write_archive_inner(
     kdf_params: &KdfParams,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    key_wrap_records: Option<&KeyWrapRecordSource>,
 ) -> Result<WrittenArchive, FormatError> {
     let mut sink = MemoryArchiveSink::default();
     let summary = write_archive_stream_inner(
@@ -1136,6 +1147,7 @@ fn write_archive_inner(
         kdf_params,
         root_auth,
         authenticator,
+        key_wrap_records,
         &mut sink,
     )
     .map_err(format_error_from_archive_write_error)?;
@@ -1184,6 +1196,7 @@ fn write_archive_stream_inner<S, O>(
     kdf_params: &KdfParams,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     mut authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    key_wrap_records: Option<&KeyWrapRecordSource>,
     sink: &mut O,
 ) -> Result<WrittenArchiveSummary, ArchiveWriteError>
 where
@@ -1217,6 +1230,7 @@ where
             planned_options,
             dictionary,
             kdf_params,
+            key_wrap_records,
             archive_uuid,
             session_id,
             root_auth,
@@ -1282,6 +1296,7 @@ fn build_writer_plan<S: RegularFileSource>(
     options: WriterOptions,
     dictionary: Option<&[u8]>,
     kdf_params: &KdfParams,
+    key_wrap_records: Option<&KeyWrapRecordSource>,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
     root_auth: Option<RootAuthWriterConfig<'_>>,
@@ -1298,6 +1313,7 @@ fn build_writer_plan<S: RegularFileSource>(
         options,
         dictionary,
         kdf_params,
+        key_wrap_records,
         archive_uuid,
         session_id,
         root_auth,
@@ -1320,12 +1336,19 @@ fn build_writer_plan_from_payload(
     mut options: WriterOptions,
     dictionary: Option<&[u8]>,
     kdf_params: &KdfParams,
+    key_wrap_records: Option<&KeyWrapRecordSource>,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
     root_auth: Option<RootAuthWriterConfig<'_>>,
 ) -> Result<WriterPlan, ArchiveWriteError> {
     let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
-    let volume_format_rev = volume_format_revision_for_options(&options);
+    let (resolved_kdf_params, key_wrap_table) = resolve_key_wrap_artifacts(
+        kdf_params,
+        &archive_uuid,
+        &session_id,
+        key_wrap_records,
+    )?;
+    let volume_format_rev = volume_format_revision_for_options(&options, &resolved_kdf_params);
     let (shard_file_rows, planned_index_shards) = if payload.tar_members.is_empty() {
         (Vec::new(), Vec::new())
     } else {
@@ -1462,7 +1485,7 @@ fn build_writer_plan_from_payload(
         &subkeys,
         &archive_uuid,
         &session_id,
-        kdf_params,
+        &resolved_kdf_params,
     )?;
     let index_root_extent = ObjectExtent::new(planned_next_block_index, metadata_class.index_root)?;
     let total_block_count = index_root_extent.next_block_index()?;
@@ -1474,6 +1497,18 @@ fn build_writer_plan_from_payload(
             )
         })
         .transpose()?;
+    let block_records_offset = checked_u64_add(
+        checked_u64_add(
+            VOLUME_HEADER_LEN as u64,
+            crypto_header.len() as u64,
+            "CryptoHeader",
+        )?,
+        key_wrap_table
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or(0) as u64,
+        "KeyWrapTableV1",
+    )?;
 
     Ok(WriterPlan {
         options,
@@ -1494,6 +1529,8 @@ fn build_writer_plan_from_payload(
         directory_hint_objects,
         directory_hint_entries,
         root_auth_footer_length,
+        key_wrap_table,
+        block_records_offset,
         total_block_count,
     })
 }
@@ -1652,7 +1689,7 @@ where
     let session_id = options
         .session_id
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
-    let volume_format_rev = volume_format_revision_for_options(&options);
+    let volume_format_rev = volume_format_revision_for_options(&options, kdf_params);
     let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
     let crypto_header = build_crypto_header(
         options,
@@ -1667,6 +1704,7 @@ where
         sink,
         options,
         &crypto_header,
+        None,
         archive_uuid,
         session_id,
         volume_format_rev,
@@ -1810,7 +1848,7 @@ where
     let session_id = options
         .session_id
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
-    let volume_format_rev = volume_format_revision_for_options(&options);
+    let volume_format_rev = volume_format_revision_for_options(&options, kdf_params);
     let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
     let crypto_header = build_crypto_header(
         options,
@@ -1825,6 +1863,7 @@ where
         sink,
         options,
         &crypto_header,
+        None,
         archive_uuid,
         session_id,
         volume_format_rev,
@@ -2095,7 +2134,7 @@ where
     let session_id = options
         .session_id
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
-    let volume_format_rev = volume_format_revision_for_options(&options);
+    let volume_format_rev = volume_format_revision_for_options(&options, kdf_params);
     let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
     let crypto_header = build_crypto_header(
         options,
@@ -2110,6 +2149,7 @@ where
         sink,
         options,
         &crypto_header,
+        None,
         archive_uuid,
         session_id,
         volume_format_rev,
@@ -2837,6 +2877,7 @@ fn begin_writer_emission_state<O: ArchiveWriteSink>(
     sink: &mut O,
     options: WriterOptions,
     crypto_header: &[u8],
+    key_wrap_table: Option<&[u8]>,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
     volume_format_rev: u16,
@@ -2871,11 +2912,20 @@ fn begin_writer_emission_state<O: ArchiveWriteSink>(
         let volume_header_bytes = volume_header.to_bytes();
         sink.write_volume(volume_index, &volume_header_bytes)?;
         sink.write_volume(volume_index, crypto_header)?;
-        state.bytes_written[volume_index] = checked_u64_add(
+        let mut bytes_written = checked_u64_add(
             VOLUME_HEADER_LEN as u64,
             crypto_header.len() as u64,
             "volume header",
         )?;
+        if let Some(key_wrap_table) = key_wrap_table {
+            sink.write_volume(volume_index, key_wrap_table)?;
+            bytes_written = checked_u64_add(
+                bytes_written,
+                key_wrap_table.len() as u64,
+                "KeyWrapTableV1",
+            )?;
+        }
+        state.bytes_written[volume_index] = bytes_written;
         state.volume_headers.push(volume_header_bytes);
     }
 
@@ -3342,7 +3392,7 @@ fn planned_v41_volume_size(
     let block_record_len = plan.options.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
     let block_record_bytes = checked_u64_mul(block_count, block_record_len, "volume records")?;
     let manifest_footer_offset = checked_u64_add(
-        VOLUME_HEADER_LEN as u64 + plan.crypto_header.len() as u64,
+        plan.block_records_offset,
         block_record_bytes,
         "volume records",
     )?;
@@ -3393,10 +3443,12 @@ fn planned_v41_volume_size(
         volume_header_bytes: &volume_header_bytes,
         crypto_header: &plan.crypto_header,
         block_count,
+        block_records_offset: plan.block_records_offset,
         manifest_footer_offset,
         manifest_footer: &manifest_footer,
         root_auth_footer_offset,
         root_auth_footer: root_auth_footer.as_deref(),
+        key_wrap_table: plan.key_wrap_table.as_deref(),
         trailer_offset,
         trailer: &trailer,
         cmra_offset,
@@ -3445,6 +3497,7 @@ where
         sink,
         plan.options,
         &plan.crypto_header,
+        plan.key_wrap_table.as_deref(),
         plan.archive_uuid,
         plan.session_id,
         plan.volume_format_rev,
@@ -3689,10 +3742,12 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
             volume_header_bytes: &state.volume_headers[volume_index],
             crypto_header: &plan.crypto_header,
             block_count: state.record_counts[volume_index],
+            block_records_offset: state.bytes_written[volume_index],
             manifest_footer_offset,
             manifest_footer: &manifest_footer,
             root_auth_footer_offset,
             root_auth_footer: root_auth_footer.as_deref(),
+            key_wrap_table: plan.key_wrap_table.as_deref(),
             trailer_offset,
             trailer: &trailer,
             cmra_offset,
@@ -5814,10 +5869,12 @@ struct CmraBuildInput<'a> {
     volume_header_bytes: &'a [u8; VOLUME_HEADER_LEN],
     crypto_header: &'a [u8],
     block_count: u64,
+    block_records_offset: u64,
     manifest_footer_offset: u64,
     manifest_footer: &'a [u8; MANIFEST_FOOTER_LEN],
     root_auth_footer_offset: Option<u64>,
     root_auth_footer: Option<&'a [u8]>,
+    key_wrap_table: Option<&'a [u8]>,
     trailer_offset: u64,
     trailer: &'a [u8; VOLUME_TRAILER_LEN],
     cmra_offset: u64,
@@ -5829,7 +5886,29 @@ struct CmraBuildInput<'a> {
 
 fn build_v41_cmra(input: CmraBuildInput<'_>) -> Result<BuiltCmra, FormatError> {
     let block_record_len = input.options.block_size as u64 + BLOCK_RECORD_FRAMING_LEN as u64;
-    let block_records_offset = VOLUME_HEADER_LEN as u64 + input.crypto_header.len() as u64;
+    let crypto_end = VOLUME_HEADER_LEN as u64 + input.crypto_header.len() as u64;
+    let block_records_offset = input.block_records_offset;
+    let key_wrap_table = input
+        .key_wrap_table
+        .map(|table| {
+            if table.is_empty() {
+                return Err(FormatError::WriterInvariant(
+                    "KeyWrapTableV1 must include at least one recipient record",
+                ));
+            }
+            let key_wrap_table_length = u32_len(table.len(), "KeyWrapTableV1 table_length")?;
+            Ok((table, key_wrap_table_length))
+        })
+        .transpose()?;
+    let key_wrap_table_length = key_wrap_table.map(|(_, length)| u64::from(length));
+    let expected_block_records_offset = key_wrap_table_length
+        .map(|length| checked_u64_add(crypto_end, length, "KeyWrapTableV1")?)
+        .unwrap_or(crypto_end);
+    if block_records_offset != expected_block_records_offset {
+        return Err(FormatError::WriterInvariant(
+            "CMRA block records offset does not match key-wrap table layout",
+        ));
+    }
     let block_records_length = checked_u64_mul(
         input.block_count,
         block_record_len,
@@ -5890,12 +5969,19 @@ fn build_v41_cmra(input: CmraBuildInput<'_>) -> Result<BuiltCmra, FormatError> {
             offset: VOLUME_HEADER_LEN as u64,
             bytes: input.crypto_header.to_vec(),
         },
-        SerializedRegion {
-            region_type: 3,
-            offset: input.manifest_footer_offset,
-            bytes: input.manifest_footer.to_vec(),
-        },
     ];
+    if let Some((table, _)) = key_wrap_table {
+        regions.push(SerializedRegion {
+            region_type: 6,
+            offset: crypto_end,
+            bytes: table.to_vec(),
+        });
+    }
+    regions.push(SerializedRegion {
+        region_type: 3,
+        offset: input.manifest_footer_offset,
+        bytes: input.manifest_footer.to_vec(),
+    });
     if let (Some(offset), Some(footer)) = (input.root_auth_footer_offset, input.root_auth_footer) {
         regions.push(SerializedRegion {
             region_type: 4,
@@ -6547,11 +6633,12 @@ mod tests {
         let crypto_header = b"test crypto header";
 
         let mut unsigned_sink = MemoryArchiveSink::default();
-        let volume_format_rev = volume_format_revision_for_options(&options);
+        let volume_format_rev = volume_format_revision_for_options(&options, &KdfParams::None);
         let unsigned = begin_writer_emission_state(
             &mut unsigned_sink,
             options,
             crypto_header,
+            None,
             archive_uuid,
             session_id,
             volume_format_rev,
@@ -6561,11 +6648,12 @@ mod tests {
         assert!(unsigned.data_leaf_hashes.is_none());
 
         let mut signed_sink = MemoryArchiveSink::default();
-        let volume_format_rev = volume_format_revision_for_options(&options);
+        let volume_format_rev = volume_format_revision_for_options(&options, &KdfParams::None);
         let signed = begin_writer_emission_state(
             &mut signed_sink,
             options,
             crypto_header,
+            None,
             archive_uuid,
             session_id,
             volume_format_rev,

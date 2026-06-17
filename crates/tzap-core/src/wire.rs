@@ -547,13 +547,14 @@ impl KeyWrapTableV1 {
             for record in &self.recipient_records {
                 recipients.extend_from_slice(&record.to_bytes()?);
             }
-            let recipient_record_count = u32_len(self.recipient_records.len())?;
+            let recipient_record_count =
+                u32_len(self.recipient_records.len(), "KeyWrapTableV1 recipient_record_count")?;
             if self.recipient_record_count != 0 && self.recipient_record_count != recipient_record_count {
                 return Err(FormatError::InvalidArchive(
                     "KeyWrapTableV1 recipient_record_count does not match fields",
                 ));
             }
-            let records_length = u32_len(recipients.len())?;
+            let records_length = u32_len(recipients.len(), "KeyWrapTableV1 records_length")?;
             if self.records_length != 0 && self.records_length != records_length {
                 return Err(FormatError::InvalidArchive(
                     "KeyWrapTableV1 records_length does not match fields",
@@ -563,7 +564,10 @@ impl KeyWrapTableV1 {
             let table_length = u32_len(
                 KEY_WRAP_TABLE_HEADER_LEN
                     .checked_add(recipients.len())
-                    .ok_or(FormatError::WriterUnsupported("key-wrap table length overflow"))?,
+                    .ok_or(FormatError::WriterUnsupported(
+                        "key-wrap table length overflow",
+                    ))?,
+                "KeyWrapTableV1 table_length",
             )?;
             if self.table_length != 0 && self.table_length != table_length {
                 return Err(FormatError::InvalidArchive(
@@ -745,13 +749,18 @@ impl RecipientRecordV1 {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, FormatError> {
         let mut bytes = vec![0u8; KEY_WRAP_RECORD_HEADER_LEN];
-        let computed_identity_length = u32_len(self.recipient_identity_bytes.len())?;
-        let computed_profile_payload_length = u32_len(self.profile_payload_bytes.len())?;
+        let computed_identity_length =
+            u32_len(self.recipient_identity_bytes.len(), "RecipientRecordV1 identity length")?;
+        let computed_profile_payload_length =
+            u32_len(self.profile_payload_bytes.len(), "RecipientRecordV1 profile payload length")?;
         let computed_record_length = u32_len(
             computed_identity_length
                 .checked_add(KEY_WRAP_RECORD_HEADER_LEN as u32)
                 .and_then(|value| value.checked_add(computed_profile_payload_length))
-                .ok_or(FormatError::WriterUnsupported("recipient-wrap record length overflow"))?,
+                .ok_or(FormatError::WriterUnsupported(
+                    "RecipientRecordV1 length overflow",
+                ))?,
+            "RecipientRecordV1 record length",
         )?;
 
         let record_length = if self.record_length == 0 {
@@ -2043,6 +2052,10 @@ fn expect_len(structure: &'static str, expected: usize, actual: usize) -> Result
         });
     }
     Ok(())
+}
+
+fn u32_len(value: usize, field: &'static str) -> Result<u32, FormatError> {
+    u32::try_from(value).map_err(|_| FormatError::WriterUnsupported(field))
 }
 
 fn expect_magic(

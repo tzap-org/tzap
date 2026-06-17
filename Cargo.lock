@@ -1321,6 +1321,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tzap-plugin-keywrap"
+version = "0.1.7"
+dependencies = [
+ "tzap-core",
+]
+
+[[package]]
 name = "tzap-plugin-signing"
 version = "0.1.7"
 dependencies = [
