@@ -5,6 +5,30 @@ The README is for the product promise, installation, and quick starts; this file
 is for exact CLI behavior when a command asks for a shape outside the current
 writer or reader path.
 
+## Unsupported archive revision
+
+Readers inspect the fixed archive header before applying revision-specific
+layout rules. If an archive was written by a newer tzap format revision than
+the installed reader supports, `tzap` exits with `12 unsupported-revision`
+instead of reporting a wrong key or corrupt archive.
+
+Example during a v43-to-v44 migration:
+
+```sh
+tzap list --keyfile project.key future-v44.tzap
+# exit 12: unsupported-revision
+```
+
+What to do:
+
+- Upgrade tzap or use a reader that supports the archive's
+  `volume_format_rev`.
+- Do not repair, rewrite, or re-save the archive with the older reader.
+- Treat this as a reader capability mismatch, not as evidence that the key,
+  passphrase, or archive bytes are bad.
+- Automation should key on exit code `12` / label `unsupported-revision` and
+  surface the required reader upgrade action to the operator.
+
 ## Writer shape validation
 
 The writer validates archive layout choices before writing bytes. If a request

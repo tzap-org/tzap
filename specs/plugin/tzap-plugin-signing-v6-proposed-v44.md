@@ -5,7 +5,8 @@ v44 root authentication.
 
 Status: implementation target for the v44 core helper API. Targets
 `specs/tzap-format-revisedv44.md` and
-`root_auth_spec_id = "tzap-root-auth-v0.44\0"` padded to 24 bytes.
+`root_auth_spec_id` as the 20 ASCII bytes `tzap-root-auth-v0.44` followed by
+four zero bytes.
 
 ## 1. Scope
 
@@ -33,8 +34,8 @@ Those are core v44 or RecipientWrap key-wrap profile responsibilities.
 
 This profile operates only when all of these are true:
 
-1. `RootAuthFooterV1.root_auth_spec_id` is the exact 24-byte padded
-   `"tzap-root-auth-v0.44\0"` value.
+1. `RootAuthFooterV1.root_auth_spec_id` is the exact 24-byte value consisting
+   of the 20 ASCII bytes `tzap-root-auth-v0.44` followed by four zero bytes.
 2. The archive has `VolumeHeader.volume_format_rev = 44`.
 3. Core has wire-validated `RootAuthFooterV1`.
 4. Core has recomputed `archive_root` according to the v44 spec.
@@ -199,6 +200,13 @@ physical completeness, or recovery margin.
 `SelfSignedConsistent` means the signature validates against an embedded key
 but no caller trust anchor matched. It MUST NOT be described as origin
 authenticity.
+
+`UnsupportedIdentity` means the footer's `signer_identity_type` is unsupported
+for this profile, or type 0 was used without a caller-supplied trusted Ed25519
+key. `Invalid` means this profile was selected but the identity length is
+malformed for the selected identity type, the authenticator value is malformed,
+the embedded type-1 key conflicts with the caller-supplied trusted key, or the
+public key/signature violates the strict Ed25519 profile or fails verification.
 
 ## 8. Evaluation Order
 

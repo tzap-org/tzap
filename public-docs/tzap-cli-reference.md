@@ -21,7 +21,7 @@ This document is a compact command reference for `tzap` operators and automation
 | 3 | io-error | Filesystem I/O or permission problem |
 | 10 | wrong-key | Wrong passphrase or key for archive |
 | 11 | corrupt-archive | Archive integrity or payload problem |
-| 12 | unsupported-revision | Unsupported archive revision |
+| 12 | unsupported-revision | Unsupported archive revision; use or upgrade to a reader that supports it |
 | 13 | unsafe-path | Unsafe extraction path |
 | 14 | missing-bootstrap | Bootstrap sidecar required |
 | 16 | unsupported-feature | Unsupported archive feature or writer shape |

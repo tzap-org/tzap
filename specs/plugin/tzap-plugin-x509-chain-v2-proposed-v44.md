@@ -6,7 +6,8 @@ tzap v44 root authentication.
 Status: implementation target for the current `tzap-plugin-signing::x509_chain`
 module and tzap CLI X.509 RootAuth flags. Targets
 `specs/tzap-format-revisedv44.md` and
-`root_auth_spec_id = "tzap-root-auth-v0.44\0"` padded to 24 bytes.
+`root_auth_spec_id` as the 20 ASCII bytes `tzap-root-auth-v0.44` followed by
+four zero bytes.
 This v2 document keeps the v1 X.509 authenticator wire profile and updates its
 core contract for v44 archive-root inputs.
 
@@ -43,8 +44,8 @@ responsibilities.
 
 This profile operates only when all of these are true:
 
-1. `RootAuthFooterV1.root_auth_spec_id` is the exact 24-byte padded
-   `"tzap-root-auth-v0.44\0"` value.
+1. `RootAuthFooterV1.root_auth_spec_id` is the exact 24-byte value consisting
+   of the 20 ASCII bytes `tzap-root-auth-v0.44` followed by four zero bytes.
 2. The archive has `VolumeHeader.volume_format_rev = 44`.
 3. Core has wire-validated `RootAuthFooterV1`.
 4. Core has recomputed `archive_root` according to the v44 spec.
@@ -277,18 +278,20 @@ After parsing, readers MUST:
    untrusted stored value.
 2. Verify the RootAuth signature with the leaf certificate public key and the
    exact `sig_scheme` parameters from §5.3.
-3. Build an X.509 store from caller-supplied trusted roots and, only when
+3. Enforce the v1 leaf KeyUsage rule in §8.
+4. Require at least one caller-supplied trusted root or an explicit request to
+   use OpenSSL default trust roots.
+5. Build an X.509 store from caller-supplied trusted roots and, only when
    explicitly requested, OpenSSL default trust roots.
-4. Add embedded chain certificates as untrusted intermediates.
-5. Verify the certificate path at the selected chain-validation time. The
+6. Add embedded chain certificates as untrusted intermediates.
+7. Verify the certificate path at the selected chain-validation time. The
    default v1 profile uses verifier current time. `signed_at_unix_seconds` MUST
    NOT be used as the chain-validation time for a successful v1 result unless a
    separate trusted timestamp profile or explicit deployment policy supplies
    independent evidence that binds the archive signature to that time.
-6. Enforce the v1 leaf KeyUsage rule in §8.
 
-RootAuth verification MUST fail if either signature verification or certificate
-path verification fails.
+RootAuth verification MUST fail if signature verification, KeyUsage enforcement,
+or certificate path verification fails.
 
 ## 8. Trust and Time Policy
 
@@ -388,7 +391,15 @@ certificate path at the selected chain-validation time. It MUST NOT be described
 as origin authenticity or public commitment verification.
 
 `UnsupportedIdentity` means `signer_identity_type` is not `2` for this profile
-or the selected RootAuth authenticator is not `0x0003`.
+only. An unsupported `authenticator_id` is a core unsupported-authenticator /
+root-auth-unavailable result before this profile is selected, not an
+`X509RootAuthOutcome`.
+
+`Invalid` means this profile was selected but the type-2 identity bytes are not
+exactly one DER X.509 leaf certificate, the authenticator value is malformed,
+the chain digest mismatches, the signature scheme or key parameters are
+unsupported or mismatched, signature verification fails, or the v1 leaf KeyUsage
+rule fails.
 
 ## 10. Report Fields
 
@@ -420,18 +431,25 @@ claims come from an explicitly separate policy or future profile field.
 ## 11. Evaluation Order
 
 1. Core validates and recomputes v44 root-auth inputs.
-2. The profile confirms `authenticator_id = 0x0003`.
+2. Core selects this profile for `authenticator_id = 0x0003`.
 3. The profile confirms `signer_identity_type = 2` and parses the leaf
-   certificate.
+   certificate. If `signer_identity_type != 2`, return `UnsupportedIdentity`.
+   If the leaf certificate bytes are not exactly one DER X.509 certificate,
+   return `Invalid`.
 4. The profile parses `authenticator_value`.
-5. The profile recomputes and checks `chain_digest`.
+   If parsing fails, return `Invalid`.
+5. The profile recomputes and checks `chain_digest`. If it mismatches, return
+   `Invalid`.
 6. The profile builds `SIGNING_INPUT`.
 7. The profile verifies the signature with the leaf certificate public key.
-8. The profile enforces the leaf KeyUsage rule from §8.
+   If verification fails, return `Invalid`.
+8. The profile enforces the leaf KeyUsage rule from §8. If the rule fails,
+   return `Invalid`.
 9. If no caller-supplied trusted roots are present and OpenSSL default trust
    roots were not explicitly requested, return `MissingTrustPolicy`.
 10. The profile verifies the certificate path with caller-approved trust roots at
-   the selected chain-validation time.
+   the selected chain-validation time. If path validation fails, return
+   `UntrustedChain`.
 11. If verification succeeds and core is in full RootAuth verification mode,
    return `RootAuthContentVerified`.
 12. If verification succeeds and core is in public no-key mode, return

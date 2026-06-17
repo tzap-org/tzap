@@ -101,6 +101,12 @@ Supported `RecipientRecordV1.recipient_identity_type` values:
 |---:|---|---|
 | 2 | DER X.509 leaf certificate | supported |
 
+For any other `recipient_identity_type`, the profile returns
+`UnsupportedRecipientIdentity` for that record. If
+`recipient_identity_type = 2` but `recipient_identity_bytes` is not exactly one
+DER X.509 leaf certificate, the record is malformed and the profile returns
+`InvalidRecord`.
+
 `recipient_identity_bytes` MUST contain exactly one DER-encoded X.509 leaf
 certificate. PEM is a CLI/input encoding only; writers serialize DER into
 `RecipientRecordV1`.
@@ -120,10 +126,16 @@ diagnostics and machine-readable reports.
 
 The default v1 profile supports HPKE base mode (RFC 9180) with these suites:
 
-| Suite name | KEM | KDF | AEAD |
-|---|---:|---:|---:|
-| `x25519-hkdfsha256-chacha20poly1305` | `0x0020` DHKEM(X25519, HKDF-SHA256) | `0x0001` HKDF-SHA256 | `0x0003` ChaCha20Poly1305 |
-| `p256-hkdfsha256-aes256gcm` | `0x0010` DHKEM(P-256, HKDF-SHA256) | `0x0001` HKDF-SHA256 | `0x0002` AES-256-GCM |
+| Suite name | KEM | KDF | AEAD | `enc_length` | `ciphertext_length` |
+|---|---:|---:|---:|---:|---:|
+| `x25519-hkdfsha256-chacha20poly1305` | `0x0020` DHKEM(X25519, HKDF-SHA256) | `0x0001` HKDF-SHA256 | `0x0003` ChaCha20Poly1305 | 32 | 48 |
+| `p256-hkdfsha256-aes256gcm` | `0x0010` DHKEM(P-256, HKDF-SHA256) | `0x0001` HKDF-SHA256 | `0x0002` AES-256-GCM | 65 | 48 |
+
+The P-256 `enc` value is the 65-byte uncompressed SEC1 encoded ephemeral public
+key used by RFC 9180 DHKEM(P-256). `ciphertext_length` is exactly 48 bytes for
+both suites: the 32-byte `master_key` plaintext plus the suite AEAD's 16-byte
+authentication tag. Readers MUST reject overlong encodings, alternate point
+encodings, or ciphertext lengths other than the table value.
 
 Writers SHOULD prefer X25519 when recipient infrastructure supports it. Readers
 MUST reject suites outside this table unless a future profile assigns new
@@ -149,8 +161,8 @@ behavior.
 
 Readers MAY use a local certificate store to find a private key whose public key
 matches `recipient_spki_digest`. A reader that finds a private key but whose
-deployment policy rejects the recipient certificate MUST return a policy failure
-without attempting unwrap.
+deployment policy rejects the recipient certificate MUST return
+`CertificatePolicyRejected` without attempting unwrap.
 
 ## 8. Profile Payload
 
@@ -181,8 +193,8 @@ The fixed payload header is 64 bytes. Readers MUST reject a payload unless:
 - `payload_version = 1`;
 - the HPKE suite is one of §6;
 - `flags = 0` and `_reserved` is all zero;
-- `enc_length` and `ciphertext_length` match the selected HPKE suite's
-  serialized encapsulated key and AEAD ciphertext bounds;
+- `enc_length` and `ciphertext_length` equal the selected HPKE suite's exact
+  wire lengths from §6;
 - `64 + enc_length + ciphertext_length == profile_payload_length`;
 - `key_wrap_context_digest` equals the digest in §9.
 
@@ -243,6 +255,18 @@ enum X509HpkeRecipientOutcome {
 candidate key from this record. Core MUST still verify `CryptoHeader.header_hmac`
 with that candidate before reporting archive access.
 
+`NoMatchingPrivateKey` means the record is structurally valid for this profile,
+but no available local private key matches the recipient certificate public key
+or `recipient_spki_digest`.
+`UnsupportedRecipientIdentity` means `recipient_identity_type` is not `2` for
+this profile. `UnsupportedSuite` means the record's HPKE suite is outside §6 or
+is incompatible with the recipient certificate public key.
+`CertificatePolicyRejected` means a local private key matched the recipient
+certificate, but an explicit deployment recipient-certificate policy rejected
+that certificate before unwrap. `InvalidRecord` means the record selected this
+profile but has malformed identity bytes, malformed profile payload framing,
+failed certificate KeyUsage rules, or failed HPKE authentication.
+
 If HPKE Open fails authentication, the profile returns `InvalidRecord` for that
 record. Core MAY continue trying other records unless local policy treats a
 record targeting the same private key as a hard failure.
@@ -250,12 +274,15 @@ record targeting the same private key as a hard failure.
 ## 11. Evaluation Order
 
 1. Core validates common `RecipientRecordV1` framing.
-2. The profile parses `recipient_identity_bytes` as exactly one DER X.509 leaf.
+2. If `recipient_identity_type != 2`, the profile returns
+   `UnsupportedRecipientIdentity`. Otherwise it parses
+   `recipient_identity_bytes` as exactly one DER X.509 leaf.
 3. The profile extracts and validates the leaf SubjectPublicKeyInfo.
 4. The profile enforces supported HPKE suite and KeyUsage rules.
 5. The profile finds a local private key matching the recipient public key or
    returns `NoMatchingPrivateKey`.
-6. The profile applies any deployment recipient-certificate policy.
+6. The profile applies any deployment recipient-certificate policy, returning
+   `CertificatePolicyRejected` if that policy rejects the matched certificate.
 7. The profile recomputes `key_wrap_context_digest`.
 8. The profile runs HPKE Open.
 9. The profile returns a 32-byte candidate `master_key` to core.
@@ -304,9 +331,15 @@ Diagnostics SHOULD distinguish:
    reader reject for recipient wrapping.
 7. Unsupported suite: valid framing with an unassigned HPKE suite returns
    `UnsupportedSuite`.
-8. Table binding: flipping any byte in `KeyWrapTableV1` causes core's
+8. Unsupported or malformed recipient identity: valid common framing with a
+   non-2 `recipient_identity_type` returns `UnsupportedRecipientIdentity`; type
+   2 with non-DER or multiple-certificate bytes returns `InvalidRecord`.
+9. Certificate policy rejection: a record targets a local private key but
+   deployment policy rejects the recipient certificate; the profile returns
+   `CertificatePolicyRejected` without attempting unwrap.
+10. Table binding: flipping any byte in `KeyWrapTableV1` causes core's
    `key_wrap_table_digest` check or `CryptoHeader.header_hmac` check to fail
    before payload decryption.
-9. Signing separation: a RootAuth signing certificate does not satisfy recipient
+11. Signing separation: a RootAuth signing certificate does not satisfy recipient
    unwrap unless a separate recipient record and matching recipient private key
    are present.

@@ -19,7 +19,11 @@ v0.44 keeps the v0.43 archive pipeline, optional plaintext mode, recovery
 machinery, and RootAuth model, and adds an embedded public recipient key-wrap
 table for passwordless multi-recipient encrypted archives.
 v0.44 is not wire-compatible with v0.43: writers set
-`VolumeHeader.volume_format_rev = 44`, and v0.43 readers reject v0.44 archives.
+`VolumeHeader.volume_format_rev = 44`, and v0.43-only readers fail closed
+instead of interpreting v0.44 bytes with v0.43 rules. Implementations that still
+ship a v0.43-only reader should report an unsupported-revision /
+reader-upgrade-required diagnostic for v0.44 archives rather than treating the
+archive as corrupt or using wrong-key language.
 
 1. **Embedded recipient key wrapping.** A new `KdfAlgo::RecipientWrap` mode
    stores a public `KeyWrapTableV1` immediately after the replicated
@@ -43,15 +47,21 @@ v0.44 is not wire-compatible with v0.43: writers set
    lives outside signing profiles.
 5. **Unified versioning.** The format-revision number is `44` everywhere it
    appears: `volume_format_rev = 44`, all format/root-auth hash domains end in
-   `-v44`, and `root_auth_spec_id = "tzap-root-auth-v0.44"`. The symmetric
+   `-v44`, and `root_auth_spec_id` is the 20 ASCII bytes
+   `tzap-root-auth-v0.44` followed by four zero bytes. The symmetric
    crypto-construction domains (`tzap-v1-*` for the key schedule, AEAD, nonces,
    AAD, and encrypted-mode HMACs) and `format_version = 1` are intentionally
    **unchanged**: they identify the cryptographic construction, not the archive
    format revision, and changing them would break decryption of encrypted
    archives.
-6. **Inherits v0.43 normative content** except where this document explicitly
-   changes startup layout, key acquisition, critical metadata recovery, and
-   RootAuth commitments for `KeyWrapTableV1`.
+6. **Actionable reader upgrade path.** Older readers remain fail-closed for v44,
+   but the intended user experience is an actionable version diagnostic:
+   observed revision, newest supported revision, and the action to upgrade or
+   use a reader that supports `volume_format_rev = 44`.
+7. **Preserves v0.43 design intent where restated here.** This v0.44 document is
+   self-contained; earlier drafts are not normative fallback text for startup
+   layout, key acquisition, critical metadata recovery, RootAuth commitments for
+   `KeyWrapTableV1`, or any other v44 behavior.
 
 ---
 
@@ -108,9 +118,9 @@ VolumeTrailer | CMRA | locator mirror | locator`.
    filesystem-visible results as clean until terminal verification
    succeeds.
 3. **Critical metadata recovery.** VolumeHeader, CryptoHeader,
-   ManifestFooter, optional RootAuthFooterV1, VolumeTrailer, and the layout
-   facts needed to bootstrap a volume are protected by a terminal CMRA before
-   the reader trusts them.
+   KeyWrapTableV1 when `kdf_algo = RecipientWrap`, ManifestFooter, optional
+   RootAuthFooterV1, VolumeTrailer, and the layout facts needed to bootstrap a
+   volume are protected by a terminal CMRA before the reader trusts them.
 4. **Bit-rot resilience.** Random bit flips within a configurable
    tolerance are repaired transparently.
 5. **Volume-loss resilience.** Loss of any N volumes is recoverable when
@@ -861,8 +871,10 @@ Readers use it before the archive key is known, so they MUST treat it as
 untrusted input until all of these checks have succeeded:
 
 1. `KeyWrapTableV1` framing and caps validate.
-2. `key_wrap_table_digest` from `KdfParams` equals the digest of the exact table
-   bytes.
+2. `key_wrap_table_digest` from `KdfParams` equals this §13.1
+   domain-separated value:
+   `SHA-256("tzap-key-wrap-table-v44\0" || LE32(key_wrap_table_length) ||
+   key_wrap_table_bytes)`.
 3. A recipient key-wrap profile returns a candidate 32-byte `master_key`.
 4. The candidate `master_key` derives a `mac_key` that verifies
    `CryptoHeader.header_hmac`.
@@ -905,8 +917,10 @@ struct KeyWrapTableV1 {
   of bytes supplied to the parser;
 - `header_length = 96`;
 - `flags = 0` and `_reserved` is all zero;
-- `archive_uuid` and `session_id` match the containing `VolumeHeader` and the
-  identity tuple later authenticated by `CryptoHeader.header_hmac`;
+- `archive_uuid` and `session_id` match the containing `VolumeHeader`; full
+  verification later requires the same tuple to authenticate through
+  `CryptoHeader.header_hmac`, and public no-key verification requires the same
+  tuple to match the accepted `RootAuthFooterV1` under §30.11;
 - `recipient_record_count` equals
   `KdfParams.key_wrap_table_record_count` and is within the active cap;
 - `records_offset = 96`;
@@ -990,7 +1004,16 @@ struct BlockRecord {
 }
 ```
 
-On-disk size: `BLOCK_SIZE + 20` bytes per block.
+On-disk size: `BLOCK_SIZE + 20` bytes per block. For v44 offset and cap
+arithmetic, this document uses:
+
+```text
+block_record_slot_size = 20 + CryptoHeader.block_size
+```
+
+After the candidate `CryptoHeader.block_size` has passed the checks required by
+the operation, `block_record_slot_size` is the exact serialized byte length of
+one BlockRecord slot.
 
 `record_crc32c` is computed over the `magic`, `block_index`, `kind`,
 `flags`, `_reserved`, and `payload` fields: total length
@@ -1246,7 +1269,7 @@ For an unsigned v44 volume:
 block_records_offset      = crypto_header_offset + crypto_header_length
                             + key_wrap_table_length
 manifest_footer_offset    = block_records_offset
-                           + block_count * sizeof(BlockRecord)
+                           + block_count * block_record_slot_size
 manifest_footer_end       = manifest_footer_offset + 136
 volume_trailer_offset     = manifest_footer_end
 VolumeTrailer.bytes_written == volume_trailer_offset
@@ -1429,7 +1452,7 @@ verify. For dictionary-compressed non-seekable bootstrap, flag bits 0, 1,
 and 2 MUST all be set and all three declared byte ranges MUST be present.
 
 `index_root_records_length` MUST be an integer multiple of
-`sizeof(BlockRecord)`, and every copied BlockRecord MUST have kind 2
+`block_record_slot_size`, and every copied BlockRecord MUST have kind 2
 (`index-root-data`) or kind 3 (`index-root-parity`). The copied
 BlockRecord payload bytes are the same mode-specifically verified stored
 data/parity bytes that would be read from the volume set.
@@ -1453,9 +1476,9 @@ MUST be clear and all dictionary record fields MUST be zero.
 Before reading copied BlockRecord arrays into memory, readers MUST bound
 each present record section by the corresponding FEC class maxima from
 the authenticated CryptoHeader:
-`index_root_records_length / sizeof(BlockRecord) ≤
+`index_root_records_length / block_record_slot_size ≤
 index_root_fec_data_shards + index_root_fec_parity_shards`, and
-`dictionary_records_length / sizeof(BlockRecord) ≤
+`dictionary_records_length / block_record_slot_size ≤
 index_root_fec_data_shards + index_root_fec_parity_shards`. Readers MUST
 also enforce the bootstrap sidecar file-size cap in §13.3. These caps are
 checked in addition to the packed cursor rule and mode-specific integrity
@@ -1520,7 +1543,7 @@ Bootstrap selection is deterministic:
 
 ## 13. Key Derivation
 
-### 13.1 Argon2id parameters
+### 13.1 KDF parameter payloads
 
 For `KdfAlgo::Argon2id`, the CryptoHeader KdfParams payload is exactly
 the following byte sequence:
@@ -1599,7 +1622,7 @@ CryptoHeader KdfParams payload is exactly:
 | 6 | 4 | `key_wrap_table_record_count` | expected recipient record count |
 | 10 | 2 | `key_wrap_table_version` | `1` |
 | 12 | 2 | `_reserved` | zero |
-| 14 | 32 | `key_wrap_table_digest` | SHA-256 commitment to the exact table bytes |
+| 14 | 32 | `key_wrap_table_digest` | domain-separated SHA-256 commitment to the exact table bytes |
 
 The `KeyWrapTableV1` bytes are not inside `CryptoHeader.length`. They begin
 immediately after the trailing 32-byte `CryptoHeader` integrity field and before
@@ -1615,6 +1638,10 @@ key_wrap_table_digest = SHA-256(
     || key_wrap_table_bytes
 )
 ```
+
+All later references to KdfParams `key_wrap_table_digest` mean this
+domain-separated value, not the raw CMRA `key_wrap_table_sha256` over region
+type 6 bytes.
 
 Readers parse these KdfParams only far enough to bound and locate the public
 table before `CryptoHeader` integrity succeeds. They then invoke an applicable
@@ -1670,7 +1697,7 @@ selected key-wrap profile. Both still run the same HKDF subkey schedule.
 | `m_cost_kib` | 4 GiB |
 | `t_cost` | 100 |
 | `parallelism` | 64; also requires `m_cost_kib ≥ 8 × parallelism` |
-| `argon2id_salt_length` | 8..64 bytes |
+| `argon2id_salt_length` | `8 <= salt_length <= 64` bytes |
 | `CryptoHeader byte length` | 64 KiB |
 | `KeyWrapTableV1 byte length` | 1 MiB |
 | `KeyWrapTableV1 recipient records` | 4096 |
@@ -1736,15 +1763,17 @@ The bootstrap sidecar cap is:
 + (flag bit 0 ? sizeof(ManifestFooter) : 0)
 + record_section_count
   × (index_root_fec_data_shards + index_root_fec_parity_shards)
-  × sizeof(BlockRecord)
+  × block_record_slot_size
 ```
 
 where `record_section_count` is `(flag bit 1 set ? 1 : 0) + (flag bit 2
-set ? 1 : 0)`. The dictionary BlockRecord term is included only when the
-sidecar actually carries dictionary records. Readers MAY expose a lower
-local cap, but MUST reject a sidecar whose declared packed size or
-observed file size exceeds the active cap before buffering untrusted
-sidecar bytes.
+set ? 1 : 0)` and `block_record_slot_size` is `20 +
+CryptoHeader.block_size` after the candidate CryptoHeader has passed the
+mode-specific integrity or public-safe structural checks required for the
+operation. The dictionary BlockRecord term is included only when the sidecar
+actually carries dictionary records. Readers MAY expose a lower local cap, but
+MUST reject a sidecar whose declared packed size or observed file size exceeds
+the active cap before buffering untrusted sidecar bytes.
 The cap calculation MUST use checked unsigned 64-bit arithmetic or wider;
 all intermediate additions and multiplications are checked. Overflow
 while computing the cap is a hard rejection before allocation. If the
@@ -3950,9 +3979,9 @@ The above write algorithm is fully compatible with S3 multipart uploads
 - Each volume is an S3 multipart upload.
 - Each "block" or batch of blocks is written as a multipart part (5 MiB+
   per part is the S3 minimum).
-- VolumeHeader, CryptoHeader, payload blocks, ManifestFooter, optional
-  RootAuthFooterV1, VolumeTrailer, CMRA, locator mirror, and locator are all
-  appended sequentially.
+- VolumeHeader, CryptoHeader, optional KeyWrapTableV1, payload blocks,
+  ManifestFooter, optional RootAuthFooterV1, VolumeTrailer, CMRA, locator
+  mirror, and locator are all appended sequentially.
 - The CompleteMultipartUpload API finalizes the object.
 
 No part of the v0.44 write path needs to revisit a closed S3 part or to
@@ -3962,9 +3991,9 @@ write at an arbitrary byte offset.
 
 Single-sink, fully non-reopenable streaming is supported only with
 `stripe_width = 1` and `volume_loss_tolerance = 0`. The writer emits one
-volume forward-only: VolumeHeader, CryptoHeader, payload/index blocks,
-ManifestFooter, optional RootAuthFooterV1, VolumeTrailer, CMRA, locator mirror,
-and locator. If the writer uses a payload zstd
+volume forward-only: VolumeHeader, CryptoHeader, optional KeyWrapTableV1,
+payload/index blocks, ManifestFooter, optional RootAuthFooterV1, VolumeTrailer,
+CMRA, locator mirror, and locator. If the writer uses a payload zstd
 dictionary (`has_dictionary = 1`), it MUST also emit a bootstrap sidecar
 containing mode-specifically verified IndexRoot and dictionary-object copies
 (§12.2), otherwise non-seekable sequential extraction would be
@@ -4149,6 +4178,38 @@ earlier draft revisions requires an explicit compatibility mode. v44 readers
 MUST NOT apply v36 physical EOF/trailer-placement rules to v44 archives.
 Unknown algorithm IDs and critical extensions are hard errors.
 
+### 23.1 Reader upgrade path and diagnostics
+
+A reader that observes `format_version = 1` and a `volume_format_rev` greater
+than the newest revision it implements MUST fail closed before extraction,
+verification repair, metadata recovery writes, or any attempt to interpret
+remaining bytes with older layout rules. Readers SHOULD perform this check
+before interactive key/passphrase prompts or other key acquisition when a fixed
+header can be read. This is a version-negotiation result, not archive corruption
+and not a wrong-key result.
+
+The diagnostic SHOULD use an `unsupported-revision` label, or an equivalent
+`upgrade-reader-required` label, and SHOULD include:
+
+- the observed `format_version`;
+- the observed `volume_format_rev`;
+- the newest `volume_format_rev` supported by this reader;
+- the required user action: upgrade tzap or use a reader that supports the
+  observed archive revision, and do not repair, rewrite, or re-save the archive
+  with the older reader.
+
+Readers implementing v44 SHOULD preserve v43 compatibility by dispatching on
+`VolumeHeader.volume_format_rev` after fixed `VolumeHeader` validation. Normal
+v44 operation requires revision 44; accepting v43 archives is a compatibility
+mode. A compatibility-mode read MUST use the v43 structure layouts, hash
+domains, and root-auth spec ID for v43 archives and the v44 rules for v44
+archives; it MUST NOT mix fields or validation rules across revisions.
+
+Writers that introduce v44 during a migration SHOULD make the required reader
+revision visible in CLI/status output and documentation. Until the deployment
+environment is expected to contain v44-capable readers, v44 output SHOULD be an
+explicit output-profile choice rather than a surprising silent default.
+
 The v0.x documents are pre-implementation drafts. A later v0.x draft may
 still refine wire details while retaining `format_version = 1`; once any
 implementation claims conformance to this v0.44 draft, incompatible
@@ -4232,7 +4293,8 @@ full-archive verification for hostile inputs.
 | ASCII | Hex | Purpose |
 |---|---|---|
 | `TZAP` | `54 5A 41 50` | Volume header |
-| `TZCH` | `54 5A 44 48` | CryptoHeader |
+| `TZCH` | `54 5A 43 48` | CryptoHeader |
+| `TZKW` | `54 5A 4B 57` | KeyWrapTableV1 |
 | `TZBK` | `54 5A 42 4B` | Block record |
 | `TZIR` | `54 5A 49 52` | Index Root |
 | `TZIS` | `54 5A 49 53` | Index Shard |
@@ -4241,9 +4303,9 @@ full-archive verification for hostile inputs.
 | `TZVT` | `54 5A 56 54` | VolumeTrailer |
 | `TZBS` | `54 5A 42 53` | Bootstrap sidecar |
 | `TZMI` | `54 5A 4D 49` | CriticalMetadataImageV1 |
-| `TZCR` | `54 5A 44 52` | CriticalMetadataRecoveryHeader |
-| `TZCS` | `54 5A 44 53` | CriticalMetadataRecoveryShard |
-| `TZCL` | `54 5A 44 4C` | CriticalRecoveryLocator |
+| `TZCR` | `54 5A 43 52` | CriticalMetadataRecoveryHeader |
+| `TZCS` | `54 5A 43 53` | CriticalMetadataRecoveryShard |
+| `TZCL` | `54 5A 43 4C` | CriticalRecoveryLocator |
 | `TZRA` | `54 5A 52 41` | RootAuthFooterV1 |
 
 ---
@@ -4704,7 +4766,10 @@ Additional v0.44 boundary regression cases:
   fits.
 - **Volume format revision freshness**: create archives with
   `volume_format_rev` below, equal to, and above 44; verify v0.44-only
-  readers accept only 44 and reject older or newer revisions.
+  readers accept only 44 and reject older or newer revisions. For revisions
+  newer than the reader implements, verify the diagnostic is
+  unsupported-revision / reader-upgrade-required and not corrupt-archive or
+  wrong-key.
 - **Unsafe parity conformance boundary**: attempt to emit a conforming archive
   with `--unsafe-parity` causing any serialized class parity maximum or
   per-object `parity_block_count` to differ from the §27 computation. Verify
@@ -4798,9 +4863,8 @@ Previously required regression cases retained from earlier drafts:
   Repeat with an explicit duplicate-copy recovery mode and verify it
   accepts only byte-for-byte identical duplicate inputs for the requested
   operation.
-- **Magic-field validation**: mutate each fixed magic field independently
-  (`TZAP`, `TZCH`, `TZBK`, `TZMF`, `TZVT`, `TZBS`, `TZIR`, `TZIS`, and
-  `TZDH`) while preserving any applicable CRC or mode-specific integrity envelope for the
+- **Magic-field validation**: mutate each fixed magic field from §25
+  independently while preserving any applicable CRC or mode-specific integrity envelope for the
   malformed bytes where possible; verify readers reject before trusting
   the containing structure.
 - **CryptoHeader canonical offset**: set `crypto_header_offset` to values
@@ -5307,9 +5371,10 @@ Previously required regression cases retained from earlier drafts:
   before fetching or decrypting IndexRoot.
 - **Locator-from-end**: verify seekable readers first try the final locator at
   `file_size - 128`, then the mirror locator, then the bounded critical-recovery
-  scan. Verify they reject cleanly if required VolumeHeader, CryptoHeader, CMRA,
-  ManifestFooter, or VolumeTrailer bytes are unavailable, or if the candidate is
-  smaller than the minimum v44 critical-recovery layout.
+  scan. Verify they reject cleanly if required VolumeHeader, CryptoHeader,
+  KeyWrapTableV1 bytes when `kdf_algo = RecipientWrap`, CMRA, ManifestFooter,
+  or VolumeTrailer bytes are unavailable, or if the candidate is smaller than
+  the minimum v44 critical-recovery layout.
 - **Metadata warnings**: unsupported PAX/GNU extension record, failed
   xattr/ACL application, timestamp precision loss, and sparse-file
   fallback all produce diagnostics unless best-effort quiet mode is
@@ -5870,6 +5935,7 @@ needed before object FEC can help:
 
 - `VolumeHeader`
 - `CryptoHeader`
+- `KeyWrapTableV1` when `kdf_algo = RecipientWrap`
 - `ManifestFooter`
 - `VolumeTrailer`
 - optional root-auth footer pointer and length
@@ -5955,6 +6021,7 @@ v44 layout is:
 ```text
 VolumeHeader
 CryptoHeader
+KeyWrapTableV1?                   // present iff kdf_algo = RecipientWrap
 BlockRecords...
 ManifestFooter
 RootAuthFooterV1?                 // optional core carriage
@@ -5968,8 +6035,10 @@ Consequences:
 
 - v44 archives MUST set `VolumeHeader.volume_format_rev = 44`.
 - v44 readers MUST NOT apply v36 EOF rules to v44 archives.
-- Earlier draft readers, including v0.43 readers, reject revision 44 or fail
-  v44 startup/terminal-layout checks.
+- Earlier draft readers, including v0.43 readers, fail closed for revision 44.
+  Implementations that include the §23.1 migration guidance SHOULD surface this
+  as an unsupported-revision / reader-upgrade-required diagnostic rather than a
+  corrupt-archive or wrong-key result.
 - v44 writers still write forward-only. The recovery area is terminal because
   it protects bytes that are not final until archive close.
 
@@ -6012,7 +6081,7 @@ For an unsigned v44 volume:
 block_records_offset      = crypto_header_offset + crypto_header_length
                             + key_wrap_table_length
 manifest_footer_offset    = block_records_offset
-                           + block_count * sizeof(BlockRecord)
+                           + block_count * block_record_slot_size
 manifest_footer_end       = manifest_footer_offset + 136
 volume_trailer_offset     = manifest_footer_end
 VolumeTrailer.bytes_written == volume_trailer_offset
@@ -6246,7 +6315,7 @@ satisfy the public-safe `VolumeTrailer` profile in §30.11.
 | `stripe_width` | MUST equal integrity-checked `CryptoHeader.stripe_width`; mode-specifically verified `ManifestFooter.total_volumes` and every accepted `VolumeHeader.stripe_width` MUST equal the same value. | MUST equal the structurally parsed public `CryptoHeader.stripe_width` and every public `VolumeHeader.stripe_width` in the accepted candidate set. |
 | `volume_header_offset`, `volume_header_length` | MUST equal `0` and `128`. Region type 1 offset and length MUST equal these fields, and region type 1 bytes MUST validate as a v44 `VolumeHeader` with a valid CRC before layout use. | Same fixed offset, length, region, v44 `VolumeHeader`, and CRC checks. |
 | `crypto_header_offset`, `crypto_header_length` | MUST equal `VolumeHeader.crypto_header_offset` and `VolumeHeader.crypto_header_length`; `crypto_header_offset` MUST be `128`; `crypto_header_length` MUST equal `CryptoHeader.length` and fit the active CryptoHeader cap. Region type 2 offset and length MUST equal these fields. | MUST pass the public-safe `VolumeHeader`/`CryptoHeader` structural profile in §30.11.1, including exact offset, length, and active-cap checks, without requiring `CryptoHeader.header_hmac`. The parsed `CryptoHeader` may provide only public observation values named in §30.11. |
-| `key_wrap_table_offset`, `key_wrap_table_length` | If `CryptoHeader.kdf_algo = RecipientWrap`, MUST equal `crypto_header_offset + crypto_header_length` and `KdfParams.key_wrap_table_length`; region type 6 offset and length MUST equal these fields, and the table digest in KdfParams MUST equal the exact region bytes. Otherwise both fields MUST be zero and region type 6 MUST be absent. | If public-safe `CryptoHeader.kdf_algo = RecipientWrap`, MUST equal `crypto_header_offset + crypto_header_length` and the public-safe KdfParams table length; region type 6 offset and length MUST equal these fields and the table must pass bounded structural framing. Otherwise both fields MUST be zero and region type 6 MUST be absent. |
+| `key_wrap_table_offset`, `key_wrap_table_length` | If `CryptoHeader.kdf_algo = RecipientWrap`, MUST equal `crypto_header_offset + crypto_header_length` and `KdfParams.key_wrap_table_length`; region type 6 offset and length MUST equal these fields; and KdfParams `key_wrap_table_digest` MUST equal `SHA-256("tzap-key-wrap-table-v44\0" || LE32(key_wrap_table_length) || exact KeyWrapTableV1 bytes)`. Otherwise both fields MUST be zero and region type 6 MUST be absent. | If public-safe `CryptoHeader.kdf_algo = RecipientWrap`, MUST equal `crypto_header_offset + crypto_header_length` and the public-safe KdfParams table length; region type 6 offset and length MUST equal these fields; the table must pass bounded structural framing; and `KeyWrapTableV1.archive_uuid` / `session_id` MUST match the public `VolumeHeader`, recovered image, and `RootAuthFooterV1` identity tuple. Otherwise both fields MUST be zero and region type 6 MUST be absent. |
 | `block_records_offset` | MUST equal `crypto_header_offset + crypto_header_length + key_wrap_table_length`. It MUST also equal the start of the physically observed BlockRecord region for the selected candidate volume. | MUST equal `crypto_header_offset + crypto_header_length + key_wrap_table_length` and the public observation start in §30.11. |
 | `block_count` | MUST equal mode-specifically verified `VolumeTrailer.block_count`. | Public no-key verification MUST NOT use this field to define completeness, derive a scan limit, or claim authenticated physical block count. The public BlockRecord-region end comes only from `block_records_offset + block_records_length` after the structural checks in this table and §30.11 pass. |
 | `block_records_length` | MUST equal `VolumeTrailer.block_count * (20 + CryptoHeader.block_size)`. The same product defines the authenticated BlockRecord-region length used for root-auth and object reads. | MUST satisfy `block_records_offset + block_records_length == manifest_footer_offset`, and `block_records_length` MUST be a whole number of `20 + block_size` slots using the structurally parsed public `CryptoHeader.block_size`. This does not authenticate terminal `block_count`. |
@@ -6968,8 +7037,8 @@ fields.
 | `archive_uuid`, `session_id` | The integrity-checked archive identity tuple: `VolumeHeader` supplies the UUID/session bytes to the CryptoHeader integrity field (`header_hmac` in an encryption mode, `header_digest` in unencrypted mode); after that mode-specific integrity check verifies, mode-specifically verified `ManifestFooter` and `VolumeTrailer` fields MUST match. | `RootAuthFooterV1.archive_uuid`, `RootAuthFooterV1.session_id`, `CriticalMetadataImageV1.archive_uuid`, `CriticalMetadataImageV1.session_id`, and every CRC-valid CMRA header or locator identity hint participating in the accepted candidate MUST match the integrity-checked tuple before root auth succeeds. | Recomputed public `archive_root` uses `RootAuthFooterV1.archive_uuid` and `RootAuthFooterV1.session_id`. Public `VolumeHeader`, recovered image identity fields, and every CRC-valid candidate hint MUST match the footer; `CryptoHeader` is not a source for these fields. |
 | `format_version`, `volume_format_rev` | Fixed v44 constants: `format_version = 1`, `volume_format_rev = 44`. | `VolumeHeader`, `RootAuthFooterV1`, `CriticalMetadataImageV1`, `CriticalRecoveryLocator`, and every new v44 structure with these fields MUST carry the fixed values before use. | Recomputed public `archive_root` uses the validated `RootAuthFooterV1` fixed values. Public `VolumeHeader` and recovered v44 structures MUST carry the same fixed values. |
 | `root_auth_spec_id` | The fixed 24-byte v44 root-auth spec ID after §30.7 wire validation: the 20 ASCII bytes `tzap-root-auth-v0.44` followed by four zero bytes. | The value serialized into `archive_root` MUST equal the wire-validated `RootAuthFooterV1.root_auth_spec_id`; any other byte sequence is a footer wire-validation failure before root-auth commitment checks. | Public no-key uses the same wire-validated `RootAuthFooterV1.root_auth_spec_id` bytes. |
-| `compression_algo`, `aead_algo`, `fec_algo`, `kdf_algo`, `chunk_size`, `envelope_target_size`, `block_size`, FEC class maxima, `volume_loss_tolerance`, `bit_rot_buffer_pct`, `has_dictionary`, `max_path_length`, `expected_volume_size`, KDF parameters, Extension TLVs, and `CryptoHeader` reserved bytes | The same integrity-checked `crypto_header_pre_hmac_bytes` used for `crypto_header_pre_hmac_digest`, after the CryptoHeader mode-specific integrity field verifies. | `CryptoHeaderFixed.length` MUST equal `VolumeHeader.crypto_header_length`; `CryptoHeader.stripe_width` MUST equal `VolumeHeader.stripe_width`; every accepted present integrity-valid `CryptoHeader` copy MUST provide byte-identical pre-HMAC bytes under §30.9.0.1; all §9 structural and semantic `CryptoHeader` checks MUST pass. In RecipientWrap mode this includes the KdfParams `key_wrap_table_length`, record count, version, and table digest. | Public no-key uses only structurally parsed `CryptoHeader` bytes that passed the public-safe profile in §30.11.1 for public observation values such as `CryptoHeader.length`, `block_size`, `stripe_width`, algorithm identifiers, and RecipientWrap table framing. This is not CryptoHeader authentication; the signature result is only over the public inputs selected by these rules. |
-| `KeyWrapTableV1` bytes | The exact table bytes whose SHA-256 commitment appears in RecipientWrap KdfParams, after those bytes have structurally validated and the recovered `master_key` verifies `CryptoHeader.header_hmac`. | If `kdf_algo = RecipientWrap`, every accepted present volume MUST carry byte-identical `KeyWrapTableV1` bytes, the CMRA region type 6 bytes MUST match them when recovered, and the KdfParams digest MUST match the exact bytes. If `kdf_algo != RecipientWrap`, no table may be present and all key-wrap image fields MUST be zero. | Public no-key may structurally parse `KeyWrapTableV1` only under §30.11.1. It does not unwrap a key, prove recipient identity, or authenticate the table beyond including its digest as part of the signed `critical_metadata_digest` commitment. |
+| `compression_algo`, `aead_algo`, `fec_algo`, `kdf_algo`, `chunk_size`, `envelope_target_size`, `block_size`, FEC class maxima, `volume_loss_tolerance`, `bit_rot_buffer_pct`, `has_dictionary`, `max_path_length`, `expected_volume_size`, KDF parameters, Extension TLVs, and `CryptoHeader` reserved bytes | The same integrity-checked `crypto_header_pre_hmac_bytes` used for `crypto_header_pre_hmac_digest`, after the CryptoHeader mode-specific integrity field verifies. | `CryptoHeaderFixed.length` MUST equal `VolumeHeader.crypto_header_length`; `CryptoHeader.stripe_width` MUST equal `VolumeHeader.stripe_width`; every accepted present integrity-valid `CryptoHeader` copy MUST provide byte-identical pre-HMAC bytes under §30.9.0.1; all §9 structural and semantic `CryptoHeader` checks MUST pass. In RecipientWrap mode this includes the KdfParams `key_wrap_table_length`, record count, version, and domain-separated `key_wrap_table_digest`. | Public no-key uses only structurally parsed `CryptoHeader` bytes that passed the public-safe profile in §30.11.1 for public observation values such as `CryptoHeader.length`, `block_size`, `stripe_width`, algorithm identifiers, and RecipientWrap table framing. This is not CryptoHeader authentication; the signature result is only over the public inputs selected by these rules. |
+| `KeyWrapTableV1` bytes | The exact table bytes whose domain-separated §13.1 `key_wrap_table_digest` appears in RecipientWrap KdfParams, after those bytes have structurally validated and the recovered `master_key` verifies `CryptoHeader.header_hmac`. | If `kdf_algo = RecipientWrap`, every accepted present volume MUST carry byte-identical `KeyWrapTableV1` bytes, the CMRA region type 6 bytes MUST match them when recovered, and KdfParams `key_wrap_table_digest` MUST equal `SHA-256("tzap-key-wrap-table-v44\0" || LE32(key_wrap_table_length) || exact KeyWrapTableV1 bytes)`. If `kdf_algo != RecipientWrap`, no table may be present and all key-wrap image fields MUST be zero. | Public no-key may structurally parse `KeyWrapTableV1` only under §30.11.1. It does not unwrap a key, prove recipient identity, or authenticate observed table bytes; the signed `critical_metadata_digest` remains an opaque component commitment in public no-key mode. |
 | `stripe_width` | Integrity-checked `CryptoHeader.stripe_width`. | Every integrity-checked present `VolumeHeader.stripe_width` and every mode-specifically verified authoritative `ManifestFooter.total_volumes` used as bootstrap authority MUST equal `CryptoHeader.stripe_width`. Present volume indexes MUST be unique and in range. Full RootAuth verification does not require the accepted physical volume count to equal `stripe_width`; missing indexes are permitted only when their count is within integrity-checked `CryptoHeader.volume_loss_tolerance` and every required signed data leaf and metadata object can be reconstructed and validated by §§30.9.2-30.9.4. | Public no-key uses structurally parsed `CryptoHeader.stripe_width`; every public `VolumeHeader.stripe_width` MUST match it, and the accepted candidate set MUST contain exactly one candidate for every `volume_index` in `0 .. stripe_width - 1`. Missing, duplicate, or out-of-range public candidates make public no-key verification incomplete or failed. |
 | `total_volumes` and IndexRoot extent fields in `critical_metadata_digest` | The same mode-specifically verified authoritative `ManifestFooter` bytes used for `manifest_footer_global_pre_hmac_digest`. | `ManifestFooter.is_authoritative = 1`, reserved bytes zero, `ManifestFooter.total_volumes == CryptoHeader.stripe_width`, and all §11 ManifestFooter size/extent checks MUST pass. | Public no-key does not recompute these values. It intentionally copies `RootAuthFooterV1.critical_metadata_digest` as an opaque signer commitment. |
 | `manifest_footer_global_pre_hmac_digest` | Canonicalized pre-integrity-field `ManifestFooter` bytes with only `volume_index` replaced by `LE32(0)`. | Every mode-specifically verified authoritative `ManifestFooter` used as a bootstrap authority MUST produce the same canonical digest. | Opaque through `RootAuthFooterV1.critical_metadata_digest`; public no-key makes no ManifestFooter authenticity claim. |
@@ -6999,8 +7068,10 @@ For full RootAuth verification:
    `replicated_crypto_header_mismatch` and root auth MUST fail before any one
    copy is selected as the source for §30.9.1 fields.
 2. In RecipientWrap mode, every accepted present volume MUST have byte-identical
-   `KeyWrapTableV1` bytes, and those bytes MUST match the table digest committed
-   by the accepted `CryptoHeader` KdfParams. A mismatch is
+   `KeyWrapTableV1` bytes, and accepted `CryptoHeader` KdfParams
+   `key_wrap_table_digest` MUST equal
+   `SHA-256("tzap-key-wrap-table-v44\0" || LE32(key_wrap_table_length) ||
+   exact KeyWrapTableV1 bytes)`. A mismatch is
    `replicated_key_wrap_table_mismatch` and root auth MUST fail.
 3. Every accepted present authoritative `ManifestFooter` copy used as bootstrap
    authority MUST already produce the same
@@ -7022,8 +7093,8 @@ handled by §30.11 as an incomplete public candidate set.
 
 #### 30.9.1 critical_metadata_digest
 
-v0.4 signed one critical metadata leaf per volume. This v44 section deliberately
-does not.
+Earlier drafts signed one critical metadata leaf per volume. This v44 section
+deliberately does not.
 Per-volume critical metadata may be unavailable when an entire volume is lost,
 even though object FEC can recover the archive data. Signing every volume's
 header/footer/trailer would regress volume-loss recovery.
@@ -7119,7 +7190,9 @@ authenticated CryptoHeader framing. Readers MUST reject if any CryptoHeader-owne
 scalar listed in §30.9.0 does not come from the same authenticated CryptoHeader
 bytes used for `crypto_header_pre_hmac_digest`. In RecipientWrap mode, readers
 MUST also reject if the exact `KeyWrapTableV1` bytes used for recipient unwrap
-do not hash to the committed `key_wrap_table_digest`.
+do not produce the KdfParams `key_wrap_table_digest` value
+`SHA-256("tzap-key-wrap-table-v44\0" || LE32(key_wrap_table_length) ||
+exact KeyWrapTableV1 bytes)`.
 
 The canonical ManifestFooter byte commitment makes the root-authenticated
 metadata set cover the completed-archive authority bit and global pre-HMAC
@@ -7560,7 +7633,7 @@ For each accepted public candidate volume:
    `algo_tag` MUST match `kdf_algo`. For `Raw`, the payload is exactly the
    two-byte raw KDF parameter form with `algo_tag = 0`. For `Argon2id`, the
    fixed prefix and complete salt MUST fit, `algo_tag = 1`, `salt_length` MUST
-   be in `8..64`, `t_cost` and `parallelism` MUST be non-zero,
+   satisfy `8 <= salt_length <= 64`, `t_cost` and `parallelism` MUST be non-zero,
    `m_cost_kib >= 8 * parallelism`, and all KDF scalar values MUST fit active
    reader caps. For `None`, the payload is exactly the two-byte unencrypted-mode
    KDF parameter form with `algo_tag = 2`; no key material, salt, or subkeys
@@ -7568,9 +7641,14 @@ For each accepted public candidate volume:
    fit, `algo_tag = 3`, `key_wrap_table_version = 1`, `_reserved = 0`,
    `key_wrap_table_length` and `key_wrap_table_record_count` MUST fit active
    caps, and the recovered region type 6 bytes MUST satisfy §9.3 bounded
-   structural framing and match `key_wrap_table_digest`. A public verifier
-   checks this framing and these scalar bounds without deriving any key or
-   invoking a recipient private-key operation.
+   structural framing, including `KeyWrapTableV1.archive_uuid` / `session_id`
+   equality with the public `VolumeHeader`, recovered image, and
+   `RootAuthFooterV1` identity tuple, with KdfParams `key_wrap_table_digest`
+   equal to
+   `SHA-256("tzap-key-wrap-table-v44\0" || LE32(key_wrap_table_length) ||
+   exact KeyWrapTableV1 bytes)`. A public verifier checks this framing and
+   these scalar bounds without deriving any key or invoking a recipient
+   private-key operation.
 4. `CryptoHeader` reserved bytes MUST be zero. The Extension TLV list MUST
    satisfy the §9 pre-integrity structural scan: every TLV header fits before
    `length - 32`, every payload length is `<= 256`, `tag = 0` appears only as
@@ -8023,8 +8101,8 @@ the v1 symmetric encryption construction.
 | §5 / §9.3 / §13 | `KdfAlgo::RecipientWrap = 3`; `KeyWrapTableV1` stores public recipient records that wrap the same 32-byte archive `master_key`. |
 | §7 / §12 / §30.5 | `KeyWrapTableV1` is a startup section between `CryptoHeader` and `BlockRecord` bytes and is covered by critical metadata recovery when present. |
 | §30.9 | RootAuth commits to the `KeyWrapTableV1` digest through RecipientWrap KdfParams and `critical_metadata_digest`; signing profiles still sign only core's recomputed `archive_root`. |
-| §8 / §9 / §30 | Unified versioning: `volume_format_rev = 44`, format/root-auth hash domains end in `-v44`, `root_auth_spec_id = "tzap-root-auth-v0.44"`. The `tzap-v1-*` crypto-construction domains and `format_version = 1` are unchanged. |
-| §3 / §17.1 / §29 | v44 readers reject earlier draft revisions unless an explicit compatibility mode is provided; v0.43 readers reject v44 archives. |
+| §8 / §9 / §30 | Unified versioning: `volume_format_rev = 44`, format/root-auth hash domains end in `-v44`, `root_auth_spec_id` is the 20 ASCII bytes `tzap-root-auth-v0.44` followed by four zero bytes. The `tzap-v1-*` crypto-construction domains and `format_version = 1` are unchanged. |
+| §3 / §17.1 / §23 / §29 | v44 readers reject earlier draft revisions unless an explicit compatibility mode is provided; v0.43-only readers fail closed for v44 archives and should direct users to upgrade or use a revision-compatible reader. |
 
 ---
 

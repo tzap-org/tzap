@@ -5189,7 +5189,7 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
         | FormatError::UnsupportedBootstrapSidecarVersion(_) => Diagnostic {
             label: "unsupported-revision",
             exit_code: EXIT_UNSUPPORTED_REVISION,
-            action: "use the matching tzap version for this archive",
+            action: "upgrade tzap or use a reader that supports this archive revision",
         },
         FormatError::BadMagic {
             structure: "VolumeHeader",
@@ -5577,6 +5577,23 @@ mod tests {
                 "VolumeHeader and CryptoHeader stripe_width differ"
             ))
         );
+    }
+
+    #[test]
+    fn unsupported_revision_errors_suggest_reader_upgrade() {
+        for err in [
+            FormatError::UnsupportedFormatVersion(2),
+            FormatError::UnsupportedVolumeFormatRevision(44),
+        ] {
+            let diagnostic = classify_format_error(&err);
+
+            assert_eq!(diagnostic.label, "unsupported-revision");
+            assert_eq!(diagnostic.exit_code, EXIT_UNSUPPORTED_REVISION);
+            assert_eq!(
+                diagnostic.action,
+                "upgrade tzap or use a reader that supports this archive revision"
+            );
+        }
     }
 
     #[test]
