@@ -14,3 +14,6 @@ categories = ["cryptography"]
 
 [dependencies]
 tzap-core = { path = "../tzap-core", version = "0.1.7" }
+openssl = { workspace = true }
+sha2 = { workspace = true }
+x509-parser = "0.18"
