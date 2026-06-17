@@ -12,8 +12,9 @@ use crate::format::{
     READER_MAX_INDEX_FEC_CLASS_SHARDS, READER_MAX_INDEX_ROOT_FEC_CLASS_SHARDS,
     READER_MAX_PATH_LENGTH, READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN,
     READER_MAX_ROOT_AUTH_FOOTER_LEN, READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN,
-    READER_MAX_STRIPE_WIDTH, ROOT_AUTH_FOOTER_FIXED_LEN, ROOT_AUTH_SPEC_ID,
-    SERIALIZED_REGION_HEADER_LEN, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, READER_MAX_STRIPE_WIDTH, ROOT_AUTH_FOOTER_FIXED_LEN,
+    ROOT_AUTH_SPEC_ID, SERIALIZED_REGION_HEADER_LEN, VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44,
+    VolumeFormatRevision, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::raw_stream_profile::{
     validate_raw_stream_content_model_extension, RAW_STREAM_CONTENT_MODEL_EXTENSION_TAG,
@@ -75,14 +76,19 @@ impl VolumeHeader {
         Ok(header)
     }
 
+    pub fn parse_volume_format_revision(&self) -> Result<VolumeFormatRevision, FormatError> {
+        VolumeFormatRevision::from_u16(self.volume_format_rev).ok_or_else(|| {
+            FormatError::UnsupportedVolumeFormatRevision {
+                format_version: self.format_version,
+                volume_format_rev: self.volume_format_rev,
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            }
+        })
+    }
+
     pub fn validate(&self) -> Result<(), FormatError> {
         if self.format_version != FORMAT_VERSION {
             return Err(FormatError::UnsupportedFormatVersion(self.format_version));
-        }
-        if self.volume_format_rev != VOLUME_FORMAT_REV {
-            return Err(FormatError::UnsupportedVolumeFormatRevision(
-                self.volume_format_rev,
-            ));
         }
         if self.stripe_width == 0 {
             return Err(FormatError::ZeroStripeWidth);
@@ -858,9 +864,11 @@ impl RootAuthFooterV1 {
         }
         let volume_format_rev = read_u16(bytes, 72)?;
         if volume_format_rev != VOLUME_FORMAT_REV {
-            return Err(FormatError::UnsupportedVolumeFormatRevision(
+            return Err(FormatError::UnsupportedVolumeFormatRevision {
+                format_version,
                 volume_format_rev,
-            ));
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            });
         }
         let signer_identity_length = read_u32(bytes, 78)?;
         let authenticator_value_length = read_u32(bytes, 82)?;
@@ -1081,9 +1089,11 @@ impl CriticalMetadataImage {
         }
         let volume_format_rev = read_u16(bytes, 6)?;
         if volume_format_rev != VOLUME_FORMAT_REV {
-            return Err(FormatError::UnsupportedVolumeFormatRevision(
+            return Err(FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
                 volume_format_rev,
-            ));
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            });
         }
         let layout_flags = read_u32(bytes, 48)?;
         if layout_flags & !0x0000_0001 != 0 {
@@ -1357,9 +1367,11 @@ impl CriticalRecoveryLocator {
         }
         let volume_format_rev = read_u16(bytes, 6)?;
         if volume_format_rev != VOLUME_FORMAT_REV {
-            return Err(FormatError::UnsupportedVolumeFormatRevision(
+            return Err(FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
                 volume_format_rev,
-            ));
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            });
         }
         if read_u16(bytes, 20)? != CRITICAL_METADATA_RECOVERY_HEADER_LEN as u16 {
             return Err(FormatError::InvalidArchive(
@@ -1849,8 +1861,15 @@ mod tests {
         let crc = crc32c(&bytes[..124]);
         write_u32(&mut bytes, 124, crc);
         assert_eq!(
-            VolumeHeader::parse(&bytes).unwrap_err(),
-            FormatError::UnsupportedVolumeFormatRevision(35)
+            VolumeHeader::parse(&bytes)
+                .unwrap()
+                .parse_volume_format_revision()
+                .unwrap_err(),
+            FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
+                volume_format_rev: 35,
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            }
         );
 
         let mut bytes = volume_header().to_bytes();
@@ -1882,6 +1901,39 @@ mod tests {
                 cap: READER_MAX_CRYPTO_HEADER_LEN as u64,
                 actual: (READER_MAX_CRYPTO_HEADER_LEN + 1) as u64,
             }
+        );
+    }
+
+    #[test]
+    fn volume_header_revision_dispatch_is_versioned() {
+        let bytes = volume_header().to_bytes();
+        let parsed = VolumeHeader::parse(&bytes).unwrap();
+        assert_eq!(
+            parsed.parse_volume_format_revision().unwrap(),
+            VolumeFormatRevision::V43
+        );
+
+        let mut v44 = volume_header().to_bytes();
+        write_u16(&mut v44, 6, VOLUME_FORMAT_REV_44);
+        let v44_crc = crc32c(&v44[..124]);
+        write_u32(&mut v44, 124, v44_crc);
+        let parsed = VolumeHeader::parse(&v44).unwrap();
+        assert_eq!(
+            parsed.parse_volume_format_revision().unwrap(),
+            VolumeFormatRevision::V44
+        );
+
+        let mut v45 = volume_header().to_bytes();
+        write_u16(&mut v45, 6, VOLUME_FORMAT_REV_44 + 1);
+        let v45_crc = crc32c(&v45[..124]);
+        write_u32(&mut v45, 124, v45_crc);
+        assert_eq!(
+            VolumeHeader::parse(&v45).unwrap().parse_volume_format_revision(),
+            Err(FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
+                volume_format_rev: VOLUME_FORMAT_REV_44 + 1,
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            })
         );
     }
 
@@ -2717,6 +2769,20 @@ mod tests {
                 ..
             }
         ));
+
+        let mut v44 = footer.to_bytes().unwrap();
+        write_u16(&mut v44, 72, VOLUME_FORMAT_REV_44);
+        let v44_crc_offset = v44.len() - 4;
+        let v44_crc = crc32c(&v44[..v44_crc_offset]);
+        write_u32(&mut v44, v44_crc_offset, v44_crc);
+        assert_eq!(
+            RootAuthFooterV1::parse(&v44).unwrap_err(),
+            FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
+                volume_format_rev: VOLUME_FORMAT_REV_44,
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            }
+        );
     }
 
     #[test]
@@ -2758,6 +2824,50 @@ mod tests {
                 )
                 .unwrap_err(),
             FormatError::NonCanonicalBootstrapSidecarLayout
+        );
+    }
+
+    #[test]
+    fn critical_metadata_image_rejects_future_volume_format_revision() {
+        let image = CriticalMetadataImage {
+            archive_uuid: uuid(),
+            session_id: session(),
+            volume_index: 0,
+            stripe_width: 1,
+            layout_flags: 1,
+            volume_header_offset: 0,
+            volume_header_length: VOLUME_HEADER_LEN as u32,
+            crypto_header_offset: 0,
+            crypto_header_length: 0,
+            block_records_offset: 0,
+            block_records_length: 0,
+            block_count: 0,
+            manifest_footer_offset: 0,
+            manifest_footer_length: 0,
+            root_auth_footer_offset: 0,
+            root_auth_footer_length: 0,
+            volume_trailer_offset: 0,
+            volume_trailer_length: 0,
+            body_bytes_before_cmra: 0,
+            volume_header_sha256: [0u8; 32],
+            crypto_header_sha256: [0u8; 32],
+            manifest_footer_sha256: [0u8; 32],
+            root_auth_footer_sha256: [0u8; 32],
+            volume_trailer_sha256: [0u8; 32],
+            regions: vec![],
+        };
+        let mut bytes = image.to_bytes().unwrap();
+        write_u16(&mut bytes, 6, VOLUME_FORMAT_REV_44);
+        let crc_offset = bytes.len() - 4;
+        let crc = crc32c(&bytes[..crc_offset]);
+        write_u32(&mut bytes, crc_offset, crc);
+        assert_eq!(
+            CriticalMetadataImage::parse(&bytes).unwrap_err(),
+            FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
+                volume_format_rev: VOLUME_FORMAT_REV_44,
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            }
         );
     }
 }

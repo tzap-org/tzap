@@ -22,7 +22,7 @@ use crate::format::{
     MANIFEST_FOOTER_LEN, READER_MAX_CMRA_PARITY_PCT, READER_MAX_INDEX_ROOT_FEC_CLASS_SHARDS,
     READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN, READER_MAX_ROOT_AUTH_FOOTER_LEN,
     READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN,
-    VOLUME_TRAILER_LEN,
+    VOLUME_FORMAT_REV_44, VOLUME_TRAILER_LEN,
 };
 use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, validate_file_path_bytes, DirectoryHintEntry,
@@ -71,6 +71,14 @@ fn default_jobs() -> usize {
     std::thread::available_parallelism()
         .map(|jobs| jobs.get())
         .unwrap_or(1)
+}
+
+fn volume_format_revision_for_options(options: &WriterOptions) -> u16 {
+    if options.aead_algo.is_encrypted() {
+        VOLUME_FORMAT_REV
+    } else {
+        VOLUME_FORMAT_REV_44
+    }
 }
 
 fn should_emit_directory_hints(file_count: usize) -> bool {
@@ -547,6 +555,7 @@ struct WriterPlan {
     index_root_extent: ObjectExtent,
     index_shard_objects: Vec<PlannedIndexShardObject>,
     shard_entries: Vec<ShardEntry>,
+    volume_format_rev: u16,
     compressed_dictionary: Option<Vec<u8>>,
     dictionary_extent: Option<(ObjectExtent, u32)>,
     directory_hint_objects: Vec<PlannedDirectoryHintObject>,
@@ -1187,6 +1196,7 @@ fn build_writer_plan_from_payload(
     root_auth: Option<RootAuthWriterConfig<'_>>,
 ) -> Result<WriterPlan, ArchiveWriteError> {
     let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
+    let volume_format_rev = volume_format_revision_for_options(&options);
     let (shard_file_rows, planned_index_shards) = if payload.tar_members.is_empty() {
         (Vec::new(), Vec::new())
     } else {
@@ -1318,6 +1328,7 @@ fn build_writer_plan_from_payload(
     options = metadata_class.options;
     let crypto_header = build_crypto_header(
         options,
+        volume_format_rev,
         dictionary.is_some(),
         &subkeys,
         &archive_uuid,
@@ -1350,6 +1361,7 @@ fn build_writer_plan_from_payload(
         shard_entries,
         compressed_dictionary,
         dictionary_extent,
+        volume_format_rev,
         directory_hint_objects,
         directory_hint_entries,
         root_auth_footer_length,
@@ -1511,9 +1523,11 @@ where
     let session_id = options
         .session_id
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
+    let volume_format_rev = volume_format_revision_for_options(&options);
     let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
     let crypto_header = build_crypto_header(
         options,
+        volume_format_rev,
         false,
         &subkeys,
         &archive_uuid,
@@ -1526,6 +1540,7 @@ where
         &crypto_header,
         archive_uuid,
         session_id,
+        volume_format_rev,
         root_auth.is_some(),
     )?;
 
@@ -1666,9 +1681,11 @@ where
     let session_id = options
         .session_id
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
+    let volume_format_rev = volume_format_revision_for_options(&options);
     let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
     let crypto_header = build_crypto_header(
         options,
+        volume_format_rev,
         false,
         &subkeys,
         &archive_uuid,
@@ -1681,6 +1698,7 @@ where
         &crypto_header,
         archive_uuid,
         session_id,
+        volume_format_rev,
         root_auth.is_some(),
     )?;
 
@@ -1948,9 +1966,11 @@ where
     let session_id = options
         .session_id
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
+    let volume_format_rev = volume_format_revision_for_options(&options);
     let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
     let crypto_header = build_crypto_header(
         options,
+        volume_format_rev,
         false,
         &subkeys,
         &archive_uuid,
@@ -1963,6 +1983,7 @@ where
         &crypto_header,
         archive_uuid,
         session_id,
+        volume_format_rev,
         root_auth.is_some(),
     )?;
 
@@ -2689,6 +2710,7 @@ fn begin_writer_emission_state<O: ArchiveWriteSink>(
     crypto_header: &[u8],
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
+    volume_format_rev: u16,
     collect_data_leaf_hashes: bool,
 ) -> Result<WriterEmissionState, ArchiveWriteError> {
     let volume_count = usize::try_from(options.stripe_width)
@@ -2708,7 +2730,7 @@ fn begin_writer_emission_state<O: ArchiveWriteSink>(
             .map_err(|_| FormatError::WriterUnsupported("volume_index"))?;
         let volume_header = VolumeHeader {
             format_version: FORMAT_VERSION,
-            volume_format_rev: VOLUME_FORMAT_REV,
+            volume_format_rev,
             volume_index: volume_index_u32,
             stripe_width: options.stripe_width,
             archive_uuid,
@@ -3178,7 +3200,7 @@ fn planned_v41_volume_size(
 ) -> Result<u64, FormatError> {
     let volume_header = VolumeHeader {
         format_version: FORMAT_VERSION,
-        volume_format_rev: VOLUME_FORMAT_REV,
+        volume_format_rev: plan.volume_format_rev,
         volume_index,
         stripe_width: plan.options.stripe_width,
         archive_uuid: plan.archive_uuid,
@@ -3198,6 +3220,7 @@ fn planned_v41_volume_size(
     let manifest_footer = build_manifest_footer(
         subkeys,
         plan.options.aead_algo,
+        plan.volume_format_rev,
         plan.archive_uuid,
         plan.session_id,
         volume_index,
@@ -3226,6 +3249,7 @@ fn planned_v41_volume_size(
     let trailer = build_volume_trailer(VolumeTrailerBuildInput {
         subkeys,
         aead_algo: plan.options.aead_algo,
+        volume_format_rev: plan.volume_format_rev,
         archive_uuid: plan.archive_uuid,
         session_id: plan.session_id,
         volume_index,
@@ -3294,6 +3318,7 @@ where
         &plan.crypto_header,
         plan.archive_uuid,
         plan.session_id,
+        plan.volume_format_rev,
         root_auth.is_some(),
     )?;
 
@@ -3433,6 +3458,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
     let volume_zero_manifest = build_manifest_footer(
         subkeys,
         plan.options.aead_algo,
+        plan.volume_format_rev,
         plan.archive_uuid,
         plan.session_id,
         0,
@@ -3480,6 +3506,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
         let manifest_footer = build_manifest_footer(
             subkeys,
             plan.options.aead_algo,
+            plan.volume_format_rev,
             plan.archive_uuid,
             plan.session_id,
             volume_index_u32,
@@ -3511,6 +3538,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
         let trailer = build_volume_trailer(VolumeTrailerBuildInput {
             subkeys,
             aead_algo: plan.options.aead_algo,
+            volume_format_rev: plan.volume_format_rev,
             archive_uuid: plan.archive_uuid,
             session_id: plan.session_id,
             volume_index: volume_index_u32,
@@ -3589,6 +3617,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
         let sidecar = build_bootstrap_sidecar(
             subkeys,
             plan.options.aead_algo,
+            plan.volume_format_rev,
             plan.archive_uuid,
             plan.session_id,
             &volume_zero_manifest,
@@ -4083,6 +4112,7 @@ fn validate_writer_options_match_reader_caps(options: WriterOptions) -> Result<(
 
 fn build_crypto_header(
     options: WriterOptions,
+    volume_format_rev: u16,
     has_dictionary: bool,
     subkeys: &Subkeys,
     archive_uuid: &[u8; 16],
@@ -4142,6 +4172,7 @@ fn build_crypto_header(
     let hmac = compute_integrity_tag(
         HmacDomain::CryptoHeader,
         options.aead_algo,
+        volume_format_rev,
         Some(&subkeys.mac_key),
         archive_uuid,
         session_id,
@@ -5538,6 +5569,7 @@ fn validate_root_auth_variable_lengths_for_writer(
 fn build_manifest_footer(
     subkeys: &Subkeys,
     aead_algo: AeadAlgo,
+    volume_format_rev: u16,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
     volume_index: u32,
@@ -5562,6 +5594,7 @@ fn build_manifest_footer(
     footer.manifest_hmac = compute_integrity_tag(
         HmacDomain::ManifestFooter,
         aead_algo,
+        volume_format_rev,
         Some(&subkeys.mac_key),
         &archive_uuid,
         &session_id,
@@ -5575,6 +5608,7 @@ fn build_manifest_footer(
 struct VolumeTrailerBuildInput<'a> {
     subkeys: &'a Subkeys,
     aead_algo: AeadAlgo,
+    volume_format_rev: u16,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
     volume_index: u32,
@@ -5611,6 +5645,7 @@ fn build_volume_trailer(
     trailer.trailer_hmac = compute_integrity_tag(
         HmacDomain::VolumeTrailer,
         input.aead_algo,
+        input.volume_format_rev,
         Some(&input.subkeys.mac_key),
         &input.archive_uuid,
         &input.session_id,
@@ -5954,6 +5989,7 @@ fn checked_u64_mul(lhs: u64, rhs: u64, field: &'static str) -> Result<u64, Forma
 fn build_bootstrap_sidecar(
     subkeys: &Subkeys,
     aead_algo: AeadAlgo,
+    volume_format_rev: u16,
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
     manifest_footer: &[u8; MANIFEST_FOOTER_LEN],
@@ -5997,6 +6033,7 @@ fn build_bootstrap_sidecar(
     header.sidecar_hmac = compute_integrity_tag(
         HmacDomain::BootstrapSidecar,
         aead_algo,
+        volume_format_rev,
         Some(&subkeys.mac_key),
         &archive_uuid,
         &session_id,
@@ -6365,24 +6402,28 @@ mod tests {
         let crypto_header = b"test crypto header";
 
         let mut unsigned_sink = MemoryArchiveSink::default();
+        let volume_format_rev = volume_format_revision_for_options(&options);
         let unsigned = begin_writer_emission_state(
             &mut unsigned_sink,
             options,
             crypto_header,
             archive_uuid,
             session_id,
+            volume_format_rev,
             false,
         )
         .unwrap();
         assert!(unsigned.data_leaf_hashes.is_none());
 
         let mut signed_sink = MemoryArchiveSink::default();
+        let volume_format_rev = volume_format_revision_for_options(&options);
         let signed = begin_writer_emission_state(
             &mut signed_sink,
             options,
             crypto_header,
             archive_uuid,
             session_id,
+            volume_format_rev,
             true,
         )
         .unwrap();

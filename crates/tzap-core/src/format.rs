@@ -1,7 +1,10 @@
 use thiserror::Error;
 
 pub const FORMAT_VERSION: u16 = 1;
-pub const VOLUME_FORMAT_REV: u16 = 43;
+pub const VOLUME_FORMAT_REV_43: u16 = 43;
+pub const VOLUME_FORMAT_REV_44: u16 = 44;
+pub const READER_MAX_SUPPORTED_VOLUME_FORMAT_REV: u16 = VOLUME_FORMAT_REV_44;
+pub const VOLUME_FORMAT_REV: u16 = VOLUME_FORMAT_REV_43;
 
 pub const VOLUME_HEADER_LEN: usize = 128;
 pub const CRYPTO_HEADER_FIXED_LEN: usize = 76;
@@ -28,6 +31,23 @@ pub const CRYPTO_EXTENSION_MAX_VALUE_LEN: u32 = 256;
 pub const MASTER_KEY_LEN: usize = 32;
 pub const SUBKEY_LEN: usize = 32;
 pub const READER_MAX_ARGON2ID_M_COST_KIB: u32 = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum VolumeFormatRevision {
+    V43 = VOLUME_FORMAT_REV_43,
+    V44 = VOLUME_FORMAT_REV_44,
+}
+
+impl VolumeFormatRevision {
+    pub const fn from_u16(value: u16) -> Option<Self> {
+        match value {
+            VOLUME_FORMAT_REV_43 => Some(Self::V43),
+            VOLUME_FORMAT_REV_44 => Some(Self::V44),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ExtractError {
@@ -248,8 +268,14 @@ pub enum FormatError {
     #[error("unsupported format version {0}")]
     UnsupportedFormatVersion(u16),
 
-    #[error("unsupported volume format revision {0}")]
-    UnsupportedVolumeFormatRevision(u16),
+    #[error(
+        "unsupported volume format revision {volume_format_rev} for format version {format_version}; reader supports up to {reader_max_supported_revision}"
+    )]
+    UnsupportedVolumeFormatRevision {
+        format_version: u16,
+        volume_format_rev: u16,
+        reader_max_supported_revision: u16,
+    },
 
     #[error("non-zero reserved bytes in {structure}")]
     NonZeroReserved { structure: &'static str },

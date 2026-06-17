@@ -13,6 +13,7 @@ use aes_gcm_siv::aead::{Aead, KeyInit as AeadKeyInit, Payload};
 use crate::format::{
     AeadAlgo, FormatError, KdfAlgo, MASTER_KEY_LEN, READER_MAX_ARGON2ID_M_COST_KIB,
     READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST, SUBKEY_LEN,
+    VOLUME_FORMAT_REV_43, VOLUME_FORMAT_REV_44,
 };
 use crate::padding::{depad_suffix_padding, suffix_pad_for_aead};
 
@@ -23,10 +24,14 @@ const CRYPTO_HEADER_HMAC_DOMAIN: &[u8] = b"tzap-v1-crypto-header";
 const MANIFEST_FOOTER_HMAC_DOMAIN: &[u8] = b"tzap-v1-manifest-footer";
 const VOLUME_TRAILER_HMAC_DOMAIN: &[u8] = b"tzap-v1-volume-trailer";
 const BOOTSTRAP_SIDECAR_HMAC_DOMAIN: &[u8] = b"tzap-v1-sidecar";
-const CRYPTO_HEADER_DIGEST_DOMAIN: &[u8] = b"tzap-header-v43";
-const MANIFEST_FOOTER_DIGEST_DOMAIN: &[u8] = b"tzap-manifest-v43";
-const VOLUME_TRAILER_DIGEST_DOMAIN: &[u8] = b"tzap-trailer-v43";
-const BOOTSTRAP_SIDECAR_DIGEST_DOMAIN: &[u8] = b"tzap-sidecar-v43";
+const CRYPTO_HEADER_DIGEST_DOMAIN_V43: &[u8] = b"tzap-header-v43";
+const MANIFEST_FOOTER_DIGEST_DOMAIN_V43: &[u8] = b"tzap-manifest-v43";
+const VOLUME_TRAILER_DIGEST_DOMAIN_V43: &[u8] = b"tzap-trailer-v43";
+const BOOTSTRAP_SIDECAR_DIGEST_DOMAIN_V43: &[u8] = b"tzap-sidecar-v43";
+const CRYPTO_HEADER_DIGEST_DOMAIN_V44: &[u8] = b"tzap-header-v44";
+const MANIFEST_FOOTER_DIGEST_DOMAIN_V44: &[u8] = b"tzap-manifest-v44";
+const VOLUME_TRAILER_DIGEST_DOMAIN_V44: &[u8] = b"tzap-trailer-v44";
+const BOOTSTRAP_SIDECAR_DIGEST_DOMAIN_V44: &[u8] = b"tzap-sidecar-v44";
 
 const RAW_KDF_PARAMS_LEN: usize = 2;
 const NONE_KDF_PARAMS_LEN: usize = 2;
@@ -177,12 +182,28 @@ impl HmacDomain {
         }
     }
 
-    fn digest_domain_bytes(self) -> &'static [u8] {
+    fn digest_domain_bytes(self, volume_format_rev: u16) -> &'static [u8] {
+        let (crypto_header_domain, manifest_footer_domain, trailer_domain, sidecar_domain) =
+            if volume_format_rev == VOLUME_FORMAT_REV_44 {
+                (
+                    CRYPTO_HEADER_DIGEST_DOMAIN_V44,
+                    MANIFEST_FOOTER_DIGEST_DOMAIN_V44,
+                    VOLUME_TRAILER_DIGEST_DOMAIN_V44,
+                    BOOTSTRAP_SIDECAR_DIGEST_DOMAIN_V44,
+                )
+            } else {
+                (
+                    CRYPTO_HEADER_DIGEST_DOMAIN_V43,
+                    MANIFEST_FOOTER_DIGEST_DOMAIN_V43,
+                    VOLUME_TRAILER_DIGEST_DOMAIN_V43,
+                    BOOTSTRAP_SIDECAR_DIGEST_DOMAIN_V43,
+                )
+            };
         match self {
-            Self::CryptoHeader => CRYPTO_HEADER_DIGEST_DOMAIN,
-            Self::ManifestFooter => MANIFEST_FOOTER_DIGEST_DOMAIN,
-            Self::VolumeTrailer => VOLUME_TRAILER_DIGEST_DOMAIN,
-            Self::BootstrapSidecar => BOOTSTRAP_SIDECAR_DIGEST_DOMAIN,
+            Self::CryptoHeader => crypto_header_domain,
+            Self::ManifestFooter => manifest_footer_domain,
+            Self::VolumeTrailer => trailer_domain,
+            Self::BootstrapSidecar => sidecar_domain,
         }
     }
 }
@@ -229,6 +250,7 @@ pub fn verify_hmac(
 pub fn compute_integrity_tag(
     domain: HmacDomain,
     aead_algo: AeadAlgo,
+    volume_format_rev: u16,
     mac_key: Option<&[u8; SUBKEY_LEN]>,
     archive_uuid: &[u8; 16],
     session_id: &[u8; 16],
@@ -245,7 +267,7 @@ pub fn compute_integrity_tag(
     }
 
     let mut hasher = Sha256::new();
-    hasher.update(domain.digest_domain_bytes());
+    hasher.update(domain.digest_domain_bytes(volume_format_rev));
     hasher.update(archive_uuid);
     hasher.update(session_id);
     hasher.update(covered_bytes);
@@ -258,6 +280,7 @@ pub fn compute_integrity_tag(
 pub fn verify_integrity_tag(
     domain: HmacDomain,
     aead_algo: AeadAlgo,
+    volume_format_rev: u16,
     mac_key: Option<&[u8; SUBKEY_LEN]>,
     archive_uuid: &[u8; 16],
     session_id: &[u8; 16],
@@ -278,6 +301,7 @@ pub fn verify_integrity_tag(
     let actual = compute_integrity_tag(
         domain,
         aead_algo,
+        volume_format_rev,
         None,
         archive_uuid,
         session_id,
@@ -998,9 +1022,20 @@ mod tests {
     #[test]
     fn computes_and_verifies_unkeyed_integrity_domains() {
         let covered = b"covered bytes";
-        let tag = compute_integrity_tag(
+        let tag_v43 = compute_integrity_tag(
             HmacDomain::CryptoHeader,
             AeadAlgo::None,
+            VOLUME_FORMAT_REV_43,
+            None,
+            &uuid(),
+            &session(),
+            covered,
+        )
+        .unwrap();
+        let tag_v44 = compute_integrity_tag(
+            HmacDomain::CryptoHeader,
+            AeadAlgo::None,
+            VOLUME_FORMAT_REV_44,
             None,
             &uuid(),
             &session(),
@@ -1011,23 +1046,52 @@ mod tests {
         verify_integrity_tag(
             HmacDomain::CryptoHeader,
             AeadAlgo::None,
+            VOLUME_FORMAT_REV_43,
             None,
             &uuid(),
             &session(),
             covered,
-            &tag,
+            &tag_v43,
         )
         .unwrap();
+        verify_integrity_tag(
+            HmacDomain::CryptoHeader,
+            AeadAlgo::None,
+            VOLUME_FORMAT_REV_44,
+            None,
+            &uuid(),
+            &session(),
+            covered,
+            &tag_v44,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_integrity_tag(
+                HmacDomain::CryptoHeader,
+                AeadAlgo::None,
+                VOLUME_FORMAT_REV_44,
+                None,
+                &uuid(),
+                &session(),
+                covered,
+                &tag_v43,
+            )
+            .unwrap_err(),
+            FormatError::IntegrityDigestMismatch {
+                structure: "CryptoHeader"
+            }
+        );
 
         assert_eq!(
             verify_integrity_tag(
                 HmacDomain::ManifestFooter,
                 AeadAlgo::None,
+                VOLUME_FORMAT_REV_43,
                 None,
                 &uuid(),
                 &session(),
                 covered,
-                &tag,
+                &tag_v43,
             )
             .unwrap_err(),
             FormatError::IntegrityDigestMismatch {
@@ -1035,11 +1099,60 @@ mod tests {
             }
         );
 
+        let manifest_tag_v43 = compute_integrity_tag(
+            HmacDomain::ManifestFooter,
+            AeadAlgo::None,
+            VOLUME_FORMAT_REV_43,
+            None,
+            &uuid(),
+            &session(),
+            covered,
+        )
+        .unwrap();
+        let manifest_tag_v44 = compute_integrity_tag(
+            HmacDomain::ManifestFooter,
+            AeadAlgo::None,
+            VOLUME_FORMAT_REV_44,
+            None,
+            &uuid(),
+            &session(),
+            covered,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_integrity_tag(
+                HmacDomain::ManifestFooter,
+                AeadAlgo::None,
+                VOLUME_FORMAT_REV_43,
+                None,
+                &uuid(),
+                &session(),
+                covered,
+                &manifest_tag_v43,
+            )
+            .unwrap(),
+            ()
+        );
+        assert_eq!(
+            verify_integrity_tag(
+                HmacDomain::ManifestFooter,
+                AeadAlgo::None,
+                VOLUME_FORMAT_REV_44,
+                None,
+                &uuid(),
+                &session(),
+                covered,
+                &manifest_tag_v44,
+            )
+            .unwrap(),
+            ()
+        );
         assert_ne!(
-            tag,
+            tag_v43,
             compute_integrity_tag(
                 HmacDomain::ManifestFooter,
                 AeadAlgo::None,
+                VOLUME_FORMAT_REV_43,
                 None,
                 &uuid(),
                 &session(),
@@ -1047,6 +1160,8 @@ mod tests {
             )
             .unwrap()
         );
+        assert_ne!(tag_v43, tag_v44);
+        assert_ne!(manifest_tag_v43, manifest_tag_v44);
     }
 
     #[test]

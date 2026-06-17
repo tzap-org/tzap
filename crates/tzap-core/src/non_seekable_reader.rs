@@ -35,6 +35,13 @@ const DEFAULT_MAX_RETAINED_METADATA_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_INCOMPLETE_TAR_GROUP_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_STREAMED_MEMBER_COUNT: u64 = 1_000_000;
 
+fn parse_volume_format_dispatch(volume_header: &VolumeHeader) -> Result<(), FormatError> {
+    let revision = volume_header.parse_volume_format_revision()?;
+    match revision {
+        crate::format::VolumeFormatRevision::V43 | crate::format::VolumeFormatRevision::V44 => Ok(()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequentialRootAuthStatus {
     Absent,
@@ -456,6 +463,7 @@ where
     let mut volume_header_bytes = [0u8; VOLUME_HEADER_LEN];
     read_exact_stream(&mut reader, &mut volume_header_bytes, "VolumeHeader")?;
     let volume_header = VolumeHeader::parse(&volume_header_bytes)?;
+    parse_volume_format_dispatch(&volume_header)?;
 
     let crypto_len = usize::try_from(volume_header.crypto_header_length)
         .map_err(|_| FormatError::InvalidArchive("CryptoHeader length overflow"))?;
@@ -476,6 +484,7 @@ where
     verify_integrity_tag(
         HmacDomain::CryptoHeader,
         crypto_header.aead_algo,
+        volume_header.volume_format_rev,
         Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,

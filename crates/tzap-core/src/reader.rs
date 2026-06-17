@@ -20,6 +20,7 @@ use crate::format::{
     LOCATOR_PAIR_LEN, MANIFEST_FOOTER_LEN, READER_MAX_CMRA_PARITY_PCT,
     READER_MAX_CRYPTO_HEADER_LEN, READER_MAX_ROOT_AUTH_FOOTER_LEN, SERIALIZED_REGION_HEADER_LEN,
     VOLUME_FORMAT_REV, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    VolumeFormatRevision,
 };
 use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, DirectoryHintShardEntry, DirectoryHintTable,
@@ -627,6 +628,15 @@ pub type ExtractedRegularFile = (Vec<u8>, Vec<MetadataDiagnostic>);
 const FAST_FULL_EXTRACT_UNIQUE_PATHS_UNSUPPORTED: &str =
     "fast full extract requires unique archive paths";
 
+fn parse_volume_format_dispatch(
+    volume_header: &VolumeHeader,
+) -> Result<VolumeFormatRevision, FormatError> {
+    let revision = volume_header.parse_volume_format_revision()?;
+    match revision {
+        VolumeFormatRevision::V43 | VolumeFormatRevision::V44 => Ok(revision),
+    }
+}
+
 #[derive(Debug)]
 struct PayloadIndexTables {
     shards: Vec<IndexShard>,
@@ -682,6 +692,7 @@ fn require_unencrypted_volume_profile(bytes: &[u8]) -> Result<(), FormatError> {
         });
     }
     let volume_header = VolumeHeader::parse(slice(bytes, 0, VOLUME_HEADER_LEN, "archive")?)?;
+    parse_volume_format_dispatch(&volume_header)?;
     let crypto_start = volume_header.crypto_header_offset as usize;
     let crypto_len = volume_header.crypto_header_length as usize;
     let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
@@ -1314,6 +1325,7 @@ impl OpenedArchive {
         }
 
         let volume_header = VolumeHeader::parse(slice(bytes, 0, VOLUME_HEADER_LEN, "archive")?)?;
+        parse_volume_format_dispatch(&volume_header)?;
         let crypto_start = volume_header.crypto_header_offset as usize;
         let crypto_len = volume_header.crypto_header_length as usize;
         let crypto_end = checked_add(crypto_start, crypto_len, "CryptoHeader")?;
@@ -1325,15 +1337,16 @@ impl OpenedArchive {
             &volume_header.archive_uuid,
             &volume_header.session_id,
         )?;
-        verify_integrity_tag(
-            HmacDomain::CryptoHeader,
-            parsed_crypto.fixed.aead_algo,
-            Some(&subkeys.mac_key),
-            &volume_header.archive_uuid,
-            &volume_header.session_id,
-            parsed_crypto.hmac_covered_bytes,
-            &parsed_crypto.header_hmac,
-        )?;
+    verify_integrity_tag(
+        HmacDomain::CryptoHeader,
+        parsed_crypto.fixed.aead_algo,
+        volume_header.volume_format_rev,
+        Some(&subkeys.mac_key),
+        &volume_header.archive_uuid,
+        &volume_header.session_id,
+        parsed_crypto.hmac_covered_bytes,
+        &parsed_crypto.header_hmac,
+    )?;
         parsed_crypto.validate_extension_semantics()?;
         reject_unsupported_raw_stream_profile(&parsed_crypto.extensions)?;
         validate_bootstrap_single_volume_input(&volume_header, &parsed_crypto.fixed)?;
@@ -3347,6 +3360,9 @@ fn parse_seekable_volume(
     let prefix = match parse_open_prefix(bytes, master_key) {
         Ok(prefix) => prefix,
         Err(prefix_err) => {
+            if matches!(prefix_err, FormatError::UnsupportedVolumeFormatRevision { .. }) {
+                return Err(prefix_err);
+            }
             return parse_seekable_volume_from_recovered_terminal(bytes, master_key, options)
                 .or(Err(prefix_err));
         }
@@ -3406,6 +3422,7 @@ fn parse_seekable_volume_from_recovered_terminal(
     options: ReaderOptions,
 ) -> Result<ParsedSeekableVolume, FormatError> {
     let authority = locate_v41_terminal_authority(bytes, master_key, options)?;
+    parse_volume_format_dispatch(&authority.volume_header)?;
     let crypto_end = checked_add(
         authority.volume_header.crypto_header_offset as usize,
         authority.volume_header.crypto_header_length as usize,
@@ -3427,6 +3444,7 @@ fn parse_open_prefix(
     master_key: &MasterKey,
 ) -> Result<ParsedOpenPrefix, FormatError> {
     let volume_header = VolumeHeader::parse(slice(bytes, 0, VOLUME_HEADER_LEN, "archive")?)?;
+    parse_volume_format_dispatch(&volume_header)?;
     let crypto_start = volume_header.crypto_header_offset as usize;
     let crypto_len = volume_header.crypto_header_length as usize;
     let crypto_end = checked_add(crypto_start, crypto_len, "CryptoHeader")?;
@@ -3441,6 +3459,7 @@ fn parse_open_prefix(
     verify_integrity_tag(
         HmacDomain::CryptoHeader,
         parsed_crypto.fixed.aead_algo,
+        volume_header.volume_format_rev,
         Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
@@ -3548,6 +3567,9 @@ fn parse_seekable_read_at_volume(
     let prefix = match parse_read_at_open_prefix(reader.as_ref(), master_key) {
         Ok(prefix) => prefix,
         Err(prefix_err) => {
+            if matches!(prefix_err, FormatError::UnsupportedVolumeFormatRevision { .. }) {
+                return Err(prefix_err);
+            }
             return parse_seekable_read_at_volume_from_recovered_terminal(
                 reader,
                 observed_len,
@@ -3618,6 +3640,7 @@ fn parse_seekable_read_at_volume_from_recovered_terminal(
 ) -> Result<ParsedSeekableReadAtVolume, FormatError> {
     let authority =
         locate_v41_terminal_authority_read_at(reader.as_ref(), observed_len, master_key, options)?;
+    parse_volume_format_dispatch(&authority.volume_header)?;
     let crypto_end = checked_u64_add(
         authority.volume_header.crypto_header_offset as u64,
         authority.volume_header.crypto_header_length as u64,
@@ -3640,6 +3663,7 @@ fn parse_read_at_open_prefix(
 ) -> Result<ParsedReadAtOpenPrefix, FormatError> {
     let volume_header_bytes = read_at_vec(reader, 0, VOLUME_HEADER_LEN, "archive")?;
     let volume_header = VolumeHeader::parse(&volume_header_bytes)?;
+    parse_volume_format_dispatch(&volume_header)?;
     let crypto_start = volume_header.crypto_header_offset as u64;
     let crypto_len = volume_header.crypto_header_length as u64;
     let crypto_end = checked_u64_add(crypto_start, crypto_len, "CryptoHeader")?;
@@ -3659,6 +3683,7 @@ fn parse_read_at_open_prefix(
     verify_integrity_tag(
         HmacDomain::CryptoHeader,
         parsed_crypto.fixed.aead_algo,
+        volume_header.volume_format_rev,
         Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
@@ -3873,6 +3898,7 @@ fn parse_public_no_key_volume(
         });
     }
     let volume_header = VolumeHeader::parse(slice(bytes, 0, VOLUME_HEADER_LEN, "archive")?)?;
+    parse_volume_format_dispatch(&volume_header)?;
     let crypto_start = volume_header.crypto_header_offset as usize;
     let crypto_len = volume_header.crypto_header_length as usize;
     let crypto_end = checked_add(crypto_start, crypto_len, "CryptoHeader")?;
@@ -3965,6 +3991,7 @@ fn parse_valid_manifest_footer(
         crypto_header,
         &manifest_footer,
         subkeys,
+        volume_header.volume_format_rev,
         manifest_bytes,
     )?;
     manifest_footer.validate_index_root_extent(crypto_header.block_size)?;
@@ -5736,6 +5763,7 @@ fn validate_recovered_terminal_authority(
     verify_integrity_tag(
         HmacDomain::CryptoHeader,
         parsed_crypto.fixed.aead_algo,
+        volume_header.volume_format_rev,
         Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
@@ -5866,6 +5894,7 @@ fn validate_recovered_terminal_inner(
     verify_integrity_tag(
         HmacDomain::CryptoHeader,
         recovered_crypto.fixed.aead_algo,
+        volume_header.volume_format_rev,
         Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
@@ -5884,6 +5913,7 @@ fn validate_recovered_terminal_inner(
         crypto_header,
         &manifest_footer,
         subkeys,
+        volume_header.volume_format_rev,
         &manifest_region.bytes,
     )?;
     manifest_footer.validate_index_root_extent(crypto_header.block_size)?;
@@ -5913,6 +5943,7 @@ fn validate_recovered_terminal_inner(
     verify_integrity_tag(
         HmacDomain::VolumeTrailer,
         crypto_header.aead_algo,
+        volume_header.volume_format_rev,
         Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
@@ -6358,6 +6389,7 @@ fn parse_bootstrap_sidecar(
     verify_integrity_tag(
         HmacDomain::BootstrapSidecar,
         crypto_header.aead_algo,
+        volume_header.volume_format_rev,
         Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
@@ -6387,6 +6419,7 @@ fn parse_bootstrap_sidecar(
             crypto_header,
             &manifest_footer,
             subkeys,
+            volume_header.volume_format_rev,
             manifest_bytes,
         )?;
         manifest_footer.validate_index_root_extent(crypto_header.block_size)?;
@@ -6438,6 +6471,7 @@ fn validate_sidecar_manifest_footer(
     crypto_header: &CryptoHeaderFixed,
     footer: &ManifestFooter,
     subkeys: &Subkeys,
+    volume_format_rev: u16,
     raw: &[u8],
 ) -> Result<(), FormatError> {
     if footer.archive_uuid != volume_header.archive_uuid
@@ -6465,6 +6499,7 @@ fn validate_sidecar_manifest_footer(
     verify_integrity_tag(
         HmacDomain::ManifestFooter,
         crypto_header.aead_algo,
+        volume_format_rev,
         Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
@@ -6640,6 +6675,7 @@ fn validate_manifest_footer(
     crypto_header: &CryptoHeaderFixed,
     footer: &ManifestFooter,
     subkeys: &Subkeys,
+    volume_format_rev: u16,
     raw: &[u8],
 ) -> Result<(), FormatError> {
     if footer.archive_uuid != volume_header.archive_uuid
@@ -6663,6 +6699,7 @@ fn validate_manifest_footer(
     verify_integrity_tag(
         HmacDomain::ManifestFooter,
         crypto_header.aead_algo,
+        volume_format_rev,
         Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
@@ -7162,6 +7199,7 @@ fn sequential_extract_tar_stream_with_options(
     verify_integrity_tag(
         HmacDomain::CryptoHeader,
         parsed_crypto.fixed.aead_algo,
+        volume_header.volume_format_rev,
         Some(&subkeys.mac_key),
         &volume_header.archive_uuid,
         &volume_header.session_id,
@@ -8364,7 +8402,7 @@ mod tests {
     use crate::fec::encode_parity_gf16;
     use crate::format::{
         AeadAlgo, CompressionAlgo, FecAlgo, KdfAlgo, CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION,
-        VOLUME_FORMAT_REV,
+        READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44,
     };
     use crate::metadata::{
         DirectoryHintEntry, DirectoryHintTableHeader, IndexRootHeader, IndexShardHeader,
@@ -8745,6 +8783,44 @@ mod tests {
         assert_eq!(verified.authenticator_id, 0x2222);
         assert_eq!(verified.signer_identity_bytes, b"public verifier");
         assert!(verified.total_data_block_count > 0);
+    }
+
+    #[test]
+    fn public_no_key_verifier_not_invoked_for_future_revision() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("public.txt", b"public callback")],
+            &master_key(),
+            single_stream_options(),
+            RootAuthWriterConfig {
+                authenticator_id: 0x2222,
+                signer_identity_type: 1,
+                signer_identity: b"public verifier",
+                authenticator_value_length: 32,
+            },
+            |request| Ok(request.archive_root.to_vec()),
+        )
+        .unwrap();
+        let mut bytes = archive.bytes;
+        let mut header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
+        header.volume_format_rev = 45;
+        bytes[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
+
+        let mut called = false;
+        let err = public_no_key_verify_archive_with(&bytes, |_, _| {
+            called = true;
+            Ok(true)
+        })
+        .unwrap_err();
+
+        assert!(!called);
+        assert_eq!(
+            err,
+            FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
+                volume_format_rev: 45,
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            }
+        );
     }
 
     #[test]
@@ -9511,6 +9587,93 @@ mod tests {
             open_archive(&archive.bytes, &wrong).unwrap_err(),
             FormatError::HmacMismatch {
                 structure: "CryptoHeader"
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_future_volume_format_revision_before_key_mismatch() {
+        let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
+        let mut bytes = archive.bytes;
+        let mut header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
+        header.volume_format_rev = 45;
+        bytes[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
+        let wrong = MasterKey::from_raw_key(&[0x43; 32]).unwrap();
+
+        assert_eq!(
+            open_archive(&bytes, &wrong).unwrap_err(),
+            FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
+                volume_format_rev: 45,
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            }
+        );
+    }
+
+    #[test]
+    fn open_archive_unencrypted_accepts_v44_profile() {
+        let archive = write_archive_unencrypted(
+            &[RegularFile::new("payload.txt", b"smoke-v44-unencrypted")],
+            WriterOptions {
+                aead_algo: AeadAlgo::None,
+                ..single_stream_options()
+            },
+        )
+        .unwrap();
+
+        let opened = open_archive_unencrypted(&archive.bytes).unwrap();
+        let header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
+
+        assert_eq!(header.volume_format_rev, VOLUME_FORMAT_REV_44);
+        assert_eq!(opened.volume_header.volume_format_rev, VOLUME_FORMAT_REV_44);
+        assert_eq!(
+            opened.extract_file("payload.txt").unwrap(),
+            Some(b"smoke-v44-unencrypted".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn write_archive_defaults_to_v43_revision() {
+        let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
+        let header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
+
+        assert_eq!(header.format_version, FORMAT_VERSION);
+        assert_eq!(header.volume_format_rev, VOLUME_FORMAT_REV);
+    }
+
+    #[test]
+    fn non_seekable_stream_rejects_future_volume_format_revision() {
+        let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
+        let mut bytes = archive.bytes;
+        let mut header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
+        header.volume_format_rev = 45;
+        bytes[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
+
+        assert_eq!(
+            verify_non_seekable_stream(std::io::Cursor::new(bytes), &master_key()).unwrap_err(),
+            FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
+                volume_format_rev: 45,
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            }
+        );
+    }
+
+    #[test]
+    fn open_seekable_archive_rejects_future_volume_format_revision() {
+        let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
+        let mut bytes = archive.bytes;
+        let mut header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
+        header.volume_format_rev = 45;
+        bytes[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
+
+        assert_eq!(
+            open_seekable_archive(CountingReadAt::new(bytes, vec![]), &master_key()).unwrap_err(),
+            FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
+                volume_format_rev: 45,
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
             }
         );
     }
