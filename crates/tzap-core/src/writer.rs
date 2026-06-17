@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -39,9 +40,10 @@ use crate::root_auth::{
     CriticalMetadataDigestInputs, FecLayoutObjectRow,
 };
 use crate::wire::{
-    BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage, CriticalMetadataRecoveryHeader,
-    CriticalMetadataRecoveryShard, CriticalRecoveryLocator, CryptoHeader, CryptoHeaderFixed,
-    ManifestFooter, RootAuthFooterV1, SerializedRegion, VolumeHeader, VolumeTrailer,
+    compute_key_wrap_table_digest, BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage,
+    CriticalMetadataRecoveryHeader, CriticalMetadataRecoveryShard, CriticalRecoveryLocator,
+    CryptoHeader, CryptoHeaderFixed, KeyWrapTableV1, ManifestFooter, RecipientRecordV1,
+    RootAuthFooterV1, SerializedRegion, VolumeHeader, VolumeTrailer,
 };
 
 const TAR_BLOCK_LEN: usize = 512;
@@ -67,17 +69,144 @@ const MAX_HASH_PREFIX_RUN_FILES: usize = 50_000;
 const DEFAULT_DIRECTORY_HINT_ENTRIES_PER_SHARD: usize = 10_000;
 const CMRA_SHARD_SIZE: usize = 512;
 
+#[derive(Debug, Clone)]
+pub enum KeyWrapRecordSource {
+    None,
+    Fixed(Vec<RecipientRecordV1>),
+    Callback(Arc<dyn Fn() -> Result<Vec<RecipientRecordV1>, FormatError> + Send + Sync>),
+}
+
+impl Default for KeyWrapRecordSource {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl KeyWrapRecordSource {
+    pub fn fixed(records: Vec<RecipientRecordV1>) -> Self {
+        Self::Fixed(records)
+    }
+
+    pub fn callback<F>(callback: F) -> Self
+    where
+        F: Fn() -> Result<Vec<RecipientRecordV1>, FormatError> + Send + Sync + 'static,
+    {
+        Self::Callback(Arc::new(callback))
+    }
+
+    fn resolve(&self) -> Result<Option<Vec<RecipientRecordV1>>, FormatError> {
+        match self {
+            Self::None => Ok(None),
+            Self::Fixed(records) => Ok(Some(records.clone())),
+            Self::Callback(callback) => Ok(Some(callback()?)),
+        }
+    }
+}
+
 fn default_jobs() -> usize {
     std::thread::available_parallelism()
         .map(|jobs| jobs.get())
         .unwrap_or(1)
 }
 
-fn volume_format_revision_for_options(options: &WriterOptions) -> u16 {
-    if options.aead_algo.is_encrypted() {
-        VOLUME_FORMAT_REV
-    } else {
-        VOLUME_FORMAT_REV_44
+fn volume_format_revision_for_options(
+    options: &WriterOptions,
+    kdf_params: &KdfParams,
+) -> u16 {
+    match kdf_params {
+        KdfParams::RecipientWrap { .. } => VOLUME_FORMAT_REV_44,
+        _ if options.aead_algo.is_encrypted() => VOLUME_FORMAT_REV,
+        _ => VOLUME_FORMAT_REV_44,
+    }
+}
+
+fn resolve_key_wrap_artifacts(
+    kdf_params: &KdfParams,
+    archive_uuid: &[u8; 16],
+    session_id: &[u8; 16],
+    key_wrap_records: Option<&KeyWrapRecordSource>,
+) -> Result<(KdfParams, Option<Vec<u8>>), FormatError> {
+    match kdf_params {
+        KdfParams::RecipientWrap {
+            key_wrap_table_length,
+            key_wrap_table_record_count,
+            key_wrap_table_version,
+            ..
+        } => {
+            if *key_wrap_table_version != 1 {
+                return Err(FormatError::InvalidKdfParams(
+                    "recipient-wrap table version must be 1",
+                ));
+            }
+            let Some(records) = key_wrap_records
+                .ok_or(FormatError::WriterUnsupported(
+                    "RecipientWrap requires key-wrap records",
+                ))?
+                .resolve()?
+            else {
+                return Err(FormatError::WriterUnsupported(
+                    "RecipientWrap requires key-wrap records",
+                ));
+            };
+            if records.is_empty() {
+                return Err(FormatError::WriterUnsupported(
+                    "RecipientWrap requires at least one recipient record",
+                ));
+            }
+            let mut recipient_records = Vec::with_capacity(records.len());
+            for record in records {
+                let mut prepared = record.clone();
+                let record_length = u32_len(prepared.to_bytes()?.len(), "RecipientWrap record")?;
+                prepared = prepared.with_record_length(record_length);
+                recipient_records.push(prepared);
+            }
+            let declared_record_count = u32_len(
+                recipient_records.len(),
+                "KeyWrapTableV1 recipient_record_count",
+            )?;
+            if *key_wrap_table_record_count != declared_record_count {
+                return Err(FormatError::InvalidKdfParams(
+                    "recipient-wrap key_wrap_table_record_count mismatch",
+                ));
+            }
+
+            let key_wrap_table = KeyWrapTableV1 {
+                version: *key_wrap_table_version,
+                volume_format_rev: VOLUME_FORMAT_REV_44,
+                table_length: 0,
+                flags: 0,
+                archive_uuid: *archive_uuid,
+                session_id: *session_id,
+                recipient_record_count: declared_record_count,
+                records_offset: 96,
+                records_length: 0,
+                recipient_records,
+            }
+            .to_bytes()?;
+            let key_wrap_table_length = u32_len(
+                key_wrap_table.len(),
+                "KeyWrapTableV1 table_length",
+            )?;
+            if key_wrap_table_length != *key_wrap_table_length {
+                return Err(FormatError::InvalidKdfParams(
+                    "recipient-wrap key_wrap_table_length mismatch",
+                ));
+            }
+            let key_wrap_table_digest = compute_key_wrap_table_digest(
+                key_wrap_table_length,
+                &key_wrap_table,
+            );
+            Ok((
+                KdfParams::RecipientWrap {
+                    key_wrap_table_length,
+                    key_wrap_table_record_count: declared_record_count,
+                    key_wrap_table_version: *key_wrap_table_version,
+                    key_wrap_table_digest,
+                },
+                Some(key_wrap_table),
+            ))
+        }
+        _ => Ok((kdf_params.clone(), None)),
     }
 }
 

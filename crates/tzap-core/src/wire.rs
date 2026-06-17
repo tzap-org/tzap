@@ -525,6 +525,72 @@ pub struct KeyWrapTableV1 {
 }
 
 impl KeyWrapTableV1 {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, FormatError> {
+        if self.version != KEY_WRAP_TABLE_VERSION {
+            return Err(FormatError::InvalidArchive("KeyWrapTableV1 version must be 1"));
+        }
+        if self.volume_format_rev != VOLUME_FORMAT_REV_44 {
+            return Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 volume_format_rev must be 44",
+            ));
+        }
+        if self.flags != 0 {
+            return Err(FormatError::NonZeroReserved {
+                structure: "KeyWrapTableV1",
+            });
+        }
+        if self.records_offset != KEY_WRAP_TABLE_HEADER_LEN as u32 {
+            return Err(FormatError::InvalidArchive("KeyWrapTableV1 records_offset must be 96"));
+        }
+        if !self.recipient_records.is_empty() {
+            let mut recipients = Vec::with_capacity(self.recipient_records.len());
+            for record in &self.recipient_records {
+                recipients.extend_from_slice(&record.to_bytes()?);
+            }
+            let recipient_record_count = u32_len(self.recipient_records.len())?;
+            if self.recipient_record_count != 0 && self.recipient_record_count != recipient_record_count {
+                return Err(FormatError::InvalidArchive(
+                    "KeyWrapTableV1 recipient_record_count does not match fields",
+                ));
+            }
+            let records_length = u32_len(recipients.len())?;
+            if self.records_length != 0 && self.records_length != records_length {
+                return Err(FormatError::InvalidArchive(
+                    "KeyWrapTableV1 records_length does not match fields",
+                ));
+            }
+
+            let table_length = u32_len(
+                KEY_WRAP_TABLE_HEADER_LEN
+                    .checked_add(recipients.len())
+                    .ok_or(FormatError::WriterUnsupported("key-wrap table length overflow"))?,
+            )?;
+            if self.table_length != 0 && self.table_length != table_length {
+                return Err(FormatError::InvalidArchive(
+                    "KeyWrapTableV1 table_length does not match fields",
+                ));
+            }
+
+            let mut bytes = vec![0u8; KEY_WRAP_TABLE_HEADER_LEN];
+            bytes[0..4].copy_from_slice(&TZKW_MAGIC);
+            write_u16(&mut bytes, 4, self.version);
+            write_u16(&mut bytes, 6, self.volume_format_rev);
+            write_u32(&mut bytes, 8, table_length);
+            write_u32(&mut bytes, 12, KEY_WRAP_TABLE_HEADER_LEN as u32);
+            bytes[20..36].copy_from_slice(&self.archive_uuid);
+            bytes[36..52].copy_from_slice(&self.session_id);
+            write_u32(&mut bytes, 52, recipient_record_count);
+            write_u32(&mut bytes, 56, KEY_WRAP_TABLE_HEADER_LEN as u32);
+            write_u32(&mut bytes, 60, records_length);
+            bytes.extend(recipients);
+            Ok(bytes)
+        } else {
+            Err(FormatError::WriterUnsupported(
+                "KeyWrapTableV1 must include at least one recipient record",
+            ))
+        }
+    }
+
     pub fn parse(
         bytes: &[u8],
         archive_uuid: &[u8; 16],
@@ -672,6 +738,71 @@ pub struct RecipientRecordV1 {
 }
 
 impl RecipientRecordV1 {
+    pub fn with_record_length(mut self, record_length: u32) -> Self {
+        self.record_length = record_length;
+        self
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, FormatError> {
+        let mut bytes = vec![0u8; KEY_WRAP_RECORD_HEADER_LEN];
+        let computed_identity_length = u32_len(self.recipient_identity_bytes.len())?;
+        let computed_profile_payload_length = u32_len(self.profile_payload_bytes.len())?;
+        let computed_record_length = u32_len(
+            computed_identity_length
+                .checked_add(KEY_WRAP_RECORD_HEADER_LEN as u32)
+                .and_then(|value| value.checked_add(computed_profile_payload_length))
+                .ok_or(FormatError::WriterUnsupported("recipient-wrap record length overflow"))?,
+        )?;
+
+        let record_length = if self.record_length == 0 {
+            computed_record_length
+        } else {
+            if self.record_length != computed_record_length {
+                return Err(FormatError::InvalidArchive(
+                    "RecipientRecordV1 length is inconsistent with payload sizes",
+                ));
+            }
+            self.record_length
+        };
+        if self.recipient_identity_length != 0
+            && self.recipient_identity_length != computed_identity_length
+        {
+            return Err(FormatError::InvalidArchive(
+                "RecipientRecordV1 identity length is inconsistent with payload size",
+            ));
+        }
+        if self.profile_payload_length != 0
+            && self.profile_payload_length != computed_profile_payload_length
+        {
+            return Err(FormatError::InvalidArchive(
+                "RecipientRecordV1 payload length is inconsistent with payload size",
+            ));
+        }
+
+        let mut digest = Sha256::new();
+        digest.update(&self.recipient_identity_bytes);
+        let mut expected_digest = [0u8; 32];
+        expected_digest.copy_from_slice(&digest.finalize());
+        if self.recipient_identity_digest != [0u8; 32]
+            && self.recipient_identity_digest != expected_digest
+        {
+            return Err(FormatError::InvalidArchive(
+                "RecipientRecordV1 recipient_identity_digest mismatch",
+            ));
+        }
+
+        write_u32(&mut bytes, 0, record_length);
+        write_u16(&mut bytes, 4, self.profile_id);
+        write_u16(&mut bytes, 6, self.recipient_identity_type);
+        write_u32(&mut bytes, 8, 0);
+        write_u32(&mut bytes, 12, computed_identity_length);
+        write_u32(&mut bytes, 16, computed_profile_payload_length);
+        bytes[20..52].copy_from_slice(&expected_digest);
+        bytes.extend_from_slice(&self.recipient_identity_bytes);
+        bytes.extend_from_slice(&self.profile_payload_bytes);
+        Ok(bytes)
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<(Self, usize), FormatError> {
         if bytes.len() < KEY_WRAP_RECORD_HEADER_LEN {
             return Err(FormatError::InvalidLength {
