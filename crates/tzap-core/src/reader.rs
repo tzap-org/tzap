@@ -333,6 +333,8 @@ impl PublicNoKeyDiagnostic {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootAuthVerification {
+    pub format_version: u16,
+    pub volume_format_rev: u16,
     pub archive_root: [u8; 32],
     pub authenticator_id: u16,
     pub signer_identity_type: u16,
@@ -343,6 +345,8 @@ pub struct RootAuthVerification {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicNoKeyVerification {
+    pub format_version: u16,
+    pub volume_format_rev: u16,
     pub archive_root: [u8; 32],
     pub authenticator_id: u16,
     pub signer_identity_type: u16,
@@ -2511,6 +2515,8 @@ impl OpenedArchive {
             ));
         }
         Ok(RootAuthVerification {
+            format_version: footer.format_version,
+            volume_format_rev: footer.volume_format_rev,
             archive_root: material.archive_root,
             authenticator_id: footer.authenticator_id,
             signer_identity_type: footer.signer_identity_type,
@@ -4254,6 +4260,8 @@ where
         ));
     }
     Ok(PublicNoKeyVerification {
+        format_version: footer.format_version,
+        volume_format_rev: footer.volume_format_rev,
         archive_root,
         authenticator_id: footer.authenticator_id,
         signer_identity_type: footer.signer_identity_type,
@@ -10067,6 +10075,43 @@ mod tests {
     }
 
     #[test]
+    fn root_auth_unencrypted_v44_round_trips_with_recomputed_archive_root() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("signed-v44.txt", b"root-auth v44 plaintext")],
+            &master_key(),
+            WriterOptions {
+                aead_algo: AeadAlgo::None,
+                ..single_stream_options()
+            },
+            test_root_auth_config(),
+            |request| Ok(test_root_auth_value(request)),
+        )
+        .unwrap();
+        let opened = open_archive_unencrypted(&archive.bytes).unwrap();
+        let header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
+
+        assert_eq!(header.volume_format_rev, VOLUME_FORMAT_REV_44);
+        assert_eq!(opened.volume_header.volume_format_rev, VOLUME_FORMAT_REV_44);
+        assert_eq!(
+            opened.extract_file("signed-v44.txt").unwrap(),
+            Some(b"root-auth v44 plaintext".to_vec())
+        );
+
+        let verified = opened
+            .verify_root_auth_with(|footer, archive_root| {
+                Ok(test_root_auth_verifies(footer, archive_root))
+            })
+            .unwrap();
+
+        assert_eq!(verified.format_version, FORMAT_VERSION);
+        assert_eq!(verified.volume_format_rev, VOLUME_FORMAT_REV_44);
+        assert_eq!(
+            verified.archive_root,
+            opened.root_auth_footer.as_ref().unwrap().archive_root
+        );
+    }
+
+    #[test]
     fn recipientwrap_open_accepts_candidate_after_header_hmac() {
         let master = master_key();
         let archive = write_archive_with_recipient_wrap_records(
@@ -10092,6 +10137,81 @@ mod tests {
             Some(b"recipient payload".to_vec())
         );
         opened.verify().unwrap();
+    }
+
+    #[test]
+    fn recipientwrap_future_revision_rejects_before_resolver_callback() {
+        let archive = write_archive_with_recipient_wrap_records(
+            &[RegularFile::new("wrapped.txt", b"recipient payload")],
+            &master_key(),
+            single_stream_options(),
+            vec![recipient_wrap_test_record()],
+        )
+        .unwrap();
+        let mut bytes = archive.bytes;
+        let mut header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
+        header.volume_format_rev = VOLUME_FORMAT_REV_44 + 1;
+        bytes[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
+
+        let mut called = false;
+        let err = open_archive_with_recipient_wrap_resolver(&bytes, |_| {
+            called = true;
+            Ok(vec![master_key().0])
+        })
+        .unwrap_err();
+
+        assert!(!called);
+        assert_eq!(
+            err,
+            FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
+                volume_format_rev: VOLUME_FORMAT_REV_44 + 1,
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            }
+        );
+    }
+
+    #[test]
+    fn recipientwrap_key_wrap_table_digest_mismatch_rejects_before_resolver_callback() {
+        let archive = write_archive_with_recipient_wrap_records(
+            &[RegularFile::new("wrapped.txt", b"recipient payload")],
+            &master_key(),
+            single_stream_options(),
+            vec![recipient_wrap_test_record()],
+        )
+        .unwrap();
+        let mut bytes = archive.bytes;
+        let header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_start = header.crypto_header_offset as usize;
+        let crypto_end = crypto_start + header.crypto_header_length as usize;
+        let crypto_header =
+            CryptoHeader::parse(&bytes[crypto_start..crypto_end], header.crypto_header_length)
+                .unwrap();
+        let KdfParams::RecipientWrap {
+            key_wrap_table_length,
+            ..
+        } = crypto_header.kdf_params
+        else {
+            panic!("expected RecipientWrap KdfParams");
+        };
+        let table_start = crypto_end;
+        let table_end = table_start + key_wrap_table_length as usize;
+        bytes[table_end - 1] ^= 0x01;
+
+        let mut called = false;
+        let err = open_archive_with_recipient_wrap_resolver(&bytes, |_| {
+            called = true;
+            Ok(vec![master_key().0])
+        })
+        .unwrap_err();
+
+        assert!(!called);
+        assert_eq!(
+            err,
+            FormatError::IntegrityDigestMismatch {
+                structure: "KeyWrapTableV1",
+            }
+        );
     }
 
     #[test]

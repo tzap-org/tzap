@@ -16,7 +16,8 @@ use serde_json::json;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tzap_core::format::{
     FormatError, CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION, READER_MAX_ARGON2ID_M_COST_KIB,
-    READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST, VOLUME_FORMAT_REV_44,
+    READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST,
+    READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_43, VOLUME_FORMAT_REV_44,
     VOLUME_HEADER_LEN,
 };
 use tzap_core::reader::{ArchiveEntry, ArchiveIndexEntry, RecipientWrapRecordContext};
@@ -44,7 +45,8 @@ use tzap_core::{
     MasterKey, MemoryArchiveSink, MetadataDiagnostic, NonSeekableReaderOptions, OpenedArchive,
     PublicNoKeyVerification, ReaderOptions, RegularFile, RegularFileSource, RootAuthSigningRequest,
     RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions, StreamingRawWriterSummary,
-    StreamingTarWriterSummary, TarEntryKind, WriterOptions, WriterTimings, WrittenArchiveSummary,
+    StreamingTarWriterSummary, SequentialRootAuthStatus, TarEntryKind, WriterOptions,
+    WriterTimings, WrittenArchiveSummary,
 };
 use tzap_plugin_keywrap::{
     dispatch_key_wrap_record, wrap_master_key_for_recipient,
@@ -1979,6 +1981,19 @@ fn run(cli: Cli) -> Result<()> {
                             "ok": true,
                             "archives": &archive_paths,
                             "verification_mode": "key-holding-non-seekable-stream",
+                            "status": {
+                                "revision_mode": revision_mode_label(report.volume_format_rev),
+                                "format_version": FORMAT_VERSION,
+                                "volume_format_rev": report.volume_format_rev,
+                                "header_base_integrity": "verified",
+                                "decryption_keywrap": if keyfile.is_some() { "key_holding_decrypted" } else { "plaintext_opened" },
+                                "root_auth_signer": match report.root_auth {
+                                    SequentialRootAuthStatus::Absent => "absent",
+                                    SequentialRootAuthStatus::WireValidOnly => "wire_valid_only",
+                                },
+                                "trust_policy": "not_requested",
+                                "public_no_key_metadata_only": "not_requested",
+                            },
                             "volume_count": report.total_volumes,
                             "file_count": report.file_count,
                             "tar_total_size": report.tar_total_size,
@@ -1990,10 +2005,16 @@ fn run(cli: Cli) -> Result<()> {
                 emit_success_stdout(
                     quiet,
                     &format!(
-                        "{} ({} volume(s), {} file(s))",
-                        "-: OK non-seekable stream", report.total_volumes, report.file_count
+                        "{} {} ({} volume(s), {} file(s))",
+                        "-: OK non-seekable stream",
+                        revision_mode_label(report.volume_format_rev),
+                        report.total_volumes,
+                        report.file_count
                     ),
                 )?;
+                if report.root_auth == SequentialRootAuthStatus::WireValidOnly {
+                    emit_success_stdout(quiet, "root-auth: wire-valid-only (signer trust not checked)")?;
+                }
                 return Ok(());
             }
             if public_no_key {
@@ -2167,6 +2188,15 @@ fn run(cli: Cli) -> Result<()> {
                             "ok": true,
                             "archives": &archive_paths,
                             "verification_mode": if fast { "fast" } else { "key-holding" },
+                            "status": key_holding_status_json(
+                                &opened,
+                                root_auth.as_ref(),
+                                fast,
+                                recipient_key.is_some(),
+                                trusted_public_key.is_some()
+                                    || !trusted_ca_cert.is_empty()
+                                    || trusted_system_roots,
+                            ),
                             "volume_count": volume_count,
                             "file_count": file_count,
                         });
@@ -2202,9 +2232,11 @@ fn run(cli: Cli) -> Result<()> {
                     emit_success_stdout(
                         quiet,
                         &format!(
-                            "{}: OK{} ({} volume(s), {} file(s))",
+                            "{}: OK{} {} {} ({} volume(s), {} file(s))",
                             first,
                             if fast { " fast" } else { "" },
+                            revision_mode_label(opened.volume_header.volume_format_rev),
+                            key_access_status(&opened, recipient_key.is_some()),
                             volume_count,
                             file_count
                         ),
@@ -2547,6 +2579,19 @@ fn emit_verify_json_error(
     err: &anyhow::Error,
 ) -> Result<()> {
     let diagnostic = classify_error(err);
+    if diagnostic.label == "unsupported-revision" {
+        let payload = json!({
+            "ok": false,
+            "archives": archives,
+            "error": unsupported_revision_error_json(err, diagnostic.action),
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&payload)
+                .context("failed to encode verify error output as JSON")?
+        );
+        return Ok(());
+    }
     let mut payload = json!({
         "ok": false,
         "archives": archives,
@@ -2567,6 +2612,56 @@ fn emit_verify_json_error(
         serde_json::to_string(&payload).context("failed to encode verify error output as JSON")?
     );
     Ok(())
+}
+
+fn unsupported_revision_error_json(err: &anyhow::Error, action: &'static str) -> serde_json::Value {
+    for cause in err.chain() {
+        if let Some(format) = cause.downcast_ref::<FormatError>() {
+            match format {
+                FormatError::UnsupportedFormatVersion(observed_format_version) => {
+                    return json!({
+                    "label": "unsupported-revision",
+                    "observed": {
+                        "format_version": observed_format_version,
+                    },
+                    "supported": {
+                        "format_version": FORMAT_VERSION,
+                        "max_volume_format_rev": READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+                    },
+                    "action": action,
+                    });
+                }
+                FormatError::UnsupportedVolumeFormatRevision {
+                    format_version,
+                    volume_format_rev,
+                    reader_max_supported_revision,
+                } => {
+                    return json!({
+                    "label": "unsupported-revision",
+                    "observed": {
+                        "format_version": format_version,
+                        "volume_format_rev": volume_format_rev,
+                    },
+                    "supported": {
+                        "format_version": FORMAT_VERSION,
+                        "max_volume_format_rev": reader_max_supported_revision,
+                    },
+                    "action": action,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    json!({
+        "label": "unsupported-revision",
+        "observed": null,
+        "supported": {
+            "format_version": FORMAT_VERSION,
+            "max_volume_format_rev": READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+        },
+        "action": action,
+    })
 }
 
 #[derive(Debug)]
@@ -4490,6 +4585,7 @@ fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()>
                 "ok": true,
                 "archives": &archive_paths,
                 "verification_mode": "public-no-key",
+                "status": public_no_key_status_json(&root_auth),
                 "volume_count": archive_paths.len(),
                 "root_auth": public_no_key_root_auth_json(&root_auth),
                 "public_diagnostics": public_no_key_diagnostic_labels_for_root_auth(&root_auth),
@@ -4501,7 +4597,7 @@ fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()>
     emit_success_stdout(
         request.quiet,
         &format!(
-            "{}: OK public no-key ({} volume(s), {} data block(s))",
+            "{}: OK public-no-key metadata-only ({} volume(s), {} data block(s))",
             first,
             archive_paths.len(),
             public_no_key_total_data_block_count(&root_auth)
@@ -4667,12 +4763,110 @@ fn verify_opened_root_auth_x509(
     })
 }
 
+fn revision_mode_label(volume_format_rev: u16) -> &'static str {
+    match volume_format_rev {
+        VOLUME_FORMAT_REV_43 => "v43-compatibility",
+        VOLUME_FORMAT_REV_44 => "v44",
+        _ => "unsupported",
+    }
+}
+
+fn key_access_status(opened: &OpenedArchive, used_recipient_key: bool) -> &'static str {
+    if opened.crypto_header.aead_algo == AeadAlgo::None {
+        "plaintext_opened"
+    } else if used_recipient_key || opened.crypto_header.kdf_algo == KdfAlgo::RecipientWrap {
+        "recipientwrap_opened"
+    } else {
+        "key_holding_decrypted"
+    }
+}
+
+fn key_holding_status_json(
+    opened: &OpenedArchive,
+    root_auth: Option<&VerifiedRootAuth>,
+    fast: bool,
+    used_recipient_key: bool,
+    trust_requested: bool,
+) -> serde_json::Value {
+    json!({
+        "revision_mode": revision_mode_label(opened.volume_header.volume_format_rev),
+        "format_version": opened.volume_header.format_version,
+        "volume_format_rev": opened.volume_header.volume_format_rev,
+        "header_base_integrity": if fast { "fast_verified" } else { "verified" },
+        "decryption_keywrap": key_access_status(opened, used_recipient_key),
+        "root_auth_signer": key_holding_root_auth_status(opened, root_auth, fast),
+        "trust_policy": key_holding_trust_policy_status(root_auth, trust_requested),
+        "public_no_key_metadata_only": "not_requested",
+    })
+}
+
+fn key_holding_root_auth_status(
+    opened: &OpenedArchive,
+    root_auth: Option<&VerifiedRootAuth>,
+    fast: bool,
+) -> &'static str {
+    if let Some(root_auth) = root_auth {
+        return verified_root_auth_status(root_auth);
+    }
+    if fast && opened.root_auth_footer.is_some() {
+        "deferred_full_archive_scan_required"
+    } else if opened.root_auth_footer.is_some() {
+        "not_requested"
+    } else {
+        "absent"
+    }
+}
+
+fn key_holding_trust_policy_status(
+    root_auth: Option<&VerifiedRootAuth>,
+    trust_requested: bool,
+) -> &'static str {
+    if root_auth.is_some() {
+        "trusted"
+    } else if trust_requested {
+        "unverified"
+    } else {
+        "not_requested"
+    }
+}
+
+fn verified_root_auth_status(root_auth: &VerifiedRootAuth) -> &'static str {
+    match root_auth {
+        VerifiedRootAuth::Ed25519(verification) => root_auth_status(verification),
+        VerifiedRootAuth::X509 { verification, .. } => root_auth_status(verification),
+    }
+}
+
+fn public_no_key_status_json(root_auth: &VerifiedPublicNoKeyRootAuth) -> serde_json::Value {
+    let verification = public_no_key_verification(root_auth);
+    json!({
+        "revision_mode": revision_mode_label(verification.volume_format_rev),
+        "format_version": verification.format_version,
+        "volume_format_rev": verification.volume_format_rev,
+        "header_base_integrity": "public_metadata_verified",
+        "decryption_keywrap": "not_used",
+        "root_auth_signer": public_no_key_status(verification),
+        "trust_policy": "public_trust_matched",
+        "public_no_key_metadata_only": "metadata_commitments_verified",
+    })
+}
+
+fn public_no_key_verification(root_auth: &VerifiedPublicNoKeyRootAuth) -> &PublicNoKeyVerification {
+    match root_auth {
+        VerifiedPublicNoKeyRootAuth::Ed25519(verification) => verification,
+        VerifiedPublicNoKeyRootAuth::X509 { verification, .. } => verification,
+    }
+}
+
 fn root_auth_json(root_auth: &VerifiedRootAuth) -> serde_json::Value {
     match root_auth {
         VerifiedRootAuth::Ed25519(root_auth) => {
             let mut payload = json!({
                 "status": root_auth_status(root_auth),
                 "diagnostics": root_auth_diagnostic_labels(root_auth),
+                "revision_mode": revision_mode_label(root_auth.volume_format_rev),
+                "format_version": root_auth.format_version,
+                "volume_format_rev": root_auth.volume_format_rev,
                 "authenticator": "ed25519",
                 "archive_root": encode_hex(&root_auth.archive_root),
                 "authenticator_id": root_auth.authenticator_id,
@@ -4691,6 +4885,9 @@ fn root_auth_json(root_auth: &VerifiedRootAuth) -> serde_json::Value {
         } => json!({
             "status": root_auth_status(verification),
             "diagnostics": root_auth_diagnostic_labels(verification),
+            "revision_mode": revision_mode_label(verification.volume_format_rev),
+            "format_version": verification.format_version,
+            "volume_format_rev": verification.volume_format_rev,
             "authenticator": "x509",
             "archive_root": encode_hex(&verification.archive_root),
             "authenticator_id": verification.authenticator_id,
@@ -4814,6 +5011,9 @@ fn public_no_key_root_auth_json(root_auth: &VerifiedPublicNoKeyRootAuth) -> serd
             let mut payload = json!({
                 "status": public_no_key_status(verification),
                 "diagnostics": public_no_key_diagnostic_labels(verification),
+                "revision_mode": revision_mode_label(verification.volume_format_rev),
+                "format_version": verification.format_version,
+                "volume_format_rev": verification.volume_format_rev,
                 "authenticator": "ed25519",
                 "archive_root": encode_hex(&verification.archive_root),
                 "authenticator_id": verification.authenticator_id,
@@ -4834,6 +5034,9 @@ fn public_no_key_root_auth_json(root_auth: &VerifiedPublicNoKeyRootAuth) -> serd
         } => json!({
             "status": public_no_key_status(verification),
             "diagnostics": public_no_key_diagnostic_labels(verification),
+            "revision_mode": revision_mode_label(verification.volume_format_rev),
+            "format_version": verification.format_version,
+            "volume_format_rev": verification.volume_format_rev,
             "authenticator": "x509",
             "archive_root": encode_hex(&verification.archive_root),
             "authenticator_id": verification.authenticator_id,
@@ -6101,6 +6304,70 @@ mod tests {
                 "upgrade tzap or use a reader that supports this archive revision"
             );
         }
+    }
+
+    #[test]
+    fn reporting_unsupported_revision_json_has_observed_supported_action_only() {
+        let err = anyhow!(FormatError::UnsupportedVolumeFormatRevision {
+            format_version: 1,
+            volume_format_rev: VOLUME_FORMAT_REV_44 + 1,
+            reader_max_supported_revision: VOLUME_FORMAT_REV_44,
+        });
+
+        let payload = unsupported_revision_error_json(
+            &err,
+            "upgrade tzap or use a reader that supports this archive revision",
+        );
+
+        assert_eq!(payload["label"], "unsupported-revision");
+        assert_eq!(
+            payload["observed"]["format_version"],
+            serde_json::json!(FORMAT_VERSION)
+        );
+        assert_eq!(
+            payload["observed"]["volume_format_rev"],
+            serde_json::json!(VOLUME_FORMAT_REV_44 + 1)
+        );
+        assert_eq!(
+            payload["supported"]["max_volume_format_rev"],
+            serde_json::json!(VOLUME_FORMAT_REV_44)
+        );
+        assert!(payload.get("root_auth").is_none());
+        assert!(payload.get("decryption_keywrap").is_none());
+    }
+
+    #[test]
+    fn reporting_public_no_key_status_is_metadata_only() {
+        let root_auth =
+            VerifiedPublicNoKeyRootAuth::Ed25519(PublicNoKeyVerification {
+                format_version: FORMAT_VERSION,
+                volume_format_rev: VOLUME_FORMAT_REV_44,
+                archive_root: [1; 32],
+                authenticator_id: ED25519_AUTHENTICATOR_ID,
+                signer_identity_type: 1,
+                signer_identity_bytes: [2; 32].to_vec(),
+                total_data_block_count: 7,
+                diagnostics: vec![
+                    tzap_core::reader::PublicNoKeyDiagnostic::PublicDataBlockCommitmentVerified,
+                    tzap_core::reader::PublicNoKeyDiagnostic::PublicPhysicalCompletenessUnverified,
+                ],
+            });
+
+        let status = public_no_key_status_json(&root_auth);
+
+        assert_eq!(status["revision_mode"], serde_json::json!("v44"));
+        assert_eq!(
+            status["decryption_keywrap"],
+            serde_json::json!("not_used")
+        );
+        assert_eq!(
+            status["trust_policy"],
+            serde_json::json!("public_trust_matched")
+        );
+        assert_eq!(
+            status["public_no_key_metadata_only"],
+            serde_json::json!("metadata_commitments_verified")
+        );
     }
 
     #[test]

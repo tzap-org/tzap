@@ -282,12 +282,17 @@ as the explicit input set.
 
 Useful flags:
 
-- `--json`: machine-readable status output
+- `--json`: machine-readable status output. Verify JSON includes separate
+  status axes for `revision_mode`, `header_base_integrity`,
+  `decryption_keywrap`, `root_auth_signer`, `trust_policy`, and
+  `public_no_key_metadata_only`.
 - `--quiet`: suppress success summary
 - `--trusted-public-key`: verify Ed25519 RootAuth with a trusted public key
 - `--trusted-ca-cert`: verify X.509 RootAuth with a trusted CA certificate
 - `--trusted-system-roots`: allow OpenSSL default trust roots for X.509 RootAuth
-- `--public-no-key`: verify public v43 RootAuth commitments without the archive key
+- `--public-no-key`: verify public RootAuth metadata commitments without the
+  archive key. This is a metadata-only/public commitment check and does not
+  claim full payload integrity.
 - `--recipient-key`: verify a v44 RecipientWrap archive with a local recipient
   private key
 - `--fast`: use the seekable archive fast-verification path. For plaintext,
@@ -313,6 +318,12 @@ Notes:
 - Key-holding verification opens archive files through the core file-backed
   random-access reader, then intentionally walks the payload and metadata needed
   to validate the full archive.
+- RecipientWrap success reports the archive as opened/decryptable through the
+  recipient key, but it does not imply RootAuth signing or signer trust.
+- RootAuth success reports a trusted signer over the recomputed archive root,
+  but it does not imply the signer can decrypt the archive.
+- `revision_mode` is explicit: v43 archives report `v43-compatibility`; v44
+  archives report `v44`.
 - Fast verification is available only for seekable archive paths, not archive
   stdin. For plaintext, unsigned, dictionary-free archives with no recovery
   parity, it validates metadata and payload BlockRecord integrity without
@@ -325,8 +336,8 @@ Notes:
   `root_auth_content_verified`.
 - Public no-key verification requires `--public-no-key` plus one trust source:
   `--trusted-public-key`, `--trusted-ca-cert`, or `--trusted-system-roots`.
-  It does not use archive key material or bootstrap sidecars, and reports the
-  public v43 diagnostics `public_data_block_commitment_verified`,
+  It does not use archive key material or bootstrap sidecars, and reports
+  metadata-only public diagnostics `public_data_block_commitment_verified`,
   `public_physical_completeness_unverified`, and
   `public_recovery_margin_unchecked` on success.
 - Verification reports unsupported local tar metadata profiles to stderr as

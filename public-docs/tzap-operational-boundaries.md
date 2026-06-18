@@ -28,6 +28,9 @@ What to do:
   passphrase, or archive bytes are bad.
 - Automation should key on exit code `12` / label `unsupported-revision` and
   surface the required reader upgrade action to the operator.
+- `tzap verify --json` does not emit partial authentication, decryption, or
+  RootAuth status fields for unsupported revisions. Its error object is limited
+  to the observed revision, supported reader maximum, and upgrade action.
 
 ## Writer shape validation
 
