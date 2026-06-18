@@ -59,16 +59,11 @@ impl HpkeSuite {
             },
         ];
 
-        for suite in suites {
-            if suite.kem_id == hpke_kem_id
+        suites.into_iter().find(|suite| {
+            suite.kem_id == hpke_kem_id
                 && suite.kdf_id == hpke_kdf_id
                 && suite.aead_id == hpke_aead_id
-            {
-                return Some(suite);
-            }
-        }
-
-        None
+        })
     }
 }
 
@@ -191,7 +186,7 @@ struct ParsedProfilePayload {
 /// - context digest computation
 /// - supported HPKE suites and fixed lengths
 ///
-/// It does not yet execute HPKE Open.
+/// It then asks the caller for a matching private key and attempts HPKE Open.
 pub fn dispatch_key_wrap_record<L>(
     input: RecipientRecordInput,
     private_key_lookup: &L,
@@ -466,18 +461,14 @@ fn parse_profile_payload(
         return Err(KeyWrapOutcome::InvalidRecord);
     }
 
-    let payload_version = u16::from_le_bytes(profile_payload_bytes[0..2].try_into().unwrap());
-    let hpke_kem_id = u16::from_le_bytes(profile_payload_bytes[2..4].try_into().unwrap());
-    let hpke_kdf_id = u16::from_le_bytes(profile_payload_bytes[4..6].try_into().unwrap());
-    let hpke_aead_id = u16::from_le_bytes(profile_payload_bytes[6..8].try_into().unwrap());
-    let enc_length = usize::from(u16::from_le_bytes(
-        profile_payload_bytes[8..10].try_into().unwrap(),
-    ));
-    let ciphertext_length = usize::from(u16::from_le_bytes(
-        profile_payload_bytes[10..12].try_into().unwrap(),
-    ));
-    let flags = u32::from_le_bytes(profile_payload_bytes[12..16].try_into().unwrap());
-    let key_wrap_context_digest: [u8; 32] = profile_payload_bytes[16..48].try_into().unwrap();
+    let payload_version = read_u16(profile_payload_bytes, 0)?;
+    let hpke_kem_id = read_u16(profile_payload_bytes, 2)?;
+    let hpke_kdf_id = read_u16(profile_payload_bytes, 4)?;
+    let hpke_aead_id = read_u16(profile_payload_bytes, 6)?;
+    let enc_length = usize::from(read_u16(profile_payload_bytes, 8)?);
+    let ciphertext_length = usize::from(read_u16(profile_payload_bytes, 10)?);
+    let flags = read_u32(profile_payload_bytes, 12)?;
+    let key_wrap_context_digest = read_array_32(profile_payload_bytes, 16)?;
 
     if flags != 0 {
         return Err(KeyWrapOutcome::InvalidRecord);
@@ -517,19 +508,18 @@ fn parse_profile_payload(
         return Err(KeyWrapOutcome::InvalidRecord);
     }
 
-    let mut key_wrap_context_digest_array = [0u8; 32];
-    key_wrap_context_digest_array.copy_from_slice(&key_wrap_context_digest);
-
-    let enc = profile_payload_bytes[64..64 + enc_length].to_vec();
+    let enc_start = KEYWRAP_PROFILE_PAYLOAD_HEADER_LEN;
+    let ciphertext_start = enc_start + enc_length;
+    let enc = profile_payload_bytes[enc_start..ciphertext_start].to_vec();
     let ciphertext =
-        profile_payload_bytes[64 + enc_length..64 + enc_length + ciphertext_length].to_vec();
+        profile_payload_bytes[ciphertext_start..ciphertext_start + ciphertext_length].to_vec();
 
     Ok(ParsedProfilePayload {
         suite,
         recipient_spki_digest: identity.recipient_spki_digest,
         enc,
         ciphertext,
-        key_wrap_context_digest: key_wrap_context_digest_array,
+        key_wrap_context_digest,
     })
 }
 
@@ -541,8 +531,8 @@ fn compute_key_wrap_context_digest(
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(KEY_WRAP_CONTEXT_DOMAIN);
-    hasher.update(&archive_identity.archive_uuid);
-    hasher.update(&archive_identity.session_id);
+    hasher.update(archive_identity.archive_uuid);
+    hasher.update(archive_identity.session_id);
     hasher.update(archive_identity.format_version.to_le_bytes());
     hasher.update(archive_identity.volume_format_rev.to_le_bytes());
     hasher.update(metadata.profile_id.to_le_bytes());
@@ -665,6 +655,29 @@ fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     out
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, KeyWrapOutcome> {
+    let value = bytes
+        .get(offset..offset + 2)
+        .ok_or(KeyWrapOutcome::InvalidRecord)?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, KeyWrapOutcome> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or(KeyWrapOutcome::InvalidRecord)?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn read_array_32(bytes: &[u8], offset: usize) -> Result<[u8; 32], KeyWrapOutcome> {
+    let value = bytes
+        .get(offset..offset + 32)
+        .ok_or(KeyWrapOutcome::InvalidRecord)?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(value);
+    Ok(out)
 }
 
 #[cfg(test)]

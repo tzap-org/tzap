@@ -1,9 +1,14 @@
-use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::{cmp::Ordering, fmt};
 
+use openssl::bn::{BigNum, BigNumContext, BigNumRef};
+use openssl::ecdsa::EcdsaSig;
 use openssl::error::ErrorStack;
 use openssl::hash::MessageDigest;
-use openssl::pkey::{Id, PKey, Private};
-use openssl::sign::{Signer, Verifier};
+use openssl::nid::Nid;
+use openssl::pkey::{HasParams, HasPublic, Id, PKey, PKeyRef, Private};
+use openssl::rsa::Padding;
+use openssl::sign::{RsaPssSaltlen, Signer, Verifier};
 use openssl::stack::Stack;
 use openssl::x509::store::X509StoreBuilder;
 use openssl::x509::verify::X509VerifyParam;
@@ -12,13 +17,16 @@ use sha2::{Digest, Sha256, Sha512};
 use tzap_core::format::{root_auth_spec_id_for_revision, ROOT_AUTH_SPEC_ID};
 use tzap_core::wire::RootAuthFooterV1;
 use tzap_core::writer::{RootAuthSigningRequest, RootAuthWriterConfig};
+use x509_parser::prelude::FromDer;
 
 pub const X509_AUTHENTICATOR_ID: u16 = 0x0003;
 pub const X509_SIGNER_IDENTITY_TYPE_DER_CERT: u16 = 2;
 
 const MAGIC: &[u8; 4] = b"TZXC";
 const VERSION: u16 = 1;
-const SIG_SCHEME_OPENSSL_SHA256: u16 = 1;
+const SIG_SCHEME_RSA_PKCS1_SHA256: u16 = 1;
+const SIG_SCHEME_ECDSA_SHA256_DER: u16 = 2;
+const SIG_SCHEME_RSA_PSS_SHA256: u16 = 3;
 const X509_SIGNING_DOMAIN: &[u8] = b"tzap-sig-x509-v1\0";
 const X509_CHAIN_DOMAIN: &[u8] = b"tzap-x509-chain-v1\0";
 const AUTHENTICATOR_FIXED_LEN: usize = 60;
@@ -59,6 +67,15 @@ impl From<ErrorStack> for X509RootAuthError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct X509RootAuthReport {
     pub signed_at_unix_seconds: i64,
+    pub signature_scheme: &'static str,
+    pub chain_validation_time_unix_seconds: i64,
+    pub trust_store_policy: &'static str,
+    pub x509_time_policy: &'static str,
+    pub chain_time_basis: &'static str,
+    pub trusted_timestamp: bool,
+    pub revocation_checked: bool,
+    pub key_usage_policy: &'static str,
+    pub eku_policy: &'static str,
     pub subject: String,
     pub issuer: String,
     pub serial_number_hex: String,
@@ -74,6 +91,7 @@ pub struct X509RootAuthSigner {
     chain_certificate_der: Vec<Vec<u8>>,
     signed_at_unix_seconds: i64,
     signature_capacity: usize,
+    sig_scheme: u16,
 }
 
 impl X509RootAuthSigner {
@@ -93,11 +111,45 @@ impl X509RootAuthSigner {
         )
     }
 
+    pub fn from_pem_or_der_with_signature_scheme(
+        leaf_certificate_bytes: &[u8],
+        private_key_bytes: &[u8],
+        chain_certificate_der: Vec<Vec<u8>>,
+        signed_at_unix_seconds: i64,
+        signature_scheme: X509SignatureScheme,
+    ) -> Result<Self, X509RootAuthError> {
+        let leaf_certificate_der = certificate_der_from_pem_or_der(leaf_certificate_bytes)?;
+        let private_key = private_key_from_pem_or_der(private_key_bytes)?;
+        Self::new_with_signature_scheme(
+            leaf_certificate_der,
+            private_key,
+            chain_certificate_der,
+            signed_at_unix_seconds,
+            Some(signature_scheme),
+        )
+    }
+
     pub fn new(
         leaf_certificate_der: Vec<u8>,
         private_key: PKey<Private>,
         chain_certificate_der: Vec<Vec<u8>>,
         signed_at_unix_seconds: i64,
+    ) -> Result<Self, X509RootAuthError> {
+        Self::new_with_signature_scheme(
+            leaf_certificate_der,
+            private_key,
+            chain_certificate_der,
+            signed_at_unix_seconds,
+            None,
+        )
+    }
+
+    pub fn new_with_signature_scheme(
+        leaf_certificate_der: Vec<u8>,
+        private_key: PKey<Private>,
+        chain_certificate_der: Vec<Vec<u8>>,
+        signed_at_unix_seconds: i64,
+        signature_scheme: Option<X509SignatureScheme>,
     ) -> Result<Self, X509RootAuthError> {
         let leaf_certificate = X509::from_der(&leaf_certificate_der)?;
         let leaf_certificate_der = leaf_certificate.to_der()?;
@@ -112,6 +164,13 @@ impl X509RootAuthSigner {
                 "EdDSA X.509 keys are not supported by this RootAuth profile",
             ));
         }
+        let sig_scheme = match signature_scheme {
+            Some(scheme) => {
+                validate_private_key_matches_scheme(scheme.wire_id(), &private_key)?;
+                scheme.wire_id()
+            }
+            None => signature_scheme_for_private_key(&private_key)?,
+        };
         let chain_certificate_der = normalize_certificate_der_chain(chain_certificate_der)?;
         let signature_capacity = private_key.size();
         let signer = Self {
@@ -120,6 +179,7 @@ impl X509RootAuthSigner {
             chain_certificate_der,
             signed_at_unix_seconds,
             signature_capacity,
+            sig_scheme,
         };
         signer.authenticator_value_length()?;
         Ok(signer)
@@ -155,9 +215,13 @@ impl X509RootAuthSigner {
             self.signed_at_unix_seconds,
             &chain_digest,
         );
-        let mut signer = Signer::new(MessageDigest::sha256(), &self.private_key)?;
+        let mut signer = signer_for_scheme(self.sig_scheme, &self.private_key)?;
         signer.update(&signing_input)?;
-        let signature = signer.sign_to_vec()?;
+        let signature = normalize_signature_for_scheme(
+            self.sig_scheme,
+            &self.private_key,
+            signer.sign_to_vec()?,
+        )?;
         if signature.len() > self.signature_capacity {
             return Err(X509RootAuthError::Invalid(
                 "signature exceeded reserved authenticator capacity",
@@ -167,7 +231,7 @@ impl X509RootAuthSigner {
         let mut out = Vec::with_capacity(self.authenticator_value_length()? as usize);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
-        out.extend_from_slice(&SIG_SCHEME_OPENSSL_SHA256.to_le_bytes());
+        out.extend_from_slice(&self.sig_scheme.to_le_bytes());
         out.extend_from_slice(&self.signed_at_unix_seconds.to_le_bytes());
         out.extend_from_slice(&chain_digest);
         out.extend_from_slice(&u32_len(signature.len(), "signature length")?.to_le_bytes());
@@ -186,6 +250,23 @@ impl X509RootAuthSigner {
             out.extend_from_slice(cert_der);
         }
         Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum X509SignatureScheme {
+    RsaPkcs1Sha256,
+    EcdsaSha256Der,
+    RsaPssSha256,
+}
+
+impl X509SignatureScheme {
+    fn wire_id(self) -> u16 {
+        match self {
+            Self::RsaPkcs1Sha256 => SIG_SCHEME_RSA_PKCS1_SHA256,
+            Self::EcdsaSha256Der => SIG_SCHEME_ECDSA_SHA256_DER,
+            Self::RsaPssSha256 => SIG_SCHEME_RSA_PSS_SHA256,
+        }
     }
 }
 
@@ -279,6 +360,7 @@ pub fn verify_root_auth_footer(
 
     let leaf_certificate = X509::from_der(&footer.signer_identity_bytes)?;
     let parsed = parse_authenticator_value(&footer.authenticator_value)?;
+    validate_leaf_key_usage(&footer.signer_identity_bytes)?;
     let root_auth_spec_id =
         root_auth_spec_id_for_revision(footer.format_version, footer.volume_format_rev).map_err(
             |_| X509RootAuthError::Invalid("unsupported RootAuthFooter root_auth_spec_id"),
@@ -292,7 +374,9 @@ pub fn verify_root_auth_footer(
         &parsed.chain_digest,
     );
     let leaf_public_key = leaf_certificate.public_key()?;
-    let mut verifier = Verifier::new(MessageDigest::sha256(), &leaf_public_key)?;
+    validate_public_key_matches_scheme(parsed.sig_scheme, &leaf_public_key)?;
+    validate_signature_for_scheme(parsed.sig_scheme, &leaf_public_key, &parsed.signature)?;
+    let mut verifier = verifier_for_scheme(parsed.sig_scheme, &leaf_public_key)?;
     verifier.update(&signing_input)?;
     if !verifier.verify(&parsed.signature)? {
         return Err(X509RootAuthError::Invalid(
@@ -300,12 +384,13 @@ pub fn verify_root_auth_footer(
         ));
     }
 
+    let chain_validation_time_unix_seconds = current_unix_seconds()?;
     let verified_chain_subjects = verify_certificate_chain(
         &leaf_certificate,
         &parsed.chain_certificate_der,
         trusted_roots_der,
         use_system_roots,
-        parsed.signed_at_unix_seconds,
+        chain_validation_time_unix_seconds,
     )?;
     let fingerprint = leaf_certificate.digest(MessageDigest::sha256())?;
     let mut certificate_sha256 = [0u8; SHA256_LEN];
@@ -314,6 +399,15 @@ pub fn verify_root_auth_footer(
 
     Ok(X509RootAuthReport {
         signed_at_unix_seconds: parsed.signed_at_unix_seconds,
+        signature_scheme: signature_scheme_name(parsed.sig_scheme),
+        chain_validation_time_unix_seconds,
+        trust_store_policy: trust_store_policy_label(trusted_roots_der, use_system_roots),
+        x509_time_policy: "verifier_current_time",
+        chain_time_basis: "verifier_current_time",
+        trusted_timestamp: false,
+        revocation_checked: false,
+        key_usage_policy: "archive_signature_minimal",
+        eku_policy: "none",
         subject: name_to_string(leaf_certificate.subject_name()),
         issuer: name_to_string(leaf_certificate.issuer_name()),
         serial_number_hex: leaf_certificate
@@ -329,6 +423,7 @@ pub fn verify_root_auth_footer(
 
 #[derive(Debug)]
 struct ParsedAuthenticator {
+    sig_scheme: u16,
     signed_at_unix_seconds: i64,
     chain_digest: [u8; SHA256_LEN],
     signature: Vec<u8>,
@@ -340,6 +435,286 @@ fn private_key_from_pem_or_der(bytes: &[u8]) -> Result<PKey<Private>, X509RootAu
         return Ok(key);
     }
     Ok(PKey::private_key_from_der(bytes)?)
+}
+
+fn signature_scheme_for_private_key(
+    private_key: &PKeyRef<Private>,
+) -> Result<u16, X509RootAuthError> {
+    match private_key.id() {
+        Id::RSA => Ok(SIG_SCHEME_RSA_PKCS1_SHA256),
+        Id::RSA_PSS => Err(X509RootAuthError::Invalid(
+            "RSASSA-PSS X.509 keys require explicit rsa-pss-sha256 signature scheme",
+        )),
+        Id::EC => {
+            validate_allowed_ec_curve(private_key)?;
+            Ok(SIG_SCHEME_ECDSA_SHA256_DER)
+        }
+        _ => Err(X509RootAuthError::Invalid(
+            "unsupported X.509 signature key type",
+        )),
+    }
+}
+
+fn signature_scheme_name(sig_scheme: u16) -> &'static str {
+    match sig_scheme {
+        SIG_SCHEME_RSA_PKCS1_SHA256 => "rsa-pkcs1-sha256",
+        SIG_SCHEME_ECDSA_SHA256_DER => "ecdsa-sha256-der",
+        SIG_SCHEME_RSA_PSS_SHA256 => "rsa-pss-sha256",
+        _ => "unknown",
+    }
+}
+
+fn trust_store_policy_label(trusted_roots_der: &[Vec<u8>], use_system_roots: bool) -> &'static str {
+    match (trusted_roots_der.is_empty(), use_system_roots) {
+        (false, true) => "caller_roots_plus_openssl_default_roots",
+        (false, false) => "caller_roots",
+        (true, true) => "openssl_default_roots",
+        (true, false) => "none",
+    }
+}
+
+fn validate_private_key_matches_scheme(
+    sig_scheme: u16,
+    private_key: &PKeyRef<Private>,
+) -> Result<(), X509RootAuthError> {
+    validate_public_key_matches_scheme(sig_scheme, private_key)
+}
+
+fn signer_for_scheme<'a>(
+    sig_scheme: u16,
+    private_key: &'a PKeyRef<Private>,
+) -> Result<Signer<'a>, X509RootAuthError> {
+    let mut signer = Signer::new(MessageDigest::sha256(), private_key)?;
+    match sig_scheme {
+        SIG_SCHEME_RSA_PKCS1_SHA256 => {
+            signer.set_rsa_padding(Padding::PKCS1)?;
+        }
+        SIG_SCHEME_RSA_PSS_SHA256 => {
+            signer.set_rsa_padding(Padding::PKCS1_PSS)?;
+            signer.set_rsa_mgf1_md(MessageDigest::sha256())?;
+            signer.set_rsa_pss_saltlen(RsaPssSaltlen::custom(32))?;
+        }
+        SIG_SCHEME_ECDSA_SHA256_DER => {}
+        _ => {
+            return Err(X509RootAuthError::Invalid(
+                "unsupported X.509 signature scheme",
+            ));
+        }
+    }
+    Ok(signer)
+}
+
+fn verifier_for_scheme<'a, T>(
+    sig_scheme: u16,
+    public_key: &'a PKeyRef<T>,
+) -> Result<Verifier<'a>, X509RootAuthError>
+where
+    T: HasPublic,
+{
+    let mut verifier = Verifier::new(MessageDigest::sha256(), public_key)?;
+    match sig_scheme {
+        SIG_SCHEME_RSA_PKCS1_SHA256 => {
+            verifier.set_rsa_padding(Padding::PKCS1)?;
+        }
+        SIG_SCHEME_RSA_PSS_SHA256 => {
+            verifier.set_rsa_padding(Padding::PKCS1_PSS)?;
+            verifier.set_rsa_mgf1_md(MessageDigest::sha256())?;
+            verifier.set_rsa_pss_saltlen(RsaPssSaltlen::custom(32))?;
+        }
+        SIG_SCHEME_ECDSA_SHA256_DER => {}
+        _ => {
+            return Err(X509RootAuthError::Invalid(
+                "unsupported X.509 signature scheme",
+            ));
+        }
+    }
+    Ok(verifier)
+}
+
+fn validate_public_key_matches_scheme<T>(
+    sig_scheme: u16,
+    public_key: &PKeyRef<T>,
+) -> Result<(), X509RootAuthError>
+where
+    T: HasParams,
+{
+    match sig_scheme {
+        SIG_SCHEME_RSA_PKCS1_SHA256 => {
+            if public_key.id() != Id::RSA {
+                return Err(X509RootAuthError::Invalid(
+                    "X.509 signature scheme/key mismatch",
+                ));
+            }
+        }
+        SIG_SCHEME_ECDSA_SHA256_DER => {
+            if public_key.id() != Id::EC {
+                return Err(X509RootAuthError::Invalid(
+                    "X.509 signature scheme/key mismatch",
+                ));
+            }
+            validate_allowed_ec_curve(public_key)?;
+        }
+        SIG_SCHEME_RSA_PSS_SHA256 => {
+            if !matches!(public_key.id(), Id::RSA | Id::RSA_PSS) {
+                return Err(X509RootAuthError::Invalid(
+                    "X.509 signature scheme/key mismatch",
+                ));
+            }
+        }
+        _ => {
+            return Err(X509RootAuthError::Invalid(
+                "unsupported X.509 signature scheme",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_leaf_key_usage(leaf_certificate_der: &[u8]) -> Result<(), X509RootAuthError> {
+    let (remaining, parsed_certificate) = x509_parser::certificate::X509Certificate::from_der(
+        leaf_certificate_der,
+    )
+    .map_err(|err| {
+        X509RootAuthError::Chain(format!("failed to parse leaf certificate KeyUsage: {err}"))
+    })?;
+    if !remaining.is_empty() {
+        return Err(X509RootAuthError::Invalid(
+            "leaf certificate DER has trailing bytes",
+        ));
+    }
+    let Some(key_usage) = parsed_certificate.key_usage().map_err(|err| {
+        X509RootAuthError::Chain(format!("failed to parse leaf certificate KeyUsage: {err}"))
+    })?
+    else {
+        return Ok(());
+    };
+    if key_usage.value.digital_signature() || key_usage.value.non_repudiation() {
+        return Ok(());
+    }
+    Err(X509RootAuthError::Invalid(
+        "leaf certificate KeyUsage does not allow archive signing",
+    ))
+}
+
+fn validate_signature_for_scheme<T>(
+    sig_scheme: u16,
+    public_key: &PKeyRef<T>,
+    signature: &[u8],
+) -> Result<(), X509RootAuthError>
+where
+    T: HasParams,
+{
+    match sig_scheme {
+        SIG_SCHEME_RSA_PKCS1_SHA256 | SIG_SCHEME_RSA_PSS_SHA256 => {
+            if signature.len() != public_key.size() {
+                return Err(X509RootAuthError::Invalid(
+                    "X.509 RSA signature length does not match modulus",
+                ));
+            }
+        }
+        SIG_SCHEME_ECDSA_SHA256_DER => {
+            validate_ecdsa_der_low_s(public_key, signature)?;
+        }
+        _ => {
+            return Err(X509RootAuthError::Invalid(
+                "unsupported X.509 signature scheme",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_signature_for_scheme(
+    sig_scheme: u16,
+    private_key: &PKeyRef<Private>,
+    signature: Vec<u8>,
+) -> Result<Vec<u8>, X509RootAuthError> {
+    if sig_scheme != SIG_SCHEME_ECDSA_SHA256_DER {
+        return Ok(signature);
+    }
+    let sig = EcdsaSig::from_der(&signature)?;
+    let (_, order, half_order) = ec_curve_order(private_key)?;
+    if sig.s().ucmp(&half_order) != Ordering::Greater {
+        return Ok(signature);
+    }
+    let mut low_s = BigNum::new()?;
+    low_s.checked_sub(&order, sig.s())?;
+    let normalized = EcdsaSig::from_private_components(sig.r().to_owned()?, low_s)?;
+    Ok(normalized.to_der()?)
+}
+
+fn validate_ecdsa_der_low_s<T>(
+    public_key: &PKeyRef<T>,
+    signature: &[u8],
+) -> Result<(), X509RootAuthError>
+where
+    T: HasParams,
+{
+    let sig = EcdsaSig::from_der(signature)?;
+    if sig.to_der()? != signature {
+        return Err(X509RootAuthError::Invalid(
+            "X.509 ECDSA signature is not canonical DER",
+        ));
+    }
+    let (zero, order, half_order) = ec_curve_order(public_key)?;
+    validate_positive_scalar(sig.r(), &zero, &order)?;
+    validate_positive_scalar(sig.s(), &zero, &order)?;
+    if sig.s().ucmp(&half_order) == Ordering::Greater {
+        return Err(X509RootAuthError::Invalid(
+            "X.509 ECDSA signature is high-S",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_positive_scalar(
+    value: &BigNumRef,
+    zero: &BigNumRef,
+    order: &BigNumRef,
+) -> Result<(), X509RootAuthError> {
+    if value.is_negative()
+        || value.ucmp(zero) != Ordering::Greater
+        || value.ucmp(order) != Ordering::Less
+    {
+        return Err(X509RootAuthError::Invalid(
+            "X.509 ECDSA signature scalar is out of range",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_allowed_ec_curve<T>(key: &PKeyRef<T>) -> Result<(), X509RootAuthError>
+where
+    T: HasParams,
+{
+    let curve = key
+        .ec_key()?
+        .group()
+        .curve_name()
+        .ok_or(X509RootAuthError::Invalid(
+            "X.509 ECDSA key must use a named curve",
+        ))?;
+    if !matches!(
+        curve,
+        Nid::X9_62_PRIME256V1 | Nid::SECP384R1 | Nid::SECP521R1
+    ) {
+        return Err(X509RootAuthError::Invalid("unsupported X.509 ECDSA curve"));
+    }
+    Ok(())
+}
+
+fn ec_curve_order<T>(key: &PKeyRef<T>) -> Result<(BigNum, BigNum, BigNum), X509RootAuthError>
+where
+    T: HasParams,
+{
+    let ec_key = key.ec_key()?;
+    let mut ctx = BigNumContext::new()?;
+    let mut order = BigNum::new()?;
+    ec_key.group().order(&mut order, &mut ctx)?;
+    let zero = BigNum::from_u32(0)?;
+    let mut half_order = BigNum::new()?;
+    half_order.rshift1(&order)?;
+    Ok((zero, order, half_order))
 }
 
 fn parse_authenticator_value(value: &[u8]) -> Result<ParsedAuthenticator, X509RootAuthError> {
@@ -358,7 +733,11 @@ fn parse_authenticator_value(value: &[u8]) -> Result<ParsedAuthenticator, X509Ro
             "unsupported X.509 authenticator version",
         ));
     }
-    if read_u16(value, 6)? != SIG_SCHEME_OPENSSL_SHA256 {
+    let sig_scheme = read_u16(value, 6)?;
+    if !matches!(
+        sig_scheme,
+        SIG_SCHEME_RSA_PKCS1_SHA256 | SIG_SCHEME_ECDSA_SHA256_DER | SIG_SCHEME_RSA_PSS_SHA256
+    ) {
         return Err(X509RootAuthError::Invalid(
             "unsupported X.509 signature scheme",
         ));
@@ -427,6 +806,7 @@ fn parse_authenticator_value(value: &[u8]) -> Result<ParsedAuthenticator, X509Ro
         ));
     }
     Ok(ParsedAuthenticator {
+        sig_scheme,
         signed_at_unix_seconds,
         chain_digest: parsed_chain_digest,
         signature,
@@ -439,7 +819,7 @@ fn verify_certificate_chain(
     chain_certificate_der: &[Vec<u8>],
     trusted_roots_der: &[Vec<u8>],
     use_system_roots: bool,
-    signed_at_unix_seconds: i64,
+    chain_validation_time_unix_seconds: i64,
 ) -> Result<Vec<String>, X509RootAuthError> {
     let mut store_builder = X509StoreBuilder::new()?;
     for root_der in trusted_roots_der {
@@ -449,7 +829,7 @@ fn verify_certificate_chain(
         store_builder.set_default_paths()?;
     }
     let mut params = X509VerifyParam::new()?;
-    params.set_time(signed_at_unix_seconds as _);
+    params.set_time(chain_validation_time_unix_seconds as _);
     store_builder.set_param(&params)?;
     let store = store_builder.build();
 
@@ -483,6 +863,14 @@ fn verify_certificate_chain(
         subjects.push(name_to_string(leaf_certificate.subject_name()));
     }
     Ok(subjects)
+}
+
+fn current_unix_seconds() -> Result<i64, X509RootAuthError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| X509RootAuthError::Invalid("system clock is before Unix epoch"))?;
+    i64::try_from(duration.as_secs())
+        .map_err(|_| X509RootAuthError::Invalid("system clock exceeds i64 Unix seconds"))
 }
 
 fn chain_digest(chain_certificate_der: &[Vec<u8>]) -> Result<[u8; SHA256_LEN], X509RootAuthError> {
@@ -589,15 +977,17 @@ mod tests {
     use super::*;
     use openssl::asn1::Asn1Time;
     use openssl::bn::{BigNum, MsbOption};
+    use openssl::ec::{EcGroup, EcKey};
     use openssl::hash::MessageDigest;
+    use openssl::nid::Nid;
     use openssl::pkey::PKeyRef;
     use openssl::rsa::Rsa;
     use openssl::x509::extension::{BasicConstraints, KeyUsage};
     use openssl::x509::{X509NameBuilder, X509Ref};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tzap_core::format::{
-        FORMAT_VERSION, ROOT_AUTH_SPEC_ID, ROOT_AUTH_SPEC_ID_V44, VOLUME_FORMAT_REV,
-        VOLUME_FORMAT_REV_44,
+        FORMAT_VERSION, ROOT_AUTH_SPEC_ID, ROOT_AUTH_SPEC_ID_V43, ROOT_AUTH_SPEC_ID_V44,
+        VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44,
     };
 
     #[test]
@@ -647,12 +1037,242 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.signed_at_unix_seconds, signed_at);
+        assert_eq!(report.signature_scheme, "rsa-pkcs1-sha256");
+        assert_eq!(report.x509_time_policy, "verifier_current_time");
+        assert_eq!(report.chain_time_basis, "verifier_current_time");
+        assert!(!report.trusted_timestamp);
+        assert!(!report.revocation_checked);
+        assert!(report.chain_validation_time_unix_seconds >= signed_at - 5);
         assert!(report.subject.contains("CN=Acme Release Signing"));
         assert!(report.issuer.contains("CN=Acme Test Root CA"));
         assert_eq!(
             report.trust_anchor_subject.as_deref(),
             Some("CN=Acme Test Root CA")
         );
+    }
+
+    #[test]
+    fn chain_validation_uses_verifier_current_time_not_signer_claimed_time() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_leaf_cert(
+            "Acme Release Signing",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+        );
+        let signed_at = now_unix_seconds() + 10 * 365 * 24 * 60 * 60;
+        let signer =
+            X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), signed_at)
+                .unwrap();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let footer = RootAuthFooterV1 {
+            archive_uuid: request.archive_uuid,
+            session_id: request.session_id,
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV,
+            authenticator_id: X509_AUTHENTICATOR_ID,
+            signer_identity_type: X509_SIGNER_IDENTITY_TYPE_DER_CERT,
+            signer_identity_bytes: leaf_cert.to_der().unwrap(),
+            authenticator_value: signer.authenticator_value_for_request(&request).unwrap(),
+            total_data_block_count: 0,
+            critical_metadata_digest: [0; 32],
+            index_digest: [0; 32],
+            fec_layout_digest: [0; 32],
+            data_block_merkle_root: [0; 32],
+            signer_identity_digest: [0; 32],
+            archive_root: request.archive_root,
+            footer_crc32c: 0,
+        };
+
+        let report = verify_root_auth_footer(
+            &footer,
+            &request.archive_root,
+            &[root_cert.to_der().unwrap()],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.signed_at_unix_seconds, signed_at);
+        assert!(report.chain_validation_time_unix_seconds < signed_at);
+    }
+
+    #[test]
+    fn rejects_leaf_key_usage_without_signature_or_content_commitment() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_leaf_cert_with_usage(
+            "Acme Encipherment Only",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+            LeafKeyUsage::KeyEnciphermentOnly,
+        );
+        let signed_at = now_unix_seconds();
+        let signer =
+            X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), signed_at)
+                .unwrap();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let footer = RootAuthFooterV1 {
+            archive_uuid: request.archive_uuid,
+            session_id: request.session_id,
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV,
+            authenticator_id: X509_AUTHENTICATOR_ID,
+            signer_identity_type: X509_SIGNER_IDENTITY_TYPE_DER_CERT,
+            signer_identity_bytes: leaf_cert.to_der().unwrap(),
+            authenticator_value: signer.authenticator_value_for_request(&request).unwrap(),
+            total_data_block_count: 0,
+            critical_metadata_digest: [0; 32],
+            index_digest: [0; 32],
+            fec_layout_digest: [0; 32],
+            data_block_merkle_root: [0; 32],
+            signer_identity_digest: [0; 32],
+            archive_root: request.archive_root,
+            footer_crc32c: 0,
+        };
+
+        let err = verify_root_auth_footer(
+            &footer,
+            &request.archive_root,
+            &[root_cert.to_der().unwrap()],
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("KeyUsage"));
+    }
+
+    #[test]
+    fn ecdsa_authenticator_uses_scheme_2_and_round_trips() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_ec_leaf_cert(
+            "Acme EC Release Signing",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+            Nid::X9_62_PRIME256V1,
+        );
+        let signed_at = now_unix_seconds();
+        let signer =
+            X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), signed_at)
+                .unwrap();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V44,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let value = signer.authenticator_value_for_request(&request).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([value[6], value[7]]),
+            SIG_SCHEME_ECDSA_SHA256_DER
+        );
+        let footer = RootAuthFooterV1 {
+            archive_uuid: request.archive_uuid,
+            session_id: request.session_id,
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV_44,
+            authenticator_id: X509_AUTHENTICATOR_ID,
+            signer_identity_type: X509_SIGNER_IDENTITY_TYPE_DER_CERT,
+            signer_identity_bytes: leaf_cert.to_der().unwrap(),
+            authenticator_value: value,
+            total_data_block_count: 0,
+            critical_metadata_digest: [0; 32],
+            index_digest: [0; 32],
+            fec_layout_digest: [0; 32],
+            data_block_merkle_root: [0; 32],
+            signer_identity_digest: [0; 32],
+            archive_root: request.archive_root,
+            footer_crc32c: 0,
+        };
+
+        verify_root_auth_footer(
+            &footer,
+            &request.archive_root,
+            &[root_cert.to_der().unwrap()],
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn signer_honors_explicit_rsa_pss_scheme() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_leaf_cert(
+            "Acme RSA PSS Release Signing",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+        );
+        let signed_at = now_unix_seconds();
+        let signer = X509RootAuthSigner::new_with_signature_scheme(
+            leaf_cert.to_der().unwrap(),
+            leaf_key,
+            Vec::new(),
+            signed_at,
+            Some(X509SignatureScheme::RsaPssSha256),
+        )
+        .unwrap();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V44,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let value = signer.authenticator_value_for_request(&request).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([value[6], value[7]]),
+            SIG_SCHEME_RSA_PSS_SHA256
+        );
+        let footer = RootAuthFooterV1 {
+            archive_uuid: request.archive_uuid,
+            session_id: request.session_id,
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV_44,
+            authenticator_id: X509_AUTHENTICATOR_ID,
+            signer_identity_type: X509_SIGNER_IDENTITY_TYPE_DER_CERT,
+            signer_identity_bytes: leaf_cert.to_der().unwrap(),
+            authenticator_value: value,
+            total_data_block_count: 0,
+            critical_metadata_digest: [0; 32],
+            index_digest: [0; 32],
+            fec_layout_digest: [0; 32],
+            data_block_merkle_root: [0; 32],
+            signer_identity_digest: [0; 32],
+            archive_root: request.archive_root,
+            footer_crc32c: 0,
+        };
+
+        let report = verify_root_auth_footer(
+            &footer,
+            &request.archive_root,
+            &[root_cert.to_der().unwrap()],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.signature_scheme, "rsa-pss-sha256");
+    }
+
+    #[test]
+    fn signer_rejects_unsupported_ec_curve() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_ec_leaf_cert(
+            "Acme Unsupported EC Signing",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+            Nid::SECP256K1,
+        );
+
+        let err = X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), 1)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("unsupported X.509 ECDSA curve"));
     }
 
     #[test]
@@ -701,12 +1321,13 @@ mod tests {
         .unwrap();
 
         let wrong_spec_request = RootAuthSigningRequest {
-            root_auth_spec_id: ROOT_AUTH_SPEC_ID,
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V43,
             ..request
         };
         let mut wrong_spec_footer = footer;
-        wrong_spec_footer.authenticator_value =
-            signer.authenticator_value_for_request(&wrong_spec_request).unwrap();
+        wrong_spec_footer.authenticator_value = signer
+            .authenticator_value_for_request(&wrong_spec_request)
+            .unwrap();
         let err = verify_root_auth_footer(
             &wrong_spec_footer,
             &request.archive_root,
@@ -875,7 +1496,63 @@ mod tests {
         ca_cert: &X509Ref,
         ca_key: &PKeyRef<Private>,
     ) -> (X509, PKey<Private>) {
+        test_leaf_cert_with_usage(cn, ca_cert, ca_key, LeafKeyUsage::DigitalSignature)
+    }
+
+    #[derive(Clone, Copy)]
+    enum LeafKeyUsage {
+        DigitalSignature,
+        KeyEnciphermentOnly,
+    }
+
+    fn test_leaf_cert_with_usage(
+        cn: &str,
+        ca_cert: &X509Ref,
+        ca_key: &PKeyRef<Private>,
+        key_usage: LeafKeyUsage,
+    ) -> (X509, PKey<Private>) {
         let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", cn).unwrap();
+        let name = name.build();
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_serial_number(&random_serial_number()).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(ca_cert.subject_name()).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+            .unwrap();
+        builder
+            .append_extension(BasicConstraints::new().build().unwrap())
+            .unwrap();
+        let mut usage = KeyUsage::new();
+        usage.critical();
+        match key_usage {
+            LeafKeyUsage::DigitalSignature => {
+                usage.digital_signature();
+            }
+            LeafKeyUsage::KeyEnciphermentOnly => {
+                usage.key_encipherment();
+            }
+        }
+        builder.append_extension(usage.build().unwrap()).unwrap();
+        builder.sign(ca_key, MessageDigest::sha256()).unwrap();
+        (builder.build(), key)
+    }
+
+    fn test_ec_leaf_cert(
+        cn: &str,
+        ca_cert: &X509Ref,
+        ca_key: &PKeyRef<Private>,
+        curve: Nid,
+    ) -> (X509, PKey<Private>) {
+        let group = EcGroup::from_curve_name(curve).unwrap();
+        let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
         let mut name = X509NameBuilder::new().unwrap();
         name.append_entry_by_text("CN", cn).unwrap();
         let name = name.build();

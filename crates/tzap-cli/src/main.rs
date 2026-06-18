@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
 use openssl::pkey::PKey;
 use openssl::x509::X509;
@@ -44,8 +44,8 @@ use tzap_core::{
     ArchiveRepairPatch, ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfAlgo, KdfParams,
     MasterKey, MemoryArchiveSink, MetadataDiagnostic, NonSeekableReaderOptions, OpenedArchive,
     PublicNoKeyVerification, ReaderOptions, RegularFile, RegularFileSource, RootAuthSigningRequest,
-    RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions, StreamingRawWriterSummary,
-    StreamingTarWriterSummary, SequentialRootAuthStatus, TarEntryKind, WriterOptions,
+    RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions, SequentialRootAuthStatus,
+    StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind, WriterOptions,
     WriterTimings, WrittenArchiveSummary,
 };
 use tzap_plugin_keywrap::{
@@ -58,7 +58,7 @@ use tzap_plugin_signing::ed25519_raw::{
     ED25519_AUTHENTICATOR_VALUE_LEN,
 };
 use tzap_plugin_signing::x509_chain::{
-    self, X509RootAuthReport, X509RootAuthSigner, X509_AUTHENTICATOR_ID,
+    self, X509RootAuthReport, X509RootAuthSigner, X509SignatureScheme, X509_AUTHENTICATOR_ID,
 };
 
 mod plaintext_spool;
@@ -199,7 +199,7 @@ enum Command {
         #[arg(
             long = "no-encryption",
             conflicts_with = "recipient_cert",
-            help = "Create an explicit plaintext v43 archive with no password or keyfile."
+            help = "Create an explicit plaintext v44 archive with no password or keyfile."
         )]
         no_encryption: bool,
 
@@ -280,6 +280,15 @@ enum Command {
             help = "PEM or DER intermediate certificate chain for --signing-cert."
         )]
         signing_chain: Vec<String>,
+
+        #[arg(
+            long = "x509-signature-scheme",
+            value_name = "SCHEME",
+            value_enum,
+            requires = "signing_cert",
+            help = "X.509 RootAuth signature scheme: rsa-pkcs1-sha256, ecdsa-sha256-der, or rsa-pss-sha256."
+        )]
+        x509_signature_scheme: Option<CliX509SignatureScheme>,
 
         #[arg(
             long = "bootstrap-out",
@@ -588,7 +597,7 @@ enum Command {
     },
     #[command(
         about = "Verify archive integrity",
-        long_about = "Verify archive signatures and checksum integrity. No payload changes are made unless --write-repaired is set; original archive files are never modified.\n\nEncrypted archives need --keyfile, --password, --password-stdin, or --recipient-key for v44 RecipientWrap archives. Unencrypted v43 archives need no key source. With --public-no-key, verify uses the v43 public RootAuth profile and does not require the archive key.",
+        long_about = "Verify archive signatures and checksum integrity. No payload changes are made unless --write-repaired is set; original archive files are never modified.\n\nEncrypted archives need --keyfile, --password, --password-stdin, or --recipient-key for v44 RecipientWrap archives. Unencrypted archives need no key source. With --public-no-key, verify uses the public RootAuth profile and does not require the archive key.",
         after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --recipient-key recipient.key backup.tzap\n  tzap verify --keyfile key.hex --write-repaired backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --public-no-key --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --keyfile key.hex backup.vol000.tzap backup.vol001.tzap\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives named `.volNNN.tzap`, passing any one volume discovers matching siblings in the same directory. Additional positionals are explicit extra volumes."
     )]
     Verify {
@@ -667,7 +676,7 @@ enum Command {
 
         #[arg(
             long = "public-no-key",
-            help = "Verify v43 public RootAuth commitments without the archive key."
+            help = "Verify public RootAuth commitments without the archive key."
         )]
         public_no_key: bool,
 
@@ -810,6 +819,7 @@ fn run(cli: Cli) -> Result<()> {
             signing_cert,
             signing_private_key,
             signing_chain,
+            x509_signature_scheme,
             bootstrap_out,
             tar_stdin,
             raw_stdin,
@@ -970,6 +980,7 @@ fn run(cli: Cli) -> Result<()> {
                     signing_cert.as_deref(),
                     signing_private_key.as_deref(),
                     &signing_chain,
+                    x509_signature_scheme,
                 )?;
                 let root_auth = root_auth_profile
                     .as_ref()
@@ -1235,6 +1246,7 @@ fn run(cli: Cli) -> Result<()> {
                 signing_cert.as_deref(),
                 signing_private_key.as_deref(),
                 &signing_chain,
+                x509_signature_scheme,
             )?;
             let root_auth = root_auth_profile
                 .as_ref()
@@ -2013,7 +2025,10 @@ fn run(cli: Cli) -> Result<()> {
                     ),
                 )?;
                 if report.root_auth == SequentialRootAuthStatus::WireValidOnly {
-                    emit_success_stdout(quiet, "root-auth: wire-valid-only (signer trust not checked)")?;
+                    emit_success_stdout(
+                        quiet,
+                        "root-auth: wire-valid-only (signer trust not checked)",
+                    )?;
                 }
                 return Ok(());
             }
@@ -2720,12 +2735,32 @@ enum CreateRootAuthProfile {
     X509(X509RootAuthSigner),
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliX509SignatureScheme {
+    #[value(name = "rsa-pkcs1-sha256")]
+    RsaPkcs1Sha256,
+    #[value(name = "ecdsa-sha256-der")]
+    EcdsaSha256Der,
+    #[value(name = "rsa-pss-sha256")]
+    RsaPssSha256,
+}
+
+impl CliX509SignatureScheme {
+    fn to_plugin_scheme(self) -> X509SignatureScheme {
+        match self {
+            Self::RsaPkcs1Sha256 => X509SignatureScheme::RsaPkcs1Sha256,
+            Self::EcdsaSha256Der => X509SignatureScheme::EcdsaSha256Der,
+            Self::RsaPssSha256 => X509SignatureScheme::RsaPssSha256,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum VerifiedRootAuth {
     Ed25519(RootAuthVerification),
     X509 {
         verification: RootAuthVerification,
-        report: X509RootAuthReport,
+        report: Box<X509RootAuthReport>,
     },
 }
 
@@ -2745,7 +2780,7 @@ enum VerifiedPublicNoKeyRootAuth {
     Ed25519(PublicNoKeyVerification),
     X509 {
         verification: PublicNoKeyVerification,
-        report: X509RootAuthReport,
+        report: Box<X509RootAuthReport>,
     },
 }
 
@@ -4574,7 +4609,7 @@ fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()>
             ))?;
             VerifiedPublicNoKeyRootAuth::X509 {
                 verification,
-                report,
+                report: Box::new(report),
             }
         }
     };
@@ -4759,7 +4794,7 @@ fn verify_opened_root_auth_x509(
     ))?;
     Ok(VerifiedRootAuth::X509 {
         verification,
-        report,
+        report: Box::new(report),
     })
 }
 
@@ -4901,6 +4936,16 @@ fn root_auth_json(root_auth: &VerifiedRootAuth) -> serde_json::Value {
             "signed_at_unix_seconds": report.signed_at_unix_seconds,
             "signed_at": format_unix_timestamp(report.signed_at_unix_seconds),
             "time_source": "signer_claimed",
+            "signature_scheme": report.signature_scheme,
+            "chain_validation_time_unix_seconds": report.chain_validation_time_unix_seconds,
+            "chain_validation_time": format_unix_timestamp(report.chain_validation_time_unix_seconds),
+            "x509_time_policy": report.x509_time_policy,
+            "chain_time_basis": report.chain_time_basis,
+            "trusted_timestamp": report.trusted_timestamp,
+            "revocation_checked": report.revocation_checked,
+            "trust_store_policy": report.trust_store_policy,
+            "key_usage_policy": report.key_usage_policy,
+            "eku_policy": report.eku_policy,
             "verified_chain_subjects": &report.verified_chain_subjects,
             "trust_anchor_subject": &report.trust_anchor_subject,
         }),
@@ -4956,6 +5001,26 @@ fn emit_root_auth_stdout(quiet: bool, root_auth: &VerifiedRootAuth) -> io::Resul
                 &format!(
                     "root-auth signed-at: {} (signer-claimed)",
                     format_unix_timestamp(report.signed_at_unix_seconds)
+                ),
+            )?;
+            emit_success_stdout(
+                quiet,
+                &format!(
+                    "root-auth chain-validation-time: {} ({})",
+                    format_unix_timestamp(report.chain_validation_time_unix_seconds),
+                    report.chain_time_basis
+                ),
+            )?;
+            emit_success_stdout(
+                quiet,
+                &format!(
+                    "root-auth x509-policy: signature-scheme={} trust-store={} key-usage={} eku={} revocation-checked={} trusted-timestamp={}",
+                    report.signature_scheme,
+                    report.trust_store_policy,
+                    report.key_usage_policy,
+                    report.eku_policy,
+                    report.revocation_checked,
+                    report.trusted_timestamp
                 ),
             )?;
             emit_success_stdout(
@@ -5050,6 +5115,16 @@ fn public_no_key_root_auth_json(root_auth: &VerifiedPublicNoKeyRootAuth) -> serd
             "signed_at_unix_seconds": report.signed_at_unix_seconds,
             "signed_at": format_unix_timestamp(report.signed_at_unix_seconds),
             "time_source": "signer_claimed",
+            "signature_scheme": report.signature_scheme,
+            "chain_validation_time_unix_seconds": report.chain_validation_time_unix_seconds,
+            "chain_validation_time": format_unix_timestamp(report.chain_validation_time_unix_seconds),
+            "x509_time_policy": report.x509_time_policy,
+            "chain_time_basis": report.chain_time_basis,
+            "trusted_timestamp": report.trusted_timestamp,
+            "revocation_checked": report.revocation_checked,
+            "trust_store_policy": report.trust_store_policy,
+            "key_usage_policy": report.key_usage_policy,
+            "eku_policy": report.eku_policy,
             "verified_chain_subjects": &report.verified_chain_subjects,
             "trust_anchor_subject": &report.trust_anchor_subject,
         }),
@@ -5118,6 +5193,26 @@ fn emit_public_no_key_root_auth_stdout(
                 &format!(
                     "root-auth signed-at: {} (signer-claimed)",
                     format_unix_timestamp(report.signed_at_unix_seconds)
+                ),
+            )?;
+            emit_success_stdout(
+                quiet,
+                &format!(
+                    "root-auth chain-validation-time: {} ({})",
+                    format_unix_timestamp(report.chain_validation_time_unix_seconds),
+                    report.chain_time_basis
+                ),
+            )?;
+            emit_success_stdout(
+                quiet,
+                &format!(
+                    "root-auth x509-policy: signature-scheme={} trust-store={} key-usage={} eku={} revocation-checked={} trusted-timestamp={}",
+                    report.signature_scheme,
+                    report.trust_store_policy,
+                    report.key_usage_policy,
+                    report.eku_policy,
+                    report.revocation_checked,
+                    report.trusted_timestamp
                 ),
             )
         }
@@ -5208,9 +5303,13 @@ fn load_create_root_auth_profile(
     signing_cert: Option<&str>,
     signing_private_key: Option<&str>,
     signing_chain: &[String],
+    x509_signature_scheme: Option<CliX509SignatureScheme>,
 ) -> Result<Option<CreateRootAuthProfile>> {
     match (signing_key, signing_cert, signing_private_key) {
         (Some(path), None, None) => {
+            if x509_signature_scheme.is_some() {
+                return Err(UsageError("--x509-signature-scheme requires --signing-cert").into());
+            }
             let signing_key = load_ed25519_signing_key(path)?;
             let signer_identity = signing_key.verifying_key().to_bytes();
             Ok(Some(CreateRootAuthProfile::Ed25519 {
@@ -5225,18 +5324,27 @@ fn load_create_root_auth_profile(
                 format!("failed to read signing private key {private_key_path}")
             })?;
             let chain_der = load_x509_certificate_files(signing_chain)?;
-            let signer = X509RootAuthSigner::from_pem_or_der(
-                &cert,
-                &private_key,
-                chain_der,
-                current_unix_seconds()?,
-            )
+            let signed_at = current_unix_seconds()?;
+            let signer = if let Some(scheme) = x509_signature_scheme {
+                X509RootAuthSigner::from_pem_or_der_with_signature_scheme(
+                    &cert,
+                    &private_key,
+                    chain_der,
+                    signed_at,
+                    scheme.to_plugin_scheme(),
+                )
+            } else {
+                X509RootAuthSigner::from_pem_or_der(&cert, &private_key, chain_der, signed_at)
+            }
             .with_context(|| format!("failed to load X.509 signing profile from {cert_path}"))?;
             Ok(Some(CreateRootAuthProfile::X509(signer)))
         }
         (None, None, None) => {
             if !signing_chain.is_empty() {
                 return Err(UsageError("--signing-chain requires --signing-cert").into());
+            }
+            if x509_signature_scheme.is_some() {
+                return Err(UsageError("--x509-signature-scheme requires --signing-cert").into());
             }
             Ok(None)
         }
@@ -5326,7 +5434,7 @@ fn build_recipient_wrap_record(
         ) {
             Ok(record) => return Ok(record),
             Err(KeyWrapOutcome::InvalidRecord) | Err(KeyWrapOutcome::UnsupportedSuite) => {}
-            Err(outcome) => return Err(key_wrap_outcome_error(outcome).into()),
+            Err(outcome) => return Err(key_wrap_outcome_error(outcome)),
         }
     }
     Err(anyhow!(FormatError::WriterUnsupported(
@@ -6338,28 +6446,24 @@ mod tests {
 
     #[test]
     fn reporting_public_no_key_status_is_metadata_only() {
-        let root_auth =
-            VerifiedPublicNoKeyRootAuth::Ed25519(PublicNoKeyVerification {
-                format_version: FORMAT_VERSION,
-                volume_format_rev: VOLUME_FORMAT_REV_44,
-                archive_root: [1; 32],
-                authenticator_id: ED25519_AUTHENTICATOR_ID,
-                signer_identity_type: 1,
-                signer_identity_bytes: [2; 32].to_vec(),
-                total_data_block_count: 7,
-                diagnostics: vec![
-                    tzap_core::reader::PublicNoKeyDiagnostic::PublicDataBlockCommitmentVerified,
-                    tzap_core::reader::PublicNoKeyDiagnostic::PublicPhysicalCompletenessUnverified,
-                ],
-            });
+        let root_auth = VerifiedPublicNoKeyRootAuth::Ed25519(PublicNoKeyVerification {
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV_44,
+            archive_root: [1; 32],
+            authenticator_id: ED25519_AUTHENTICATOR_ID,
+            signer_identity_type: 1,
+            signer_identity_bytes: [2; 32].to_vec(),
+            total_data_block_count: 7,
+            diagnostics: vec![
+                tzap_core::reader::PublicNoKeyDiagnostic::PublicDataBlockCommitmentVerified,
+                tzap_core::reader::PublicNoKeyDiagnostic::PublicPhysicalCompletenessUnverified,
+            ],
+        });
 
         let status = public_no_key_status_json(&root_auth);
 
         assert_eq!(status["revision_mode"], serde_json::json!("v44"));
-        assert_eq!(
-            status["decryption_keywrap"],
-            serde_json::json!("not_used")
-        );
+        assert_eq!(status["decryption_keywrap"], serde_json::json!("not_used"));
         assert_eq!(
             status["trust_policy"],
             serde_json::json!("public_trust_matched")

@@ -443,6 +443,7 @@ fn cli_create_help_includes_examples_and_flags() {
     assert!(stdout.contains("--signing-cert <FILE>"));
     assert!(stdout.contains("--signing-private-key <FILE>"));
     assert!(stdout.contains("--signing-chain <FILE>"));
+    assert!(stdout.contains("--x509-signature-scheme <SCHEME>"));
     assert!(stdout.contains("--bootstrap-out <FILE>"));
     assert!(stdout.contains("--tar-stdin"));
     assert!(stdout.contains("--raw-stdin"));
@@ -2453,7 +2454,7 @@ fn cli_verify_reads_unencrypted_archive_without_key_source() {
         .args(["verify", archive.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK (1 volume(s), 1 file(s))"));
+        .stdout(predicate::str::contains("(1 volume(s), 1 file(s))"));
 }
 
 #[test]
@@ -3003,7 +3004,7 @@ fn cli_verify_one_volume_archive_with_keyfile_reports_summary_with_counts() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK (1 volume(s), 1 file(s))"));
+        .stdout(predicate::str::contains("(1 volume(s), 1 file(s))"));
 }
 
 #[test]
@@ -3095,7 +3096,7 @@ fn cli_verify_write_repaired_writes_sibling_for_crc_erased_payload_block() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK (1 volume(s), 1 file(s))"))
+        .stdout(predicate::str::contains("(1 volume(s), 1 file(s))"))
         .stdout(predicate::str::contains("wrote repaired volume copy"))
         .stdout(predicate::str::contains("sample.repaired.tzap"));
 
@@ -3110,7 +3111,7 @@ fn cli_verify_write_repaired_writes_sibling_for_crc_erased_payload_block() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK (1 volume(s), 1 file(s))"));
+        .stdout(predicate::str::contains("(1 volume(s), 1 file(s))"));
 }
 
 #[test]
@@ -3155,7 +3156,7 @@ fn cli_verify_write_repaired_writes_sibling_for_malformed_payload_block_slot() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK (1 volume(s), 1 file(s))"))
+        .stdout(predicate::str::contains("(1 volume(s), 1 file(s))"))
         .stdout(predicate::str::contains("wrote repaired volume copy"))
         .stdout(predicate::str::contains("sample.repaired.tzap"));
 
@@ -3170,7 +3171,7 @@ fn cli_verify_write_repaired_writes_sibling_for_malformed_payload_block_slot() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK (1 volume(s), 1 file(s))"));
+        .stdout(predicate::str::contains("(1 volume(s), 1 file(s))"));
 }
 
 #[test]
@@ -3210,7 +3211,7 @@ fn cli_verify_recovers_malformed_volume_header_from_cmra() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK (1 volume(s), 1 file(s))"));
+        .stdout(predicate::str::contains("(1 volume(s), 1 file(s))"));
 }
 
 #[test]
@@ -3269,7 +3270,7 @@ fn cli_create_signed_archive_and_verify_root_auth_profiles() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("OK (1 volume(s), 1 file(s))")
+            predicate::str::contains("(1 volume(s), 1 file(s))")
                 .and(predicate::str::contains("root-auth: OK ed25519")),
         );
 
@@ -3307,7 +3308,7 @@ fn cli_create_signed_archive_and_verify_root_auth_profiles() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("OK public no-key")
+            predicate::str::contains("OK public-no-key")
                 .and(predicate::str::contains(
                     "public_data_block_commitment_verified",
                 ))
@@ -3404,7 +3405,7 @@ fn cli_no_encryption_signed_archive_round_trips_and_publicly_verifies() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("OK (1 volume(s), 1 file(s))")
+            predicate::str::contains("(1 volume(s), 1 file(s))")
                 .and(predicate::str::contains("root-auth: OK ed25519")),
         );
 
@@ -3469,6 +3470,8 @@ fn cli_create_x509_signed_archive_and_verify_certificate_details() {
             signer_cert.to_str().unwrap(),
             "--signing-private-key",
             signer_key.to_str().unwrap(),
+            "--x509-signature-scheme",
+            "rsa-pss-sha256",
             "-o",
             archive.to_str().unwrap(),
             input.to_str().unwrap(),
@@ -3497,7 +3500,11 @@ fn cli_create_x509_signed_archive_and_verify_certificate_details() {
                 .and(predicate::str::contains(
                     "root-auth issuer: CN=Acme Test Root CA",
                 ))
-                .and(predicate::str::contains("root-auth signed-at:")),
+                .and(predicate::str::contains("root-auth signed-at:"))
+                .and(predicate::str::contains("root-auth chain-validation-time:"))
+                .and(predicate::str::contains(
+                    "root-auth x509-policy: signature-scheme=rsa-pss-sha256",
+                )),
         );
 
     let output = Command::cargo_bin("tzap")
@@ -3522,6 +3529,24 @@ fn cli_create_x509_signed_archive_and_verify_certificate_details() {
     assert_eq!(value["root_auth"]["subject"], "CN=Acme Release Signing");
     assert_eq!(value["root_auth"]["issuer"], "CN=Acme Test Root CA");
     assert_eq!(value["root_auth"]["time_source"], "signer_claimed");
+    assert_eq!(value["root_auth"]["signature_scheme"], "rsa-pss-sha256");
+    assert_eq!(
+        value["root_auth"]["x509_time_policy"],
+        "verifier_current_time"
+    );
+    assert_eq!(
+        value["root_auth"]["chain_time_basis"],
+        "verifier_current_time"
+    );
+    assert_eq!(value["root_auth"]["trusted_timestamp"], false);
+    assert_eq!(value["root_auth"]["revocation_checked"], false);
+    assert_eq!(
+        value["root_auth"]["key_usage_policy"],
+        "archive_signature_minimal"
+    );
+    assert_eq!(value["root_auth"]["eku_policy"], "none");
+    assert_eq!(value["root_auth"]["trust_store_policy"], "caller_roots");
+    assert!(value["root_auth"]["chain_validation_time_unix_seconds"].is_number());
     assert_eq!(
         value["root_auth"]["trust_anchor_subject"],
         "CN=Acme Test Root CA"
@@ -3539,7 +3564,7 @@ fn cli_create_x509_signed_archive_and_verify_certificate_details() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("OK public no-key")
+            predicate::str::contains("OK public-no-key")
                 .and(predicate::str::contains("root-auth: OK public-no-key x509"))
                 .and(predicate::str::contains(
                     "root-auth signer: CN=Acme Release Signing",
@@ -3568,6 +3593,12 @@ fn cli_create_x509_signed_archive_and_verify_certificate_details() {
     assert_eq!(value["ok"], true);
     assert_eq!(value["verification_mode"], "public-no-key");
     assert_eq!(value["root_auth"]["authenticator"], "x509");
+    assert_eq!(value["root_auth"]["signature_scheme"], "rsa-pss-sha256");
+    assert_eq!(
+        value["root_auth"]["x509_time_policy"],
+        "verifier_current_time"
+    );
+    assert_eq!(value["root_auth"]["revocation_checked"], false);
     assert_eq!(
         value["root_auth"]["status"],
         "public_data_block_commitment_verified"
@@ -4460,7 +4491,7 @@ fn cli_verify_with_stripped_dictionary_sidecar_uses_terminal_archive_metadata() 
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK (1 volume(s), 1 file(s))"));
+        .stdout(predicate::str::contains("(1 volume(s), 1 file(s))"));
 }
 
 #[test]
@@ -4707,7 +4738,7 @@ fn cli_verify_autodiscovers_sibling_volumes_from_middle_volume() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK (3 volume(s), 1 file(s))"));
+        .stdout(predicate::str::contains("(3 volume(s), 1 file(s))"));
 }
 
 #[test]
@@ -4749,7 +4780,7 @@ fn cli_verify_autodiscovery_recovers_when_vol000_is_damaged() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK (2 volume(s), 1 file(s))"));
+        .stdout(predicate::str::contains("(2 volume(s), 1 file(s))"));
 }
 
 #[test]
@@ -4864,7 +4895,7 @@ fn cli_verify_missing_recoverable_volume_is_recovered_with_tolerance() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK (3 volume(s), 1 file(s))"));
+        .stdout(predicate::str::contains("(3 volume(s), 1 file(s))"));
 }
 
 #[test]
@@ -7542,7 +7573,7 @@ fn cli_bit_rot_buffer_recovers_corrupted_payload_blocks_in_split_archive() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK (3 volume(s), 1 file(s))"));
+        .stdout(predicate::str::contains("(3 volume(s), 1 file(s))"));
 
     Command::cargo_bin("tzap")
         .unwrap()

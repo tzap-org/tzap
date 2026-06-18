@@ -563,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn v43_root_auth_wrappers_preserve_existing_domains() {
+    fn root_auth_wrappers_use_current_revision_domains() {
         let descriptor = root_auth_descriptor_digest(1, 1, b"identity", 64, 512).unwrap();
         assert_eq!(
             descriptor,
@@ -594,7 +594,10 @@ mod tests {
         );
 
         let inputs = sample_archive_inputs(VOLUME_FORMAT_REV, KdfAlgo::None, [8; 32]);
-        assert_eq!(archive_root(inputs), archive_root_for_revision(inputs).unwrap());
+        assert_eq!(
+            archive_root(inputs),
+            archive_root_for_revision(inputs).unwrap()
+        );
     }
 
     #[test]

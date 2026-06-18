@@ -134,9 +134,9 @@ What to do:
 - For multi-volume workflows, pass the available volume files and omit
   `--bootstrap-out` and `--bootstrap`.
 
-## Root-authenticated v43 archives
+## Root-authenticated v44 archives
 
-The core library and CLI can create and verify root-authenticated v43 archives
+The core library and CLI can create and verify root-authenticated v44 archives
 with the Ed25519 helper profile or an X.509 certificate profile. CLI Ed25519
 signing uses a 32-byte signing seed and writes the derived 32-byte public key
 through `signing-keygen`. CLI X.509 signing uses a leaf certificate plus its
@@ -197,15 +197,17 @@ Operational shape:
 - X.509 RootAuth verification is requested by adding `--trusted-ca-cert` and/or
   `--trusted-system-roots` to ordinary `tzap verify`.
 - X.509 verification reports the certificate subject, issuer, serial number,
-  certificate SHA-256, verified chain subjects, trust anchor subject, and the
-  signer-claimed signing time.
+  certificate SHA-256, verified chain subjects, trust anchor subject, signature
+  scheme, signer-claimed signing time, chain validation time, and verifier
+  policy labels.
 - Public no-key verification is requested with `--public-no-key` plus
   `--trusted-public-key`, `--trusted-ca-cert`, or `--trusted-system-roots`. It
   does not use `--keyfile`, `--password`, `--password-stdin`, or `--bootstrap`.
 - X.509 RootAuth signing time is a signer-claimed timestamp embedded in the
-  authenticator and used for certificate validity checks. It is not a trusted
-  timestamp token, transparency log proof, notarization receipt, or revocation
-  proof.
+  authenticator. Verification uses verifier current time for certificate
+  validity checks unless a future trusted-timestamp profile supplies separate
+  evidence. The signer-claimed time is not a trusted timestamp token,
+  transparency log proof, notarization receipt, or revocation proof.
 - Successful public no-key verification reports
   `public_data_block_commitment_verified`,
   `public_physical_completeness_unverified`, and
@@ -213,9 +215,9 @@ Operational shape:
 
 ## Explicit plaintext archives
 
-`--no-encryption` is the v43 mode for workflows that intentionally publish
+`--no-encryption` is the v44 mode for workflows that intentionally publish
 archive payloads and metadata without archive key material. It sets
-`aead_algo = None`, `kdf_algo = None`, and uses unkeyed v43 integrity digests
+`aead_algo = None`, `kdf_algo = None`, and uses unkeyed v44 integrity digests
 for fixed metadata instead of HMAC.
 
 Example:
@@ -434,14 +436,14 @@ file-backed path is also much faster for later selected-file workflows because
 seekable readers can use random access.
 
 Known-size raw stdin (`--stdin-size`) is consumed once and archived as one
-regular-file member in the standard tar-member v43 profile. With `--volumes N`,
+regular-file member in the standard tar-member v44 profile. With `--volumes N`,
 the same member is striped across the fixed output volume set. Short stdin or
 extra bytes after the declared size reject the create and remove the temporary
 archive output or volume set.
 
 Unknown-size raw stdin is supported only with explicit `--spool-stdin`. That
 mode writes plaintext stdin to a restrictive temporary file, then archives that
-file as a regular tar-member v43 member. With `--volumes N`, tzap waits for EOF,
+file as a regular tar-member v44 member. With `--volumes N`, tzap waits for EOF,
 uses the file-backed spool size as the known raw member size, and stripes the
 member across the fixed output volume set. The spool is removed after normal
 success or normal failure, but the plaintext exists on local disk while the
@@ -517,7 +519,7 @@ What to do:
 
 ## Tar metadata profile
 
-The current v0.43 CLI create path emits regular-file tar member groups. Archive
+The current v0.44 CLI create path emits regular-file tar member groups. Archive
 paths are normalized safe relative UTF-8 paths using `/` separators. Long paths
 and non-ASCII paths are represented with a path-specific local PAX `path` record
 inside the same member group as the file it modifies. The writer does not emit

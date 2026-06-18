@@ -286,6 +286,7 @@ pub fn compute_integrity_tag(
     Ok(output)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_integrity_tag(
     domain: HmacDomain,
     aead_algo: AeadAlgo,

@@ -1,6 +1,6 @@
 # tzap-core
 
-`tzap-core` is the Rust library implementation of the tzap v0.43 archive format.
+`tzap-core` is the Rust library implementation of the tzap v0.44 archive format.
 It owns wire parsing, metadata validation, compression, optional encryption, FEC
 recovery structures, archive writing, archive opening, and safe extraction
 primitives.
@@ -18,7 +18,7 @@ tzap-core = "0.1.7"
 
 ## What It Provides
 
-- v43 encrypted and explicit plaintext archive writing and opening
+- v44 encrypted and explicit plaintext archive writing and opening
 - AEAD encryption, HMAC authentication, unencrypted digest mode, and KDF handling
 - zstd compression and dictionary support
 - multi-volume layout and FEC recovery
@@ -75,6 +75,6 @@ RootAuth or public no-key verification.
 ## More Information
 
 - Repository: <https://github.com/tzap-org/tzap>
-- Implemented format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv43.md>
-- Draft v44 target specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv44.md>
+- Implemented format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv44.md>
+- v43 compatibility specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv43.md>
 - CLI crate: <https://crates.io/crates/tzap>

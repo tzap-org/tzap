@@ -23,7 +23,7 @@ use crate::format::{
     CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, MANIFEST_FOOTER_LEN, READER_MAX_CMRA_PARITY_PCT,
     READER_MAX_INDEX_ROOT_FEC_CLASS_SHARDS, READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN,
     READER_MAX_ROOT_AUTH_FOOTER_LEN, READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN,
-    VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, validate_file_path_bytes, DirectoryHintEntry,
@@ -69,17 +69,12 @@ const MAX_HASH_PREFIX_RUN_FILES: usize = 50_000;
 const DEFAULT_DIRECTORY_HINT_ENTRIES_PER_SHARD: usize = 10_000;
 const CMRA_SHARD_SIZE: usize = 512;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum KeyWrapRecordSource {
+    #[default]
     None,
     Fixed(Vec<RecipientRecordV1>),
     Callback(Arc<dyn Fn() -> Result<Vec<RecipientRecordV1>, FormatError> + Send + Sync>),
-}
-
-impl Default for KeyWrapRecordSource {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl KeyWrapRecordSource {
@@ -109,12 +104,8 @@ fn default_jobs() -> usize {
         .unwrap_or(1)
 }
 
-fn volume_format_revision_for_options(options: &WriterOptions, kdf_params: &KdfParams) -> u16 {
-    match kdf_params {
-        KdfParams::RecipientWrap { .. } => VOLUME_FORMAT_REV_44,
-        _ if options.aead_algo.is_encrypted() => VOLUME_FORMAT_REV,
-        _ => VOLUME_FORMAT_REV_44,
-    }
+fn volume_format_revision_for_options(_options: &WriterOptions, _kdf_params: &KdfParams) -> u16 {
+    VOLUME_FORMAT_REV_44
 }
 
 fn resolve_key_wrap_artifacts(
@@ -820,6 +811,37 @@ pub fn write_archive_with_recipient_wrap_records(
     )
 }
 
+pub fn write_archive_with_root_auth_and_recipient_wrap_records<F>(
+    files: &[RegularFile<'_>],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    records: Vec<RecipientRecordV1>,
+    root_auth: RootAuthWriterConfig<'_>,
+    mut authenticator: F,
+) -> Result<WrittenArchive, FormatError>
+where
+    F: FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
+{
+    let record_count = u32_len(records.len(), "KeyWrapTableV1 recipient_record_count")?;
+    let kdf_params = KdfParams::RecipientWrap {
+        key_wrap_table_length: 0,
+        key_wrap_table_record_count: record_count,
+        key_wrap_table_version: 1,
+        key_wrap_table_digest: [0u8; 32],
+    };
+    let key_wrap_records = KeyWrapRecordSource::fixed(records);
+    write_archive_inner(
+        files,
+        master_key,
+        options,
+        None,
+        &kdf_params,
+        Some(root_auth),
+        Some(&mut authenticator),
+        Some(&key_wrap_records),
+    )
+}
+
 pub fn write_archive_with_root_auth<F>(
     files: &[RegularFile<'_>],
     master_key: &MasterKey,
@@ -830,12 +852,17 @@ pub fn write_archive_with_root_auth<F>(
 where
     F: FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
 {
+    let kdf_params = if options.aead_algo.is_encrypted() {
+        KdfParams::Raw
+    } else {
+        KdfParams::None
+    };
     write_archive_inner(
         files,
         master_key,
         options,
         None,
-        &KdfParams::Raw,
+        &kdf_params,
         Some(root_auth),
         Some(&mut authenticator),
         None,
@@ -1157,6 +1184,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_archive_inner(
     files: &[RegularFile<'_>],
     master_key: &MasterKey,
@@ -2898,6 +2926,7 @@ fn validate_single_pass_writer_options(options: WriterOptions) -> Result<(), For
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn begin_writer_emission_state<O: ArchiveWriteSink>(
     sink: &mut O,
     options: WriterOptions,
@@ -3465,6 +3494,7 @@ fn planned_v41_volume_size(
     })?;
     let cmra_offset = checked_u64_add(trailer_offset, VOLUME_TRAILER_LEN as u64, "CMRA")?;
     let cmra = build_v41_cmra(CmraBuildInput {
+        volume_format_rev: plan.volume_format_rev,
         volume_header_bytes: &volume_header_bytes,
         crypto_header: &plan.crypto_header,
         block_count,
@@ -3769,6 +3799,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
 
         let cmra_offset = state.bytes_written[volume_index];
         let cmra = build_v41_cmra(CmraBuildInput {
+            volume_format_rev: plan.volume_format_rev,
             volume_header_bytes: &state.volume_headers[volume_index],
             crypto_header: &plan.crypto_header,
             block_count: state.record_counts[volume_index],
@@ -3793,6 +3824,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
             "CMRA",
         )?;
         let locator_base = CriticalRecoveryLocator {
+            volume_format_rev: plan.volume_format_rev,
             cmra_offset,
             cmra_length: u32_len(cmra.bytes.len(), "CMRA")?,
             volume_trailer_offset: trailer_offset,
@@ -5597,8 +5629,11 @@ fn build_root_auth_footer_from_leaf_hashes(
         index_root_decompressed_size: u32_len(input.index_root_plaintext.len(), "IndexRoot")?,
         root_auth_descriptor_digest,
     })?;
-    let index_digest =
-        index_digest_for_revision(FORMAT_VERSION, input.volume_format_rev, input.index_root_plaintext)?;
+    let index_digest = index_digest_for_revision(
+        FORMAT_VERSION,
+        input.volume_format_rev,
+        input.index_root_plaintext,
+    )?;
     let fec_layout_rows = writer_fec_layout_rows_from_extents(
         input.index_root_extent,
         u32_len(input.index_root_plaintext.len(), "IndexRoot")?,
@@ -5915,6 +5950,7 @@ struct BuiltCmra {
 
 #[derive(Debug, Clone, Copy)]
 struct CmraBuildInput<'a> {
+    volume_format_rev: u16,
     volume_header_bytes: &'a [u8; VOLUME_HEADER_LEN],
     crypto_header: &'a [u8],
     block_count: u64,
@@ -5949,6 +5985,11 @@ fn build_v41_cmra(input: CmraBuildInput<'_>) -> Result<BuiltCmra, FormatError> {
             Ok((table, key_wrap_table_length))
         })
         .transpose()?;
+    if input.volume_format_rev != VOLUME_FORMAT_REV_44 && key_wrap_table.is_some() {
+        return Err(FormatError::WriterInvariant(
+            "KeyWrapTableV1 requires volume_format_rev 44",
+        ));
+    }
     let key_wrap_table_length = key_wrap_table.map(|(_, length)| u64::from(length));
     let expected_block_records_offset = match key_wrap_table_length {
         Some(length) => checked_u64_add(crypto_end, length, "KeyWrapTableV1")?,
@@ -6044,20 +6085,29 @@ fn build_v41_cmra(input: CmraBuildInput<'_>) -> Result<BuiltCmra, FormatError> {
         offset: input.trailer_offset,
         bytes: input.trailer.to_vec(),
     });
+    let root_auth_flag = if input.root_auth_footer.is_some() {
+        0x0000_0001
+    } else {
+        0
+    };
+    let key_wrap_flag = if key_wrap_table.is_some() {
+        0x0000_0002
+    } else {
+        0
+    };
     let image = CriticalMetadataImage {
+        volume_format_rev: input.volume_format_rev,
         archive_uuid: input.archive_uuid,
         session_id: input.session_id,
         volume_index: input.volume_index,
         stripe_width: input.options.stripe_width,
-        layout_flags: if input.root_auth_footer.is_some() {
-            0x0000_0001
-        } else {
-            0
-        },
+        layout_flags: root_auth_flag | key_wrap_flag,
         volume_header_offset: 0,
         volume_header_length: VOLUME_HEADER_LEN as u32,
         crypto_header_offset: VOLUME_HEADER_LEN as u64,
         crypto_header_length: u32_len(input.crypto_header.len(), "CryptoHeader")?,
+        key_wrap_table_offset: key_wrap_table.map(|_| crypto_end).unwrap_or(0),
+        key_wrap_table_length: key_wrap_table.map(|(_, length)| length).unwrap_or(0),
         block_records_offset,
         block_records_length,
         block_count: input.block_count,
@@ -6070,6 +6120,9 @@ fn build_v41_cmra(input: CmraBuildInput<'_>) -> Result<BuiltCmra, FormatError> {
         body_bytes_before_cmra,
         volume_header_sha256: sha256_bytes(input.volume_header_bytes),
         crypto_header_sha256: sha256_bytes(input.crypto_header),
+        key_wrap_table_sha256: key_wrap_table
+            .map(|(table, _)| sha256_bytes(table))
+            .unwrap_or([0u8; 32]),
         manifest_footer_sha256: sha256_bytes(input.manifest_footer),
         root_auth_footer_sha256: input
             .root_auth_footer
@@ -6267,6 +6320,7 @@ fn checked_u64_mul(lhs: u64, rhs: u64, field: &'static str) -> Result<u64, Forma
         .ok_or(FormatError::WriterUnsupported(field))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_bootstrap_sidecar(
     subkeys: &Subkeys,
     aead_algo: AeadAlgo,

@@ -3,7 +3,7 @@
 This document is a compact command reference for `tzap` operators and automation.
 
 - **Version**: from binary metadata (`tzap --version`)
-- **Revision**: format v0.43 plus v0.44 RecipientWrap create/open
+- **Revision**: v0.44 writers and readers, with v0.43 reader compatibility
 
 ## Global options
 
@@ -76,13 +76,15 @@ Useful flags:
 - `--argon2-*`: passphrase derivation tuning
 - `--recipient-cert`: encrypt a v44 RecipientWrap archive to one X.509
   recipient certificate
-- `--no-encryption`: write an explicit plaintext archive with unkeyed v43
+- `--no-encryption`: write an explicit plaintext archive with unkeyed v44
   integrity digests
 - `--dictionary`: optional zstd dictionary
-- `--signing-key`: Ed25519 signing seed for v43 RootAuth
+- `--signing-key`: Ed25519 signing seed for RootAuth
 - `--signing-cert`: X.509 leaf certificate for RootAuth
 - `--signing-private-key`: private key for `--signing-cert`
 - `--signing-chain`: optional PEM or DER intermediate certificate chain
+- `--x509-signature-scheme`: optional X.509 RootAuth signature scheme
+  (`rsa-pkcs1-sha256`, `ecdsa-sha256-der`, or `rsa-pss-sha256`)
 - `--bootstrap-out`: sidecar output path for single-volume archives only
 - `--tar-stdin`: create an archive from a tar stream at input path `-`
 - `--raw-stdin`: create from one raw stdin member at input path `-`
@@ -104,7 +106,7 @@ Notes:
 - `--bootstrap-out` rejects `--volumes > 1` and `--volume-size` with
   `unsupported-feature`.
 - `--no-encryption` stores payload and metadata without confidentiality. It
-  uses `aead_algo = None`, `kdf_algo = None`, and unkeyed v43 integrity
+  uses `aead_algo = None`, `kdf_algo = None`, and unkeyed v44 integrity
   digests for fixed metadata. RootAuth signing can still authenticate the
   archive and signer provenance.
 - `--insecure-zero-key` was removed in v43. Use `--no-encryption` when the
@@ -123,11 +125,11 @@ Notes:
   `--volume-size`, and `--volume-loss-tolerance > 0` before reading payload
   stdin.
 - `--raw-stdin --stdin-size SIZE` streams exactly `SIZE` bytes into one
-  regular-file member in the standard tar-member v43 profile. Add `--volumes N`
+  regular-file member in the standard tar-member v44 profile. Add `--volumes N`
   for fixed-count multi-volume output. Short or overlong stdin is rejected and
   the temporary archive path or volume set is not published.
 - `--raw-stdin --spool-stdin` writes stdin to an explicit plaintext temporary
-  spool first, then archives it as the same tar-member v43 profile. Add
+  spool first, then archives it as the same tar-member v44 profile. Add
   `--volumes N` for fixed-count multi-volume output. After EOF the spool gives
   tzap a file-backed raw source with a known size, while `-o` still writes a
   normal file-backed archive path or volume set. That output shape is faster
@@ -311,7 +313,7 @@ Notes:
 
 - Key-holding verification uses `--keyfile`, `--password`,
   `--password-stdin`, or `--recipient-key` for encrypted archives. Unencrypted
-  v43 archives use no archive key. Add `--trusted-public-key` to require
+  archives use no archive key. Add `--trusted-public-key` to require
   RootAuth content verification after ordinary archive integrity verification
   for Ed25519, or add `--trusted-ca-cert` / `--trusted-system-roots` for X.509
   RootAuth.

@@ -1,4 +1,4 @@
-//! Core implementation surface for the tzap v0.43 archive format.
+//! Core implementation surface for the tzap v0.44 archive format.
 //!
 //! This crate owns wire-format parsing, validation, crypto, compression, FEC,
 //! and archive read/write primitives. The CLI stays intentionally thin.

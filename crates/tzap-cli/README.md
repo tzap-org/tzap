@@ -131,8 +131,8 @@ tzap verify --keyfile project.key --trusted-public-key root.public.hex signed.tz
 tzap verify --public-no-key --trusted-public-key root.public.hex signed.tzap
 ```
 
-X.509 RootAuth signing is available with `--signing-cert` and
-`--signing-private-key`.
+X.509 RootAuth signing is available with `--signing-cert`,
+`--signing-private-key`, and optional `--x509-signature-scheme`.
 
 ## Safety defaults
 
@@ -151,6 +151,6 @@ archive data; raw-key archives require the original 32-byte key.
 ## More information
 
 - Repository: <https://github.com/tzap-org/tzap>
-- Format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv43.md>
+- Format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv44.md>
 - Library crate: <https://crates.io/crates/tzap-core>
 - Signing plugin crate: <https://crates.io/crates/tzap-plugin-signing>

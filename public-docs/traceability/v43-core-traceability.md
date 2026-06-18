@@ -1,4 +1,4 @@
-# v43 core traceability
+# v43 compatibility traceability
 
 Source specification:
 
@@ -7,8 +7,8 @@ Source specification:
 
 Scope:
 
-- The matrix covers the documented supported `tzap-core` and CLI archive
-  workflows.
+- The matrix covers documented v43 reader-compatibility behavior for
+  `tzap-core` and CLI archive workflows. Current writers emit v44 archives.
 - Unsupported workflow shapes are acceptable only when they reject with stable
   diagnostics and are documented in `public-docs/`.
 - RootAuth authenticator algorithms are mapped in
@@ -16,7 +16,7 @@ Scope:
 
 | ID | Spec area | Requirement summary | Status | Implementation | Evidence |
 |---|---|---|---|---|---|
-| V43-001 | Format revision and fixed structures | v43 archives set `VolumeHeader.volume_format_rev = 43`; readers reject unsupported revisions, bad magic, bad CRC, non-zero reserved fields, and malformed fixed structures before use. | Implemented and tested | `crates/tzap-core/src/wire.rs`; `crates/tzap-core/src/format.rs`; writer header construction | `volume_format_revision_freshness_is_pinned_to_current_revision`; `wire::tests::fixed_structure_magic_matrix_rejects_all_magic_fields`; `volume_header_rejects_mutations`; fuzz `parse_fixed_structures` |
+| V43-001 | Format revision and fixed structures | v43 compatibility archives set `VolumeHeader.volume_format_rev = 43`; readers accept v43 as compatibility mode and reject unsupported revisions, bad magic, bad CRC, non-zero reserved fields, and malformed fixed structures before use. | Implemented and tested | `crates/tzap-core/src/wire.rs`; `crates/tzap-core/src/format.rs`; revision dispatch | `volume_format_revision_freshness_is_pinned_to_current_revision`; `wire::tests::fixed_structure_magic_matrix_rejects_all_magic_fields`; `volume_header_rejects_mutations`; fuzz `parse_fixed_structures` |
 | V43-002 | Algorithm registry | v43 supported archives use zstd-framed compression, AEAD algorithms including `None`, KDF algorithms including `None`, and Reed-Solomon GF(2^16) FEC; unsupported algorithms reject before payload trust. | Implemented and tested | `crates/tzap-core/src/compression.rs`; `crypto.rs`; `fec.rs`; `wire.rs` | `crypto_header_fixed_rejects_unsupported_profile_values`; `aead_round_trips_all_registered_algorithms`; `compresses_and_decompresses_exact_frame`; `gf16_arithmetic_matches_polynomial_examples` |
 | V43-003 | KDF and key sources | Raw and Argon2id KDF parameters are bounded, serialized, authenticated, and exposed through explicit CLI key sources; `KdfAlgo::None` is accepted only with `AeadAlgo::None`. | Implemented and tested | `crates/tzap-core/src/crypto.rs`; `crates/tzap-core/src/wire.rs`; `crates/tzap-cli/src/main.rs` | `parses_raw_kdf_params`; `parses_argon2id_kdf_params`; `rejects_argon2id_params_above_reader_caps`; `cli_create_and_verify_with_password_stdin_argon2id`; v43 plaintext CLI smoke tests |
 | V43-004 | CryptoHeader extensions | Extension TLVs are bounded, terminated exactly, reject forbidden or duplicate known tags, and keep unknown critical extensions from being silently accepted. | Implemented and tested | `crates/tzap-core/src/wire.rs`; `crates/tzap-core/src/raw_stream_profile.rs` | `crypto_extension_scanner_enforces_terminator_and_caps`; `crypto_extension_semantics_reject_forbidden_duplicate_and_critical`; `raw_content_model_extension_is_critical_and_exact` |
@@ -42,7 +42,7 @@ Scope:
 | V43-024 | Error labels and exit categories | Wrong key, corruption, unsupported revision, unsafe extraction, missing bootstrap, and unsupported features have stable CLI labels and exit codes. | Implemented and tested | `crates/tzap-cli/src/main.rs`; CLI error mapping | `cli_reports_wrong_key_with_stable_category_and_exit_code`; `cli_reports_corrupt_archive_after_header_authentication_succeeds`; `cli_reports_unsupported_revision_with_stable_category_and_exit_code`; public-docs tests |
 | V43-025 | Fuzz parser coverage | Deterministic fuzz-smoke exercises fixed structures, metadata, compression, padding, and terminal/RootAuth/CMRA parser markers without adding `libfuzzer-sys` to normal workspace tests. | Implemented and tested | `fuzz/fuzz_targets/*`; `fuzz/corpus/*`; `fuzz/corpus/manifest.tsv` | `cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked`; manifest maps parser targets to seed purpose |
 | V43-026 | Package and release documentation | Public package docs link the v43 spec, keep private/internal docs out of package READMEs, and keep operational boundaries outside marketing README prose. | Implemented and tested | `README.md`; crate READMEs; `public-docs/`; release tests | `crates_io_metadata::package_readmes_render_without_workspace_paths`; `public_docs_keep_boundaries_out_of_readme_marketing`; `release_workflows` tests |
-| V43-027 | Explicit plaintext mode | `--no-encryption` writes v43 archives with `AeadAlgo::None`, `KdfAlgo::None`, zero object tag length, plaintext object framing, no HKDF subkey schedule, and unkeyed fixed-metadata digests; list, extract, and verify open those archives with no archive key while encrypted zero-key archives still require an explicit key source. | Implemented and tested | `crates/tzap-core/src/format.rs`; `crypto.rs`; `wire.rs`; `writer.rs`; `reader.rs`; `non_seekable_reader.rs`; `crates/tzap-cli/src/main.rs` | `cli_extract_reads_unencrypted_archive_without_key_source`; `cli_list_reads_unencrypted_archive_without_key_source`; `cli_verify_reads_unencrypted_archive_without_key_source`; `cli_unencrypted_archive_stdin_reads_without_key_source`; `cli_no_key_does_not_open_encrypted_zero_key_archive`; `cli_encrypted_zero_key_archive_stdin_without_key_is_rejected`; `cli_plaintext_header_digest_corruption_is_corrupt_archive_not_wrong_key` |
+| V43-027 | Explicit plaintext compatibility | v43 plaintext archives use `AeadAlgo::None`, `KdfAlgo::None`, zero object tag length, plaintext object framing, no HKDF subkey schedule, and unkeyed fixed-metadata digests; list, extract, and verify open those archives with no archive key while encrypted zero-key archives still require an explicit key source. Current `--no-encryption` writes v44. | Implemented and tested | `crates/tzap-core/src/format.rs`; `crypto.rs`; `wire.rs`; `writer.rs`; `reader.rs`; `non_seekable_reader.rs`; `crates/tzap-cli/src/main.rs` | `cli_extract_reads_unencrypted_archive_without_key_source`; `cli_list_reads_unencrypted_archive_without_key_source`; `cli_verify_reads_unencrypted_archive_without_key_source`; `cli_unencrypted_archive_stdin_reads_without_key_source`; `cli_no_key_does_not_open_encrypted_zero_key_archive`; `cli_encrypted_zero_key_archive_stdin_without_key_is_rejected`; `cli_plaintext_header_digest_corruption_is_corrupt_archive_not_wrong_key` |
 
 ## Current matrix result
 

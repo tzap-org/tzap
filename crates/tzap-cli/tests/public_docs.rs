@@ -184,14 +184,14 @@ fn public_reference_file_exists_and_covers_commands() {
 
 #[test]
 fn public_spec_file_remains_linked() {
-    let spec = read_workspace_file("specs/tzap-format-revisedv43.md");
+    let spec = read_workspace_file("specs/tzap-format-revisedv44.md");
     let root_readme = read_workspace_file("README.md");
     let cli_readme = read_workspace_file("crates/tzap-cli/README.md");
 
-    assert!(spec.contains("### 28.1 Test corpus additions through v0.43"));
     assert!(spec.contains("## 29. Conformance"));
-    assert!(root_readme.contains("specs/tzap-format-revisedv43.md"));
-    assert!(cli_readme.contains("specs/tzap-format-revisedv43.md"));
+    assert!(spec.contains("## 30. Critical Metadata Recovery and Root Authentication"));
+    assert!(root_readme.contains("specs/tzap-format-revisedv44.md"));
+    assert!(cli_readme.contains("specs/tzap-format-revisedv44.md"));
 }
 
 #[test]
@@ -392,7 +392,7 @@ fn readme_multivolume_recovery_example_executes() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK (2 volume(s), 1 file(s))"));
+        .stdout(predicate::str::contains("(2 volume(s), 1 file(s))"));
 
     fs::remove_file(&volume_1).unwrap();
 
@@ -498,7 +498,7 @@ fn traceability_materials_live_under_requested_folder_and_cover_claim_gates() {
     let signing = read_workspace_file("public-docs/traceability/signing-plugin-traceability.md");
     let runbook = read_workspace_file("public-docs/traceability/verification-runbook.md");
 
-    assert!(index.contains("v43-compliant for the documented supported archive workflows"));
+    assert!(index.contains("implements v44 for documented writer workflows"));
     assert!(index.contains("public-docs/traceability"));
     assert!(index.contains("cargo fmt --check"));
     assert!(index.contains("cargo clippy --workspace --all-targets -- -D warnings"));

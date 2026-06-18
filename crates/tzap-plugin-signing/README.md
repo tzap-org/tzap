@@ -1,10 +1,10 @@
 # tzap-plugin-signing
 
 `tzap-plugin-signing` adds RootAuth signing profiles for tzap archives. It is
-the companion crate for applications that want signed v43 RootAuth archives on
+the companion crate for applications that want signed v44 RootAuth archives on
 top of the standalone `tzap-core` archive foundation.
 
-The `ed25519_raw` profile implements the v43 optional Ed25519 RootAuth
+The `ed25519_raw` profile implements the Ed25519 RootAuth
 authenticator (`authenticator_id = 0x0002`). The `x509_chain` profile adds an
 OpenSSL-backed certificate verifier (`authenticator_id = 0x0003`) for leaf
 certificates, optional intermediate chains, and trusted CA roots. Core provides
@@ -78,13 +78,15 @@ The `x509_chain` module provides:
 - `X509RootAuthSigner` for core writer callbacks
 - `verify_root_auth_footer` for core verifier callbacks
 - reports with signer subject, issuer, serial number, certificate SHA-256,
-  signer-claimed signing time, verified chain subjects, and trust anchor subject
+  signature scheme, signer-claimed signing time, verifier-current chain
+  validation time, policy labels, verified chain subjects, and trust anchor
+  subject
 
 ## More Information
 
 - Repository: <https://github.com/tzap-org/tzap>
 - Core crate: <https://crates.io/crates/tzap-core>
 - CLI crate: <https://crates.io/crates/tzap>
-- Implemented format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv43.md>
-- Draft v44 Ed25519 RootAuth spec: <https://github.com/tzap-org/tzap/blob/main/specs/plugin/tzap-plugin-signing-v6-proposed-v44.md>
-- Draft v44 X.509 RootAuth spec: <https://github.com/tzap-org/tzap/blob/main/specs/plugin/tzap-plugin-x509-chain-v2-proposed-v44.md>
+- Implemented format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv44.md>
+- v44 Ed25519 RootAuth spec: <https://github.com/tzap-org/tzap/blob/main/specs/plugin/tzap-plugin-signing-v6-proposed-v44.md>
+- v44 X.509 RootAuth spec: <https://github.com/tzap-org/tzap/blob/main/specs/plugin/tzap-plugin-x509-chain-v2-proposed-v44.md>

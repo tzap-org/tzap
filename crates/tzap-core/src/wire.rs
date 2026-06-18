@@ -5,10 +5,10 @@ use crate::crypto::KdfParams;
 use crate::format::{
     root_auth_spec_id_for_revision, AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, FormatError,
     KdfAlgo, VolumeFormatRevision, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN,
-    CRITICAL_METADATA_IMAGE_FIXED_LEN, CRITICAL_METADATA_RECOVERY_HEADER_LEN,
-    CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN, CRITICAL_RECOVERY_LOCATOR_LEN,
-    CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_EXTENSION_MAX_VALUE_LEN, CRYPTO_HEADER_FIXED_LEN,
-    CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, IMAGE_CRC_LEN,
+    CRITICAL_METADATA_IMAGE_FIXED_LEN, CRITICAL_METADATA_IMAGE_FIXED_LEN_V43,
+    CRITICAL_METADATA_RECOVERY_HEADER_LEN, CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN,
+    CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_EXTENSION_MAX_VALUE_LEN,
+    CRYPTO_HEADER_FIXED_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, IMAGE_CRC_LEN,
     MANIFEST_FOOTER_LEN, READER_MAX_BLOCK_SIZE, READER_MAX_CHUNK_SIZE,
     READER_MAX_CRYPTO_HEADER_LEN, READER_MAX_ENVELOPE_TARGET_SIZE, READER_MAX_FEC_CLASS_SHARDS,
     READER_MAX_INDEX_FEC_CLASS_SHARDS, READER_MAX_INDEX_ROOT_FEC_CLASS_SHARDS,
@@ -16,7 +16,7 @@ use crate::format::{
     READER_MAX_PATH_LENGTH, READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN,
     READER_MAX_ROOT_AUTH_FOOTER_LEN, READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN,
     READER_MAX_STRIPE_WIDTH, READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, ROOT_AUTH_FOOTER_FIXED_LEN,
-    SERIALIZED_REGION_HEADER_LEN, VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN,
+    SERIALIZED_REGION_HEADER_LEN, VOLUME_FORMAT_REV_43, VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN,
     VOLUME_TRAILER_LEN,
 };
 use crate::raw_stream_profile::{
@@ -86,7 +86,7 @@ impl VolumeHeader {
     }
 
     pub fn parse_volume_format_revision(&self) -> Result<VolumeFormatRevision, FormatError> {
-        VolumeFormatRevision::from_u16(self.volume_format_rev).ok_or_else(|| {
+        VolumeFormatRevision::from_u16(self.volume_format_rev).ok_or({
             FormatError::UnsupportedVolumeFormatRevision {
                 format_version: self.format_version,
                 volume_format_rev: self.volume_format_rev,
@@ -501,7 +501,7 @@ pub fn compute_key_wrap_table_digest(
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(KEY_WRAP_TABLE_DIGEST_DOMAIN_V44);
-    hasher.update(&key_wrap_table_length.to_le_bytes());
+    hasher.update(key_wrap_table_length.to_le_bytes());
     hasher.update(key_wrap_table_bytes);
     let digest = hasher.finalize();
     let mut output = [0u8; 32];
@@ -609,7 +609,6 @@ impl KeyWrapTableV1 {
         key_wrap_table_length: u32,
         key_wrap_table_record_count: u32,
     ) -> Result<Self, FormatError> {
-        expect_magic("KeyWrapTableV1", TZKW_MAGIC, &bytes[0..4])?;
         if bytes.len() > READER_MAX_KEY_WRAP_TABLE_LEN as usize {
             return Err(FormatError::ReaderResourceLimitExceeded {
                 field: "KeyWrapTableV1 length",
@@ -624,6 +623,7 @@ impl KeyWrapTableV1 {
                 actual: bytes.len(),
             });
         }
+        expect_magic("KeyWrapTableV1", TZKW_MAGIC, &bytes[0..4])?;
 
         let header_length = read_u32(bytes, 12)?;
         if header_length != KEY_WRAP_TABLE_HEADER_LEN as u32 {
@@ -1417,6 +1417,7 @@ impl SerializedRegion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CriticalMetadataImage {
+    pub volume_format_rev: u16,
     pub archive_uuid: [u8; 16],
     pub session_id: [u8; 16],
     pub volume_index: u32,
@@ -1426,6 +1427,8 @@ pub struct CriticalMetadataImage {
     pub volume_header_length: u32,
     pub crypto_header_offset: u64,
     pub crypto_header_length: u32,
+    pub key_wrap_table_offset: u64,
+    pub key_wrap_table_length: u32,
     pub block_records_offset: u64,
     pub block_records_length: u64,
     pub block_count: u64,
@@ -1438,14 +1441,39 @@ pub struct CriticalMetadataImage {
     pub body_bytes_before_cmra: u64,
     pub volume_header_sha256: [u8; 32],
     pub crypto_header_sha256: [u8; 32],
+    pub key_wrap_table_sha256: [u8; 32],
     pub manifest_footer_sha256: [u8; 32],
     pub root_auth_footer_sha256: [u8; 32],
     pub volume_trailer_sha256: [u8; 32],
     pub regions: Vec<SerializedRegion>,
 }
 
+fn critical_metadata_image_fixed_len(volume_format_rev: u16) -> Result<usize, FormatError> {
+    match volume_format_rev {
+        VOLUME_FORMAT_REV_43 => Ok(CRITICAL_METADATA_IMAGE_FIXED_LEN_V43),
+        VOLUME_FORMAT_REV_44 => Ok(CRITICAL_METADATA_IMAGE_FIXED_LEN),
+        _ => Err(FormatError::UnsupportedVolumeFormatRevision {
+            format_version: FORMAT_VERSION,
+            volume_format_rev,
+            reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+        }),
+    }
+}
+
 impl CriticalMetadataImage {
     pub fn to_bytes(&self) -> Result<Vec<u8>, FormatError> {
+        let fixed_len = critical_metadata_image_fixed_len(self.volume_format_rev)?;
+        if self.volume_format_rev == VOLUME_FORMAT_REV_43
+            && (self.layout_flags & !0x0000_0001 != 0
+                || self.key_wrap_table_offset != 0
+                || self.key_wrap_table_length != 0
+                || self.key_wrap_table_sha256 != [0u8; 32]
+                || self.regions.iter().any(|region| region.region_type == 6))
+        {
+            return Err(FormatError::InvalidArchive(
+                "v43 CriticalMetadataImage cannot contain KeyWrapTableV1",
+            ));
+        }
         let region_count = u16::try_from(self.regions.len()).map_err(|_| {
             FormatError::InvalidArchive("CriticalMetadataImage has too many regions")
         })?;
@@ -1458,7 +1486,7 @@ impl CriticalMetadataImage {
         })?;
         let mut bytes = vec![
             0u8;
-            CRITICAL_METADATA_IMAGE_FIXED_LEN
+            fixed_len
                 .checked_add(variable_len)
                 .and_then(|value| value.checked_add(IMAGE_CRC_LEN))
                 .ok_or(FormatError::InvalidArchive(
@@ -1467,7 +1495,7 @@ impl CriticalMetadataImage {
         ];
         bytes[0..4].copy_from_slice(&TZMI_MAGIC);
         write_u16(&mut bytes, 4, 1);
-        write_u16(&mut bytes, 6, VOLUME_FORMAT_REV);
+        write_u16(&mut bytes, 6, self.volume_format_rev);
         bytes[8..24].copy_from_slice(&self.archive_uuid);
         bytes[24..40].copy_from_slice(&self.session_id);
         write_u32(&mut bytes, 40, self.volume_index);
@@ -1477,24 +1505,46 @@ impl CriticalMetadataImage {
         write_u32(&mut bytes, 60, self.volume_header_length);
         write_u64(&mut bytes, 64, self.crypto_header_offset);
         write_u32(&mut bytes, 72, self.crypto_header_length);
-        write_u64(&mut bytes, 76, self.block_records_offset);
-        write_u64(&mut bytes, 84, self.block_records_length);
-        write_u64(&mut bytes, 92, self.block_count);
-        write_u64(&mut bytes, 100, self.manifest_footer_offset);
-        write_u32(&mut bytes, 108, self.manifest_footer_length);
-        write_u64(&mut bytes, 112, self.root_auth_footer_offset);
-        write_u32(&mut bytes, 120, self.root_auth_footer_length);
-        write_u64(&mut bytes, 124, self.volume_trailer_offset);
-        write_u32(&mut bytes, 132, self.volume_trailer_length);
-        write_u64(&mut bytes, 136, self.body_bytes_before_cmra);
-        bytes[144..176].copy_from_slice(&self.volume_header_sha256);
-        bytes[176..208].copy_from_slice(&self.crypto_header_sha256);
-        bytes[208..240].copy_from_slice(&self.manifest_footer_sha256);
-        bytes[240..272].copy_from_slice(&self.root_auth_footer_sha256);
-        bytes[272..304].copy_from_slice(&self.volume_trailer_sha256);
-        write_u16(&mut bytes, 304, region_count);
+        if self.volume_format_rev == VOLUME_FORMAT_REV_44 {
+            write_u64(&mut bytes, 76, self.key_wrap_table_offset);
+            write_u32(&mut bytes, 84, self.key_wrap_table_length);
+            write_u64(&mut bytes, 88, self.block_records_offset);
+            write_u64(&mut bytes, 96, self.block_records_length);
+            write_u64(&mut bytes, 104, self.block_count);
+            write_u64(&mut bytes, 112, self.manifest_footer_offset);
+            write_u32(&mut bytes, 120, self.manifest_footer_length);
+            write_u64(&mut bytes, 124, self.root_auth_footer_offset);
+            write_u32(&mut bytes, 132, self.root_auth_footer_length);
+            write_u64(&mut bytes, 136, self.volume_trailer_offset);
+            write_u32(&mut bytes, 144, self.volume_trailer_length);
+            write_u64(&mut bytes, 148, self.body_bytes_before_cmra);
+            bytes[156..188].copy_from_slice(&self.volume_header_sha256);
+            bytes[188..220].copy_from_slice(&self.crypto_header_sha256);
+            bytes[220..252].copy_from_slice(&self.key_wrap_table_sha256);
+            bytes[252..284].copy_from_slice(&self.manifest_footer_sha256);
+            bytes[284..316].copy_from_slice(&self.root_auth_footer_sha256);
+            bytes[316..348].copy_from_slice(&self.volume_trailer_sha256);
+            write_u16(&mut bytes, 348, region_count);
+        } else {
+            write_u64(&mut bytes, 76, self.block_records_offset);
+            write_u64(&mut bytes, 84, self.block_records_length);
+            write_u64(&mut bytes, 92, self.block_count);
+            write_u64(&mut bytes, 100, self.manifest_footer_offset);
+            write_u32(&mut bytes, 108, self.manifest_footer_length);
+            write_u64(&mut bytes, 112, self.root_auth_footer_offset);
+            write_u32(&mut bytes, 120, self.root_auth_footer_length);
+            write_u64(&mut bytes, 124, self.volume_trailer_offset);
+            write_u32(&mut bytes, 132, self.volume_trailer_length);
+            write_u64(&mut bytes, 136, self.body_bytes_before_cmra);
+            bytes[144..176].copy_from_slice(&self.volume_header_sha256);
+            bytes[176..208].copy_from_slice(&self.crypto_header_sha256);
+            bytes[208..240].copy_from_slice(&self.manifest_footer_sha256);
+            bytes[240..272].copy_from_slice(&self.root_auth_footer_sha256);
+            bytes[272..304].copy_from_slice(&self.volume_trailer_sha256);
+            write_u16(&mut bytes, 304, region_count);
+        }
 
-        let mut cursor = CRITICAL_METADATA_IMAGE_FIXED_LEN;
+        let mut cursor = fixed_len;
         for region in &self.regions {
             let region_bytes = region.to_bytes()?;
             let end = cursor + region_bytes.len();
@@ -1507,10 +1557,10 @@ impl CriticalMetadataImage {
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self, FormatError> {
-        if bytes.len() < CRITICAL_METADATA_IMAGE_FIXED_LEN + IMAGE_CRC_LEN {
+        if bytes.len() < 8 + IMAGE_CRC_LEN {
             return Err(FormatError::InvalidLength {
                 structure: "CriticalMetadataImageV1",
-                expected: CRITICAL_METADATA_IMAGE_FIXED_LEN + IMAGE_CRC_LEN,
+                expected: 8 + IMAGE_CRC_LEN,
                 actual: bytes.len(),
             });
         }
@@ -1520,7 +1570,15 @@ impl CriticalMetadataImage {
             return Err(FormatError::UnsupportedFormatVersion(version));
         }
         let volume_format_rev = read_u16(bytes, 6)?;
-        if volume_format_rev != VOLUME_FORMAT_REV {
+        let fixed_len = critical_metadata_image_fixed_len(volume_format_rev)?;
+        if bytes.len() < fixed_len + IMAGE_CRC_LEN {
+            return Err(FormatError::InvalidLength {
+                structure: "CriticalMetadataImageV1",
+                expected: fixed_len + IMAGE_CRC_LEN,
+                actual: bytes.len(),
+            });
+        }
+        if volume_format_rev > READER_MAX_SUPPORTED_VOLUME_FORMAT_REV {
             return Err(FormatError::UnsupportedVolumeFormatRevision {
                 format_version: FORMAT_VERSION,
                 volume_format_rev,
@@ -1528,12 +1586,21 @@ impl CriticalMetadataImage {
             });
         }
         let layout_flags = read_u32(bytes, 48)?;
-        if layout_flags & !0x0000_0001 != 0 {
+        let allowed_layout_flags = if volume_format_rev == VOLUME_FORMAT_REV_44 {
+            0x0000_0003
+        } else {
+            0x0000_0001
+        };
+        if layout_flags & !allowed_layout_flags != 0 {
             return Err(FormatError::InvalidArchive(
                 "CriticalMetadataImage layout_flags has unknown bits",
             ));
         }
-        expect_zero("CriticalMetadataImageV1", &bytes[306..320])?;
+        if volume_format_rev == VOLUME_FORMAT_REV_44 {
+            expect_zero("CriticalMetadataImageV1", &bytes[350..364])?;
+        } else {
+            expect_zero("CriticalMetadataImageV1", &bytes[306..320])?;
+        }
         let expected_crc_offset =
             bytes
                 .len()
@@ -1547,8 +1614,12 @@ impl CriticalMetadataImage {
             read_u32(bytes, expected_crc_offset)?,
         )?;
 
-        let serialized_region_count = read_u16(bytes, 304)? as usize;
-        let mut cursor = CRITICAL_METADATA_IMAGE_FIXED_LEN;
+        let serialized_region_count = if volume_format_rev == VOLUME_FORMAT_REV_44 {
+            read_u16(bytes, 348)?
+        } else {
+            read_u16(bytes, 304)?
+        } as usize;
+        let mut cursor = fixed_len;
         let mut regions = Vec::with_capacity(serialized_region_count);
         for _ in 0..serialized_region_count {
             if cursor + SERIALIZED_REGION_HEADER_LEN > expected_crc_offset {
@@ -1592,33 +1663,71 @@ impl CriticalMetadataImage {
             ));
         }
 
-        Ok(Self {
-            archive_uuid: read_array_16(bytes, 8)?,
-            session_id: read_array_16(bytes, 24)?,
-            volume_index: read_u32(bytes, 40)?,
-            stripe_width: read_u32(bytes, 44)?,
-            layout_flags,
-            volume_header_offset: read_u64(bytes, 52)?,
-            volume_header_length: read_u32(bytes, 60)?,
-            crypto_header_offset: read_u64(bytes, 64)?,
-            crypto_header_length: read_u32(bytes, 72)?,
-            block_records_offset: read_u64(bytes, 76)?,
-            block_records_length: read_u64(bytes, 84)?,
-            block_count: read_u64(bytes, 92)?,
-            manifest_footer_offset: read_u64(bytes, 100)?,
-            manifest_footer_length: read_u32(bytes, 108)?,
-            root_auth_footer_offset: read_u64(bytes, 112)?,
-            root_auth_footer_length: read_u32(bytes, 120)?,
-            volume_trailer_offset: read_u64(bytes, 124)?,
-            volume_trailer_length: read_u32(bytes, 132)?,
-            body_bytes_before_cmra: read_u64(bytes, 136)?,
-            volume_header_sha256: read_array_32(bytes, 144)?,
-            crypto_header_sha256: read_array_32(bytes, 176)?,
-            manifest_footer_sha256: read_array_32(bytes, 208)?,
-            root_auth_footer_sha256: read_array_32(bytes, 240)?,
-            volume_trailer_sha256: read_array_32(bytes, 272)?,
-            regions,
-        })
+        if volume_format_rev == VOLUME_FORMAT_REV_44 {
+            Ok(Self {
+                volume_format_rev,
+                archive_uuid: read_array_16(bytes, 8)?,
+                session_id: read_array_16(bytes, 24)?,
+                volume_index: read_u32(bytes, 40)?,
+                stripe_width: read_u32(bytes, 44)?,
+                layout_flags,
+                volume_header_offset: read_u64(bytes, 52)?,
+                volume_header_length: read_u32(bytes, 60)?,
+                crypto_header_offset: read_u64(bytes, 64)?,
+                crypto_header_length: read_u32(bytes, 72)?,
+                key_wrap_table_offset: read_u64(bytes, 76)?,
+                key_wrap_table_length: read_u32(bytes, 84)?,
+                block_records_offset: read_u64(bytes, 88)?,
+                block_records_length: read_u64(bytes, 96)?,
+                block_count: read_u64(bytes, 104)?,
+                manifest_footer_offset: read_u64(bytes, 112)?,
+                manifest_footer_length: read_u32(bytes, 120)?,
+                root_auth_footer_offset: read_u64(bytes, 124)?,
+                root_auth_footer_length: read_u32(bytes, 132)?,
+                volume_trailer_offset: read_u64(bytes, 136)?,
+                volume_trailer_length: read_u32(bytes, 144)?,
+                body_bytes_before_cmra: read_u64(bytes, 148)?,
+                volume_header_sha256: read_array_32(bytes, 156)?,
+                crypto_header_sha256: read_array_32(bytes, 188)?,
+                key_wrap_table_sha256: read_array_32(bytes, 220)?,
+                manifest_footer_sha256: read_array_32(bytes, 252)?,
+                root_auth_footer_sha256: read_array_32(bytes, 284)?,
+                volume_trailer_sha256: read_array_32(bytes, 316)?,
+                regions,
+            })
+        } else {
+            Ok(Self {
+                volume_format_rev,
+                archive_uuid: read_array_16(bytes, 8)?,
+                session_id: read_array_16(bytes, 24)?,
+                volume_index: read_u32(bytes, 40)?,
+                stripe_width: read_u32(bytes, 44)?,
+                layout_flags,
+                volume_header_offset: read_u64(bytes, 52)?,
+                volume_header_length: read_u32(bytes, 60)?,
+                crypto_header_offset: read_u64(bytes, 64)?,
+                crypto_header_length: read_u32(bytes, 72)?,
+                key_wrap_table_offset: 0,
+                key_wrap_table_length: 0,
+                block_records_offset: read_u64(bytes, 76)?,
+                block_records_length: read_u64(bytes, 84)?,
+                block_count: read_u64(bytes, 92)?,
+                manifest_footer_offset: read_u64(bytes, 100)?,
+                manifest_footer_length: read_u32(bytes, 108)?,
+                root_auth_footer_offset: read_u64(bytes, 112)?,
+                root_auth_footer_length: read_u32(bytes, 120)?,
+                volume_trailer_offset: read_u64(bytes, 124)?,
+                volume_trailer_length: read_u32(bytes, 132)?,
+                body_bytes_before_cmra: read_u64(bytes, 136)?,
+                volume_header_sha256: read_array_32(bytes, 144)?,
+                crypto_header_sha256: read_array_32(bytes, 176)?,
+                key_wrap_table_sha256: [0u8; 32],
+                manifest_footer_sha256: read_array_32(bytes, 208)?,
+                root_auth_footer_sha256: read_array_32(bytes, 240)?,
+                volume_trailer_sha256: read_array_32(bytes, 272)?,
+                regions,
+            })
+        }
     }
 
     pub fn region(&self, region_type: u16) -> Option<&SerializedRegion> {
@@ -1769,6 +1878,7 @@ impl CriticalMetadataRecoveryShard {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CriticalRecoveryLocator {
+    pub volume_format_rev: u16,
     pub cmra_offset: u64,
     pub cmra_length: u32,
     pub volume_trailer_offset: u64,
@@ -1798,7 +1908,10 @@ impl CriticalRecoveryLocator {
             return Err(FormatError::UnsupportedFormatVersion(version));
         }
         let volume_format_rev = read_u16(bytes, 6)?;
-        if volume_format_rev != VOLUME_FORMAT_REV {
+        if !matches!(
+            volume_format_rev,
+            VOLUME_FORMAT_REV_43 | VOLUME_FORMAT_REV_44
+        ) {
             return Err(FormatError::UnsupportedVolumeFormatRevision {
                 format_version: FORMAT_VERSION,
                 volume_format_rev,
@@ -1827,6 +1940,7 @@ impl CriticalRecoveryLocator {
         )?;
 
         Ok(Self {
+            volume_format_rev,
             cmra_offset: read_u64(bytes, 8)?,
             cmra_length: read_u32(bytes, 16)?,
             volume_trailer_offset: read_u64(bytes, 24)?,
@@ -1848,7 +1962,7 @@ impl CriticalRecoveryLocator {
         let mut bytes = [0u8; CRITICAL_RECOVERY_LOCATOR_LEN];
         bytes[0..4].copy_from_slice(&TZCL_MAGIC);
         write_u16(&mut bytes, 4, 1);
-        write_u16(&mut bytes, 6, VOLUME_FORMAT_REV);
+        write_u16(&mut bytes, 6, self.volume_format_rev);
         write_u64(&mut bytes, 8, self.cmra_offset);
         write_u32(&mut bytes, 16, self.cmra_length);
         write_u16(&mut bytes, 20, CRITICAL_METADATA_RECOVERY_HEADER_LEN as u16);
@@ -2212,7 +2326,7 @@ fn write_i64(bytes: &mut [u8], offset: usize, value: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{CRYPTO_HEADER_HMAC_LEN, VOLUME_FORMAT_REV_43};
+    use crate::format::{CRYPTO_HEADER_HMAC_LEN, VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_43};
     use sha2::{Digest, Sha256};
 
     fn uuid() -> [u8; 16] {
@@ -2292,7 +2406,7 @@ mod tests {
     }
 
     fn key_wrap_table_bytes() -> (Vec<u8>, u32) {
-        let mut records = recipient_record_bytes();
+        let records = recipient_record_bytes();
         let record_count = 1u32;
         let records_length = records.len() as u32;
         let table_length = KEY_WRAP_TABLE_HEADER_LEN as u32 + records_length;
@@ -2397,17 +2511,17 @@ mod tests {
         let parsed = VolumeHeader::parse(&bytes).unwrap();
         assert_eq!(
             parsed.parse_volume_format_revision().unwrap(),
-            VolumeFormatRevision::V43
+            VolumeFormatRevision::V44
         );
 
-        let mut v44 = volume_header().to_bytes();
-        write_u16(&mut v44, 6, VOLUME_FORMAT_REV_44);
-        let v44_crc = crc32c(&v44[..124]);
-        write_u32(&mut v44, 124, v44_crc);
-        let parsed = VolumeHeader::parse(&v44).unwrap();
+        let mut v43 = volume_header().to_bytes();
+        write_u16(&mut v43, 6, VOLUME_FORMAT_REV_43);
+        let v43_crc = crc32c(&v43[..124]);
+        write_u32(&mut v43, 124, v43_crc);
+        let parsed = VolumeHeader::parse(&v43).unwrap();
         assert_eq!(
             parsed.parse_volume_format_revision().unwrap(),
-            VolumeFormatRevision::V44
+            VolumeFormatRevision::V43
         );
 
         let mut v45 = volume_header().to_bytes();
@@ -2588,7 +2702,7 @@ mod tests {
         let digest = compute_key_wrap_table_digest(table_length, &table_bytes);
         let mut expected = Sha256::new();
         expected.update(KEY_WRAP_TABLE_DIGEST_DOMAIN_V44);
-        expected.update(&table_length.to_le_bytes());
+        expected.update(table_length.to_le_bytes());
         expected.update(&table_bytes);
         let expected = expected.finalize();
         let expected_digest: [u8; 32] = expected[..].try_into().unwrap();
@@ -2610,10 +2724,20 @@ mod tests {
         write_u32(&mut bad, 8, table_length + 1);
         assert_eq!(
             KeyWrapTableV1::parse(&bad, &uuid(), &session(), table_length, 1),
+            Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 length does not match KdfParams"
+            ))
+        );
+    }
+
+    #[test]
+    fn key_wrap_table_parse_rejects_short_table_without_panic() {
+        assert_eq!(
+            KeyWrapTableV1::parse(&[0u8; 3], &uuid(), &session(), 3, 0),
             Err(FormatError::InvalidLength {
                 structure: "KeyWrapTableV1",
-                expected: (table_length + 1) as usize,
-                actual: bad.len(),
+                expected: KEY_WRAP_TABLE_HEADER_LEN,
+                actual: 3,
             })
         );
     }
@@ -2691,8 +2815,7 @@ mod tests {
 
     #[test]
     fn key_wrap_records_parse_unknown_profile_id() {
-        let mut table =
-            recipient_record_bytes_with_profile_and_payload(0xBEEF, b"charlie", b"payload");
+        let table = recipient_record_bytes_with_profile_and_payload(0xBEEF, b"charlie", b"payload");
         let (record, consumed) = RecipientRecordV1::parse(&table).unwrap();
         assert_eq!(record.profile_id, 0xBEEF);
         assert_eq!(record.recipient_identity_bytes, b"charlie");
@@ -3412,17 +3535,17 @@ mod tests {
             }
         ));
 
-        let mut v44 = footer.to_bytes().unwrap();
-        v44[6..30].copy_from_slice(&crate::format::ROOT_AUTH_SPEC_ID_V44);
-        write_u16(&mut v44, 72, VOLUME_FORMAT_REV_44);
-        let v44_crc_offset = v44.len() - 4;
-        let v44_crc = crc32c(&v44[..v44_crc_offset]);
-        write_u32(&mut v44, v44_crc_offset, v44_crc);
-        let parsed_v44 = RootAuthFooterV1::parse(&v44).unwrap();
-        assert_eq!(parsed_v44.volume_format_rev, VOLUME_FORMAT_REV_44);
+        let mut v43 = footer.to_bytes().unwrap();
+        v43[6..30].copy_from_slice(&crate::format::ROOT_AUTH_SPEC_ID_V43);
+        write_u16(&mut v43, 72, VOLUME_FORMAT_REV_43);
+        let v43_crc_offset = v43.len() - 4;
+        let v43_crc = crc32c(&v43[..v43_crc_offset]);
+        write_u32(&mut v43, v43_crc_offset, v43_crc);
+        let parsed_v43 = RootAuthFooterV1::parse(&v43).unwrap();
+        assert_eq!(parsed_v43.volume_format_rev, VOLUME_FORMAT_REV_43);
 
         let mut mismatched = footer.to_bytes().unwrap();
-        write_u16(&mut mismatched, 72, VOLUME_FORMAT_REV_44);
+        write_u16(&mut mismatched, 72, VOLUME_FORMAT_REV_43);
         let mismatch_crc_offset = mismatched.len() - 4;
         let mismatch_crc = crc32c(&mismatched[..mismatch_crc_offset]);
         write_u32(&mut mismatched, mismatch_crc_offset, mismatch_crc);
@@ -3479,6 +3602,7 @@ mod tests {
     #[test]
     fn critical_metadata_image_rejects_future_volume_format_revision() {
         let image = CriticalMetadataImage {
+            volume_format_rev: VOLUME_FORMAT_REV_43,
             archive_uuid: uuid(),
             session_id: session(),
             volume_index: 0,
@@ -3488,6 +3612,8 @@ mod tests {
             volume_header_length: VOLUME_HEADER_LEN as u32,
             crypto_header_offset: 0,
             crypto_header_length: 0,
+            key_wrap_table_offset: 0,
+            key_wrap_table_length: 0,
             block_records_offset: 0,
             block_records_length: 0,
             block_count: 0,
@@ -3500,13 +3626,14 @@ mod tests {
             body_bytes_before_cmra: 0,
             volume_header_sha256: [0u8; 32],
             crypto_header_sha256: [0u8; 32],
+            key_wrap_table_sha256: [0u8; 32],
             manifest_footer_sha256: [0u8; 32],
             root_auth_footer_sha256: [0u8; 32],
             volume_trailer_sha256: [0u8; 32],
             regions: vec![],
         };
         let mut bytes = image.to_bytes().unwrap();
-        write_u16(&mut bytes, 6, VOLUME_FORMAT_REV_44);
+        write_u16(&mut bytes, 6, VOLUME_FORMAT_REV_44 + 1);
         let crc_offset = bytes.len() - 4;
         let crc = crc32c(&bytes[..crc_offset]);
         write_u32(&mut bytes, crc_offset, crc);
@@ -3514,7 +3641,7 @@ mod tests {
             CriticalMetadataImage::parse(&bytes).unwrap_err(),
             FormatError::UnsupportedVolumeFormatRevision {
                 format_version: FORMAT_VERSION,
-                volume_format_rev: VOLUME_FORMAT_REV_44,
+                volume_format_rev: VOLUME_FORMAT_REV_44 + 1,
                 reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
             }
         );

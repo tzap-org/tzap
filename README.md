@@ -123,8 +123,8 @@ See the [recovery matrix](public-docs/tzap-recovery-matrix.md) for the simple
 - CLI crate: [crates.io/crates/tzap](https://crates.io/crates/tzap)
 - Core library: [crates.io/crates/tzap-core](https://crates.io/crates/tzap-core)
 - Signing plugin: [crates.io/crates/tzap-plugin-signing](https://crates.io/crates/tzap-plugin-signing)
-- Implemented format spec: [specs/tzap-format-revisedv43.md](specs/tzap-format-revisedv43.md)
-- Draft v44 target spec: [specs/tzap-format-revisedv44.md](specs/tzap-format-revisedv44.md)
+- Implemented format spec: [specs/tzap-format-revisedv44.md](specs/tzap-format-revisedv44.md)
+- v43 compatibility spec: [specs/tzap-format-revisedv43.md](specs/tzap-format-revisedv43.md)
 - Development guide: [public-docs/tzap-development.md](public-docs/tzap-development.md)
 
 ## License

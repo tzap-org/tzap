@@ -1603,6 +1603,7 @@ dependencies = [
  "rand",
  "sha2",
  "tzap-core",
+ "x509-parser",
 ]
 
 [[package]]
