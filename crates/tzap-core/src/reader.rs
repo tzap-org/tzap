@@ -11817,6 +11817,82 @@ mod tests {
     }
 
     #[test]
+    fn fast_verify_root_auth_archive_does_not_defer_payload_semantics() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("signed.txt", b"root-auth payload")],
+            &master_key(),
+            single_stream_options(),
+            RootAuthWriterConfig {
+                authenticator_id: 0x7777,
+                signer_identity_type: 1,
+                signer_identity: b"test signer",
+                authenticator_value_length: 32,
+            },
+            |request| Ok(request.archive_root.to_vec()),
+        )
+        .unwrap();
+
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        assert!(!opened.fast_verify_defers_payload_semantics());
+        assert!(matches!(
+            opened.verify_content_fast().unwrap().mode,
+            ContentVerificationMode::Full
+        ));
+    }
+
+    #[test]
+    fn fast_verify_dictionary_archive_does_not_defer_payload_semantics() {
+        let archive = write_archive_with_dictionary(
+            &[RegularFile::new("dict.txt", b"dictionary payload")],
+            &master_key(),
+            single_stream_options(),
+            dictionary(),
+        )
+        .unwrap();
+
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        assert!(!opened.fast_verify_defers_payload_semantics());
+    }
+
+    #[test]
+    fn fast_verify_encrypted_archive_does_not_defer_payload_semantics() {
+        let options = WriterOptions {
+            aead_algo: AeadAlgo::AesGcmSiv256,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            ..single_stream_options()
+        };
+        let archive = write_archive(
+            &[RegularFile::new("payload.txt", b"encrypted payload")],
+            &master_key(),
+            options,
+        )
+        .unwrap();
+
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        assert!(!opened.fast_verify_defers_payload_semantics());
+    }
+
+    #[test]
+    fn fast_verify_repair_archive_does_not_defer_payload_semantics() {
+        let options = WriterOptions {
+            fec_parity_shards: 2,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            ..single_stream_options()
+        };
+        let archive = write_archive(
+            &[RegularFile::new("payload.txt", b"payload for repair")],
+            &master_key(),
+            options,
+        )
+        .unwrap();
+
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        assert!(!opened.fast_verify_defers_payload_semantics());
+    }
+
+    #[test]
     fn dictionary_archive_opens_lists_verifies_and_extracts_seekable() {
         let archive = write_archive_with_dictionary(
             &[RegularFile::new(

@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256, Sha512};
 use tzap_core::format::{root_auth_spec_id_for_revision, ROOT_AUTH_SPEC_ID};
 use tzap_core::wire::RootAuthFooterV1;
 use tzap_core::writer::{RootAuthSigningRequest, RootAuthWriterConfig};
+use x509_parser::signature_algorithm::SignatureAlgorithm;
 use x509_parser::prelude::FromDer;
 
 pub const X509_AUTHENTICATOR_ID: u16 = 0x0003;
@@ -375,6 +376,7 @@ pub fn verify_root_auth_footer(
         &parsed.chain_digest,
     );
     let leaf_public_key = leaf_certificate.public_key()?;
+    validate_rsa_pss_signature_algorithm(footer.signer_identity_bytes.as_slice())?;
     validate_public_key_matches_scheme(parsed.sig_scheme, &leaf_public_key)?;
     validate_signature_for_scheme(parsed.sig_scheme, &leaf_public_key, &parsed.signature)?;
     let mut verifier = verifier_for_scheme(parsed.sig_scheme, &leaf_public_key)?;
@@ -424,6 +426,57 @@ pub fn verify_root_auth_footer(
         verified_chain_subjects,
         trust_anchor_subject,
     })
+}
+
+fn validate_rsa_pss_signature_algorithm(
+    leaf_certificate_bytes: &[u8],
+) -> Result<(), X509RootAuthError> {
+    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(leaf_certificate_bytes)
+        .map_err(|_| X509RootAuthError::Invalid("failed to parse leaf certificate"))?;
+
+    let signature_algorithm = SignatureAlgorithm::try_from(&certificate.tbs_certificate.signature_algorithm)
+        .map_err(|_| X509RootAuthError::Invalid("unsupported leaf signature algorithm"))?;
+
+    let SignatureAlgorithm::RSASSA_PSS(params) = signature_algorithm else {
+        return Ok(());
+    };
+
+    let hash_algorithm = params.hash_algorithm_oid();
+    if hash_algorithm.to_id_string() != "2.16.840.1.101.3.4.2.1" {
+        return Err(X509RootAuthError::Invalid(
+            "leaf RSA-PSS signature algorithm must be sha256withRSA-PSS",
+        ));
+    }
+
+    let mask_generation = params
+        .mask_gen_algorithm()
+        .map_err(|_| X509RootAuthError::Invalid("leaf RSA-PSS signature algorithm is missing mask generation parameters"))?;
+    if mask_generation.mgf.to_id_string() != "1.2.840.113549.1.1.8" {
+        return Err(X509RootAuthError::Invalid(
+            "leaf RSA-PSS signature algorithm must use MGF1 in mask generation parameters",
+        ));
+    }
+    if mask_generation.hash.to_id_string() != "2.16.840.1.101.3.4.2.1" {
+        return Err(X509RootAuthError::Invalid(
+            "leaf RSA-PSS signature algorithm must use SHA-256 as MGF1 digest",
+        ));
+    }
+
+    let salt_length = params.salt_length();
+    if salt_length != 32 {
+        return Err(X509RootAuthError::Invalid(
+            "leaf RSA-PSS signature algorithm must use saltLength=32",
+        ));
+    }
+
+    let trailer = params.trailer_field();
+    if trailer != 1 {
+        return Err(X509RootAuthError::Invalid(
+            "leaf RSA-PSS signature algorithm must use trailerField=1",
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1455,6 +1508,56 @@ mod tests {
     }
 
     #[test]
+    fn signer_rejects_rsa_pss_certs_with_nonstandard_pss_parameters() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_leaf_cert(
+            "Acme RSA PSS Release Signing",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+        );
+        let signed_at = now_unix_seconds();
+        let signer = X509RootAuthSigner::new_with_signature_scheme(
+            leaf_cert.to_der().unwrap(),
+            leaf_key,
+            Vec::new(),
+            signed_at,
+            Some(X509SignatureScheme::RsaPssSha256),
+        )
+        .unwrap();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V44,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let mut footer = signed_footer_for_request(&signer, &leaf_cert, &request, VOLUME_FORMAT_REV_44);
+
+        let sha256_with_rsa_encryption = [
+            0x06, 0x09, 0x60, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B,
+        ];
+        let rsa_pss_no_params = [
+            0x06, 0x09, 0x60, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A,
+        ];
+        let mutated_leaf_identity = replace_first_subsequence(
+            &footer.signer_identity_bytes,
+            &sha256_with_rsa_encryption,
+            &rsa_pss_no_params,
+        )
+        .unwrap();
+        footer.signer_identity_bytes = mutated_leaf_identity;
+
+        let err = verify_root_auth_footer(
+            &footer,
+            &request.archive_root,
+            &[root_cert.to_der().unwrap()],
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, X509RootAuthError::Invalid(_)));
+    }
+
+    #[test]
     fn signer_rejects_unsupported_ec_curve() {
         let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
         let (leaf_cert, leaf_key) = test_ec_leaf_cert(
@@ -1650,6 +1753,27 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("chain count"));
+    }
+
+    fn replace_first_subsequence(
+        haystack: &[u8],
+        needle: &[u8],
+        replacement: &[u8],
+    ) -> Option<Vec<u8>> {
+        if needle.is_empty() {
+            return None;
+        }
+        let Some(found) = haystack.windows(needle.len()).position(|window| window == needle) else {
+            return None;
+        };
+
+        let mut output = Vec::with_capacity(
+            haystack.len() - needle.len() + replacement.len(),
+        );
+        output.extend_from_slice(&haystack[..found]);
+        output.extend_from_slice(replacement);
+        output.extend_from_slice(&haystack[found + needle.len()..]);
+        Some(output)
     }
 
     fn test_ca_cert(cn: &str) -> (X509, PKey<Private>) {
