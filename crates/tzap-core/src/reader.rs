@@ -3549,8 +3549,6 @@ fn startup_key_wrap_table(
     if volume_header.volume_format_rev == VOLUME_FORMAT_REV_44 {
         let &KdfParams::RecipientWrap {
             key_wrap_table_length,
-            key_wrap_table_record_count,
-            key_wrap_table_digest,
             ..
         } = kdf_params
         else {
@@ -3559,30 +3557,11 @@ fn startup_key_wrap_table(
         let key_wrap_table_length_usize =
             to_usize(u64::from(key_wrap_table_length), "KeyWrapTableV1 length")?;
         let key_wrap_table_bytes = read_key_wrap_table(crypto_end, key_wrap_table_length_usize)?;
-        let key_wrap_table = KeyWrapTableV1::parse(
-            &key_wrap_table_bytes,
-            &volume_header.archive_uuid,
-            &volume_header.session_id,
-            key_wrap_table_length,
-            key_wrap_table_record_count,
-        )?;
-        if compute_key_wrap_table_digest(key_wrap_table_length, &key_wrap_table_bytes)
-            != key_wrap_table_digest
-        {
-            return Err(FormatError::IntegrityDigestMismatch {
-                structure: "KeyWrapTableV1",
-            });
-        }
-        let block_records_start = checked_u64_add(
-            crypto_end,
-            key_wrap_table.table_length as u64,
-            "KeyWrapTableV1",
-        )?;
-        Ok(Some(StartupKeyWrapTable {
-            table: key_wrap_table,
-            bytes: key_wrap_table_bytes,
-            block_records_start,
-        }))
+        Ok(Some(parse_startup_key_wrap_table_bytes(
+            volume_header,
+            kdf_params,
+            key_wrap_table_bytes,
+        )?))
     } else if matches!(kdf_params, KdfParams::RecipientWrap { .. }) {
         Err(FormatError::InvalidArchive(
             "RecipientWrap KdfParams require volume_format_rev 44",
@@ -3590,6 +3569,51 @@ fn startup_key_wrap_table(
     } else {
         Ok(None)
     }
+}
+
+fn parse_startup_key_wrap_table_bytes(
+    volume_header: &VolumeHeader,
+    kdf_params: &KdfParams,
+    key_wrap_table_bytes: Vec<u8>,
+) -> Result<StartupKeyWrapTable, FormatError> {
+    let crypto_end = checked_u64_add(
+        volume_header.crypto_header_offset as u64,
+        volume_header.crypto_header_length as u64,
+        "CryptoHeader",
+    )?;
+    let KdfParams::RecipientWrap {
+        key_wrap_table_length,
+        key_wrap_table_record_count,
+        key_wrap_table_digest,
+        ..
+    } = kdf_params
+    else {
+        return Err(FormatError::KeyMaterialMismatch);
+    };
+    let key_wrap_table = KeyWrapTableV1::parse(
+        &key_wrap_table_bytes,
+        &volume_header.archive_uuid,
+        &volume_header.session_id,
+        *key_wrap_table_length,
+        *key_wrap_table_record_count,
+    )?;
+    if compute_key_wrap_table_digest(*key_wrap_table_length, &key_wrap_table_bytes)
+        != *key_wrap_table_digest
+    {
+        return Err(FormatError::IntegrityDigestMismatch {
+            structure: "KeyWrapTableV1",
+        });
+    }
+    let block_records_start = checked_u64_add(
+        crypto_end,
+        key_wrap_table.table_length as u64,
+        "KeyWrapTableV1",
+    )?;
+    Ok(StartupKeyWrapTable {
+        table: key_wrap_table,
+        bytes: key_wrap_table_bytes,
+        block_records_start,
+    })
 }
 
 fn parse_seekable_volume(
@@ -3647,8 +3671,32 @@ where
         RecipientWrapRecordContext<'_>,
     ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
 {
-    let prefix = parse_open_prefix_with_recipient_wrap_resolver(bytes, resolver)?;
-    parse_seekable_volume_with_prefix(bytes, prefix, options)
+    let prefix = match parse_open_prefix_with_recipient_wrap_resolver(bytes, resolver) {
+        Ok(prefix) => prefix,
+        Err(prefix_err) => {
+            if recipient_wrap_prefix_error_precludes_recovery(&prefix_err) {
+                return Err(prefix_err);
+            }
+            return parse_seekable_volume_with_recipient_wrap_resolver_from_recovered_terminal(
+                bytes, resolver, options,
+            )
+            .or(Err(prefix_err));
+        }
+    };
+    let physical_crypto_header_bytes = prefix.crypto_header_bytes.clone();
+    match parse_seekable_volume_with_prefix(bytes, prefix, options) {
+        Ok(parsed) => Ok(parsed),
+        Err(prefix_err) => {
+            match parse_seekable_volume_with_recipient_wrap_resolver_from_recovered_terminal(
+                bytes, resolver, options,
+            ) {
+                Ok(recovered) if recovered.crypto_header_bytes == physical_crypto_header_bytes => {
+                    Ok(recovered)
+                }
+                Ok(_) | Err(_) => Err(prefix_err),
+            }
+        }
+    }
 }
 
 fn parse_seekable_volume_with_prefix(
@@ -3720,6 +3768,43 @@ fn parse_seekable_volume_from_recovered_terminal(
         block_records_start,
         authority.subkeys,
         authority.terminal,
+    )
+}
+
+fn parse_seekable_volume_with_recipient_wrap_resolver_from_recovered_terminal<F>(
+    bytes: &[u8],
+    resolver: &mut F,
+    options: ReaderOptions,
+) -> Result<ParsedSeekableVolume, FormatError>
+where
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    let authority = locate_v41_recipient_wrap_terminal_authority(bytes, resolver, options)?;
+    finish_parse_seekable_volume(
+        bytes,
+        authority.volume_header,
+        authority.crypto_header,
+        authority.crypto_header_bytes,
+        Some(authority.key_wrap_table_bytes),
+        authority.block_records_start,
+        authority.subkeys,
+        authority.terminal,
+    )
+}
+
+fn recipient_wrap_prefix_error_precludes_recovery(error: &FormatError) -> bool {
+    matches!(
+        error,
+        FormatError::UnsupportedVolumeFormatRevision { .. }
+            | FormatError::ReaderUnsupported(_)
+            | FormatError::InvalidArchive(
+                "VolumeHeader and CryptoHeader stripe_width differ"
+                    | "fec_parity_shards does not match v41 compute_parity"
+                    | "index_fec_parity_shards does not match v41 compute_parity"
+                    | "index_root_fec_parity_shards does not match v41 compute_parity"
+            )
     )
 }
 
@@ -3818,6 +3903,14 @@ where
         return Err(FormatError::KeyMaterialMismatch);
     }
 
+    parsed_crypto.validate_extension_semantics()?;
+    validate_seekable_supported_volume(
+        &volume_header,
+        &parsed_crypto.fixed,
+        &parsed_crypto.extensions,
+    )?;
+    validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
+
     let startup_key_wrap_table = startup_key_wrap_table(
         &volume_header,
         &parsed_crypto.kdf_params,
@@ -3831,6 +3924,35 @@ where
     let key_wrap_table_bytes = Some(startup_key_wrap_table.bytes);
     let block_records_start = startup_key_wrap_table.block_records_start;
 
+    let subkeys = recipient_wrap_subkeys_from_table(
+        &volume_header,
+        &parsed_crypto,
+        &key_wrap_table,
+        resolver,
+    )?;
+
+    let crypto_header = parsed_crypto.fixed.clone();
+    Ok(ParsedOpenPrefix {
+        volume_header,
+        crypto_header,
+        crypto_header_bytes: crypto_bytes.to_vec(),
+        key_wrap_table_bytes,
+        block_records_start,
+        subkeys,
+    })
+}
+
+fn recipient_wrap_subkeys_from_table<F>(
+    volume_header: &VolumeHeader,
+    parsed_crypto: &CryptoHeader<'_>,
+    key_wrap_table: &KeyWrapTableV1,
+    resolver: &mut F,
+) -> Result<Subkeys, FormatError>
+where
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
     let archive_identity = RecipientWrapArchiveIdentity {
         archive_uuid: volume_header.archive_uuid,
         session_id: volume_header.session_id,
@@ -3838,7 +3960,6 @@ where
         volume_format_rev: volume_header.volume_format_rev,
     };
 
-    let mut accepted_subkeys = None;
     for record in &key_wrap_table.recipient_records {
         let candidates = resolver(RecipientWrapRecordContext {
             archive_identity,
@@ -3864,32 +3985,11 @@ where
             )
             .is_ok()
             {
-                accepted_subkeys = Some(subkeys);
-                break;
+                return Ok(subkeys);
             }
         }
-        if accepted_subkeys.is_some() {
-            break;
-        }
     }
-    let subkeys = accepted_subkeys.ok_or(FormatError::KeyMaterialMismatch)?;
-
-    parsed_crypto.validate_extension_semantics()?;
-    validate_seekable_supported_volume(
-        &volume_header,
-        &parsed_crypto.fixed,
-        &parsed_crypto.extensions,
-    )?;
-    validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
-    let crypto_header = parsed_crypto.fixed.clone();
-    Ok(ParsedOpenPrefix {
-        volume_header,
-        crypto_header,
-        crypto_header_bytes: crypto_bytes.to_vec(),
-        key_wrap_table_bytes,
-        block_records_start,
-        subkeys,
-    })
+    Err(FormatError::KeyMaterialMismatch)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4212,6 +4312,7 @@ fn finish_parse_seekable_read_at_volume(
 struct ParsedPublicNoKeyVolume {
     volume_header: VolumeHeader,
     crypto_header: CryptoHeaderFixed,
+    kdf_params: KdfParams,
     root_auth_footer: RootAuthFooterV1,
     root_auth_footer_bytes: Vec<u8>,
     blocks: BTreeMap<u64, BlockRecord>,
@@ -4248,6 +4349,7 @@ where
         if volume.volume_header.archive_uuid != first.volume_header.archive_uuid
             || volume.volume_header.session_id != first.volume_header.session_id
             || !public_crypto_headers_agree(&volume.crypto_header, &first.crypto_header)
+            || !public_kdf_profiles_agree(&volume.kdf_params, &first.kdf_params)
         {
             return Err(FormatError::InvalidArchive(
                 "public no-key volume global metadata differs",
@@ -4350,8 +4452,7 @@ fn parse_public_no_key_volume(
     )?;
     validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
 
-    let terminal =
-        locate_v41_public_terminal(bytes, &volume_header, &parsed_crypto.fixed, options)?;
+    let terminal = locate_v41_public_terminal(bytes, &volume_header, &parsed_crypto, options)?;
     let block_records_start = match &parsed_crypto.kdf_params {
         KdfParams::RecipientWrap {
             key_wrap_table_length,
@@ -4373,6 +4474,7 @@ fn parse_public_no_key_volume(
     Ok(ParsedPublicNoKeyVolume {
         volume_header,
         crypto_header: parsed_crypto.fixed,
+        kdf_params: parsed_crypto.kdf_params,
         root_auth_footer: terminal.root_auth_footer,
         root_auth_footer_bytes: terminal.root_auth_footer_bytes,
         blocks: block_region,
@@ -4387,6 +4489,32 @@ fn public_crypto_headers_agree(left: &CryptoHeaderFixed, right: &CryptoHeaderFix
         && left.aead_algo == right.aead_algo
         && left.fec_algo == right.fec_algo
         && left.kdf_algo == right.kdf_algo
+}
+
+fn public_kdf_profiles_agree(left: &KdfParams, right: &KdfParams) -> bool {
+    match (left, right) {
+        (
+            KdfParams::RecipientWrap {
+                key_wrap_table_length: left_length,
+                key_wrap_table_record_count: left_count,
+                key_wrap_table_version: left_version,
+                key_wrap_table_digest: left_digest,
+            },
+            KdfParams::RecipientWrap {
+                key_wrap_table_length: right_length,
+                key_wrap_table_record_count: right_count,
+                key_wrap_table_version: right_version,
+                key_wrap_table_digest: right_digest,
+            },
+        ) => {
+            left_length == right_length
+                && left_count == right_count
+                && left_version == right_version
+                && left_digest == right_digest
+        }
+        (KdfParams::RecipientWrap { .. }, _) | (_, KdfParams::RecipientWrap { .. }) => false,
+        _ => true,
+    }
 }
 
 fn recompute_public_archive_root(
@@ -4731,8 +4859,27 @@ struct RecoveredTerminalAuthority {
 }
 
 #[derive(Debug)]
+struct RecoveredRecipientWrapTerminalAuthority {
+    terminal: V41Terminal,
+    volume_header: VolumeHeader,
+    crypto_header: CryptoHeaderFixed,
+    crypto_header_bytes: Vec<u8>,
+    key_wrap_table_bytes: Vec<u8>,
+    block_records_start: u64,
+    subkeys: Subkeys,
+}
+
+#[derive(Debug)]
 struct TerminalAuthorityCandidate {
     authority: RecoveredTerminalAuthority,
+    anchor: usize,
+    cmra_offset: u64,
+    cmra_length: u64,
+}
+
+#[derive(Debug)]
+struct RecipientWrapTerminalAuthorityCandidate {
+    authority: RecoveredRecipientWrapTerminalAuthority,
     anchor: usize,
     cmra_offset: u64,
     cmra_length: u64,
@@ -4866,6 +5013,69 @@ fn locate_v41_terminal_authority(
     choose_v41_terminal_authority_candidate(candidates).map(|candidate| candidate.authority)
 }
 
+fn locate_v41_recipient_wrap_terminal_authority<F>(
+    bytes: &[u8],
+    resolver: &mut F,
+    options: ReaderOptions,
+) -> Result<RecoveredRecipientWrapTerminalAuthority, FormatError>
+where
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    let mut candidates = Vec::new();
+    if bytes.len() >= CRITICAL_RECOVERY_LOCATOR_LEN {
+        let final_offset = bytes.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
+        collect_v41_recipient_wrap_locator_authority_candidate(
+            bytes,
+            final_offset,
+            0,
+            resolver,
+            &mut candidates,
+        );
+    }
+    if bytes.len() >= LOCATOR_PAIR_LEN {
+        let mirror_offset = bytes.len() - LOCATOR_PAIR_LEN;
+        collect_v41_recipient_wrap_locator_authority_candidate(
+            bytes,
+            mirror_offset,
+            1,
+            resolver,
+            &mut candidates,
+        );
+    }
+
+    if candidates.is_empty() {
+        let scan = max_critical_recovery_scan(options)?;
+        let scan_start = bytes.len().saturating_sub(scan);
+        let mut offset = bytes.len().saturating_sub(4);
+        while offset >= scan_start {
+            if bytes.get(offset..offset + 4) == Some(b"TZCL") {
+                collect_v41_recipient_wrap_locator_authority_candidate(
+                    bytes,
+                    offset,
+                    2,
+                    resolver,
+                    &mut candidates,
+                );
+            } else if bytes.get(offset..offset + 4) == Some(b"TZCR") {
+                if let Ok(candidate) = parse_locatorless_cmra_recipient_wrap_authority_candidate(
+                    bytes, offset, resolver,
+                ) {
+                    candidates.push(candidate);
+                }
+            }
+            if offset == 0 {
+                break;
+            }
+            offset -= 1;
+        }
+    }
+
+    choose_v41_recipient_wrap_terminal_authority_candidate(candidates)
+        .map(|candidate| candidate.authority)
+}
+
 fn locate_v41_terminal_authority_read_at(
     reader: &dyn ArchiveReadAt,
     len: u64,
@@ -4969,7 +5179,7 @@ fn locate_v41_terminal_candidate(
 fn locate_v41_public_terminal(
     bytes: &[u8],
     volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    crypto_header: &CryptoHeader<'_>,
     options: ReaderOptions,
 ) -> Result<V41PublicTerminal, FormatError> {
     let mut candidates = Vec::new();
@@ -5100,6 +5310,33 @@ fn collect_v41_locator_authority_candidate(
     }
 }
 
+fn collect_v41_recipient_wrap_locator_authority_candidate<F>(
+    bytes: &[u8],
+    offset: usize,
+    expected_sequence: u32,
+    resolver: &mut F,
+    candidates: &mut Vec<RecipientWrapTerminalAuthorityCandidate>,
+) where
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    let Some(raw) = bytes.get(offset..offset + CRITICAL_RECOVERY_LOCATOR_LEN) else {
+        return;
+    };
+    let Ok(locator) = CriticalRecoveryLocator::parse(raw) else {
+        return;
+    };
+    if expected_sequence <= 1 && locator.locator_sequence != expected_sequence {
+        return;
+    }
+    if let Ok(candidate) =
+        parse_locator_cmra_recipient_wrap_authority_candidate(bytes, offset, locator, resolver)
+    {
+        candidates.push(candidate);
+    }
+}
+
 fn collect_v41_locator_authority_candidate_read_at(
     reader: &dyn ArchiveReadAt,
     offset: u64,
@@ -5133,7 +5370,7 @@ fn collect_v41_public_locator_candidate(
     offset: usize,
     expected_sequence: u32,
     volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    crypto_header: &CryptoHeader<'_>,
     candidates: &mut Vec<PublicTerminalCandidate>,
 ) {
     let Some(raw) = bytes.get(offset..offset + CRITICAL_RECOVERY_LOCATOR_LEN) else {
@@ -5173,6 +5410,24 @@ fn choose_v41_terminal_candidate(
 fn choose_v41_terminal_authority_candidate(
     mut candidates: Vec<TerminalAuthorityCandidate>,
 ) -> Result<TerminalAuthorityCandidate, FormatError> {
+    candidates.sort_by_key(|candidate| candidate.anchor);
+    let winner = candidates.pop().ok_or(FormatError::InvalidArchive(
+        "no valid v41 CMRA candidate found",
+    ))?;
+    if let Some(previous) = candidates.last() {
+        if previous.anchor == winner.anchor
+            && (previous.cmra_offset != winner.cmra_offset
+                || previous.cmra_length != winner.cmra_length)
+        {
+            return Err(FormatError::InvalidArchive("ambiguous v41 CMRA candidates"));
+        }
+    }
+    Ok(winner)
+}
+
+fn choose_v41_recipient_wrap_terminal_authority_candidate(
+    mut candidates: Vec<RecipientWrapTerminalAuthorityCandidate>,
+) -> Result<RecipientWrapTerminalAuthorityCandidate, FormatError> {
     candidates.sort_by_key(|candidate| candidate.anchor);
     let winner = candidates.pop().ok_or(FormatError::InvalidArchive(
         "no valid v41 CMRA candidate found",
@@ -5353,6 +5608,59 @@ fn parse_locator_cmra_authority_candidate(
     })
 }
 
+fn parse_locator_cmra_recipient_wrap_authority_candidate<F>(
+    bytes: &[u8],
+    locator_offset: usize,
+    locator: CriticalRecoveryLocator,
+    resolver: &mut F,
+) -> Result<RecipientWrapTerminalAuthorityCandidate, FormatError>
+where
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    let tuple = CmraDecoderTuple::from(locator);
+    validate_cmra_decoder_tuple(tuple)?;
+    let expected_cmra_length = cmra_serialized_length(tuple)?;
+    if locator.cmra_length as u64 != expected_cmra_length {
+        return Err(FormatError::InvalidArchive("locator CMRA length mismatch"));
+    }
+    validate_locator_position(locator_offset, locator)?;
+    let recovered = recover_cmra(
+        bytes,
+        locator.cmra_offset,
+        Some(tuple),
+        CmraRecoveryMode::KeyHolding,
+    )?;
+    if recovered.tuple != tuple {
+        return Err(FormatError::InvalidArchive("CMRA decoder tuple mismatch"));
+    }
+    if expected_cmra_length != recovered.cmra_length {
+        return Err(FormatError::InvalidArchive("locator CMRA length mismatch"));
+    }
+    validate_locator_image_boundary(locator, &recovered.image)?;
+    validate_cmra_identity_hints(
+        recovered.header_hints,
+        Some(CmraIdentityHints::from(locator)),
+        &recovered.image,
+    )?;
+    let cmra_length = recovered.cmra_length;
+    let authority = validate_recovered_recipient_wrap_terminal_authority(
+        recovered.image,
+        recovered.tuple,
+        resolver,
+        false,
+    )?;
+    Ok(RecipientWrapTerminalAuthorityCandidate {
+        authority,
+        anchor: locator_offset
+            .checked_add(CRITICAL_RECOVERY_LOCATOR_LEN)
+            .ok_or(FormatError::InvalidArchive("locator anchor overflow"))?,
+        cmra_offset: locator.cmra_offset,
+        cmra_length,
+    })
+}
+
 fn parse_locator_cmra_authority_candidate_read_at(
     reader: &dyn ArchiveReadAt,
     locator_offset: u64,
@@ -5410,7 +5718,7 @@ fn parse_public_locator_cmra_candidate(
     locator_offset: usize,
     locator: CriticalRecoveryLocator,
     volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    crypto_header: &CryptoHeader<'_>,
 ) -> Result<PublicTerminalCandidate, FormatError> {
     let tuple = CmraDecoderTuple::from(locator);
     validate_cmra_decoder_tuple(tuple)?;
@@ -5578,6 +5886,56 @@ fn parse_locatorless_cmra_authority_candidate(
     })
 }
 
+fn parse_locatorless_cmra_recipient_wrap_authority_candidate<F>(
+    bytes: &[u8],
+    cmra_offset: usize,
+    resolver: &mut F,
+) -> Result<RecipientWrapTerminalAuthorityCandidate, FormatError>
+where
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    let recovered = recover_cmra(
+        bytes,
+        cmra_offset as u64,
+        None,
+        CmraRecoveryMode::KeyHolding,
+    )?;
+    if recovered.image.body_bytes_before_cmra != cmra_offset as u64 {
+        return Err(FormatError::InvalidArchive(
+            "locatorless CMRA boundary mismatch",
+        ));
+    }
+    if recovered
+        .image
+        .volume_trailer_offset
+        .checked_add(VOLUME_TRAILER_LEN as u64)
+        .ok_or(FormatError::InvalidArchive("CMRA boundary overflow"))?
+        != cmra_offset as u64
+    {
+        return Err(FormatError::InvalidArchive(
+            "locatorless trailer boundary mismatch",
+        ));
+    }
+    validate_cmra_identity_hints(recovered.header_hints, None, &recovered.image)?;
+    let cmra_length = recovered.cmra_length;
+    let authority = validate_recovered_recipient_wrap_terminal_authority(
+        recovered.image,
+        recovered.tuple,
+        resolver,
+        true,
+    )?;
+    Ok(RecipientWrapTerminalAuthorityCandidate {
+        authority,
+        anchor: cmra_offset
+            .checked_add(to_usize(cmra_length, "CMRA")?)
+            .ok_or(FormatError::InvalidArchive("CMRA anchor overflow"))?,
+        cmra_offset: cmra_offset as u64,
+        cmra_length,
+    })
+}
+
 fn parse_locatorless_cmra_authority_candidate_read_at(
     reader: &dyn ArchiveReadAt,
     cmra_offset: u64,
@@ -5619,7 +5977,7 @@ fn parse_public_locatorless_cmra_candidate(
     bytes: &[u8],
     cmra_offset: usize,
     volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    crypto_header: &CryptoHeader<'_>,
 ) -> Result<PublicTerminalCandidate, FormatError> {
     let recovered = recover_cmra(
         bytes,
@@ -6399,6 +6757,84 @@ fn validate_recovered_terminal_authority(
     })
 }
 
+fn validate_recovered_recipient_wrap_terminal_authority<F>(
+    image: CriticalMetadataImage,
+    tuple: CmraDecoderTuple,
+    resolver: &mut F,
+    require_cmra_boundary_magic: bool,
+) -> Result<RecoveredRecipientWrapTerminalAuthority, FormatError>
+where
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    let volume_header_region = image
+        .region(1)
+        .ok_or(FormatError::InvalidArchive("missing VolumeHeader region"))?;
+    let volume_header = VolumeHeader::parse(&volume_header_region.bytes)?;
+    let crypto_region = image
+        .region(2)
+        .ok_or(FormatError::InvalidArchive("missing CryptoHeader region"))?;
+    let crypto_header_bytes = crypto_region.bytes.clone();
+    let parsed_crypto = CryptoHeader::parse(&crypto_header_bytes, image.crypto_header_length)?;
+    if !matches!(parsed_crypto.kdf_params, KdfParams::RecipientWrap { .. })
+        || !parsed_crypto.fixed.aead_algo.is_encrypted()
+    {
+        return Err(FormatError::KeyMaterialMismatch);
+    }
+    parsed_crypto.validate_extension_semantics()?;
+    validate_seekable_supported_volume(
+        &volume_header,
+        &parsed_crypto.fixed,
+        &parsed_crypto.extensions,
+    )?;
+    validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
+    if parsed_crypto.fixed.bit_rot_buffer_pct == 0 {
+        return Err(FormatError::InvalidArchive(
+            "CMRA startup recovery requires a nonzero bit-rot budget",
+        ));
+    }
+    validate_cmra_writer_parity_lower_bound(tuple, parsed_crypto.fixed.bit_rot_buffer_pct)?;
+    validate_image_key_wrap_table(&image, &volume_header, &parsed_crypto.kdf_params)?;
+    let key_wrap_region = image.region(6).ok_or(FormatError::InvalidArchive(
+        "missing CriticalMetadataImage key-wrap region",
+    ))?;
+    let startup_key_wrap_table = parse_startup_key_wrap_table_bytes(
+        &volume_header,
+        &parsed_crypto.kdf_params,
+        key_wrap_region.bytes.clone(),
+    )?;
+    let subkeys = recipient_wrap_subkeys_from_table(
+        &volume_header,
+        &parsed_crypto,
+        &startup_key_wrap_table.table,
+        resolver,
+    )?;
+    let crypto_header = parsed_crypto.fixed.clone();
+
+    let terminal = validate_recovered_terminal_inner(
+        image,
+        tuple,
+        require_cmra_boundary_magic,
+        true,
+        KeyHoldingTerminalContext {
+            subkeys: &subkeys,
+            volume_header: &volume_header,
+            crypto_header: &crypto_header,
+            crypto_header_bytes: &crypto_header_bytes,
+        },
+    )?;
+    Ok(RecoveredRecipientWrapTerminalAuthority {
+        terminal,
+        volume_header,
+        crypto_header,
+        crypto_header_bytes,
+        key_wrap_table_bytes: startup_key_wrap_table.bytes,
+        block_records_start: startup_key_wrap_table.block_records_start,
+        subkeys,
+    })
+}
+
 fn validate_recovered_terminal(
     image: CriticalMetadataImage,
     tuple: CmraDecoderTuple,
@@ -6566,7 +7002,7 @@ fn validate_recovered_public_terminal(
     image: CriticalMetadataImage,
     bytes: &[u8],
     volume_header: &VolumeHeader,
-    crypto_header: &CryptoHeaderFixed,
+    public_crypto_header: &CryptoHeader<'_>,
     require_cmra_boundary_magic: bool,
 ) -> Result<V41PublicTerminal, FormatError> {
     if image.layout_flags & 0x0000_0001 == 0 {
@@ -6583,12 +7019,17 @@ fn validate_recovered_public_terminal(
             "CMRA VolumeHeader differs from parsed VolumeHeader",
         ));
     }
-    validate_image_identity(&image, volume_header, crypto_header)?;
+    validate_image_identity(&image, volume_header, &public_crypto_header.fixed)?;
     let crypto_region = image
         .region(2)
         .ok_or(FormatError::InvalidArchive("missing CryptoHeader region"))?;
     let recovered_crypto = CryptoHeader::parse(&crypto_region.bytes, image.crypto_header_length)?;
-    if recovered_crypto.fixed != *crypto_header {
+    if !public_crypto_headers_agree(&recovered_crypto.fixed, &public_crypto_header.fixed)
+        || !public_kdf_profiles_agree(
+            &recovered_crypto.kdf_params,
+            &public_crypto_header.kdf_params,
+        )
+    {
         return Err(FormatError::InvalidArchive(
             "CMRA CryptoHeader differs from parsed CryptoHeader",
         ));
@@ -9004,8 +9445,9 @@ mod tests {
     use crate::crypto::{compute_hmac, encrypt_padded_aead_object};
     use crate::fec::encode_parity_gf16;
     use crate::format::{
-        AeadAlgo, CompressionAlgo, FecAlgo, KdfAlgo, CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION,
-        READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44,
+        AeadAlgo, CompressionAlgo, FecAlgo, KdfAlgo, CRYPTO_EXTENSION_HEADER_LEN,
+        CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION, READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+        VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44,
     };
     use crate::metadata::{
         DirectoryHintEntry, DirectoryHintTableHeader, IndexRootHeader, IndexShardHeader,
@@ -9015,6 +9457,9 @@ mod tests {
         extract_non_seekable_stream_to_dir, list_non_seekable_stream, verify_non_seekable_stream,
         verify_non_seekable_stream_with_bootstrap_sidecar, verify_non_seekable_stream_with_options,
         NonSeekableReaderOptions, SequentialRootAuthStatus,
+    };
+    use crate::raw_stream_profile::{
+        serialize_raw_stream_content_model_extension, RAW_STREAM_UNSUPPORTED_MESSAGE,
     };
     use crate::wire::RecipientRecordV1;
     use crate::writer::{
@@ -9040,6 +9485,83 @@ mod tests {
             recipient_identity_bytes: b"recipient-a".to_vec(),
             profile_payload_bytes: b"profile-payload".to_vec(),
         }
+    }
+
+    fn recipient_wrap_layout(volume: &[u8]) -> (usize, usize, usize, usize, u32) {
+        let header = VolumeHeader::parse(&volume[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_start = header.crypto_header_offset as usize;
+        let crypto_len = header.crypto_header_length as usize;
+        let crypto_end = crypto_start + crypto_len;
+        let crypto = CryptoHeader::parse(
+            &volume[crypto_start..crypto_end],
+            header.crypto_header_length,
+        )
+        .unwrap();
+        let KdfParams::RecipientWrap {
+            key_wrap_table_length,
+            ..
+        } = crypto.kdf_params
+        else {
+            panic!("expected RecipientWrap KdfParams");
+        };
+        (
+            crypto_start,
+            crypto_len,
+            crypto_end,
+            key_wrap_table_length as usize,
+            key_wrap_table_length,
+        )
+    }
+
+    fn rewrite_recipient_wrap_kdf_digest(crypto_bytes: &mut [u8], digest: [u8; 32]) {
+        let digest_start = CRYPTO_HEADER_FIXED_LEN + 14;
+        crypto_bytes[digest_start..digest_start + 32].copy_from_slice(&digest);
+    }
+
+    fn mutate_top_level_recipient_wrap_public_profile(volume: &mut [u8]) {
+        let (crypto_start, crypto_len, table_start, table_len, table_len_u32) =
+            recipient_wrap_layout(volume);
+        let table_end = table_start + table_len;
+        volume[table_end - 1] ^= 0x5a;
+        let digest = compute_key_wrap_table_digest(table_len_u32, &volume[table_start..table_end]);
+        rewrite_recipient_wrap_kdf_digest(
+            &mut volume[crypto_start..crypto_start + crypto_len],
+            digest,
+        );
+    }
+
+    fn mutate_cmra_recipient_wrap_public_profile(volume: &mut [u8]) {
+        rewrite_public_cmra_image(volume, |image| {
+            let table_region = image
+                .regions
+                .iter_mut()
+                .find(|region| region.region_type == 6)
+                .unwrap();
+            *table_region.bytes.last_mut().unwrap() ^= 0x5a;
+            let digest =
+                compute_key_wrap_table_digest(table_region.bytes.len() as u32, &table_region.bytes);
+            let crypto_region = image
+                .regions
+                .iter_mut()
+                .find(|region| region.region_type == 2)
+                .unwrap();
+            rewrite_recipient_wrap_kdf_digest(&mut crypto_region.bytes, digest);
+        });
+    }
+
+    fn add_raw_stream_profile_to_physical_crypto_header(volume: &mut Vec<u8>) {
+        let mut header = VolumeHeader::parse(&volume[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_start = header.crypto_header_offset as usize;
+        let crypto_len = header.crypto_header_length as usize;
+        let hmac_start = crypto_start + crypto_len - CRYPTO_HEADER_HMAC_LEN;
+        let terminator_start = hmac_start - CRYPTO_EXTENSION_HEADER_LEN;
+        let extension = serialize_raw_stream_content_model_extension();
+        let new_crypto_len = header.crypto_header_length + extension.len() as u32;
+
+        volume.splice(terminator_start..terminator_start, extension);
+        header.crypto_header_length = new_crypto_len;
+        volume[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
+        volume[crypto_start + 4..crypto_start + 8].copy_from_slice(&new_crypto_len.to_le_bytes());
     }
 
     #[test]
@@ -10400,10 +10922,65 @@ mod tests {
     }
 
     #[test]
-    fn recipientwrap_key_wrap_table_digest_mismatch_rejects_before_resolver_callback() {
+    fn recipientwrap_stripe_width_mismatch_rejects_before_resolver_callback() {
         let archive = write_archive_with_recipient_wrap_records(
             &[RegularFile::new("wrapped.txt", b"recipient payload")],
             &master_key(),
+            single_stream_options(),
+            vec![recipient_wrap_test_record()],
+        )
+        .unwrap();
+        let mut bytes = archive.bytes;
+        let mut header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
+        header.stripe_width += 1;
+        bytes[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
+
+        let mut called = false;
+        let err = open_archive_with_recipient_wrap_resolver(&bytes, |_| {
+            called = true;
+            Ok(vec![master_key().0])
+        })
+        .unwrap_err();
+
+        assert!(!called);
+        assert_eq!(
+            err,
+            FormatError::InvalidArchive("VolumeHeader and CryptoHeader stripe_width differ")
+        );
+    }
+
+    #[test]
+    fn recipientwrap_raw_stream_profile_rejects_before_resolver_callback() {
+        let archive = write_archive_with_recipient_wrap_records(
+            &[RegularFile::new("wrapped.txt", b"recipient payload")],
+            &master_key(),
+            single_stream_options(),
+            vec![recipient_wrap_test_record()],
+        )
+        .unwrap();
+        let mut bytes = archive.bytes;
+        add_raw_stream_profile_to_physical_crypto_header(&mut bytes);
+
+        let mut called = false;
+        let err = open_archive_with_recipient_wrap_resolver(&bytes, |_| {
+            called = true;
+            Ok(vec![master_key().0])
+        })
+        .unwrap_err();
+
+        assert!(!called);
+        assert_eq!(
+            err,
+            FormatError::ReaderUnsupported(RAW_STREAM_UNSUPPORTED_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn recipientwrap_recovers_physical_key_wrap_table_from_cmra_authority() {
+        let master = master_key();
+        let archive = write_archive_with_recipient_wrap_records(
+            &[RegularFile::new("wrapped.txt", b"recipient payload")],
+            &master,
             single_stream_options(),
             vec![recipient_wrap_test_record()],
         )
@@ -10429,19 +11006,23 @@ mod tests {
         bytes[table_end - 1] ^= 0x01;
 
         let mut called = false;
-        let err = open_archive_with_recipient_wrap_resolver(&bytes, |_| {
+        let opened = open_archive_with_recipient_wrap_resolver(&bytes, |context| {
             called = true;
-            Ok(vec![master_key().0])
+            assert_eq!(
+                context.archive_identity.volume_format_rev,
+                VOLUME_FORMAT_REV_44
+            );
+            assert_eq!(context.record.profile_id, 1);
+            Ok(vec![master.0])
         })
-        .unwrap_err();
+        .unwrap();
 
-        assert!(!called);
+        assert!(called);
         assert_eq!(
-            err,
-            FormatError::IntegrityDigestMismatch {
-                structure: "KeyWrapTableV1",
-            }
+            opened.extract_file("wrapped.txt").unwrap(),
+            Some(b"recipient payload".to_vec())
         );
+        opened.verify().unwrap();
     }
 
     #[test]
@@ -10465,7 +11046,7 @@ mod tests {
     }
 
     #[test]
-    fn recipientwrap_open_rejects_tampered_crypto_header_hmac() {
+    fn recipientwrap_open_recovers_tampered_physical_crypto_header_hmac_from_cmra() {
         let master = master_key();
         let archive = write_archive_with_recipient_wrap_records(
             &[RegularFile::new("wrapped.txt", b"recipient payload")],
@@ -10474,15 +11055,23 @@ mod tests {
             vec![recipient_wrap_test_record()],
         )
         .unwrap();
-        let mut bytes = archive.bytes;
+        let mut bytes = archive.bytes.clone();
         let header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
         let hmac_end = header.crypto_header_offset as usize + header.crypto_header_length as usize;
         bytes[hmac_end - 1] ^= 0x55;
 
+        let opened =
+            open_archive_with_recipient_wrap_resolver(&bytes, |_| Ok(vec![master.0])).unwrap();
+
         assert_eq!(
-            open_archive_with_recipient_wrap_resolver(&bytes, |_| Ok(vec![master.0])).unwrap_err(),
-            FormatError::KeyMaterialMismatch
+            opened.extract_file("wrapped.txt").unwrap(),
+            Some(b"recipient payload".to_vec())
         );
+        assert_eq!(
+            opened.crypto_header_bytes,
+            archive.bytes[header.crypto_header_offset as usize..hmac_end]
+        );
+        opened.verify().unwrap();
     }
 
     #[test]
@@ -10538,6 +11127,62 @@ mod tests {
 
         assert_eq!(verified.volume_format_rev, VOLUME_FORMAT_REV_44);
         assert_eq!(verified.total_data_block_count, 3);
+    }
+
+    #[test]
+    fn public_no_key_rejects_recipientwrap_startup_and_cmra_kdf_mismatch() {
+        let archive = write_archive_with_root_auth_and_recipient_wrap_records(
+            &[RegularFile::new("wrapped.txt", b"recipient payload")],
+            &master_key(),
+            single_stream_options(),
+            vec![recipient_wrap_test_record()],
+            test_root_auth_config(),
+            |request| Ok(test_root_auth_value(request)),
+        )
+        .unwrap();
+        let mut bytes = archive.bytes;
+        mutate_top_level_recipient_wrap_public_profile(&mut bytes);
+
+        let err = public_no_key_verify_archive_with(&bytes, |footer, archive_root| {
+            Ok(test_root_auth_verifies(footer, archive_root))
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            FormatError::InvalidArchive("no valid v41 public CMRA candidate found")
+        );
+    }
+
+    #[test]
+    fn public_no_key_rejects_recipientwrap_kdf_profile_mismatch_across_volumes() {
+        let archive = write_archive_with_root_auth_and_recipient_wrap_records(
+            &[RegularFile::new("wrapped.txt", b"recipient payload")],
+            &master_key(),
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 0,
+                ..WriterOptions::default()
+            },
+            vec![recipient_wrap_test_record()],
+            test_root_auth_config(),
+            |request| Ok(test_root_auth_value(request)),
+        )
+        .unwrap();
+        let mut volumes = archive.volumes;
+        mutate_top_level_recipient_wrap_public_profile(&mut volumes[1]);
+        mutate_cmra_recipient_wrap_public_profile(&mut volumes[1]);
+
+        let volume_refs = volumes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let err = public_no_key_verify_volumes_with(&volume_refs, |footer, archive_root| {
+            Ok(test_root_auth_verifies(footer, archive_root))
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            FormatError::InvalidArchive("public no-key volume global metadata differs")
+        );
     }
 
     #[test]

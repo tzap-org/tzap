@@ -35,6 +35,9 @@ const SHA256_LEN: usize = 32;
 #[derive(Debug)]
 pub enum X509RootAuthError {
     Invalid(&'static str),
+    UnsupportedIdentity,
+    MissingTrustPolicy,
+    UntrustedChain(String),
     Crypto(ErrorStack),
     Chain(String),
 }
@@ -43,6 +46,11 @@ impl fmt::Display for X509RootAuthError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(message) => formatter.write_str(message),
+            Self::UnsupportedIdentity => formatter.write_str("unsupported signer identity type"),
+            Self::MissingTrustPolicy => {
+                formatter.write_str("X.509 verification requires trusted roots")
+            }
+            Self::UntrustedChain(message) => formatter.write_str(message),
             Self::Crypto(err) => write!(formatter, "{err}"),
             Self::Chain(message) => formatter.write_str(message),
         }
@@ -348,19 +356,12 @@ pub fn verify_root_auth_footer(
         return Err(X509RootAuthError::Invalid("unsupported authenticator id"));
     }
     if footer.signer_identity_type != X509_SIGNER_IDENTITY_TYPE_DER_CERT {
-        return Err(X509RootAuthError::Invalid(
-            "unsupported signer identity type",
-        ));
-    }
-    if trusted_roots_der.is_empty() && !use_system_roots {
-        return Err(X509RootAuthError::Invalid(
-            "X.509 verification requires trusted roots",
-        ));
+        return Err(X509RootAuthError::UnsupportedIdentity);
     }
 
-    let leaf_certificate = X509::from_der(&footer.signer_identity_bytes)?;
+    let leaf_certificate = X509::from_der(&footer.signer_identity_bytes)
+        .map_err(|_| X509RootAuthError::Invalid("invalid X.509 signer identity"))?;
     let parsed = parse_authenticator_value(&footer.authenticator_value)?;
-    validate_leaf_key_usage(&footer.signer_identity_bytes)?;
     let root_auth_spec_id =
         root_auth_spec_id_for_revision(footer.format_version, footer.volume_format_rev).map_err(
             |_| X509RootAuthError::Invalid("unsupported RootAuthFooter root_auth_spec_id"),
@@ -382,6 +383,10 @@ pub fn verify_root_auth_footer(
         return Err(X509RootAuthError::Invalid(
             "X.509 RootAuth signature failed",
         ));
+    }
+    validate_leaf_key_usage(&footer.signer_identity_bytes)?;
+    if trusted_roots_der.is_empty() && !use_system_roots {
+        return Err(X509RootAuthError::MissingTrustPolicy);
     }
 
     let chain_validation_time_unix_seconds = current_unix_seconds()?;
@@ -571,20 +576,17 @@ where
 }
 
 fn validate_leaf_key_usage(leaf_certificate_der: &[u8]) -> Result<(), X509RootAuthError> {
-    let (remaining, parsed_certificate) = x509_parser::certificate::X509Certificate::from_der(
-        leaf_certificate_der,
-    )
-    .map_err(|err| {
-        X509RootAuthError::Chain(format!("failed to parse leaf certificate KeyUsage: {err}"))
-    })?;
+    let (remaining, parsed_certificate) =
+        x509_parser::certificate::X509Certificate::from_der(leaf_certificate_der)
+            .map_err(|_| X509RootAuthError::Invalid("failed to parse leaf certificate KeyUsage"))?;
     if !remaining.is_empty() {
         return Err(X509RootAuthError::Invalid(
             "leaf certificate DER has trailing bytes",
         ));
     }
-    let Some(key_usage) = parsed_certificate.key_usage().map_err(|err| {
-        X509RootAuthError::Chain(format!("failed to parse leaf certificate KeyUsage: {err}"))
-    })?
+    let Some(key_usage) = parsed_certificate
+        .key_usage()
+        .map_err(|_| X509RootAuthError::Invalid("failed to parse leaf certificate KeyUsage"))?
     else {
         return Ok(());
     };
@@ -650,8 +652,12 @@ fn validate_ecdsa_der_low_s<T>(
 where
     T: HasParams,
 {
-    let sig = EcdsaSig::from_der(signature)?;
-    if sig.to_der()? != signature {
+    let sig = EcdsaSig::from_der(signature)
+        .map_err(|_| X509RootAuthError::Invalid("X.509 ECDSA signature is not valid DER"))?;
+    let canonical = sig
+        .to_der()
+        .map_err(|_| X509RootAuthError::Invalid("X.509 ECDSA signature is not canonical DER"))?;
+    if canonical != signature {
         return Err(X509RootAuthError::Invalid(
             "X.509 ECDSA signature is not canonical DER",
         ));
@@ -748,6 +754,11 @@ fn parse_authenticator_value(value: &[u8]) -> Result<ParsedAuthenticator, X509Ro
     let signature_len = read_u32(value, 48)? as usize;
     let signature_capacity = read_u32(value, 52)? as usize;
     let chain_count = read_u32(value, 56)? as usize;
+    if signature_len == 0 {
+        return Err(X509RootAuthError::Invalid(
+            "X.509 signature length must be nonzero",
+        ));
+    }
     if signature_len > signature_capacity {
         return Err(X509RootAuthError::Invalid(
             "X.509 signature length exceeds capacity",
@@ -792,7 +803,15 @@ fn parse_authenticator_value(value: &[u8]) -> Result<ParsedAuthenticator, X509Ro
                 "X.509 authenticator certificate chain is truncated",
             ));
         }
-        chain_certificate_der.push(value[offset..cert_end].to_vec());
+        let cert_der = value[offset..cert_end].to_vec();
+        let (remaining, _) = x509_parser::certificate::X509Certificate::from_der(&cert_der)
+            .map_err(|_| X509RootAuthError::Invalid("invalid X.509 chain certificate"))?;
+        if !remaining.is_empty() {
+            return Err(X509RootAuthError::Invalid(
+                "X.509 chain certificate DER has trailing bytes",
+            ));
+        }
+        chain_certificate_der.push(cert_der);
         offset = cert_end;
     }
     if offset != value.len() {
@@ -855,9 +874,9 @@ fn verify_certificate_chain(
         Ok(ok)
     })?;
     if !verified {
-        return Err(X509RootAuthError::Chain(verify_error.unwrap_or_else(
-            || "certificate chain verification failed".to_string(),
-        )));
+        return Err(X509RootAuthError::UntrustedChain(
+            verify_error.unwrap_or_else(|| "certificate chain verification failed".to_string()),
+        ));
     }
     if subjects.is_empty() {
         subjects.push(name_to_string(leaf_certificate.subject_name()));
@@ -990,6 +1009,32 @@ mod tests {
         VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44,
     };
 
+    fn signed_footer_for_request(
+        signer: &X509RootAuthSigner,
+        leaf_cert: &X509,
+        request: &RootAuthSigningRequest,
+        volume_format_rev: u16,
+    ) -> RootAuthFooterV1 {
+        RootAuthFooterV1 {
+            archive_uuid: request.archive_uuid,
+            session_id: request.session_id,
+            format_version: FORMAT_VERSION,
+            volume_format_rev,
+            authenticator_id: X509_AUTHENTICATOR_ID,
+            signer_identity_type: X509_SIGNER_IDENTITY_TYPE_DER_CERT,
+            signer_identity_bytes: leaf_cert.to_der().unwrap(),
+            authenticator_value: signer.authenticator_value_for_request(request).unwrap(),
+            total_data_block_count: 0,
+            critical_metadata_digest: [0; 32],
+            index_digest: [0; 32],
+            fec_layout_digest: [0; 32],
+            data_block_merkle_root: [0; 32],
+            signer_identity_digest: [0; 32],
+            archive_root: request.archive_root,
+            footer_crc32c: 0,
+        }
+    }
+
     #[test]
     fn x509_authenticator_round_trips_with_trusted_root() {
         let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
@@ -1049,6 +1094,156 @@ mod tests {
             report.trust_anchor_subject.as_deref(),
             Some("CN=Acme Test Root CA")
         );
+    }
+
+    #[test]
+    fn unsupported_identity_is_distinct_from_invalid() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_leaf_cert(
+            "Acme Release Signing",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+        );
+        let signer =
+            X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), 1).unwrap();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V44,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let mut footer =
+            signed_footer_for_request(&signer, &leaf_cert, &request, VOLUME_FORMAT_REV_44);
+        footer.signer_identity_type = 0xFFFF;
+
+        let err = verify_root_auth_footer(
+            &footer,
+            &request.archive_root,
+            &[root_cert.to_der().unwrap()],
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, X509RootAuthError::UnsupportedIdentity));
+    }
+
+    #[test]
+    fn missing_trust_policy_is_distinct_after_footer_validation() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_leaf_cert(
+            "Acme Release Signing",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+        );
+        let signer =
+            X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), 1).unwrap();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V44,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let footer = signed_footer_for_request(&signer, &leaf_cert, &request, VOLUME_FORMAT_REV_44);
+
+        let err = verify_root_auth_footer(&footer, &request.archive_root, &[], false).unwrap_err();
+
+        assert!(matches!(err, X509RootAuthError::MissingTrustPolicy));
+    }
+
+    #[test]
+    fn zero_signature_length_is_invalid_before_missing_trust_policy() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_leaf_cert(
+            "Acme Release Signing",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+        );
+        let signer =
+            X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), 1).unwrap();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V44,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let mut footer =
+            signed_footer_for_request(&signer, &leaf_cert, &request, VOLUME_FORMAT_REV_44);
+        let signature_capacity =
+            u32::from_le_bytes(footer.authenticator_value[52..56].try_into().unwrap()) as usize;
+        footer.authenticator_value[48..52].copy_from_slice(&0u32.to_le_bytes());
+        footer.authenticator_value
+            [AUTHENTICATOR_FIXED_LEN..AUTHENTICATOR_FIXED_LEN + signature_capacity]
+            .fill(0);
+
+        let err = verify_root_auth_footer(&footer, &request.archive_root, &[], false).unwrap_err();
+
+        assert!(matches!(err, X509RootAuthError::Invalid(_)));
+        assert!(err.to_string().contains("signature length"));
+    }
+
+    #[test]
+    fn malformed_chain_certificate_is_invalid_before_missing_trust_policy() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_leaf_cert(
+            "Acme Release Signing",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+        );
+        let signer = X509RootAuthSigner::new(
+            leaf_cert.to_der().unwrap(),
+            leaf_key,
+            vec![root_cert.to_der().unwrap()],
+            1,
+        )
+        .unwrap();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V44,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let mut footer =
+            signed_footer_for_request(&signer, &leaf_cert, &request, VOLUME_FORMAT_REV_44);
+        let signature_capacity =
+            u32::from_le_bytes(footer.authenticator_value[52..56].try_into().unwrap()) as usize;
+        let cert_len_offset = AUTHENTICATOR_FIXED_LEN + signature_capacity;
+        let bad_cert = b"not a DER certificate".to_vec();
+        let mut value = footer.authenticator_value[..cert_len_offset].to_vec();
+        value.extend_from_slice(&(bad_cert.len() as u32).to_le_bytes());
+        value.extend_from_slice(&bad_cert);
+        let digest = chain_digest(&[bad_cert]).unwrap();
+        value[16..48].copy_from_slice(&digest);
+        footer.authenticator_value = value;
+
+        let err = verify_root_auth_footer(&footer, &request.archive_root, &[], false).unwrap_err();
+
+        assert!(matches!(err, X509RootAuthError::Invalid(_)));
+        assert!(err.to_string().contains("chain certificate"));
+    }
+
+    #[test]
+    fn invalid_footer_precedes_missing_trust_policy() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_leaf_cert(
+            "Acme Release Signing",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+        );
+        let signer =
+            X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), 1).unwrap();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V44,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let mut footer =
+            signed_footer_for_request(&signer, &leaf_cert, &request, VOLUME_FORMAT_REV_44);
+        footer.authenticator_value[0] ^= 0xFF;
+
+        let err = verify_root_auth_footer(&footer, &request.archive_root, &[], false).unwrap_err();
+
+        assert!(matches!(err, X509RootAuthError::Invalid(_)));
     }
 
     #[test]
@@ -1385,7 +1580,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("certificate"));
+        assert!(matches!(err, X509RootAuthError::UntrustedChain(_)));
     }
 
     #[test]
