@@ -105,6 +105,8 @@ fn default_jobs() -> usize {
 }
 
 fn volume_format_revision_for_options(_options: &WriterOptions, _kdf_params: &KdfParams) -> u16 {
+    // Writer is intentionally canonicalized to v44-only output.
+    // v43 is intentionally a reader-only compatibility path.
     VOLUME_FORMAT_REV_44
 }
 

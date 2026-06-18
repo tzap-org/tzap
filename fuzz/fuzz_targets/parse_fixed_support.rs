@@ -1,16 +1,9 @@
-#![allow(dead_code)]
-
-use tzap_core::compression::{decompress_exact_zstd_frame, validate_exact_zstd_frame};
 use tzap_core::format::{
     BLOCK_RECORD_FRAMING_LEN, CRITICAL_METADATA_IMAGE_FIXED_LEN,
     CRITICAL_METADATA_RECOVERY_HEADER_LEN, CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN,
-    CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_HEADER_FIXED_LEN, IMAGE_CRC_LEN, MANIFEST_FOOTER_LEN,
-    VOLUME_TRAILER_LEN,
+    CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION, IMAGE_CRC_LEN,
+    MANIFEST_FOOTER_LEN, VOLUME_FORMAT_REV, VOLUME_TRAILER_LEN,
 };
-use tzap_core::metadata::{
-    DirectoryHintShardEntry, DirectoryHintTable, IndexRoot, IndexShard, MetadataLimits, ShardEntry,
-};
-use tzap_core::padding::depad_suffix_padding;
 use tzap_core::wire::{
     BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage, CriticalMetadataRecoveryHeader,
     CriticalMetadataRecoveryShard, CriticalRecoveryLocator, CryptoHeader, CryptoHeaderFixed,
@@ -21,7 +14,6 @@ use tzap_plugin_signing::ed25519_raw::{
 };
 
 const FUZZ_BLOCK_SIZES: [usize; 4] = [1, 16, 256, 4096];
-const MAX_FUZZ_DECOMPRESSED_SIZE: usize = 64 * 1024;
 
 pub fn parse_fixed_structures(data: &[u8]) {
     let _ = VolumeHeader::parse(data);
@@ -35,6 +27,8 @@ pub fn parse_fixed_structures(data: &[u8]) {
         let footer = RootAuthFooterV1 {
             archive_uuid: [0; 16],
             session_id: [0; 16],
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV,
             authenticator_id: ED25519_AUTHENTICATOR_ID,
             signer_identity_type: 1,
             signer_identity_bytes: [1; 32].to_vec(),
@@ -97,48 +91,4 @@ pub fn parse_fixed_structures(data: &[u8]) {
             let _ = CriticalMetadataRecoveryShard::parse(&data[..row_len], shard_size);
         }
     }
-}
-
-pub fn parse_metadata(data: &[u8]) {
-    let limits = MetadataLimits::default();
-    let _ = IndexRoot::parse(data, false, limits);
-    let _ = IndexRoot::parse(data, true, limits);
-
-    let locating_shard = ShardEntry {
-        shard_index: 0,
-        first_block_index: 0,
-        data_block_count: 1,
-        parity_block_count: 0,
-        encrypted_size: 4096,
-        decompressed_size: data.len().min(u32::MAX as usize) as u32,
-        file_count: 1,
-        first_path_hash: [0; 8],
-        last_path_hash: [0xff; 8],
-    };
-    let _ = IndexShard::parse(data, &locating_shard, limits);
-
-    let locating_hint = DirectoryHintShardEntry {
-        hint_shard_index: 0,
-        first_dir_hash: [0; 8],
-        last_dir_hash: [0xff; 8],
-        first_block_index: 0,
-        data_block_count: 1,
-        parity_block_count: 0,
-        encrypted_size: 4096,
-        decompressed_size: data.len().min(u32::MAX as usize) as u32,
-        entry_count: 1,
-    };
-    let _ = DirectoryHintTable::parse(data, &locating_hint, 1, limits);
-}
-
-pub fn parse_compressed_and_padding(data: &[u8]) {
-    let _ = validate_exact_zstd_frame(data);
-    if data.len() >= 4 {
-        let expected_size =
-            u32::from_le_bytes(data[..4].try_into().expect("slice length checked")) as usize;
-        let expected_size = expected_size.min(MAX_FUZZ_DECOMPRESSED_SIZE);
-        let _ = validate_exact_zstd_frame(&data[4..]);
-        let _ = decompress_exact_zstd_frame(&data[4..], expected_size);
-    }
-    let _ = depad_suffix_padding(data);
 }

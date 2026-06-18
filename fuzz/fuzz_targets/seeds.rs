@@ -287,6 +287,8 @@ fn valid_root_auth_footer() -> Vec<u8> {
     RootAuthFooterV1 {
         archive_uuid: uuid(),
         session_id: session(),
+        format_version: FORMAT_VERSION,
+        volume_format_rev: VOLUME_FORMAT_REV,
         authenticator_id: 0x0002,
         signer_identity_type: 1,
         signer_identity_bytes: [0x11; 32].to_vec(),
@@ -332,6 +334,7 @@ fn valid_volume_trailer() -> Vec<u8> {
 
 fn valid_critical_metadata_image() -> Vec<u8> {
     CriticalMetadataImage {
+        volume_format_rev: VOLUME_FORMAT_REV,
         archive_uuid: uuid(),
         session_id: session(),
         volume_index: 0,
@@ -341,6 +344,8 @@ fn valid_critical_metadata_image() -> Vec<u8> {
         volume_header_length: VOLUME_HEADER_LEN as u32,
         crypto_header_offset: VOLUME_HEADER_LEN as u64,
         crypto_header_length: valid_crypto_header_with_tlv().len() as u32,
+        key_wrap_table_offset: 0,
+        key_wrap_table_length: 0,
         block_records_offset: 256,
         block_records_length: 4096,
         block_count: 1,
@@ -353,6 +358,7 @@ fn valid_critical_metadata_image() -> Vec<u8> {
         body_bytes_before_cmra: 4616,
         volume_header_sha256: [0x41; 32],
         crypto_header_sha256: [0x42; 32],
+        key_wrap_table_sha256: [0; 32],
         manifest_footer_sha256: [0x43; 32],
         root_auth_footer_sha256: [0; 32],
         volume_trailer_sha256: [0x44; 32],
@@ -396,6 +402,7 @@ fn valid_cmra_data_shard() -> Vec<u8> {
 
 fn valid_critical_recovery_locator() -> Vec<u8> {
     CriticalRecoveryLocator {
+        volume_format_rev: VOLUME_FORMAT_REV,
         cmra_offset: 4616,
         cmra_length: CRITICAL_METADATA_RECOVERY_HEADER_LEN as u32 + 2 * (16 + 16),
         volume_trailer_offset: 4488,

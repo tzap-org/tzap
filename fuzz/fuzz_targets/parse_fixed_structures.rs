@@ -2,8 +2,8 @@
 
 use libfuzzer_sys::fuzz_target;
 
-mod support;
+mod parse_fixed_support;
 
 fuzz_target!(|data: &[u8]| {
-    support::parse_fixed_structures(data);
+    parse_fixed_support::parse_fixed_structures(data);
 });

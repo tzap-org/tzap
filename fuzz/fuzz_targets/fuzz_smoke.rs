@@ -1,16 +1,21 @@
+mod parse_compressed_support;
+mod parse_fixed_support;
+mod parse_metadata_support;
 mod seeds;
-mod support;
 
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const TARGETS: [(&str, fn(&[u8])); 3] = [
-    ("parse_fixed_structures", support::parse_fixed_structures),
-    ("parse_metadata", support::parse_metadata),
+    (
+        "parse_fixed_structures",
+        parse_fixed_support::parse_fixed_structures,
+    ),
+    ("parse_metadata", parse_metadata_support::parse_metadata),
     (
         "parse_compressed_and_padding",
-        support::parse_compressed_and_padding,
+        parse_compressed_support::parse_compressed_and_padding,
     ),
 ];
 

@@ -101,31 +101,31 @@ impl ArchiveReadAt for File {
 }
 
 #[cfg(unix)]
-fn file_read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> Result<(), FormatError> {
+fn file_read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
     use std::os::unix::fs::FileExt;
 
-    while !buf.is_empty() {
-        let read = file
-            .read_at(buf, offset)
-            .map_err(|_| FormatError::InvalidArchive("archive read failed"))?;
-        if read == 0 {
-            return Err(FormatError::InvalidArchive("archive read failed"));
-        }
-        offset = checked_u64_add(offset, read as u64, "archive read offset overflow")?;
-        let rest = std::mem::take(&mut buf).split_at_mut(read).1;
-        buf = rest;
-    }
-    Ok(())
+    file_read_exact_at_with(offset, buf, |chunk, offset| file.read_at(chunk, offset))
 }
 
 #[cfg(windows)]
-fn file_read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> Result<(), FormatError> {
+fn file_read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
     use std::os::windows::fs::FileExt;
 
+    file_read_exact_at_with(offset, buf, |chunk, offset| file.seek_read(chunk, offset))
+}
+
+#[cfg(any(unix, windows))]
+fn file_read_exact_at_with<F>(
+    mut offset: u64,
+    mut buf: &mut [u8],
+    mut read_at: F,
+) -> Result<(), FormatError>
+where
+    F: FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+{
     while !buf.is_empty() {
-        let read = file
-            .seek_read(buf, offset)
-            .map_err(|_| FormatError::InvalidArchive("archive read failed"))?;
+        let read =
+            read_at(buf, offset).map_err(|_| FormatError::InvalidArchive("archive read failed"))?;
         if read == 0 {
             return Err(FormatError::InvalidArchive("archive read failed"));
         }
@@ -3546,6 +3546,8 @@ fn startup_key_wrap_table(
         volume_header.crypto_header_length as u64,
         "CryptoHeader",
     )?;
+    // v43 is still supported by the reader for legacy compatibility.
+    // Key-wrap table recovery is only enabled for v44 archives.
     if volume_header.volume_format_rev == VOLUME_FORMAT_REV_44 {
         let &KdfParams::RecipientWrap {
             key_wrap_table_length,
@@ -10887,6 +10889,70 @@ mod tests {
             Some(b"recipient payload".to_vec())
         );
         opened.verify().unwrap();
+    }
+
+    #[test]
+    fn recipientwrap_open_tries_subsequent_records_after_failed_candidate() {
+        let master = master_key();
+        let mut first_record = recipient_wrap_test_record();
+        first_record.recipient_identity_bytes = b"first-candidate".to_vec();
+        let mut second_record = recipient_wrap_test_record();
+        second_record.recipient_identity_bytes = b"second-candidate".to_vec();
+
+        let archive = write_archive_with_recipient_wrap_records(
+            &[RegularFile::new("wrapped.txt", b"recipient payload")],
+            &master,
+            single_stream_options(),
+            vec![first_record, second_record],
+        )
+        .unwrap();
+
+        let mut attempts = Vec::new();
+        let opened = open_archive_with_recipient_wrap_resolver(&archive.bytes, |context| {
+            attempts.push(context.record.recipient_identity_bytes.clone());
+            if context.record.recipient_identity_bytes.as_slice() == b"second-candidate" {
+                Ok(vec![master.0])
+            } else {
+                Ok(vec![[0x99u8; 32]])
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            attempts,
+            vec![
+                b"first-candidate".to_vec(),
+                b"second-candidate".to_vec(),
+            ]
+        );
+        assert_eq!(
+            opened.extract_file("wrapped.txt").unwrap(),
+            Some(b"recipient payload".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn recipientwrap_startup_rejects_malformed_record_length() {
+        let master = master_key();
+        let archive = write_archive_with_recipient_wrap_records(
+            &[RegularFile::new("wrapped.txt", b"recipient payload")],
+            &master,
+            single_stream_options(),
+            vec![recipient_wrap_test_record()],
+        )
+        .unwrap();
+        let mut bytes = archive.bytes;
+        let (_, _, table_start, _table_len, _) = recipient_wrap_layout(&bytes);
+        bytes[table_start + 96..table_start + 100].copy_from_slice(&1u32.to_le_bytes());
+
+        assert_eq!(
+            open_archive_with_recipient_wrap_resolver(&bytes, |_| {
+                Ok(vec![master.0])
+            })
+            .unwrap_err(),
+            FormatError::InvalidArchive("RecipientRecordV1 record_length is too small")
+        );
     }
 
     #[test]
