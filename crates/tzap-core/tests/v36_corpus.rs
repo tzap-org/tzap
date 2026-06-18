@@ -5,7 +5,8 @@ use tzap_core::crypto::{
 use tzap_core::fec::encode_parity_gf16;
 use tzap_core::format::{
     AeadAlgo, FormatError, CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION,
-    MASTER_KEY_LEN, SUBKEY_LEN, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN,
+    MASTER_KEY_LEN, READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, SUBKEY_LEN, VOLUME_FORMAT_REV,
+    VOLUME_HEADER_LEN,
 };
 use tzap_core::metadata::{
     hash_prefix, normalize_lookup_directory_path, normalize_lookup_file_path,
@@ -87,7 +88,11 @@ fn mutation_fixture_generator_rejects_authentication_and_revision_mutations() {
         mutated[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
         assert_eq!(
             open_archive(&mutated, &master_key()).unwrap_err(),
-            FormatError::UnsupportedVolumeFormatRevision(revision)
+            FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
+                volume_format_rev: revision,
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            }
         );
     }
 
@@ -951,7 +956,11 @@ fn volume_format_revision_freshness_is_pinned_to_current_revision() {
         mutated.volume_format_rev = rev;
         assert_eq!(
             VolumeHeader::parse(&mutated.to_bytes()).unwrap_err(),
-            FormatError::UnsupportedVolumeFormatRevision(rev)
+            FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
+                volume_format_rev: rev,
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            }
         );
     }
 }

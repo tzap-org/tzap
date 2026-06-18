@@ -9,14 +9,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use openssl::pkey::PKey;
+use openssl::x509::X509;
 use rand::RngCore;
 use serde_json::json;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tzap_core::format::{
-    FormatError, CRYPTO_HEADER_FIXED_LEN, READER_MAX_ARGON2ID_M_COST_KIB,
-    READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST, VOLUME_HEADER_LEN,
+    FormatError, CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION, READER_MAX_ARGON2ID_M_COST_KIB,
+    READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST, VOLUME_FORMAT_REV_44,
+    VOLUME_HEADER_LEN,
 };
-use tzap_core::reader::{ArchiveEntry, ArchiveIndexEntry};
+use tzap_core::reader::{ArchiveEntry, ArchiveIndexEntry, RecipientWrapRecordContext};
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
 use tzap_core::{
     extract_non_seekable_stream_to_dir, extract_non_seekable_stream_to_dir_with_bootstrap_sidecar,
@@ -33,7 +36,8 @@ use tzap_core::{
     write_archive_sources_to_sink_ordered_parallel, write_archive_with_dictionary,
     write_archive_with_dictionary_and_kdf, write_archive_with_dictionary_and_root_auth,
     write_archive_with_dictionary_kdf_and_root_auth, write_archive_with_kdf,
-    write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
+    write_archive_with_recipient_wrap_records, write_archive_with_root_auth,
+    write_archive_with_root_auth_and_kdf,
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
     write_tar_stream_archive_to_sink_with_kdf_and_root_auth, AeadAlgo, ArchiveContentVerification,
     ArchiveRepairPatch, ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfAlgo, KdfParams,
@@ -41,6 +45,11 @@ use tzap_core::{
     PublicNoKeyVerification, ReaderOptions, RegularFile, RegularFileSource, RootAuthSigningRequest,
     RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions, StreamingRawWriterSummary,
     StreamingTarWriterSummary, TarEntryKind, WriterOptions, WriterTimings, WrittenArchiveSummary,
+};
+use tzap_plugin_keywrap::{
+    dispatch_key_wrap_record, wrap_master_key_for_recipient,
+    ArchiveIdentity as KeyWrapArchiveIdentity, KeyWrapOutcome, KeyWrapSuite, PrivateKeyLookup,
+    RecipientRecordInput, RecipientRecordMetadata,
 };
 use tzap_plugin_signing::ed25519_raw::{
     self, Ed25519RootAuthOutcome, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID,
@@ -76,9 +85,9 @@ type CliRootAuthAuthenticator<'a> =
 #[derive(Debug, Parser)]
 #[command(name = "tzap")]
 #[command(version)]
-#[command(about = "Create, list, verify, and extract v43 archives")]
+#[command(about = "Create, list, verify, and extract v43/v44 archives")]
 #[command(
-    long_about = "Create, list, verify, and extract v43 archives.\n\nCreate selects one protection mode: `--keyfile` for encrypted raw-key archives, `--password` or `--password-stdin` for encrypted passphrase archives, or `--no-encryption` for explicit plaintext archives. Plaintext archives can be listed, verified, and extracted without a password or keyfile. The `verify --public-no-key` mode verifies signed public RootAuth commitments without the archive key.\n\nSize suffixes accepted by size flags:\n  0-9 (bytes), K/KB/KiB, M/MB/MiB, G/GB/GiB.\n\nMulti-volume output naming for this CLI:\n  - one volume: --output writes exactly that path\n  - multiple volumes: --output backup.tzap writes backup.vol000.tzap, backup.vol001.tzap, ...\n\nExit codes:\n  2  usage / argument error\n  3  I/O failure (missing file, permission denied, etc.)\n  10 wrong key\n  11 archive corruption or integrity mismatch\n  12 unsupported archive revision / format version\n  13 unsafe extraction attempt\n  14 missing required bootstrap metadata\n  16 unsupported feature in this CLI/core version\n  1  generic failure\n\nSubcommands:\n  create   Build a new archive\n  extract  Extract files from an archive\n  list     List archive contents\n  verify   Validate archive integrity\n  keygen   Generate a random raw keyfile\n  signing-keygen Generate an Ed25519 RootAuth signing keypair"
+    long_about = "Create, list, verify, and extract v43/v44 archives.\n\nCreate selects one protection mode: `--keyfile` for encrypted raw-key archives, `--password` or `--password-stdin` for encrypted passphrase archives, `--recipient-cert` for encrypted v44 RecipientWrap archives, or `--no-encryption` for explicit plaintext archives. Plaintext archives can be listed, verified, and extracted without a password or keyfile. RecipientWrap archives are opened with `--recipient-key`. The `verify --public-no-key` mode verifies signed public RootAuth commitments without the archive key.\n\nSize suffixes accepted by size flags:\n  0-9 (bytes), K/KB/KiB, M/MB/MiB, G/GB/GiB.\n\nMulti-volume output naming for this CLI:\n  - one volume: --output writes exactly that path\n  - multiple volumes: --output backup.tzap writes backup.vol000.tzap, backup.vol001.tzap, ...\n\nExit codes:\n  2  usage / argument error\n  3  I/O failure (missing file, permission denied, etc.)\n  10 wrong key\n  11 archive corruption or integrity mismatch\n  12 unsupported archive revision / format version\n  13 unsafe extraction attempt\n  14 missing required bootstrap metadata\n  16 unsupported feature in this CLI/core version\n  1  generic failure\n\nSubcommands:\n  create   Build a new archive\n  extract  Extract files from an archive\n  list     List archive contents\n  verify   Validate archive integrity\n  keygen   Generate a random raw keyfile\n  signing-keygen Generate an Ed25519 RootAuth signing keypair"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -97,11 +106,12 @@ enum Command {
     #[command(
         about = "Create a new archive",
         long_about = "Create a new archive from files and directories.\n\nThe command writes one output path for single-volume archives, or `.vol000.tzap`, `.vol001.tzap`, ... files for multi-volume archives.",
-        after_help = "Examples:\n  tzap create --keyfile key.hex -o backup.tzap file.txt\n  tzap create --password -o backup.tzap file.txt\n  tzap create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8192 -o backup.tzap file.txt\n  tar cf - ./dir | tzap create --tar-stdin --keyfile key.hex -o backup.tzap -\n  tzap create --keyfile key.hex --signing-key root.signing.hex -o backup.tzap file.txt\n  tzap create --keyfile key.hex --signing-cert signer.pem --signing-private-key signer.key -o backup.tzap file.txt\n  tzap create --keyfile key.hex -o backup.tzap --volumes 3 dir/\n  tzap create --keyfile key.hex --volume-size 64M --volume-loss-tolerance 1 -o backup.tzap dir/\n  tzap create --keyfile key.hex --bootstrap-out backup.tzap.bootstrap file.txt",
+        after_help = "Examples:\n  tzap create --keyfile key.hex -o backup.tzap file.txt\n  tzap create --recipient-cert recipient.pem -o backup.tzap file.txt\n  tzap create --password -o backup.tzap file.txt\n  tzap create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8192 -o backup.tzap file.txt\n  tar cf - ./dir | tzap create --tar-stdin --keyfile key.hex -o backup.tzap -\n  tzap create --keyfile key.hex --signing-key root.signing.hex -o backup.tzap file.txt\n  tzap create --keyfile key.hex --signing-cert signer.pem --signing-private-key signer.key -o backup.tzap file.txt\n  tzap create --keyfile key.hex -o backup.tzap --volumes 3 dir/\n  tzap create --keyfile key.hex --volume-size 64M --volume-loss-tolerance 1 -o backup.tzap dir/\n  tzap create --keyfile key.hex --bootstrap-out backup.tzap.bootstrap file.txt",
         group(ArgGroup::new("create-key-source").args([
             "password_stdin",
             "password",
             "keyfile",
+            "recipient_cert",
             "no_encryption",
         ]))
     )]
@@ -168,12 +178,25 @@ enum Command {
             long = "keyfile",
             value_name = "KEYFILE",
             conflicts_with = "no_encryption",
+            conflicts_with = "recipient_cert",
             help = "Use a raw key from KEYFILE."
         )]
         keyfile: Option<String>,
 
         #[arg(
+            long = "recipient-cert",
+            value_name = "FILE",
+            conflicts_with = "keyfile",
+            conflicts_with = "password",
+            conflicts_with = "password_stdin",
+            conflicts_with = "no_encryption",
+            help = "Encrypt a v44 RecipientWrap archive to one X.509 recipient certificate."
+        )]
+        recipient_cert: Option<String>,
+
+        #[arg(
             long = "no-encryption",
+            conflicts_with = "recipient_cert",
             help = "Create an explicit plaintext v43 archive with no password or keyfile."
         )]
         no_encryption: bool,
@@ -353,10 +376,10 @@ enum Command {
     #[command(
         about = "Extract files from an archive",
         long_about = "Extract one or many archive members into a directory, with safe-path protections enabled by default.",
-        after_help = "Examples:\n  tzap extract --keyfile key.hex -C out/ backup.tzap\n  tzap extract --keyfile key.hex backup.tzap file.txt\n  tzap extract --keyfile key.hex --stdout backup.tzap hello.txt > out.bin\n  tzap extract --password-stdin --overwrite backup.tzap target/\n  tzap extract --dry-run -C out backup.tzap file.txt\n  tzap extract --bootstrap backup.tzap.bootstrap -C out backup.tzap",
+        after_help = "Examples:\n  tzap extract --keyfile key.hex -C out/ backup.tzap\n  tzap extract --recipient-key recipient.key -C out/ backup.tzap\n  tzap extract --keyfile key.hex backup.tzap file.txt\n  tzap extract --keyfile key.hex --stdout backup.tzap hello.txt > out.bin\n  tzap extract --password-stdin --overwrite backup.tzap target/\n  tzap extract --dry-run -C out backup.tzap file.txt\n  tzap extract --bootstrap backup.tzap.bootstrap -C out backup.tzap",
         group(
             ArgGroup::new("open-key-source")
-                .args(["password_stdin", "password", "keyfile", "insecure_zero_key"])
+                .args(["password_stdin", "password", "keyfile", "recipient_key", "insecure_zero_key"])
         )
     )]
     Extract {
@@ -420,9 +443,21 @@ enum Command {
             long = "keyfile",
             value_name = "KEYFILE",
             conflicts_with = "insecure_zero_key",
+            conflicts_with = "recipient_key",
             help = "Use a raw key from KEYFILE."
         )]
         keyfile: Option<String>,
+
+        #[arg(
+            long = "recipient-key",
+            value_name = "FILE",
+            conflicts_with = "keyfile",
+            conflicts_with = "password",
+            conflicts_with = "password_stdin",
+            conflicts_with = "insecure_zero_key",
+            help = "Use a local recipient private key to open a v44 RecipientWrap archive."
+        )]
+        recipient_key: Option<String>,
 
         #[arg(
             long = "insecure-zero-key",
@@ -455,10 +490,10 @@ enum Command {
     #[command(
         about = "List archive contents",
         long_about = "List archive members in plain format by default.",
-        after_help = "Examples:\n  tzap list --keyfile key.hex backup.tzap\n  tzap list --keyfile key.hex --long backup.tzap\n  tzap list --keyfile key.hex --json backup.tzap\n  tzap list --password-stdin --bootstrap backup.tzap.bootstrap backup.tzap",
+        after_help = "Examples:\n  tzap list --keyfile key.hex backup.tzap\n  tzap list --recipient-key recipient.key backup.tzap\n  tzap list --keyfile key.hex --long backup.tzap\n  tzap list --keyfile key.hex --json backup.tzap\n  tzap list --password-stdin --bootstrap backup.tzap.bootstrap backup.tzap",
         group(
             ArgGroup::new("open-key-source")
-                .args(["password_stdin", "password", "keyfile", "insecure_zero_key"])
+                .args(["password_stdin", "password", "keyfile", "recipient_key", "insecure_zero_key"])
         )
     )]
     List {
@@ -491,9 +526,21 @@ enum Command {
             long = "keyfile",
             value_name = "KEYFILE",
             conflicts_with = "insecure_zero_key",
+            conflicts_with = "recipient_key",
             help = "Use a raw key from KEYFILE."
         )]
         keyfile: Option<String>,
+
+        #[arg(
+            long = "recipient-key",
+            value_name = "FILE",
+            conflicts_with = "keyfile",
+            conflicts_with = "password",
+            conflicts_with = "password_stdin",
+            conflicts_with = "insecure_zero_key",
+            help = "Use a local recipient private key to open a v44 RecipientWrap archive."
+        )]
+        recipient_key: Option<String>,
 
         #[arg(
             long = "insecure-zero-key",
@@ -539,8 +586,8 @@ enum Command {
     },
     #[command(
         about = "Verify archive integrity",
-        long_about = "Verify archive signatures and checksum integrity. No payload changes are made unless --write-repaired is set; original archive files are never modified.\n\nEncrypted archives need --keyfile, --password, or --password-stdin. Unencrypted v43 archives need no key source. With --public-no-key, verify uses the v43 public RootAuth profile and does not require the archive key.",
-        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --keyfile key.hex --write-repaired backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --public-no-key --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --keyfile key.hex backup.vol000.tzap backup.vol001.tzap\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives named `.volNNN.tzap`, passing any one volume discovers matching siblings in the same directory. Additional positionals are explicit extra volumes."
+        long_about = "Verify archive signatures and checksum integrity. No payload changes are made unless --write-repaired is set; original archive files are never modified.\n\nEncrypted archives need --keyfile, --password, --password-stdin, or --recipient-key for v44 RecipientWrap archives. Unencrypted v43 archives need no key source. With --public-no-key, verify uses the v43 public RootAuth profile and does not require the archive key.",
+        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --recipient-key recipient.key backup.tzap\n  tzap verify --keyfile key.hex --write-repaired backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --public-no-key --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --keyfile key.hex backup.vol000.tzap backup.vol001.tzap\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives named `.volNNN.tzap`, passing any one volume discovers matching siblings in the same directory. Additional positionals are explicit extra volumes."
     )]
     Verify {
         #[arg(
@@ -573,9 +620,21 @@ enum Command {
             long = "keyfile",
             value_name = "KEYFILE",
             conflicts_with = "insecure_zero_key",
+            conflicts_with = "recipient_key",
             help = "Use a raw key from KEYFILE."
         )]
         keyfile: Option<String>,
+
+        #[arg(
+            long = "recipient-key",
+            value_name = "FILE",
+            conflicts_with = "keyfile",
+            conflicts_with = "password",
+            conflicts_with = "password_stdin",
+            conflicts_with = "insecure_zero_key",
+            help = "Use a local recipient private key to verify a v44 RecipientWrap archive."
+        )]
+        recipient_key: Option<String>,
 
         #[arg(
             long = "insecure-zero-key",
@@ -736,6 +795,7 @@ fn run(cli: Cli) -> Result<()> {
             password_stdin,
             password,
             keyfile,
+            recipient_cert,
             no_encryption,
             insecure_zero_key,
             force,
@@ -793,6 +853,7 @@ fn run(cli: Cli) -> Result<()> {
             };
             validate_create_key_source(
                 keyfile.as_deref(),
+                recipient_cert.as_deref(),
                 password_stdin,
                 password,
                 no_encryption,
@@ -819,6 +880,14 @@ fn run(cli: Cli) -> Result<()> {
                 volume_size: volume_size.as_deref(),
                 volume_loss_tolerance,
             })?;
+            validate_create_recipient_wrap_scope(
+                recipient_cert.as_deref(),
+                stdin_mode,
+                dictionary.is_some(),
+                signing_key.is_some() || signing_cert.is_some(),
+                volumes,
+                volume_size.as_deref(),
+            )?;
 
             ensure_create_output_paths_can_be_written(
                 &output,
@@ -848,6 +917,7 @@ fn run(cli: Cli) -> Result<()> {
                         "  key mode: {}",
                         create_key_mode_label(
                             keyfile.as_deref(),
+                            recipient_cert.as_deref(),
                             password_stdin,
                             password,
                             no_encryption,
@@ -1038,6 +1108,7 @@ fn run(cli: Cli) -> Result<()> {
                     "  key mode: {}",
                     create_key_mode_label(
                         keyfile.as_deref(),
+                        recipient_cert.as_deref(),
                         password_stdin,
                         password,
                         no_encryption,
@@ -1058,6 +1129,85 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 if let Some(bootstrap_path) = bootstrap_output {
                     eprintln!("  bootstrap: {}", bootstrap_path);
+                }
+                return Ok(());
+            }
+
+            if let Some(recipient_cert_path) = recipient_cert.as_deref() {
+                let read_inputs_started = Instant::now();
+                let inputs = collect_input_files(&input_specs)?;
+                let read_inputs = read_inputs_started.elapsed();
+                let regular_files = inputs
+                    .iter()
+                    .map(|file| RegularFile {
+                        path: file.archive_path.as_str(),
+                        contents: &file.contents,
+                        mode: file.mode,
+                        mtime: file.mtime,
+                    })
+                    .collect::<Vec<_>>();
+                let mut recipient_options = options;
+                let master_key = generate_random_master_key()?;
+                let recipient_record = build_recipient_wrap_record(
+                    recipient_cert_path,
+                    &master_key,
+                    &mut recipient_options,
+                )?;
+                let core_writer_started = Instant::now();
+                let archive = write_archive_with_recipient_wrap_records(
+                    &regular_files,
+                    &master_key,
+                    recipient_options,
+                    vec![recipient_record],
+                )
+                .context("failed to create recipient-wrap archive")?;
+                let core_writer = core_writer_started.elapsed();
+
+                let output_paths = create_output_paths(&output, archive.volumes.len());
+                if !force {
+                    check_archive_paths_free_for_write(&output_paths)?;
+                }
+                if let Some(bootstrap_path) = &bootstrap_output {
+                    if !force {
+                        check_output_path_free("bootstrap", Path::new(bootstrap_path))?;
+                    }
+                }
+
+                let write_outputs_started = Instant::now();
+                write_archive_outputs(&output, &archive.volumes, force)?;
+                if let Some(path) = bootstrap_out {
+                    if archive.bootstrap_sidecar.is_empty() {
+                        return Err(FormatError::WriterUnsupported(
+                            "bootstrap output is unavailable for this archive shape",
+                        )
+                        .into());
+                    }
+                    write_bootstrap_output(&path, &archive.bootstrap_sidecar, force)?;
+                }
+                let write_outputs = write_outputs_started.elapsed();
+                let summary = format!(
+                    "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
+                    regular_files.len(),
+                    input_bytes,
+                    archive.volumes.iter().map(|volume| volume.len() as u64).sum::<u64>(),
+                    archive.volumes.len(),
+                    resolved_volume_loss_tolerance,
+                    bit_rot_buffer_pct
+                );
+                emit_success_summary(quiet, &summary)?;
+                emit_success_summary(quiet, "  key wrap: recipient certificate")?;
+                if let Some(path) = bootstrap_output {
+                    emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
+                }
+                if timings {
+                    emit_create_timing_report(
+                        scan_inputs,
+                        read_inputs,
+                        core_writer,
+                        write_outputs,
+                        create_total_started.elapsed(),
+                        archive.timings,
+                    )?;
                 }
                 return Ok(());
             }
@@ -1291,6 +1441,7 @@ fn run(cli: Cli) -> Result<()> {
             password_stdin,
             password,
             keyfile,
+            recipient_key,
             insecure_zero_key,
             bootstrap,
             volumes,
@@ -1307,6 +1458,7 @@ fn run(cli: Cli) -> Result<()> {
                     password_stdin,
                     password,
                     keyfile: keyfile.as_deref(),
+                    recipient_key: recipient_key.as_deref(),
                     insecure_zero_key,
                 })?;
                 if dry_run {
@@ -1377,19 +1529,29 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             let selection = resolve_archive_input_paths(&archive, &volumes, bootstrap.is_none())?;
-            let master_key = load_open_key_from_paths(
-                keyfile.as_deref(),
-                password_stdin,
-                password,
-                insecure_zero_key,
-                &selection.paths,
-            )?;
-            let opened = open_selection_maybe_bootstrap(
-                &selection,
-                &master_key,
-                bootstrap.as_deref(),
-                reader_options,
-            )
+            let opened = if let Some(recipient_key) = recipient_key.as_deref() {
+                open_selection_with_recipient_key(
+                    &selection,
+                    recipient_key,
+                    bootstrap.as_deref(),
+                    reader_options,
+                )
+                .map(|opened_selection| opened_selection.opened)
+            } else {
+                let master_key = load_open_key_from_paths(
+                    keyfile.as_deref(),
+                    password_stdin,
+                    password,
+                    insecure_zero_key,
+                    &selection.paths,
+                )?;
+                open_selection_maybe_bootstrap(
+                    &selection,
+                    &master_key,
+                    bootstrap.as_deref(),
+                    reader_options,
+                )
+            }
             .with_context(|| format!("failed to open archive {archive}"))?;
             let (requested_entries, missing_paths) = if stdout || dry_run || !paths.is_empty() {
                 resolve_extract_index_entries(&opened, &paths)?
@@ -1473,6 +1635,7 @@ fn run(cli: Cli) -> Result<()> {
             password_stdin,
             password,
             keyfile,
+            recipient_key,
             insecure_zero_key,
             bootstrap,
             volumes,
@@ -1488,6 +1651,7 @@ fn run(cli: Cli) -> Result<()> {
                     password_stdin,
                     password,
                     keyfile.as_deref(),
+                    recipient_key.as_deref(),
                     insecure_zero_key,
                 )?;
                 let bootstrap_bytes = read_optional_bootstrap_sidecar(bootstrap.as_deref())?;
@@ -1584,19 +1748,29 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             let selection = resolve_archive_input_paths(&archive, &volumes, bootstrap.is_none())?;
-            let master_key = load_open_key_from_paths(
-                keyfile.as_deref(),
-                password_stdin,
-                password,
-                insecure_zero_key,
-                &selection.paths,
-            )?;
-            let opened = open_selection_maybe_bootstrap(
-                &selection,
-                &master_key,
-                bootstrap.as_deref(),
-                reader_options,
-            )
+            let opened = if let Some(recipient_key) = recipient_key.as_deref() {
+                open_selection_with_recipient_key(
+                    &selection,
+                    recipient_key,
+                    bootstrap.as_deref(),
+                    reader_options,
+                )
+                .map(|opened_selection| opened_selection.opened)
+            } else {
+                let master_key = load_open_key_from_paths(
+                    keyfile.as_deref(),
+                    password_stdin,
+                    password,
+                    insecure_zero_key,
+                    &selection.paths,
+                )?;
+                open_selection_maybe_bootstrap(
+                    &selection,
+                    &master_key,
+                    bootstrap.as_deref(),
+                    reader_options,
+                )
+            }
             .with_context(|| format!("failed to open archive {archive}"))?;
             if json || long {
                 let entries = opened.list_files()?;
@@ -1653,6 +1827,7 @@ fn run(cli: Cli) -> Result<()> {
             password_stdin,
             password,
             keyfile,
+            recipient_key,
             insecure_zero_key,
             trusted_public_key,
             trusted_ca_cert,
@@ -1839,6 +2014,7 @@ fn run(cli: Cli) -> Result<()> {
                     password_stdin,
                     password,
                     keyfile: keyfile.as_deref(),
+                    recipient_key: recipient_key.as_deref(),
                     insecure_zero_key,
                     bootstrap: bootstrap.as_deref(),
                     reader_options,
@@ -1848,6 +2024,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             if let Err(err) = validate_verify_key_holding_key_source(
                 keyfile.as_deref(),
+                recipient_key.as_deref(),
                 password_stdin,
                 password,
                 insecure_zero_key,
@@ -1883,28 +2060,38 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 };
             let archive_paths = selection.paths.clone();
-            let master_key = match load_open_key_from_paths(
-                keyfile.as_deref(),
-                password_stdin,
-                password,
-                insecure_zero_key,
-                &selection.paths,
-            ) {
-                Ok(master_key) => master_key,
-                Err(err) => {
-                    if json {
-                        emit_verify_json_error(&archive_paths, None, None, &err)?;
+            let opened_selection_result = if let Some(recipient_key) = recipient_key.as_deref() {
+                open_selection_with_recipient_key(
+                    &selection,
+                    recipient_key,
+                    bootstrap.as_deref(),
+                    reader_options,
+                )
+            } else {
+                let master_key = match load_open_key_from_paths(
+                    keyfile.as_deref(),
+                    password_stdin,
+                    password,
+                    insecure_zero_key,
+                    &selection.paths,
+                ) {
+                    Ok(master_key) => master_key,
+                    Err(err) => {
+                        if json {
+                            emit_verify_json_error(&archive_paths, None, None, &err)?;
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
-                }
+                };
+                open_selection_maybe_bootstrap_resolved(
+                    &selection,
+                    &master_key,
+                    bootstrap.as_deref(),
+                    reader_options,
+                )
             };
-            let opened_selection = match open_selection_maybe_bootstrap_resolved(
-                &selection,
-                &master_key,
-                bootstrap.as_deref(),
-                reader_options,
-            )
-            .with_context(|| format!("failed to open archive {first}"))
+            let opened_selection = match opened_selection_result
+                .with_context(|| format!("failed to open archive {first}"))
             {
                 Ok(opened) => opened,
                 Err(err) => {
@@ -3395,6 +3582,7 @@ fn describe_planned_volume_mode(volumes: Option<u32>, volume_size: Option<&str>)
 
 fn create_key_mode_label(
     keyfile: Option<&str>,
+    recipient_cert: Option<&str>,
     password_stdin: bool,
     password: bool,
     no_encryption: bool,
@@ -3408,6 +3596,9 @@ fn create_key_mode_label(
     }
     if keyfile.is_some() {
         return "keyfile".to_string();
+    }
+    if recipient_cert.is_some() {
+        return "recipient-cert".to_string();
     }
     if no_encryption {
         return "no-encryption".to_string();
@@ -3424,6 +3615,7 @@ fn removed_insecure_zero_key_error() -> UsageError {
 
 fn validate_create_key_source(
     keyfile: Option<&str>,
+    recipient_cert: Option<&str>,
     password_stdin: bool,
     password: bool,
     no_encryption: bool,
@@ -3433,20 +3625,55 @@ fn validate_create_key_source(
         return Err(removed_insecure_zero_key_error().into());
     }
     let count = usize::from(keyfile.is_some())
+        + usize::from(recipient_cert.is_some())
         + usize::from(password_stdin)
         + usize::from(password)
         + usize::from(no_encryption);
     if count == 0 {
         return Err(UsageError(
-            "no key source provided; use --password-stdin, --password, --keyfile PATH, or --no-encryption",
+            "no key source provided; use --password-stdin, --password, --keyfile PATH, --recipient-cert FILE, or --no-encryption",
         )
         .into());
     }
     if count > 1 {
         return Err(UsageError(
-            "create accepts exactly one protection mode: --keyfile, --password, --password-stdin, or --no-encryption",
+            "create accepts exactly one protection mode: --keyfile, --password, --password-stdin, --recipient-cert, or --no-encryption",
         )
         .into());
+    }
+    Ok(())
+}
+
+fn validate_create_recipient_wrap_scope(
+    recipient_cert: Option<&str>,
+    stdin_mode: Option<CreateStdinMode>,
+    has_dictionary: bool,
+    has_root_auth: bool,
+    volumes: Option<u32>,
+    volume_size: Option<&str>,
+) -> Result<()> {
+    if recipient_cert.is_none() {
+        return Ok(());
+    }
+    if stdin_mode.is_some() {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--recipient-cert is currently supported only for file-backed create inputs",
+        )));
+    }
+    if has_dictionary {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--recipient-cert is not yet supported with --dictionary",
+        )));
+    }
+    if has_root_auth {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--recipient-cert is not yet supported with RootAuth signing flags",
+        )));
+    }
+    if volumes.unwrap_or(1) != 1 || volume_size.is_some() {
+        return Err(anyhow!(FormatError::WriterUnsupported(
+            "--recipient-cert is currently supported only for single-volume create",
+        )));
     }
     Ok(())
 }
@@ -3507,6 +3734,39 @@ struct ArchiveInputSelection {
 struct OpenedArchiveSelection {
     paths: Vec<String>,
     opened: OpenedArchive,
+}
+
+#[derive(Debug)]
+struct CliRecipientPrivateKeyLookup {
+    private_key_bytes: Vec<u8>,
+    private_key_spki_der: Option<Vec<u8>>,
+}
+
+impl PrivateKeyLookup for CliRecipientPrivateKeyLookup {
+    fn lookup_private_key(
+        &self,
+        _archive_identity: &KeyWrapArchiveIdentity,
+        _metadata: &RecipientRecordMetadata,
+        recipient_identity_bytes: &[u8],
+    ) -> Option<Vec<u8>> {
+        if let Some(private_key_spki_der) = self.private_key_spki_der.as_ref() {
+            let certificate = X509::from_der(recipient_identity_bytes).ok()?;
+            let certificate_spki_der = certificate.public_key().ok()?.public_key_to_der().ok()?;
+            if certificate_spki_der != *private_key_spki_der {
+                return None;
+            }
+        }
+        Some(self.private_key_bytes.clone())
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecipientWrapOpenStats {
+    records_seen: usize,
+    no_matching_private_key: usize,
+    invalid_record_or_unwrap: usize,
+    unsupported_record: usize,
+    candidate_count: usize,
 }
 
 struct RepairedArchiveOutput {
@@ -3755,6 +4015,7 @@ struct ArchiveStdinOpenOptions<'a> {
     password_stdin: bool,
     password: bool,
     keyfile: Option<&'a str>,
+    recipient_key: Option<&'a str>,
     insecure_zero_key: bool,
 }
 
@@ -3778,6 +4039,7 @@ fn reject_archive_stdin_open_options(options: ArchiveStdinOpenOptions<'_>) -> Re
         options.password_stdin,
         options.password,
         options.keyfile,
+        options.recipient_key,
         options.insecure_zero_key,
     )
 }
@@ -3787,6 +4049,7 @@ fn reject_archive_stdin_list_options(
     password_stdin: bool,
     password: bool,
     keyfile: Option<&str>,
+    recipient_key: Option<&str>,
     insecure_zero_key: bool,
 ) -> Result<()> {
     if !volumes.is_empty() {
@@ -3794,13 +4057,20 @@ fn reject_archive_stdin_list_options(
             "archive stdin must be the only archive input",
         )));
     }
-    reject_archive_stdin_key_options(password_stdin, password, keyfile, insecure_zero_key)
+    reject_archive_stdin_key_options(
+        password_stdin,
+        password,
+        keyfile,
+        recipient_key,
+        insecure_zero_key,
+    )
 }
 
 fn reject_archive_stdin_key_options(
     password_stdin: bool,
     password: bool,
     _keyfile: Option<&str>,
+    recipient_key: Option<&str>,
     insecure_zero_key: bool,
 ) -> Result<()> {
     if insecure_zero_key {
@@ -3809,6 +4079,11 @@ fn reject_archive_stdin_key_options(
     if password_stdin || password {
         return Err(anyhow!(FormatError::ReaderUnsupported(
             "archive stdin currently supports raw --keyfile or no-key unencrypted archives only",
+        )));
+    }
+    if recipient_key.is_some() {
+        return Err(anyhow!(FormatError::ReaderUnsupported(
+            "--recipient-key requires a seekable archive path",
         )));
     }
     Ok(())
@@ -3820,7 +4095,7 @@ fn load_archive_stdin_key(
     password: bool,
     insecure_zero_key: bool,
 ) -> Result<MasterKey> {
-    reject_archive_stdin_key_options(password_stdin, password, keyfile, insecure_zero_key)?;
+    reject_archive_stdin_key_options(password_stdin, password, keyfile, None, insecure_zero_key)?;
     if keyfile.is_some() {
         return load_raw_master_key(keyfile);
     }
@@ -3912,6 +4187,106 @@ fn open_selection_maybe_bootstrap_resolved(
     }
 }
 
+fn open_selection_with_recipient_key(
+    selection: &ArchiveInputSelection,
+    recipient_key: &str,
+    bootstrap: Option<&str>,
+    options: ReaderOptions,
+) -> Result<OpenedArchiveSelection> {
+    if bootstrap.is_some() {
+        return Err(anyhow!(FormatError::ReaderUnsupported(
+            "--recipient-key is not currently supported with --bootstrap",
+        )));
+    }
+    if selection.paths.len() != 1 {
+        return Err(anyhow!(FormatError::ReaderUnsupported(
+            "--recipient-key currently supports one seekable archive path",
+        )));
+    }
+    let path = selection
+        .paths
+        .first()
+        .ok_or_else(|| anyhow!("at least one archive volume is required"))?;
+    let bytes = fs::read(path).with_context(|| format!("failed to read archive {path}"))?;
+    let lookup = load_recipient_private_key_lookup(recipient_key)?;
+    let mut stats = RecipientWrapOpenStats::default();
+    let opened = OpenedArchive::open_with_recipient_wrap_resolver_options(
+        &bytes,
+        |context| recipient_wrap_candidates_for_record(context, &lookup, &mut stats),
+        options,
+    )
+    .map_err(|err| recipient_wrap_open_error(err, &stats))
+    .with_context(|| format!("failed to open RecipientWrap archive {path}"))?;
+    Ok(OpenedArchiveSelection {
+        paths: selection.paths.clone(),
+        opened,
+    })
+}
+
+fn recipient_wrap_candidates_for_record(
+    context: RecipientWrapRecordContext<'_>,
+    lookup: &CliRecipientPrivateKeyLookup,
+    stats: &mut RecipientWrapOpenStats,
+) -> std::result::Result<Vec<[u8; 32]>, FormatError> {
+    stats.records_seen += 1;
+    let input = RecipientRecordInput {
+        archive_identity: KeyWrapArchiveIdentity {
+            archive_uuid: context.archive_identity.archive_uuid,
+            session_id: context.archive_identity.session_id,
+            format_version: context.archive_identity.format_version,
+            volume_format_rev: context.archive_identity.volume_format_rev,
+        },
+        metadata: RecipientRecordMetadata {
+            profile_id: context.record.profile_id,
+            recipient_identity_type: context.record.recipient_identity_type,
+            recipient_identity_digest: context.record.recipient_identity_digest,
+        },
+        recipient_identity_bytes: context.record.recipient_identity_bytes.clone(),
+        profile_payload_bytes: context.record.profile_payload_bytes.clone(),
+    };
+    match dispatch_key_wrap_record(input, lookup) {
+        KeyWrapOutcome::UnwrappedCandidateMasterKey { master_key, .. } => {
+            stats.candidate_count += 1;
+            Ok(vec![master_key])
+        }
+        KeyWrapOutcome::NoMatchingPrivateKey => {
+            stats.no_matching_private_key += 1;
+            Ok(Vec::new())
+        }
+        KeyWrapOutcome::InvalidRecord | KeyWrapOutcome::CertificatePolicyRejected => {
+            stats.invalid_record_or_unwrap += 1;
+            Ok(Vec::new())
+        }
+        KeyWrapOutcome::UnsupportedProfileId
+        | KeyWrapOutcome::UnsupportedArchiveIdentity
+        | KeyWrapOutcome::UnsupportedRecipientIdentity
+        | KeyWrapOutcome::UnsupportedSuite => {
+            stats.unsupported_record += 1;
+            Ok(Vec::new())
+        }
+    }
+}
+
+fn recipient_wrap_open_error(err: FormatError, stats: &RecipientWrapOpenStats) -> anyhow::Error {
+    if !matches!(err, FormatError::KeyMaterialMismatch) {
+        return anyhow!(err);
+    }
+    if stats.candidate_count > 0 {
+        return anyhow!(err).context(
+            "recipient private key unwrapped a candidate, but archive header_hmac did not verify",
+        );
+    }
+    if stats.records_seen == 0 {
+        return anyhow!(err).context("recipient-wrap archive has no recipient records");
+    }
+    if stats.no_matching_private_key > 0 && stats.invalid_record_or_unwrap == 0 {
+        return anyhow!(err).context("no matching recipient private key for archive");
+    }
+    anyhow!(err).context(
+        "recipient private key did not match any recipient record or failed recipient unwrap",
+    )
+}
+
 fn filter_usable_autodiscovered_volume_paths(
     paths: &[String],
     master_key: &MasterKey,
@@ -3959,6 +4334,7 @@ fn is_single_volume_candidate_usable_error(err: &FormatError) -> bool {
 
 fn validate_verify_key_holding_key_source(
     keyfile: Option<&str>,
+    recipient_key: Option<&str>,
     password_stdin: bool,
     password: bool,
     insecure_zero_key: bool,
@@ -3966,11 +4342,13 @@ fn validate_verify_key_holding_key_source(
     if insecure_zero_key {
         return Err(removed_insecure_zero_key_error().into());
     }
-    let count =
-        usize::from(keyfile.is_some()) + usize::from(password_stdin) + usize::from(password);
+    let count = usize::from(keyfile.is_some())
+        + usize::from(recipient_key.is_some())
+        + usize::from(password_stdin)
+        + usize::from(password);
     if count > 1 {
         return Err(UsageError(
-            "verify accepts at most one key source: --keyfile, --password, or --password-stdin",
+            "verify accepts at most one key source: --keyfile, --recipient-key, --password, or --password-stdin",
         )
         .into());
     }
@@ -3985,6 +4363,7 @@ struct PublicNoKeyVerifyRequest<'a> {
     password_stdin: bool,
     password: bool,
     keyfile: Option<&'a str>,
+    recipient_key: Option<&'a str>,
     insecure_zero_key: bool,
     bootstrap: Option<&'a str>,
     reader_options: ReaderOptions,
@@ -4153,9 +4532,13 @@ fn load_public_no_key_trust(request: &PublicNoKeyVerifyRequest<'_>) -> Result<Pu
     if request.insecure_zero_key {
         return Err(removed_insecure_zero_key_error().into());
     }
-    if request.password_stdin || request.password || request.keyfile.is_some() {
+    if request.password_stdin
+        || request.password
+        || request.keyfile.is_some()
+        || request.recipient_key.is_some()
+    {
         return Err(UsageError(
-            "--public-no-key cannot be combined with --keyfile, --password, or --password-stdin",
+            "--public-no-key cannot be combined with --keyfile, --recipient-key, --password, or --password-stdin",
         )
         .into());
     }
@@ -4677,6 +5060,124 @@ fn load_x509_certificate_files(paths: &[String]) -> Result<Vec<Vec<u8>>> {
     Ok(certificates)
 }
 
+fn load_single_x509_certificate_file(label: &'static str, path: &str) -> Result<Vec<u8>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {label} {path}"))?;
+    let certificates = x509_chain::certificates_der_from_pem_or_der(&bytes)
+        .with_context(|| format!("failed to parse {label} {path}"))?;
+    match certificates.as_slice() {
+        [certificate] => Ok(certificate.clone()),
+        [] => bail!("{label} must contain exactly one X.509 certificate"),
+        _ => bail!("{label} must contain exactly one X.509 certificate"),
+    }
+}
+
+fn load_recipient_private_key_lookup(path: &str) -> Result<CliRecipientPrivateKeyLookup> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read recipient key {path}"))?;
+    if bytes.len() == 32 {
+        return Ok(CliRecipientPrivateKeyLookup {
+            private_key_bytes: bytes,
+            private_key_spki_der: None,
+        });
+    }
+    let private_key = if bytes.starts_with(b"-----BEGIN") {
+        PKey::private_key_from_pem(&bytes)
+            .with_context(|| format!("failed to parse recipient private key {path}"))?
+    } else {
+        PKey::private_key_from_der(&bytes)
+            .with_context(|| format!("failed to parse recipient private key {path}"))?
+    };
+    let private_key_bytes = private_key
+        .private_key_to_der()
+        .with_context(|| format!("failed to normalize recipient private key {path}"))?;
+    let private_key_spki_der = private_key.public_key_to_der().ok();
+    Ok(CliRecipientPrivateKeyLookup {
+        private_key_bytes,
+        private_key_spki_der,
+    })
+}
+
+fn generate_random_master_key() -> Result<MasterKey> {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    MasterKey::from_raw_key(&bytes).map_err(Into::into)
+}
+
+fn build_recipient_wrap_record(
+    recipient_cert_path: &str,
+    master_key: &MasterKey,
+    options: &mut WriterOptions,
+) -> Result<tzap_core::wire::RecipientRecordV1> {
+    let recipient_certificate =
+        load_single_x509_certificate_file("recipient certificate", recipient_cert_path)?;
+    let archive_identity = recipient_wrap_archive_identity_for_writer(options);
+    let master_key_bytes = master_key.0;
+    for suite in [
+        KeyWrapSuite::X25519HkdfSha256ChaCha20Poly1305,
+        KeyWrapSuite::P256HkdfSha256Aes256Gcm,
+    ] {
+        match wrap_master_key_for_recipient(
+            archive_identity.clone(),
+            &recipient_certificate,
+            &master_key_bytes,
+            suite,
+        ) {
+            Ok(record) => return Ok(record),
+            Err(KeyWrapOutcome::InvalidRecord) | Err(KeyWrapOutcome::UnsupportedSuite) => {}
+            Err(outcome) => return Err(key_wrap_outcome_error(outcome).into()),
+        }
+    }
+    Err(anyhow!(FormatError::WriterUnsupported(
+        "recipient certificate is not supported by keywrap-v1 suites",
+    )))
+}
+
+fn recipient_wrap_archive_identity_for_writer(
+    options: &mut WriterOptions,
+) -> KeyWrapArchiveIdentity {
+    let archive_uuid = *options.archive_uuid.get_or_insert_with(random_16_bytes);
+    let session_id = *options.session_id.get_or_insert_with(random_16_bytes);
+    KeyWrapArchiveIdentity {
+        archive_uuid,
+        session_id,
+        format_version: FORMAT_VERSION,
+        volume_format_rev: VOLUME_FORMAT_REV_44,
+    }
+}
+
+fn random_16_bytes() -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes
+}
+
+fn key_wrap_outcome_error(outcome: KeyWrapOutcome) -> anyhow::Error {
+    match outcome {
+        KeyWrapOutcome::UnsupportedProfileId => anyhow!(FormatError::ReaderUnsupported(
+            "unsupported keywrap recipient profile",
+        )),
+        KeyWrapOutcome::UnsupportedArchiveIdentity => anyhow!(FormatError::ReaderUnsupported(
+            "unsupported keywrap archive identity",
+        )),
+        KeyWrapOutcome::UnsupportedRecipientIdentity => anyhow!(FormatError::ReaderUnsupported(
+            "unsupported keywrap recipient identity",
+        )),
+        KeyWrapOutcome::UnsupportedSuite => anyhow!(FormatError::ReaderUnsupported(
+            "unsupported keywrap recipient suite",
+        )),
+        KeyWrapOutcome::CertificatePolicyRejected => anyhow!(FormatError::ReaderUnsupported(
+            "recipient certificate policy rejected",
+        )),
+        KeyWrapOutcome::InvalidRecord => anyhow!(FormatError::InvalidArchive(
+            "invalid keywrap recipient record",
+        )),
+        KeyWrapOutcome::NoMatchingPrivateKey => anyhow!(FormatError::KeyMaterialMismatch)
+            .context("no matching recipient private key for archive"),
+        KeyWrapOutcome::UnwrappedCandidateMasterKey { .. } => anyhow!(
+            FormatError::WriterInvariant("keywrap success outcome cannot be converted to error",)
+        ),
+    }
+}
+
 fn current_unix_seconds() -> Result<i64> {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4816,6 +5317,8 @@ fn derive_key_from_passphrase(kdf_params: &KdfParams, passphrase: &str) -> Resul
         }
         KdfParams::Raw => Err(anyhow!(FormatError::KeyMaterialMismatch)
             .context("raw-key archives require --keyfile, not passphrase input")),
+        KdfParams::RecipientWrap { .. } => Err(anyhow!(FormatError::KeyMaterialMismatch)
+            .context("recipient-wrap archives require recipient key unwrap, not passphrase input")),
         KdfParams::None => Err(anyhow!(FormatError::KeyMaterialMismatch)
             .context("unencrypted archives do not use passphrase input")),
     }
@@ -4863,7 +5366,7 @@ fn validate_argon2_params(t_cost: u32, m_cost_kib: u32, parallelism: u32) -> Res
 fn load_raw_master_key(keyfile: Option<&str>) -> Result<MasterKey> {
     let keyfile = keyfile.ok_or_else(|| {
         anyhow!(
-            "no key source provided; use --password-stdin, --password, --keyfile PATH, or --no-encryption for create"
+            "no key source provided; use --password-stdin, --password, --keyfile PATH, --recipient-cert FILE, or --no-encryption for create"
         )
     })?;
     let bytes = fs::read(keyfile).with_context(|| format!("failed to read keyfile {keyfile}"))?;
@@ -5179,7 +5682,7 @@ fn classify_io_error(err: &io::Error) -> Diagnostic {
 fn classify_format_error(err: &FormatError) -> Diagnostic {
     match err {
         FormatError::UnsupportedFormatVersion(_)
-        | FormatError::UnsupportedVolumeFormatRevision(_)
+        | FormatError::UnsupportedVolumeFormatRevision { .. }
         | FormatError::UnknownCompressionAlgo(_)
         | FormatError::UnknownAeadAlgo(_)
         | FormatError::UnknownFecAlgo(_)
@@ -5211,7 +5714,7 @@ fn classify_format_error(err: &FormatError) -> Diagnostic {
         | FormatError::InvalidRawMasterKeyLength => Diagnostic {
             label: "wrong-key",
             exit_code: EXIT_WRONG_KEY,
-            action: "confirm the archive key source (passphrase/raw key)",
+            action: "confirm the archive key source (passphrase/raw key/recipient key)",
         },
         FormatError::IntegrityDigestMismatch { .. } => Diagnostic {
             label: "corrupt-archive",
@@ -5583,7 +6086,11 @@ mod tests {
     fn unsupported_revision_errors_suggest_reader_upgrade() {
         for err in [
             FormatError::UnsupportedFormatVersion(2),
-            FormatError::UnsupportedVolumeFormatRevision(44),
+            FormatError::UnsupportedVolumeFormatRevision {
+                format_version: 1,
+                volume_format_rev: 44,
+                reader_max_supported_revision: 43,
+            },
         ] {
             let diagnostic = classify_format_error(&err);
 

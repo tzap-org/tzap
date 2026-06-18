@@ -39,13 +39,15 @@ pub use non_seekable_reader::{
 };
 pub use reader::{
     open_archive, open_archive_unencrypted, open_archive_volumes, open_archive_volumes_unencrypted,
-    open_archive_with_bootstrap_sidecar, open_non_seekable_archive, open_seekable_archive,
-    open_seekable_archive_volumes, open_seekable_archive_with_bootstrap_sidecar,
+    open_archive_with_bootstrap_sidecar, open_archive_with_recipient_wrap_resolver,
+    open_non_seekable_archive, open_seekable_archive, open_seekable_archive_volumes,
+    open_seekable_archive_with_bootstrap_sidecar,
     open_seekable_archive_with_bootstrap_sidecar_options, public_no_key_verify_archive_with,
     public_no_key_verify_volumes_with, public_no_key_verify_volumes_with_options,
     sequential_extract_tar_stream, ArchiveContentVerification, ArchiveEntry,
     ArchiveExtractProgressSink, ArchiveIndexEntry, ArchiveReadAt, ArchiveRepairPatch,
     OpenedArchive, PublicNoKeyDiagnostic, PublicNoKeyVerification, ReaderOptions,
+    RecipientWrapArchiveIdentity, RecipientWrapCandidateMasterKey, RecipientWrapRecordContext,
     RootAuthDiagnostic, RootAuthVerification,
 };
 pub use streaming_writer::{
@@ -62,9 +64,9 @@ pub use writer::{
     write_archive_sources_to_sink_with_progress, write_archive_unencrypted,
     write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
     write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
-    write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
-    write_empty_archive, ArchiveWriteProgressSink, ArchiveWriteSink, KeyWrapRecordSource,
-    MemoryArchiveSink,
+    write_archive_with_kdf, write_archive_with_recipient_wrap_records,
+    write_archive_with_root_auth, write_archive_with_root_auth_and_kdf, write_empty_archive,
+    ArchiveWriteProgressSink, ArchiveWriteSink, KeyWrapRecordSource, MemoryArchiveSink,
     RegularFile, RegularFileSource, RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions,
     WriterTimings, WrittenArchiveSummary,
 };

@@ -326,7 +326,7 @@ fn cli_top_level_help_contains_product_description_and_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Create, list, verify, and extract v43 archives",
+            "Create, list, verify, and extract v43/v44 archives",
         ))
         .stdout(predicate::str::contains("create"))
         .stdout(predicate::str::contains("extract"))
@@ -432,6 +432,7 @@ fn cli_create_help_includes_examples_and_flags() {
     assert!(stdout.contains("--password"));
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
+    assert!(stdout.contains("--recipient-cert <FILE>"));
     assert!(stdout.contains("--no-encryption"));
     assert!(!stdout.contains("--insecure-zero-key"));
     assert!(stdout.contains("--argon2-t-cost <COUNT>"));
@@ -484,6 +485,7 @@ fn cli_extract_help_includes_examples_and_flags() {
     assert!(stdout.contains("--jobs <N>"));
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
+    assert!(stdout.contains("--recipient-key <FILE>"));
     assert!(!stdout.contains("--insecure-zero-key"));
 }
 
@@ -504,6 +506,7 @@ fn cli_list_help_includes_examples_and_flags() {
     assert!(stdout.contains("--password"));
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
+    assert!(stdout.contains("--recipient-key <FILE>"));
     assert!(!stdout.contains("--insecure-zero-key"));
     assert!(stdout.contains("--bootstrap"));
     assert!(stdout.contains("--volume"));
@@ -529,6 +532,7 @@ fn cli_verify_help_includes_examples_and_flags() {
     assert!(stdout.contains("--password"));
     assert!(stdout.contains("--password-stdin"));
     assert!(stdout.contains("--keyfile <KEYFILE>"));
+    assert!(stdout.contains("--recipient-key <FILE>"));
     assert!(!stdout.contains("--insecure-zero-key"));
     assert!(stdout.contains("--trusted-public-key <FILE>"));
     assert!(stdout.contains("--trusted-ca-cert <FILE>"));
@@ -3752,6 +3756,96 @@ fn cli_create_list_verify_and_extract_with_keyfile() {
     assert_eq!(
         fs::read(extract_dir.join("hello.txt")).unwrap(),
         b"hello from tzap\n"
+    );
+}
+
+#[test]
+fn cli_create_list_verify_and_extract_with_recipient_wrap() {
+    let temp = tempdir().unwrap();
+    let recipient_cert_path = temp.path().join("recipient.pem");
+    let recipient_key_path = temp.path().join("recipient.key");
+    let wrong_key_path = temp.path().join("wrong-recipient.key");
+    let input = temp.path().join("recipient.txt");
+    let archive = temp.path().join("recipient-wrap.tzap");
+    let extract_dir = temp.path().join("out");
+
+    let (recipient_cert, recipient_key) = test_x25519_recipient_cert();
+    let (_wrong_cert, wrong_key) = test_x25519_recipient_cert();
+    fs::write(&recipient_cert_path, recipient_cert.to_pem().unwrap()).unwrap();
+    fs::write(&recipient_key_path, recipient_key).unwrap();
+    fs::write(&wrong_key_path, wrong_key).unwrap();
+    fs::write(&input, b"recipient wrapped\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--recipient-cert",
+            recipient_cert_path.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("key wrap: recipient certificate"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--recipient-key",
+            recipient_key_path.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("recipient.txt\n"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--recipient-key",
+            recipient_key_path.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--recipient-key",
+            wrong_key_path.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .code(10)
+        .stderr(
+            predicate::str::contains("wrong-key")
+                .and(predicate::str::contains("recipient private key")),
+        );
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--recipient-key",
+            recipient_key_path.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            archive.to_str().unwrap(),
+            "recipient.txt",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(extract_dir.join("recipient.txt")).unwrap(),
+        b"recipient wrapped\n"
     );
 }
 
@@ -8171,6 +8265,34 @@ fn test_leaf_cert(cn: &str, ca_cert: &X509Ref, ca_key: &PKeyRef<Private>) -> (X5
         .unwrap();
     builder.sign(ca_key, MessageDigest::sha256()).unwrap();
     (builder.build(), key)
+}
+
+fn test_x25519_recipient_cert() -> (X509, Vec<u8>) {
+    let subject_key = PKey::generate_x25519().unwrap();
+    let signer_key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+    let mut name = X509NameBuilder::new().unwrap();
+    name.append_entry_by_text("CN", "Tzap Recipient").unwrap();
+    let name = name.build();
+    let mut builder = X509::builder().unwrap();
+    builder.set_version(2).unwrap();
+    builder.set_serial_number(&random_serial_number()).unwrap();
+    builder.set_subject_name(&name).unwrap();
+    builder.set_issuer_name(&name).unwrap();
+    builder.set_pubkey(&subject_key).unwrap();
+    builder
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    builder
+        .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+        .unwrap();
+    builder
+        .append_extension(BasicConstraints::new().build().unwrap())
+        .unwrap();
+    builder
+        .append_extension(KeyUsage::new().critical().key_agreement().build().unwrap())
+        .unwrap();
+    builder.sign(&signer_key, MessageDigest::sha256()).unwrap();
+    (builder.build(), subject_key.raw_private_key().unwrap())
 }
 
 fn random_serial_number() -> openssl::asn1::Asn1Integer {

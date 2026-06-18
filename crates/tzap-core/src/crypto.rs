@@ -12,9 +12,8 @@ use aes_gcm_siv::aead::{Aead, KeyInit as AeadKeyInit, Payload};
 
 use crate::format::{
     AeadAlgo, FormatError, KdfAlgo, MASTER_KEY_LEN, READER_MAX_ARGON2ID_M_COST_KIB,
-    READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST,
-    READER_MAX_KEY_WRAP_TABLE_LEN, READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS, SUBKEY_LEN,
-    VOLUME_FORMAT_REV_43, VOLUME_FORMAT_REV_44,
+    READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST, READER_MAX_KEY_WRAP_TABLE_LEN,
+    READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS, SUBKEY_LEN, VOLUME_FORMAT_REV_44,
 };
 use crate::padding::{depad_suffix_padding, suffix_pad_for_aead};
 
@@ -625,7 +624,9 @@ fn parse_recipient_wrap_kdf_params(bytes: &[u8]) -> Result<(KdfParams, usize), F
         });
     }
     if table_version != RECIPIENT_WRAP_TABLE_VERSION {
-        return Err(FormatError::InvalidKdfParams("recipient-wrap table version must be 1"));
+        return Err(FormatError::InvalidKdfParams(
+            "recipient-wrap table version must be 1",
+        ));
     }
     let reserved = read_u16(bytes, 12)?;
     if reserved != 0 {
@@ -767,6 +768,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, FormatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::VOLUME_FORMAT_REV_43;
 
     fn uuid() -> [u8; 16] {
         [0x11; 16]

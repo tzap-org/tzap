@@ -17,13 +17,13 @@ use crate::crypto::{
 };
 use crate::fec::encode_parity_gf16;
 use crate::format::{
-    AeadAlgo, ArchiveWriteError, BlockKind, CompressionAlgo, FecAlgo, FormatError, KdfAlgo,
-    BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN, CRITICAL_RECOVERY_LOCATOR_LEN,
-    CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_HEADER_FIXED_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION,
-    MANIFEST_FOOTER_LEN, READER_MAX_CMRA_PARITY_PCT, READER_MAX_INDEX_ROOT_FEC_CLASS_SHARDS,
-    READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN, READER_MAX_ROOT_AUTH_FOOTER_LEN,
-    READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN, VOLUME_FORMAT_REV, VOLUME_HEADER_LEN,
-    VOLUME_FORMAT_REV_44, VOLUME_TRAILER_LEN,
+    root_auth_spec_id_for_revision, AeadAlgo, ArchiveWriteError, BlockKind, CompressionAlgo,
+    FecAlgo, FormatError, KdfAlgo, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN,
+    CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_HEADER_FIXED_LEN,
+    CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, MANIFEST_FOOTER_LEN, READER_MAX_CMRA_PARITY_PCT,
+    READER_MAX_INDEX_ROOT_FEC_CLASS_SHARDS, READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN,
+    READER_MAX_ROOT_AUTH_FOOTER_LEN, READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN,
+    VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, validate_file_path_bytes, DirectoryHintEntry,
@@ -34,10 +34,10 @@ use crate::metadata::{
 };
 use crate::padding::suffix_pad_for_aead;
 use crate::root_auth::{
-    archive_root, critical_metadata_digest, data_block_merkle_leaf_hash,
-    data_block_merkle_root_from_leaf_hashes, fec_layout_digest, index_digest,
-    root_auth_descriptor_digest, signer_identity_digest, ArchiveRootInputs,
-    CriticalMetadataDigestInputs, FecLayoutObjectRow,
+    archive_root_for_revision, critical_metadata_digest, data_block_merkle_leaf_hash_for_revision,
+    data_block_merkle_root_from_leaf_hashes_for_revision, fec_layout_digest_for_revision,
+    index_digest_for_revision, root_auth_descriptor_digest_for_revision, signer_identity_digest,
+    ArchiveRootInputs, CriticalMetadataDigestInputs, FecLayoutObjectRow,
 };
 use crate::wire::{
     compute_key_wrap_table_digest, BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage,
@@ -69,7 +69,7 @@ const MAX_HASH_PREFIX_RUN_FILES: usize = 50_000;
 const DEFAULT_DIRECTORY_HINT_ENTRIES_PER_SHARD: usize = 10_000;
 const CMRA_SHARD_SIZE: usize = 512;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum KeyWrapRecordSource {
     None,
     Fixed(Vec<RecipientRecordV1>),
@@ -109,10 +109,7 @@ fn default_jobs() -> usize {
         .unwrap_or(1)
 }
 
-fn volume_format_revision_for_options(
-    options: &WriterOptions,
-    kdf_params: &KdfParams,
-) -> u16 {
+fn volume_format_revision_for_options(options: &WriterOptions, kdf_params: &KdfParams) -> u16 {
     match kdf_params {
         KdfParams::RecipientWrap { .. } => VOLUME_FORMAT_REV_44,
         _ if options.aead_algo.is_encrypted() => VOLUME_FORMAT_REV,
@@ -164,7 +161,9 @@ fn resolve_key_wrap_artifacts(
                 recipient_records.len(),
                 "KeyWrapTableV1 recipient_record_count",
             )?;
-            if *key_wrap_table_record_count != declared_record_count {
+            if *key_wrap_table_record_count != 0
+                && *key_wrap_table_record_count != declared_record_count
+            {
                 return Err(FormatError::InvalidKdfParams(
                     "recipient-wrap key_wrap_table_record_count mismatch",
                 ));
@@ -183,22 +182,20 @@ fn resolve_key_wrap_artifacts(
                 recipient_records,
             }
             .to_bytes()?;
-            let key_wrap_table_length = u32_len(
-                key_wrap_table.len(),
-                "KeyWrapTableV1 table_length",
-            )?;
-            if key_wrap_table_length != *key_wrap_table_length {
+            let computed_key_wrap_table_length =
+                u32_len(key_wrap_table.len(), "KeyWrapTableV1 table_length")?;
+            if *key_wrap_table_length != 0
+                && computed_key_wrap_table_length != *key_wrap_table_length
+            {
                 return Err(FormatError::InvalidKdfParams(
                     "recipient-wrap key_wrap_table_length mismatch",
                 ));
             }
-            let key_wrap_table_digest = compute_key_wrap_table_digest(
-                key_wrap_table_length,
-                &key_wrap_table,
-            );
+            let key_wrap_table_digest =
+                compute_key_wrap_table_digest(computed_key_wrap_table_length, &key_wrap_table);
             Ok((
                 KdfParams::RecipientWrap {
-                    key_wrap_table_length,
+                    key_wrap_table_length: computed_key_wrap_table_length,
                     key_wrap_table_record_count: declared_record_count,
                     key_wrap_table_version: *key_wrap_table_version,
                     key_wrap_table_digest,
@@ -275,6 +272,7 @@ pub struct RootAuthWriterConfig<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RootAuthSigningRequest {
+    pub root_auth_spec_id: [u8; 24],
     pub archive_uuid: [u8; 16],
     pub session_id: [u8; 16],
     pub archive_root: [u8; 32],
@@ -727,6 +725,7 @@ struct WriterEmissionState {
     volume_headers: Vec<[u8; VOLUME_HEADER_LEN]>,
     bytes_written: Vec<u64>,
     record_counts: Vec<u64>,
+    volume_format_rev: u16,
     data_leaf_hashes: Option<Vec<(u64, [u8; 32])>>,
     next_block_index: u64,
 }
@@ -790,7 +789,35 @@ pub fn write_archive_with_kdf(
     options: WriterOptions,
     kdf_params: &KdfParams,
 ) -> Result<WrittenArchive, FormatError> {
-    write_archive_inner(files, master_key, options, None, kdf_params, None, None, None)
+    write_archive_inner(
+        files, master_key, options, None, kdf_params, None, None, None,
+    )
+}
+
+pub fn write_archive_with_recipient_wrap_records(
+    files: &[RegularFile<'_>],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    records: Vec<RecipientRecordV1>,
+) -> Result<WrittenArchive, FormatError> {
+    let record_count = u32_len(records.len(), "KeyWrapTableV1 recipient_record_count")?;
+    let kdf_params = KdfParams::RecipientWrap {
+        key_wrap_table_length: 0,
+        key_wrap_table_record_count: record_count,
+        key_wrap_table_version: 1,
+        key_wrap_table_digest: [0u8; 32],
+    };
+    let key_wrap_records = KeyWrapRecordSource::fixed(records);
+    write_archive_inner(
+        files,
+        master_key,
+        options,
+        None,
+        &kdf_params,
+        None,
+        None,
+        Some(&key_wrap_records),
+    )
 }
 
 pub fn write_archive_with_root_auth<F>(
@@ -975,6 +1002,7 @@ where
         kdf_params,
         root_auth,
         authenticator,
+        None,
         sink,
     )
 }
@@ -1004,6 +1032,7 @@ where
         kdf_params,
         root_auth,
         authenticator,
+        None,
         sink,
     )
 }
@@ -1342,12 +1371,8 @@ fn build_writer_plan_from_payload(
     root_auth: Option<RootAuthWriterConfig<'_>>,
 ) -> Result<WriterPlan, ArchiveWriteError> {
     let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
-    let (resolved_kdf_params, key_wrap_table) = resolve_key_wrap_artifacts(
-        kdf_params,
-        &archive_uuid,
-        &session_id,
-        key_wrap_records,
-    )?;
+    let (resolved_kdf_params, key_wrap_table) =
+        resolve_key_wrap_artifacts(kdf_params, &archive_uuid, &session_id, key_wrap_records)?;
     let volume_format_rev = volume_format_revision_for_options(&options, &resolved_kdf_params);
     let (shard_file_rows, planned_index_shards) = if payload.tar_members.is_empty() {
         (Vec::new(), Vec::new())
@@ -1503,10 +1528,7 @@ fn build_writer_plan_from_payload(
             crypto_header.len() as u64,
             "CryptoHeader",
         )?,
-        key_wrap_table
-            .as_ref()
-            .map(Vec::len)
-            .unwrap_or(0) as u64,
+        key_wrap_table.as_ref().map(Vec::len).unwrap_or(0) as u64,
         "KeyWrapTableV1",
     )?;
 
@@ -2085,6 +2107,7 @@ where
         options,
         None,
         kdf_params,
+        None,
         archive_uuid,
         session_id,
         root_auth,
@@ -2321,6 +2344,7 @@ where
         options,
         None,
         kdf_params,
+        None,
         archive_uuid,
         session_id,
         root_auth,
@@ -2839,6 +2863,7 @@ fn emit_ordered_envelope_result<O: ArchiveWriteSink>(
                     options,
                     &mut emission_state.bytes_written,
                     &mut emission_state.record_counts,
+                    emission_state.volume_format_rev,
                     &mut emission_state.data_leaf_hashes,
                     record,
                 )?;
@@ -2891,6 +2916,7 @@ fn begin_writer_emission_state<O: ArchiveWriteSink>(
         volume_headers: Vec::with_capacity(volume_count),
         bytes_written: vec![0u64; volume_count],
         record_counts: vec![0u64; volume_count],
+        volume_format_rev,
         data_leaf_hashes: collect_data_leaf_hashes.then(Vec::new),
         next_block_index: 0,
     };
@@ -2919,11 +2945,8 @@ fn begin_writer_emission_state<O: ArchiveWriteSink>(
         )?;
         if let Some(key_wrap_table) = key_wrap_table {
             sink.write_volume(volume_index, key_wrap_table)?;
-            bytes_written = checked_u64_add(
-                bytes_written,
-                key_wrap_table.len() as u64,
-                "KeyWrapTableV1",
-            )?;
+            bytes_written =
+                checked_u64_add(bytes_written, key_wrap_table.len() as u64, "KeyWrapTableV1")?;
         }
         state.bytes_written[volume_index] = bytes_written;
         state.volume_headers.push(volume_header_bytes);
@@ -3141,6 +3164,7 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
                 self.options,
                 &mut self.emission_state.bytes_written,
                 &mut self.emission_state.record_counts,
+                self.emission_state.volume_format_rev,
                 &mut self.emission_state.data_leaf_hashes,
                 record,
             )?;
@@ -3187,6 +3211,7 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
             self.options,
             None,
             kdf_params,
+            None,
             self.archive_uuid,
             self.session_id,
             root_auth,
@@ -3552,6 +3577,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
             &plan.session_id,
             planned.extent,
             None,
+            plan.volume_format_rev,
             sink,
             &mut state.bytes_written,
             &mut state.record_counts,
@@ -3578,6 +3604,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
             &plan.session_id,
             extent,
             Some(MetadataObjectKind::Dictionary),
+            plan.volume_format_rev,
             sink,
             &mut state.bytes_written,
             &mut state.record_counts,
@@ -3605,6 +3632,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
             &plan.session_id,
             planned.extent,
             None,
+            plan.volume_format_rev,
             sink,
             &mut state.bytes_written,
             &mut state.record_counts,
@@ -3628,6 +3656,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
         &plan.session_id,
         plan.index_root_extent,
         Some(MetadataObjectKind::IndexRoot),
+        plan.volume_format_rev,
         sink,
         &mut state.bytes_written,
         &mut state.record_counts,
@@ -3659,6 +3688,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
                 RootAuthFooterBuildInput {
                     archive_uuid: plan.archive_uuid,
                     session_id: plan.session_id,
+                    volume_format_rev: plan.volume_format_rev,
                     options: plan.options,
                     crypto_header: &plan.crypto_header,
                     volume_zero_manifest: &volume_zero_manifest,
@@ -3742,7 +3772,7 @@ fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
             volume_header_bytes: &state.volume_headers[volume_index],
             crypto_header: &plan.crypto_header,
             block_count: state.record_counts[volume_index],
-            block_records_offset: state.bytes_written[volume_index],
+            block_records_offset: plan.block_records_offset,
             manifest_footer_offset,
             manifest_footer: &manifest_footer,
             root_auth_footer_offset,
@@ -3845,6 +3875,7 @@ fn emit_encrypted_object<O: ArchiveWriteSink>(
     session_id: &[u8; 16],
     expected_extent: ObjectExtent,
     metadata_kind: Option<MetadataObjectKind>,
+    volume_format_rev: u16,
     sink: &mut O,
     bytes_written: &mut [u64],
     record_counts: &mut [u64],
@@ -3878,6 +3909,7 @@ fn emit_encrypted_object<O: ArchiveWriteSink>(
             options,
             bytes_written,
             record_counts,
+            volume_format_rev,
             data_leaf_hashes,
             record,
         )?;
@@ -3890,6 +3922,7 @@ fn emit_block_record<O: ArchiveWriteSink>(
     options: WriterOptions,
     bytes_written: &mut [u64],
     record_counts: &mut [u64],
+    volume_format_rev: u16,
     data_leaf_hashes: &mut Option<Vec<(u64, [u8; 32])>>,
     record: &BlockRecord,
 ) -> Result<(), ArchiveWriteError> {
@@ -3907,12 +3940,14 @@ fn emit_block_record<O: ArchiveWriteSink>(
         if record.kind.is_data() {
             data_leaf_hashes.push((
                 record.block_index,
-                data_block_merkle_leaf_hash(
+                data_block_merkle_leaf_hash_for_revision(
+                    FORMAT_VERSION,
+                    volume_format_rev,
                     record.block_index,
                     record.kind,
                     record.flags,
                     &record.payload,
-                ),
+                )?,
             ));
         }
     }
@@ -4184,6 +4219,7 @@ fn flush_payload_envelope_emit<O: ArchiveWriteSink>(
         &plan.session_id,
         expected.object,
         None,
+        plan.volume_format_rev,
         sink,
         bytes_written,
         record_counts,
@@ -4320,8 +4356,7 @@ fn build_crypto_header(
     match (options.aead_algo, kdf_algo) {
         (AeadAlgo::None, KdfAlgo::None) => {}
         (aead_algo, KdfAlgo::Raw | KdfAlgo::Argon2id | KdfAlgo::RecipientWrap)
-            if aead_algo.is_encrypted() =>
-        {}
+            if aead_algo.is_encrypted() => {}
         _ => {
             return Err(FormatError::InvalidProtectionMode {
                 aead_algo: options.aead_algo,
@@ -5478,6 +5513,7 @@ fn map_metadata_encrypt_error(error: FormatError, kind: MetadataObjectKind) -> F
 struct RootAuthFooterBuildInput<'a> {
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
+    volume_format_rev: u16,
     options: WriterOptions,
     crypto_header: &'a [u8],
     volume_zero_manifest: &'a [u8; MANIFEST_FOOTER_LEN],
@@ -5503,7 +5539,11 @@ fn build_root_auth_footer_from_leaf_hashes(
         .collect::<Vec<_>>();
     let total_data_block_count = u64::try_from(leaf_hashes.len())
         .map_err(|_| FormatError::WriterUnsupported("root-auth data block count"))?;
-    let data_block_merkle_root = data_block_merkle_root_from_leaf_hashes(&leaf_hashes);
+    let data_block_merkle_root = data_block_merkle_root_from_leaf_hashes_for_revision(
+        FORMAT_VERSION,
+        input.volume_format_rev,
+        &leaf_hashes,
+    )?;
 
     let parsed_crypto = CryptoHeader::parse(
         input.crypto_header,
@@ -5513,7 +5553,9 @@ fn build_root_auth_footer_from_leaf_hashes(
         config.signer_identity.len(),
         config.authenticator_value_length as usize,
     )?;
-    let root_auth_descriptor_digest = root_auth_descriptor_digest(
+    let root_auth_descriptor_digest = root_auth_descriptor_digest_for_revision(
+        FORMAT_VERSION,
+        input.volume_format_rev,
         config.authenticator_id,
         config.signer_identity_type,
         config.signer_identity,
@@ -5526,6 +5568,8 @@ fn build_root_auth_footer_from_leaf_hashes(
     let critical_metadata_digest = critical_metadata_digest(CriticalMetadataDigestInputs {
         archive_uuid: input.archive_uuid,
         session_id: input.session_id,
+        format_version: FORMAT_VERSION,
+        volume_format_rev: input.volume_format_rev,
         stripe_width: input.options.stripe_width,
         total_volumes: input.options.stripe_width,
         compression_algo: parsed_crypto.fixed.compression_algo,
@@ -5553,7 +5597,8 @@ fn build_root_auth_footer_from_leaf_hashes(
         index_root_decompressed_size: u32_len(input.index_root_plaintext.len(), "IndexRoot")?,
         root_auth_descriptor_digest,
     })?;
-    let index_digest = index_digest(input.index_root_plaintext);
+    let index_digest =
+        index_digest_for_revision(FORMAT_VERSION, input.volume_format_rev, input.index_root_plaintext)?;
     let fec_layout_rows = writer_fec_layout_rows_from_extents(
         input.index_root_extent,
         u32_len(input.index_root_plaintext.len(), "IndexRoot")?,
@@ -5578,12 +5623,13 @@ fn build_root_auth_footer_from_leaf_hashes(
             "root-auth data block count does not match FEC layout",
         ));
     }
-    let fec_layout_digest = fec_layout_digest(&fec_layout_rows)?;
-    let archive_root = archive_root(ArchiveRootInputs {
+    let fec_layout_digest =
+        fec_layout_digest_for_revision(FORMAT_VERSION, input.volume_format_rev, &fec_layout_rows)?;
+    let archive_root = archive_root_for_revision(ArchiveRootInputs {
         archive_uuid: input.archive_uuid,
         session_id: input.session_id,
         format_version: FORMAT_VERSION,
-        volume_format_rev: VOLUME_FORMAT_REV,
+        volume_format_rev: input.volume_format_rev,
         compression_algo: parsed_crypto.fixed.compression_algo,
         aead_algo: parsed_crypto.fixed.aead_algo,
         fec_algo: parsed_crypto.fixed.fec_algo,
@@ -5595,8 +5641,9 @@ fn build_root_auth_footer_from_leaf_hashes(
         data_block_merkle_root,
         root_auth_descriptor_digest,
         signer_identity_digest,
-    });
+    })?;
     let authenticator_value = authenticator(&RootAuthSigningRequest {
+        root_auth_spec_id: root_auth_spec_id_for_revision(FORMAT_VERSION, input.volume_format_rev)?,
         archive_uuid: input.archive_uuid,
         session_id: input.session_id,
         archive_root,
@@ -5610,6 +5657,8 @@ fn build_root_auth_footer_from_leaf_hashes(
     RootAuthFooterV1 {
         archive_uuid: input.archive_uuid,
         session_id: input.session_id,
+        format_version: FORMAT_VERSION,
+        volume_format_rev: input.volume_format_rev,
         authenticator_id: config.authenticator_id,
         signer_identity_type: config.signer_identity_type,
         signer_identity_bytes: config.signer_identity.to_vec(),
@@ -5901,9 +5950,10 @@ fn build_v41_cmra(input: CmraBuildInput<'_>) -> Result<BuiltCmra, FormatError> {
         })
         .transpose()?;
     let key_wrap_table_length = key_wrap_table.map(|(_, length)| u64::from(length));
-    let expected_block_records_offset = key_wrap_table_length
-        .map(|length| checked_u64_add(crypto_end, length, "KeyWrapTableV1")?)
-        .unwrap_or(crypto_end);
+    let expected_block_records_offset = match key_wrap_table_length {
+        Some(length) => checked_u64_add(crypto_end, length, "KeyWrapTableV1")?,
+        None => crypto_end,
+    };
     if block_records_offset != expected_block_records_offset {
         return Err(FormatError::WriterInvariant(
             "CMRA block records offset does not match key-wrap table layout",

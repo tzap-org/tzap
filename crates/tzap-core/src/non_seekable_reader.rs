@@ -18,10 +18,10 @@ use crate::raw_stream_profile::reject_unsupported_raw_stream_profile;
 use crate::reader::{
     block_record_error_is_recoverable_erasure, expected_stream_block_index,
     manifest_bootstrap_fields_match, observed_archive_size, parse_non_seekable_bootstrap_material,
-    parse_terminal_material_read_at, required_object_parity, total_extraction_size_cap,
-    v41_terminal_tail_cap, validate_crypto_class_parity_exactness, validate_reader_options,
-    ArchiveEntry, ArchiveReadAt, KeyHoldingTerminalContext, NonSeekableBootstrapMaterial,
-    OpenedArchive, ReaderOptions, StreamedArchiveOpenParts, startup_block_records_start,
+    parse_terminal_material_read_at, required_object_parity, startup_block_records_start,
+    total_extraction_size_cap, v41_terminal_tail_cap, validate_crypto_class_parity_exactness,
+    validate_reader_options, ArchiveEntry, ArchiveReadAt, KeyHoldingTerminalContext,
+    NonSeekableBootstrapMaterial, OpenedArchive, ReaderOptions, StreamedArchiveOpenParts,
 };
 use crate::tar_model::{
     NoopTarStreamObserver, SafeExtractionOptions, TarStreamFilesystemRestoreObserver,
@@ -38,7 +38,9 @@ const DEFAULT_MAX_STREAMED_MEMBER_COUNT: u64 = 1_000_000;
 fn parse_volume_format_dispatch(volume_header: &VolumeHeader) -> Result<(), FormatError> {
     let revision = volume_header.parse_volume_format_revision()?;
     match revision {
-        crate::format::VolumeFormatRevision::V43 | crate::format::VolumeFormatRevision::V44 => Ok(()),
+        crate::format::VolumeFormatRevision::V43 | crate::format::VolumeFormatRevision::V44 => {
+            Ok(())
+        }
     }
 }
 
@@ -497,7 +499,6 @@ where
     let mut stream_cursor = checked_u64_add(
         VOLUME_HEADER_LEN as u64,
         volume_header.crypto_header_length as u64,
-        "CryptoHeader",
     )?;
     let block_records_start = startup_block_records_start(
         &volume_header,
@@ -510,7 +511,7 @@ where
             }
             let mut key_wrap_table_bytes = vec![0u8; length];
             read_exact_stream(&mut reader, &mut key_wrap_table_bytes, "KeyWrapTableV1")?;
-            stream_cursor = checked_u64_add(stream_cursor, length as u64, "KeyWrapTableV1")?;
+            stream_cursor = checked_u64_add(stream_cursor, length as u64)?;
             Ok(key_wrap_table_bytes)
         },
     )?;

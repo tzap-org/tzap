@@ -1,6 +1,6 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha512};
-use tzap_core::format::ROOT_AUTH_SPEC_ID;
+use tzap_core::format::{root_auth_spec_id_for_revision, ROOT_AUTH_SPEC_ID};
 use tzap_core::reader::RootAuthVerification;
 use tzap_core::wire::RootAuthFooterV1;
 use tzap_core::writer::RootAuthSigningRequest;
@@ -40,9 +40,18 @@ pub fn signing_input(
     session_id: &[u8; 16],
     archive_root: &[u8; 32],
 ) -> [u8; 64] {
+    signing_input_for_root_auth_spec_id(&ROOT_AUTH_SPEC_ID, archive_uuid, session_id, archive_root)
+}
+
+pub fn signing_input_for_root_auth_spec_id(
+    root_auth_spec_id: &[u8; 24],
+    archive_uuid: &[u8; 16],
+    session_id: &[u8; 16],
+    archive_root: &[u8; 32],
+) -> [u8; 64] {
     let mut hasher = Sha512::new();
     hasher.update(ED25519_SIGNING_DOMAIN);
-    hasher.update(ROOT_AUTH_SPEC_ID);
+    hasher.update(root_auth_spec_id);
     hasher.update(archive_uuid);
     hasher.update(session_id);
     hasher.update(archive_root);
@@ -67,7 +76,8 @@ pub fn authenticator_value_for_request(
     signing_key: &SigningKey,
     request: &RootAuthSigningRequest,
 ) -> [u8; ED25519_AUTHENTICATOR_VALUE_LEN as usize] {
-    let signing_input = signing_input(
+    let signing_input = signing_input_for_root_auth_spec_id(
+        &request.root_auth_spec_id,
         &request.archive_uuid,
         &request.session_id,
         &request.archive_root,
@@ -148,7 +158,17 @@ pub fn verify_root_auth_footer(
     trusted_public_key: Option<[u8; 32]>,
     mode: Ed25519VerificationMode,
 ) -> Ed25519RootAuthOutcome {
-    let signing_input = signing_input(&footer.archive_uuid, &footer.session_id, archive_root);
+    let Ok(root_auth_spec_id) =
+        root_auth_spec_id_for_revision(footer.format_version, footer.volume_format_rev)
+    else {
+        return Ed25519RootAuthOutcome::Invalid;
+    };
+    let signing_input = signing_input_for_root_auth_spec_id(
+        &root_auth_spec_id,
+        &footer.archive_uuid,
+        &footer.session_id,
+        archive_root,
+    );
     verify_root_auth(
         Ed25519RootAuthVerifierInput {
             signing_input: &signing_input,
@@ -191,6 +211,10 @@ fn parse_authenticator_value(value: &[u8]) -> Option<Signature> {
 mod tests {
     use super::*;
     use rand::rngs::OsRng;
+    use tzap_core::format::{
+        FORMAT_VERSION, ROOT_AUTH_SPEC_ID, ROOT_AUTH_SPEC_ID_V44, VOLUME_FORMAT_REV,
+        VOLUME_FORMAT_REV_44,
+    };
 
     #[test]
     fn ed25519_authenticator_value_round_trips_strict_profile() {
@@ -233,6 +257,7 @@ mod tests {
         let signing_key = SigningKey::generate(&mut OsRng);
         let public_key = signing_key.verifying_key().to_bytes();
         let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID,
             archive_uuid: [1; 16],
             session_id: [2; 16],
             archive_root: [3; 32],
@@ -241,6 +266,8 @@ mod tests {
         let footer = RootAuthFooterV1 {
             archive_uuid: request.archive_uuid,
             session_id: request.session_id,
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV,
             authenticator_id: ED25519_AUTHENTICATOR_ID,
             signer_identity_type: 1,
             signer_identity_bytes: public_key.to_vec(),
@@ -263,6 +290,65 @@ mod tests {
                 Ed25519VerificationMode::KeyHoldingRootAuth,
             ),
             Ed25519RootAuthOutcome::RootAuthContentVerified { key_id: public_key }
+        );
+    }
+
+    #[test]
+    fn v44_footer_uses_core_archive_root_and_rejects_wrong_spec_id() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V44,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let value = authenticator_value_for_request(&signing_key, &request);
+        let footer = RootAuthFooterV1 {
+            archive_uuid: request.archive_uuid,
+            session_id: request.session_id,
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV_44,
+            authenticator_id: ED25519_AUTHENTICATOR_ID,
+            signer_identity_type: 1,
+            signer_identity_bytes: public_key.to_vec(),
+            authenticator_value: value.to_vec(),
+            total_data_block_count: 0,
+            critical_metadata_digest: [0; 32],
+            index_digest: [0; 32],
+            fec_layout_digest: [0; 32],
+            data_block_merkle_root: [0; 32],
+            signer_identity_digest: [0; 32],
+            archive_root: [9; 32],
+            footer_crc32c: 0,
+        };
+
+        assert_eq!(
+            verify_root_auth_footer(
+                &footer,
+                &request.archive_root,
+                Some(public_key),
+                Ed25519VerificationMode::KeyHoldingRootAuth,
+            ),
+            Ed25519RootAuthOutcome::RootAuthContentVerified { key_id: public_key }
+        );
+
+        let wrong_spec_request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID,
+            ..request
+        };
+        let mut wrong_spec_footer = footer;
+        wrong_spec_footer.authenticator_value =
+            authenticator_value_for_request(&signing_key, &wrong_spec_request).to_vec();
+
+        assert_eq!(
+            verify_root_auth_footer(
+                &wrong_spec_footer,
+                &request.archive_root,
+                Some(public_key),
+                Ed25519VerificationMode::KeyHoldingRootAuth,
+            ),
+            Ed25519RootAuthOutcome::Invalid
         );
     }
 

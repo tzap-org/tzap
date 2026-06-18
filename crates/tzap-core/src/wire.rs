@@ -3,20 +3,21 @@ use sha2::{Digest, Sha256};
 
 use crate::crypto::KdfParams;
 use crate::format::{
-    AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, FormatError, KdfAlgo, BLOCK_RECORD_FRAMING_LEN,
-    BOOTSTRAP_SIDECAR_HEADER_LEN, CRITICAL_METADATA_IMAGE_FIXED_LEN,
-    CRITICAL_METADATA_RECOVERY_HEADER_LEN, CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN,
-    CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_EXTENSION_MAX_VALUE_LEN,
-    CRYPTO_HEADER_FIXED_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, IMAGE_CRC_LEN,
+    root_auth_spec_id_for_revision, AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, FormatError,
+    KdfAlgo, VolumeFormatRevision, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN,
+    CRITICAL_METADATA_IMAGE_FIXED_LEN, CRITICAL_METADATA_RECOVERY_HEADER_LEN,
+    CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN, CRITICAL_RECOVERY_LOCATOR_LEN,
+    CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_EXTENSION_MAX_VALUE_LEN, CRYPTO_HEADER_FIXED_LEN,
+    CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, IMAGE_CRC_LEN,
     MANIFEST_FOOTER_LEN, READER_MAX_BLOCK_SIZE, READER_MAX_CHUNK_SIZE,
     READER_MAX_CRYPTO_HEADER_LEN, READER_MAX_ENVELOPE_TARGET_SIZE, READER_MAX_FEC_CLASS_SHARDS,
     READER_MAX_INDEX_FEC_CLASS_SHARDS, READER_MAX_INDEX_ROOT_FEC_CLASS_SHARDS,
     READER_MAX_KEY_WRAP_TABLE_LEN, READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS,
     READER_MAX_PATH_LENGTH, READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN,
     READER_MAX_ROOT_AUTH_FOOTER_LEN, READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN,
-    READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, READER_MAX_STRIPE_WIDTH, ROOT_AUTH_FOOTER_FIXED_LEN,
-    ROOT_AUTH_SPEC_ID, SERIALIZED_REGION_HEADER_LEN, VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44,
-    VolumeFormatRevision, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    READER_MAX_STRIPE_WIDTH, READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, ROOT_AUTH_FOOTER_FIXED_LEN,
+    SERIALIZED_REGION_HEADER_LEN, VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN,
+    VOLUME_TRAILER_LEN,
 };
 use crate::raw_stream_profile::{
     validate_raw_stream_content_model_extension, RAW_STREAM_CONTENT_MODEL_EXTENSION_TAG,
@@ -220,10 +221,8 @@ impl CryptoHeaderFixed {
         }
         match (self.aead_algo, self.kdf_algo) {
             (AeadAlgo::None, KdfAlgo::None) => {}
-            (
-                aead_algo,
-                KdfAlgo::Raw | KdfAlgo::Argon2id | KdfAlgo::RecipientWrap,
-            ) if aead_algo.is_encrypted() => {}
+            (aead_algo, KdfAlgo::Raw | KdfAlgo::Argon2id | KdfAlgo::RecipientWrap)
+                if aead_algo.is_encrypted() => {}
             _ => {
                 return Err(FormatError::InvalidProtectionMode {
                     aead_algo: self.aead_algo,
@@ -527,7 +526,9 @@ pub struct KeyWrapTableV1 {
 impl KeyWrapTableV1 {
     pub fn to_bytes(&self) -> Result<Vec<u8>, FormatError> {
         if self.version != KEY_WRAP_TABLE_VERSION {
-            return Err(FormatError::InvalidArchive("KeyWrapTableV1 version must be 1"));
+            return Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 version must be 1",
+            ));
         }
         if self.volume_format_rev != VOLUME_FORMAT_REV_44 {
             return Err(FormatError::InvalidArchive(
@@ -540,16 +541,22 @@ impl KeyWrapTableV1 {
             });
         }
         if self.records_offset != KEY_WRAP_TABLE_HEADER_LEN as u32 {
-            return Err(FormatError::InvalidArchive("KeyWrapTableV1 records_offset must be 96"));
+            return Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 records_offset must be 96",
+            ));
         }
         if !self.recipient_records.is_empty() {
             let mut recipients = Vec::with_capacity(self.recipient_records.len());
             for record in &self.recipient_records {
                 recipients.extend_from_slice(&record.to_bytes()?);
             }
-            let recipient_record_count =
-                u32_len(self.recipient_records.len(), "KeyWrapTableV1 recipient_record_count")?;
-            if self.recipient_record_count != 0 && self.recipient_record_count != recipient_record_count {
+            let recipient_record_count = u32_len(
+                self.recipient_records.len(),
+                "KeyWrapTableV1 recipient_record_count",
+            )?;
+            if self.recipient_record_count != 0
+                && self.recipient_record_count != recipient_record_count
+            {
                 return Err(FormatError::InvalidArchive(
                     "KeyWrapTableV1 recipient_record_count does not match fields",
                 ));
@@ -620,11 +627,15 @@ impl KeyWrapTableV1 {
 
         let header_length = read_u32(bytes, 12)?;
         if header_length != KEY_WRAP_TABLE_HEADER_LEN as u32 {
-            return Err(FormatError::InvalidArchive("KeyWrapTableV1 header_length must be 96"));
+            return Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 header_length must be 96",
+            ));
         }
         let version = read_u16(bytes, 4)?;
         if version != KEY_WRAP_TABLE_VERSION {
-            return Err(FormatError::InvalidArchive("KeyWrapTableV1 version must be 1"));
+            return Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 version must be 1",
+            ));
         }
         let volume_format_rev = read_u16(bytes, 6)?;
         if volume_format_rev != VOLUME_FORMAT_REV_44 {
@@ -688,11 +699,12 @@ impl KeyWrapTableV1 {
                 "KeyWrapTableV1 records_offset must be 96",
             ));
         }
-        let records_end = records_offset
-            .checked_add(records_length)
-            .ok_or(FormatError::InvalidArchive(
-                "KeyWrapTableV1 records_offset + records_length overflow",
-            ))?;
+        let records_end =
+            records_offset
+                .checked_add(records_length)
+                .ok_or(FormatError::InvalidArchive(
+                    "KeyWrapTableV1 records_offset + records_length overflow",
+                ))?;
         if records_end != declared_length {
             return Err(FormatError::InvalidArchive(
                 "KeyWrapTableV1 records_offset and records_length are inconsistent",
@@ -749,14 +761,18 @@ impl RecipientRecordV1 {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, FormatError> {
         let mut bytes = vec![0u8; KEY_WRAP_RECORD_HEADER_LEN];
-        let computed_identity_length =
-            u32_len(self.recipient_identity_bytes.len(), "RecipientRecordV1 identity length")?;
-        let computed_profile_payload_length =
-            u32_len(self.profile_payload_bytes.len(), "RecipientRecordV1 profile payload length")?;
+        let computed_identity_length = u32_len(
+            self.recipient_identity_bytes.len(),
+            "RecipientRecordV1 identity length",
+        )?;
+        let computed_profile_payload_length = u32_len(
+            self.profile_payload_bytes.len(),
+            "RecipientRecordV1 profile payload length",
+        )?;
         let computed_record_length = u32_len(
-            computed_identity_length
-                .checked_add(KEY_WRAP_RECORD_HEADER_LEN as u32)
-                .and_then(|value| value.checked_add(computed_profile_payload_length))
+            KEY_WRAP_RECORD_HEADER_LEN
+                .checked_add(self.recipient_identity_bytes.len())
+                .and_then(|value| value.checked_add(self.profile_payload_bytes.len()))
                 .ok_or(FormatError::WriterUnsupported(
                     "RecipientRecordV1 length overflow",
                 ))?,
@@ -1164,6 +1180,8 @@ impl VolumeTrailer {
 pub struct RootAuthFooterV1 {
     pub archive_uuid: [u8; 16],
     pub session_id: [u8; 16],
+    pub format_version: u16,
+    pub volume_format_rev: u16,
     pub authenticator_id: u16,
     pub signer_identity_type: u16,
     pub signer_identity_bytes: Vec<u8>,
@@ -1192,16 +1210,18 @@ impl RootAuthFooterV1 {
             self.authenticator_value.len(),
         )?;
         let footer_length = self.footer_length()?;
+        let root_auth_spec_id =
+            root_auth_spec_id_for_revision(self.format_version, self.volume_format_rev)?;
         let mut bytes = vec![0u8; footer_length as usize];
         bytes[0..4].copy_from_slice(&TZRA_MAGIC);
         write_u16(&mut bytes, 4, 1);
-        bytes[6..30].copy_from_slice(&ROOT_AUTH_SPEC_ID);
+        bytes[6..30].copy_from_slice(&root_auth_spec_id);
         write_u32(&mut bytes, 30, footer_length);
         write_u32(&mut bytes, 34, 0);
         bytes[38..54].copy_from_slice(&self.archive_uuid);
         bytes[54..70].copy_from_slice(&self.session_id);
-        write_u16(&mut bytes, 70, FORMAT_VERSION);
-        write_u16(&mut bytes, 72, VOLUME_FORMAT_REV);
+        write_u16(&mut bytes, 70, self.format_version);
+        write_u16(&mut bytes, 72, self.volume_format_rev);
         write_u16(&mut bytes, 74, self.authenticator_id);
         write_u16(&mut bytes, 76, self.signer_identity_type);
         write_u32(
@@ -1256,11 +1276,7 @@ impl RootAuthFooterV1 {
         if version != 1 {
             return Err(FormatError::UnsupportedFormatVersion(version));
         }
-        if read_array_24(bytes, 6)? != ROOT_AUTH_SPEC_ID {
-            return Err(FormatError::InvalidArchive(
-                "RootAuthFooterV1 root_auth_spec_id is unsupported",
-            ));
-        }
+        let root_auth_spec_id = read_array_24(bytes, 6)?;
         let footer_length = read_u32(bytes, 30)?;
         if footer_length as usize != bytes.len() {
             return Err(FormatError::InvalidLength {
@@ -1279,12 +1295,10 @@ impl RootAuthFooterV1 {
             return Err(FormatError::UnsupportedFormatVersion(format_version));
         }
         let volume_format_rev = read_u16(bytes, 72)?;
-        if volume_format_rev != VOLUME_FORMAT_REV {
-            return Err(FormatError::UnsupportedVolumeFormatRevision {
-                format_version,
-                volume_format_rev,
-                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
-            });
+        if root_auth_spec_id != root_auth_spec_id_for_revision(format_version, volume_format_rev)? {
+            return Err(FormatError::InvalidArchive(
+                "RootAuthFooterV1 root_auth_spec_id does not match volume_format_rev",
+            ));
         }
         let signer_identity_length = read_u32(bytes, 78)?;
         let authenticator_value_length = read_u32(bytes, 82)?;
@@ -1317,6 +1331,8 @@ impl RootAuthFooterV1 {
         Ok(Self {
             archive_uuid: read_array_16(bytes, 38)?,
             session_id: read_array_16(bytes, 54)?,
+            format_version,
+            volume_format_rev,
             authenticator_id: read_u16(bytes, 74)?,
             signer_identity_type: read_u16(bytes, 76)?,
             signer_identity_bytes: bytes[signer_start..signer_end].to_vec(),
@@ -2196,7 +2212,7 @@ fn write_i64(bytes: &mut [u8], offset: usize, value: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::CRYPTO_HEADER_HMAC_LEN;
+    use crate::format::{CRYPTO_HEADER_HMAC_LEN, VOLUME_FORMAT_REV_43};
     use sha2::{Digest, Sha256};
 
     fn uuid() -> [u8; 16] {
@@ -2399,7 +2415,9 @@ mod tests {
         let v45_crc = crc32c(&v45[..124]);
         write_u32(&mut v45, 124, v45_crc);
         assert_eq!(
-            VolumeHeader::parse(&v45).unwrap().parse_volume_format_revision(),
+            VolumeHeader::parse(&v45)
+                .unwrap()
+                .parse_volume_format_revision(),
             Err(FormatError::UnsupportedVolumeFormatRevision {
                 format_version: FORMAT_VERSION,
                 volume_format_rev: VOLUME_FORMAT_REV_44 + 1,
@@ -2550,17 +2568,14 @@ mod tests {
     #[test]
     fn key_wrap_table_round_trips_with_record_digest_checks() {
         let (table_bytes, table_length) = key_wrap_table_bytes();
-        let parsed = KeyWrapTableV1::parse(
-            &table_bytes,
-            &uuid(),
-            &session(),
-            table_length,
-            1,
-        )
-        .unwrap();
+        let parsed =
+            KeyWrapTableV1::parse(&table_bytes, &uuid(), &session(), table_length, 1).unwrap();
         assert_eq!(parsed.table_length, table_length);
         assert_eq!(parsed.recipient_records.len(), 1);
-        assert_eq!(parsed.recipient_records[0].recipient_identity_bytes, b"alice");
+        assert_eq!(
+            parsed.recipient_records[0].recipient_identity_bytes,
+            b"alice"
+        );
 
         let (record, consumed) = RecipientRecordV1::parse(&table_bytes[96..]).unwrap();
         assert_eq!(record.profile_id, 1);
@@ -2576,7 +2591,8 @@ mod tests {
         expected.update(&table_length.to_le_bytes());
         expected.update(&table_bytes);
         let expected = expected.finalize();
-        assert_eq!(digest, expected[..].try_into().unwrap());
+        let expected_digest: [u8; 32] = expected[..].try_into().unwrap();
+        assert_eq!(digest, expected_digest);
     }
 
     #[test]
@@ -2619,7 +2635,9 @@ mod tests {
         write_u16(&mut bad_version, 4, 2);
         assert_eq!(
             KeyWrapTableV1::parse(&bad_version, &uuid(), &session(), table_length, 1),
-            Err(FormatError::InvalidArchive("KeyWrapTableV1 version must be 1"))
+            Err(FormatError::InvalidArchive(
+                "KeyWrapTableV1 version must be 1"
+            ))
         );
 
         let mut bad_revision = table_bytes.clone();
@@ -3350,6 +3368,8 @@ mod tests {
         let footer = RootAuthFooterV1 {
             archive_uuid: uuid(),
             session_id: session(),
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV,
             authenticator_id: 2,
             signer_identity_type: 1,
             signer_identity_bytes: b"public-key".to_vec(),
@@ -3393,17 +3413,24 @@ mod tests {
         ));
 
         let mut v44 = footer.to_bytes().unwrap();
+        v44[6..30].copy_from_slice(&crate::format::ROOT_AUTH_SPEC_ID_V44);
         write_u16(&mut v44, 72, VOLUME_FORMAT_REV_44);
         let v44_crc_offset = v44.len() - 4;
         let v44_crc = crc32c(&v44[..v44_crc_offset]);
         write_u32(&mut v44, v44_crc_offset, v44_crc);
+        let parsed_v44 = RootAuthFooterV1::parse(&v44).unwrap();
+        assert_eq!(parsed_v44.volume_format_rev, VOLUME_FORMAT_REV_44);
+
+        let mut mismatched = footer.to_bytes().unwrap();
+        write_u16(&mut mismatched, 72, VOLUME_FORMAT_REV_44);
+        let mismatch_crc_offset = mismatched.len() - 4;
+        let mismatch_crc = crc32c(&mismatched[..mismatch_crc_offset]);
+        write_u32(&mut mismatched, mismatch_crc_offset, mismatch_crc);
         assert_eq!(
-            RootAuthFooterV1::parse(&v44).unwrap_err(),
-            FormatError::UnsupportedVolumeFormatRevision {
-                format_version: FORMAT_VERSION,
-                volume_format_rev: VOLUME_FORMAT_REV_44,
-                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
-            }
+            RootAuthFooterV1::parse(&mismatched).unwrap_err(),
+            FormatError::InvalidArchive(
+                "RootAuthFooterV1 root_auth_spec_id does not match volume_format_rev",
+            )
         );
     }
 

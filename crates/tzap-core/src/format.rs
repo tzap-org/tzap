@@ -11,7 +11,9 @@ pub const CRYPTO_HEADER_FIXED_LEN: usize = 76;
 pub const MANIFEST_FOOTER_LEN: usize = 136;
 pub const VOLUME_TRAILER_LEN: usize = 128;
 pub const ROOT_AUTH_FOOTER_FIXED_LEN: usize = 318;
-pub const ROOT_AUTH_SPEC_ID: [u8; 24] = *b"tzap-root-auth-v0.43\0\0\0\0";
+pub const ROOT_AUTH_SPEC_ID_V43: [u8; 24] = *b"tzap-root-auth-v0.43\0\0\0\0";
+pub const ROOT_AUTH_SPEC_ID_V44: [u8; 24] = *b"tzap-root-auth-v0.44\0\0\0\0";
+pub const ROOT_AUTH_SPEC_ID: [u8; 24] = ROOT_AUTH_SPEC_ID_V43;
 pub const CRITICAL_METADATA_IMAGE_FIXED_LEN: usize = 320;
 pub const SERIALIZED_REGION_HEADER_LEN: usize = 16;
 pub const IMAGE_CRC_LEN: usize = 4;
@@ -545,4 +547,22 @@ pub enum FormatError {
 
     #[error("invalid archive: {0}")]
     InvalidArchive(&'static str),
+}
+
+pub fn root_auth_spec_id_for_revision(
+    format_version: u16,
+    volume_format_rev: u16,
+) -> Result<[u8; 24], FormatError> {
+    if format_version != FORMAT_VERSION {
+        return Err(FormatError::UnsupportedFormatVersion(format_version));
+    }
+    match volume_format_rev {
+        VOLUME_FORMAT_REV_43 => Ok(ROOT_AUTH_SPEC_ID_V43),
+        VOLUME_FORMAT_REV_44 => Ok(ROOT_AUTH_SPEC_ID_V44),
+        other => Err(FormatError::UnsupportedVolumeFormatRevision {
+            format_version,
+            volume_format_rev: other,
+            reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+        }),
+    }
 }

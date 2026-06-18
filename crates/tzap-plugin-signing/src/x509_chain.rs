@@ -9,7 +9,7 @@ use openssl::x509::store::X509StoreBuilder;
 use openssl::x509::verify::X509VerifyParam;
 use openssl::x509::{X509NameRef, X509StoreContext, X509};
 use sha2::{Digest, Sha256, Sha512};
-use tzap_core::format::ROOT_AUTH_SPEC_ID;
+use tzap_core::format::{root_auth_spec_id_for_revision, ROOT_AUTH_SPEC_ID};
 use tzap_core::wire::RootAuthFooterV1;
 use tzap_core::writer::{RootAuthSigningRequest, RootAuthWriterConfig};
 
@@ -147,7 +147,8 @@ impl X509RootAuthSigner {
         request: &RootAuthSigningRequest,
     ) -> Result<Vec<u8>, X509RootAuthError> {
         let chain_digest = chain_digest(&self.chain_certificate_der)?;
-        let signing_input = signing_input(
+        let signing_input = signing_input_for_root_auth_spec_id(
+            &request.root_auth_spec_id,
             &request.archive_uuid,
             &request.session_id,
             &request.archive_root,
@@ -195,9 +196,27 @@ pub fn signing_input(
     signed_at_unix_seconds: i64,
     chain_digest: &[u8; SHA256_LEN],
 ) -> [u8; 64] {
+    signing_input_for_root_auth_spec_id(
+        &ROOT_AUTH_SPEC_ID,
+        archive_uuid,
+        session_id,
+        archive_root,
+        signed_at_unix_seconds,
+        chain_digest,
+    )
+}
+
+pub fn signing_input_for_root_auth_spec_id(
+    root_auth_spec_id: &[u8; 24],
+    archive_uuid: &[u8; 16],
+    session_id: &[u8; 16],
+    archive_root: &[u8; 32],
+    signed_at_unix_seconds: i64,
+    chain_digest: &[u8; SHA256_LEN],
+) -> [u8; 64] {
     let mut hasher = Sha512::new();
     hasher.update(X509_SIGNING_DOMAIN);
-    hasher.update(ROOT_AUTH_SPEC_ID);
+    hasher.update(root_auth_spec_id);
     hasher.update(archive_uuid);
     hasher.update(session_id);
     hasher.update(archive_root);
@@ -260,7 +279,12 @@ pub fn verify_root_auth_footer(
 
     let leaf_certificate = X509::from_der(&footer.signer_identity_bytes)?;
     let parsed = parse_authenticator_value(&footer.authenticator_value)?;
-    let signing_input = signing_input(
+    let root_auth_spec_id =
+        root_auth_spec_id_for_revision(footer.format_version, footer.volume_format_rev).map_err(
+            |_| X509RootAuthError::Invalid("unsupported RootAuthFooter root_auth_spec_id"),
+        )?;
+    let signing_input = signing_input_for_root_auth_spec_id(
+        &root_auth_spec_id,
         &footer.archive_uuid,
         &footer.session_id,
         archive_root,
@@ -571,6 +595,10 @@ mod tests {
     use openssl::x509::extension::{BasicConstraints, KeyUsage};
     use openssl::x509::{X509NameBuilder, X509Ref};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tzap_core::format::{
+        FORMAT_VERSION, ROOT_AUTH_SPEC_ID, ROOT_AUTH_SPEC_ID_V44, VOLUME_FORMAT_REV,
+        VOLUME_FORMAT_REV_44,
+    };
 
     #[test]
     fn x509_authenticator_round_trips_with_trusted_root() {
@@ -585,6 +613,7 @@ mod tests {
             X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), signed_at)
                 .unwrap();
         let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID,
             archive_uuid: [1; 16],
             session_id: [2; 16],
             archive_root: [3; 32],
@@ -593,6 +622,8 @@ mod tests {
         let footer = RootAuthFooterV1 {
             archive_uuid: request.archive_uuid,
             session_id: request.session_id,
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV,
             authenticator_id: X509_AUTHENTICATOR_ID,
             signer_identity_type: X509_SIGNER_IDENTITY_TYPE_DER_CERT,
             signer_identity_bytes: leaf_cert.to_der().unwrap(),
@@ -625,6 +656,69 @@ mod tests {
     }
 
     #[test]
+    fn v44_footer_uses_core_archive_root_and_rejects_wrong_spec_id() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_leaf_cert(
+            "Acme Release Signing",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+        );
+        let signed_at = now_unix_seconds();
+        let signer =
+            X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), signed_at)
+                .unwrap();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V44,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let footer = RootAuthFooterV1 {
+            archive_uuid: request.archive_uuid,
+            session_id: request.session_id,
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV_44,
+            authenticator_id: X509_AUTHENTICATOR_ID,
+            signer_identity_type: X509_SIGNER_IDENTITY_TYPE_DER_CERT,
+            signer_identity_bytes: leaf_cert.to_der().unwrap(),
+            authenticator_value: signer.authenticator_value_for_request(&request).unwrap(),
+            total_data_block_count: 0,
+            critical_metadata_digest: [0; 32],
+            index_digest: [0; 32],
+            fec_layout_digest: [0; 32],
+            data_block_merkle_root: [0; 32],
+            signer_identity_digest: [0; 32],
+            archive_root: [9; 32],
+            footer_crc32c: 0,
+        };
+
+        verify_root_auth_footer(
+            &footer,
+            &request.archive_root,
+            &[root_cert.to_der().unwrap()],
+            false,
+        )
+        .unwrap();
+
+        let wrong_spec_request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID,
+            ..request
+        };
+        let mut wrong_spec_footer = footer;
+        wrong_spec_footer.authenticator_value =
+            signer.authenticator_value_for_request(&wrong_spec_request).unwrap();
+        let err = verify_root_auth_footer(
+            &wrong_spec_footer,
+            &request.archive_root,
+            &[root_cert.to_der().unwrap()],
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("signature"));
+    }
+
+    #[test]
     fn rejects_wrong_trusted_root() {
         let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
         let (wrong_root_cert, _) = test_ca_cert("Wrong Root CA");
@@ -638,6 +732,7 @@ mod tests {
             X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), signed_at)
                 .unwrap();
         let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID,
             archive_uuid: [1; 16],
             session_id: [2; 16],
             archive_root: [3; 32],
@@ -645,6 +740,8 @@ mod tests {
         let footer = RootAuthFooterV1 {
             archive_uuid: request.archive_uuid,
             session_id: request.session_id,
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV,
             authenticator_id: X509_AUTHENTICATOR_ID,
             signer_identity_type: X509_SIGNER_IDENTITY_TYPE_DER_CERT,
             signer_identity_bytes: leaf_cert.to_der().unwrap(),
@@ -702,6 +799,7 @@ mod tests {
             X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), signed_at)
                 .unwrap();
         let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID,
             archive_uuid: [1; 16],
             session_id: [2; 16],
             archive_root: [3; 32],
@@ -711,6 +809,8 @@ mod tests {
         let footer = RootAuthFooterV1 {
             archive_uuid: request.archive_uuid,
             session_id: request.session_id,
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV,
             authenticator_id: X509_AUTHENTICATOR_ID,
             signer_identity_type: X509_SIGNER_IDENTITY_TYPE_DER_CERT,
             signer_identity_bytes: leaf_cert.to_der().unwrap(),

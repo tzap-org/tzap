@@ -3,7 +3,7 @@
 This document is a compact command reference for `tzap` operators and automation.
 
 - **Version**: from binary metadata (`tzap --version`)
-- **Revision**: format v0.43
+- **Revision**: format v0.43 plus v0.44 RecipientWrap create/open
 
 ## Global options
 
@@ -38,6 +38,9 @@ printf '%s\n' "$TZAP_PASSPHRASE" | \
 # Raw key source
 tzap create --keyfile project.key -o backup.tzap ./project
 
+# Recipient certificate source
+tzap create --recipient-cert recipient.pem -o backup.tzap ./project
+
 # Explicit plaintext archive
 tzap create --no-encryption --signing-key root.signing.hex -o public.tzap ./project
 
@@ -71,6 +74,8 @@ Useful flags:
   modes default to 0.
 - `--bit-rot-buffer-pct`: recovery budget as percentage
 - `--argon2-*`: passphrase derivation tuning
+- `--recipient-cert`: encrypt a v44 RecipientWrap archive to one X.509
+  recipient certificate
 - `--no-encryption`: write an explicit plaintext archive with unkeyed v43
   integrity digests
 - `--dictionary`: optional zstd dictionary
@@ -104,6 +109,10 @@ Notes:
   archive and signer provenance.
 - `--insecure-zero-key` was removed in v43. Use `--no-encryption` when the
   archive is intentionally public plaintext.
+- `--recipient-cert` creates a v44 RecipientWrap archive for one certificate.
+  The current CLI supports this path for file-backed, single-volume archives
+  without `--dictionary` or RootAuth signing flags. Use `--recipient-key` on
+  read commands to open the archive with the matching local private key.
 - Create writes archive files to explicit paths. `-o -` is not archive stdout;
   the current CLI rejects that sentinel with `unsupported-feature`.
 - `--tar-stdin` requires exactly one input path, `-`, and writes to a
@@ -147,6 +156,7 @@ Extract selected paths or all members:
 
 ```sh
 tzap extract --keyfile project.key -C restored project.tzap
+tzap extract --recipient-key recipient.key -C restored project.tzap
 tzap extract -C restored public.tzap
 cat project.tzap | tzap extract --keyfile project.key -C restored -
 # Single file to stdout
@@ -160,6 +170,8 @@ Useful flags:
 - `--overwrite`: replace existing files
 - `--dry-run`: show what would be extracted
 - `--bootstrap`: bootstrap sidecar path
+- `--recipient-key`: open a v44 RecipientWrap archive with a local recipient
+  private key
 - `--volume`: additional multi-volume input paths
 - `--jobs`: worker count for reader CPU work; defaults to the logical CPU count
   reported by the operating system
@@ -179,6 +191,8 @@ Notes:
   random-access reader. Selecting one path reads the authenticated terminal,
   index metadata, and the payload envelopes needed for that path; it does not
   load the whole archive into memory first.
+- RecipientWrap extract currently requires one seekable archive path and does
+  not combine with `--bootstrap` or archive stdin.
 - Selected regular-file payloads stream from the needed envelopes to stdout or
   the destination file with memory bounded by the current envelope, current
   frame, and small tar metadata buffers.
@@ -199,6 +213,7 @@ Inspect archive content paths:
 
 ```sh
 tzap list --keyfile project.key project.tzap
+tzap list --recipient-key recipient.key project.tzap
 printf '%s\n' "$TZAP_PASSPHRASE" | tzap list --password-stdin project.tzap
 tzap list public.tzap
 cat project.tzap | tzap list --keyfile project.key -
@@ -212,6 +227,8 @@ Useful flags:
 - `--long`: human-readable long listing
 - `--json`: machine-readable JSON output
 - `--bootstrap`: bootstrap sidecar path
+- `--recipient-key`: open a v44 RecipientWrap archive with a local recipient
+  private key
 - `--volume`: additional multi-volume input paths
 - `--jobs`: worker count for reader CPU work; defaults to the logical CPU count
   reported by the operating system
@@ -229,6 +246,8 @@ Notes:
 - Key-holding list opens archive files through the core file-backed
   random-access reader. Default output reads terminal and index metadata rather
   than loading every payload block.
+- RecipientWrap list currently requires one seekable archive path and does not
+  combine with `--bootstrap` or archive stdin.
 - `--bootstrap` is for single-volume open paths. Multi-volume open paths should
   pass volume files and omit the sidecar; combining multiple archive inputs
   with `--bootstrap` rejects before reading archive files with
@@ -243,6 +262,7 @@ Validate archive integrity and recovery profile:
 
 ```sh
 tzap verify --keyfile project.key project.tzap
+tzap verify --recipient-key recipient.key project.tzap
 tzap verify --trusted-public-key root.public.hex public.tzap
 cat project.tzap | tzap verify --keyfile project.key -
 tzap verify --keyfile project.key project.vol000.tzap
@@ -268,6 +288,8 @@ Useful flags:
 - `--trusted-ca-cert`: verify X.509 RootAuth with a trusted CA certificate
 - `--trusted-system-roots`: allow OpenSSL default trust roots for X.509 RootAuth
 - `--public-no-key`: verify public v43 RootAuth commitments without the archive key
+- `--recipient-key`: verify a v44 RecipientWrap archive with a local recipient
+  private key
 - `--fast`: use the seekable archive fast-verification path. For plaintext,
   unsigned, dictionary-free archives with no recovery parity, this verifies
   metadata and payload block-record integrity without decompressing the payload
@@ -282,11 +304,12 @@ Useful flags:
 
 Notes:
 
-- Key-holding verification uses `--keyfile`, `--password`, or
-  `--password-stdin` for encrypted archives. Unencrypted v43 archives use no
-  archive key. Add `--trusted-public-key` to require RootAuth content
-  verification after ordinary archive integrity verification for Ed25519, or
-  add `--trusted-ca-cert` / `--trusted-system-roots` for X.509 RootAuth.
+- Key-holding verification uses `--keyfile`, `--password`,
+  `--password-stdin`, or `--recipient-key` for encrypted archives. Unencrypted
+  v43 archives use no archive key. Add `--trusted-public-key` to require
+  RootAuth content verification after ordinary archive integrity verification
+  for Ed25519, or add `--trusted-ca-cert` / `--trusted-system-roots` for X.509
+  RootAuth.
 - Key-holding verification opens archive files through the core file-backed
   random-access reader, then intentionally walks the payload and metadata needed
   to validate the full archive.
@@ -312,7 +335,9 @@ Notes:
   or no key for an unencrypted archive. Dictionary-compressed streams require
   `--bootstrap`. Archive stdin does not support `--password-stdin`,
   passphrase KDF discovery, RootAuth external verification flags,
-  `--public-no-key`, or multi-volume recovery.
+  `--recipient-key`, `--public-no-key`, or multi-volume recovery.
+- RecipientWrap verification currently requires one seekable archive path and
+  does not combine with `--bootstrap`.
 - `--bootstrap` is for single-volume open paths. Multi-volume open paths should
   pass volume files and omit the sidecar; combining multiple archive inputs
   with `--bootstrap` rejects before reading archive files with

@@ -1,18 +1,27 @@
 use sha2::{Digest, Sha256};
 
 use crate::format::{
-    AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, FormatError, KdfAlgo, FORMAT_VERSION,
-    ROOT_AUTH_SPEC_ID, VOLUME_FORMAT_REV,
+    root_auth_spec_id_for_revision, AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, FormatError,
+    KdfAlgo, FORMAT_VERSION, VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_43, VOLUME_FORMAT_REV_44,
 };
 
 const ROOT_AUTH_DESCRIPTOR_DOMAIN: &[u8] = b"tzap-root-auth-descriptor-v1\0";
-const ARCHIVE_ROOT_DOMAIN: &[u8] = b"tzap-archive-root-v43\0";
-const CRYPTO_HEADER_PRE_HMAC_DOMAIN: &[u8] = b"tzap-crypto-header-pre-hmac-v43\0";
-const MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN: &[u8] = b"tzap-manifest-footer-global-pre-hmac-v43\0";
-const CRITICAL_METADATA_DOMAIN: &[u8] = b"tzap-critical-metadata-v43\0";
-const INDEX_ROOT_DOMAIN: &[u8] = b"tzap-index-root-v43\0";
-const FEC_LAYOUT_DOMAIN: &[u8] = b"tzap-fec-layout-v43\0";
-const DATA_BLOCK_MERKLE_DOMAIN: &[u8] = b"tzap-data-block-merkle-v43\0";
+const ARCHIVE_ROOT_DOMAIN_V43: &[u8] = b"tzap-archive-root-v43\0";
+const ARCHIVE_ROOT_DOMAIN_V44: &[u8] = b"tzap-archive-root-v44\0";
+const CRYPTO_HEADER_PRE_HMAC_DOMAIN_V43: &[u8] = b"tzap-crypto-header-pre-hmac-v43\0";
+const CRYPTO_HEADER_PRE_HMAC_DOMAIN_V44: &[u8] = b"tzap-crypto-header-pre-hmac-v44\0";
+const MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN_V43: &[u8] =
+    b"tzap-manifest-footer-global-pre-hmac-v43\0";
+const MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN_V44: &[u8] =
+    b"tzap-manifest-footer-global-pre-hmac-v44\0";
+const CRITICAL_METADATA_DOMAIN_V43: &[u8] = b"tzap-critical-metadata-v43\0";
+const CRITICAL_METADATA_DOMAIN_V44: &[u8] = b"tzap-critical-metadata-v44\0";
+const INDEX_ROOT_DOMAIN_V43: &[u8] = b"tzap-index-root-v43\0";
+const INDEX_ROOT_DOMAIN_V44: &[u8] = b"tzap-index-root-v44\0";
+const FEC_LAYOUT_DOMAIN_V43: &[u8] = b"tzap-fec-layout-v43\0";
+const FEC_LAYOUT_DOMAIN_V44: &[u8] = b"tzap-fec-layout-v44\0";
+const DATA_BLOCK_MERKLE_DOMAIN_V43: &[u8] = b"tzap-data-block-merkle-v43\0";
+const DATA_BLOCK_MERKLE_DOMAIN_V44: &[u8] = b"tzap-data-block-merkle-v44\0";
 const EMPTY_MERKLE_DOMAIN: &[u8] = b"tzap-empty-merkle-tree-v1\0";
 const SIGNER_IDENTITY_DOMAIN: &[u8] = b"tzap-signer-identity-v1\0";
 
@@ -40,6 +49,8 @@ pub struct DataBlockMerkleLeaf {
 pub struct CriticalMetadataDigestInputs<'a> {
     pub archive_uuid: [u8; 16],
     pub session_id: [u8; 16],
+    pub format_version: u16,
+    pub volume_format_rev: u16,
     pub stripe_width: u32,
     pub total_volumes: u32,
     pub compression_algo: CompressionAlgo,
@@ -87,6 +98,48 @@ pub struct ArchiveRootInputs {
     pub signer_identity_digest: [u8; 32],
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RootAuthRevisionParams {
+    root_auth_spec_id: [u8; 24],
+    archive_root_domain: &'static [u8],
+    crypto_header_pre_hmac_domain: &'static [u8],
+    manifest_footer_global_pre_hmac_domain: &'static [u8],
+    critical_metadata_domain: &'static [u8],
+    index_root_domain: &'static [u8],
+    fec_layout_domain: &'static [u8],
+    data_block_merkle_domain: &'static [u8],
+}
+
+fn root_auth_revision_params(
+    format_version: u16,
+    volume_format_rev: u16,
+) -> Result<RootAuthRevisionParams, FormatError> {
+    let root_auth_spec_id = root_auth_spec_id_for_revision(format_version, volume_format_rev)?;
+    match volume_format_rev {
+        VOLUME_FORMAT_REV_43 => Ok(RootAuthRevisionParams {
+            root_auth_spec_id,
+            archive_root_domain: ARCHIVE_ROOT_DOMAIN_V43,
+            crypto_header_pre_hmac_domain: CRYPTO_HEADER_PRE_HMAC_DOMAIN_V43,
+            manifest_footer_global_pre_hmac_domain: MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN_V43,
+            critical_metadata_domain: CRITICAL_METADATA_DOMAIN_V43,
+            index_root_domain: INDEX_ROOT_DOMAIN_V43,
+            fec_layout_domain: FEC_LAYOUT_DOMAIN_V43,
+            data_block_merkle_domain: DATA_BLOCK_MERKLE_DOMAIN_V43,
+        }),
+        VOLUME_FORMAT_REV_44 => Ok(RootAuthRevisionParams {
+            root_auth_spec_id,
+            archive_root_domain: ARCHIVE_ROOT_DOMAIN_V44,
+            crypto_header_pre_hmac_domain: CRYPTO_HEADER_PRE_HMAC_DOMAIN_V44,
+            manifest_footer_global_pre_hmac_domain: MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN_V44,
+            critical_metadata_domain: CRITICAL_METADATA_DOMAIN_V44,
+            index_root_domain: INDEX_ROOT_DOMAIN_V44,
+            fec_layout_domain: FEC_LAYOUT_DOMAIN_V44,
+            data_block_merkle_domain: DATA_BLOCK_MERKLE_DOMAIN_V44,
+        }),
+        _ => unreachable!("root_auth_spec_id_for_revision accepted unsupported revision"),
+    }
+}
+
 pub fn root_auth_descriptor_digest(
     authenticator_id: u16,
     signer_identity_type: u16,
@@ -94,12 +147,33 @@ pub fn root_auth_descriptor_digest(
     authenticator_value_length: u32,
     footer_length: u32,
 ) -> Result<[u8; 32], FormatError> {
+    root_auth_descriptor_digest_for_revision(
+        FORMAT_VERSION,
+        VOLUME_FORMAT_REV,
+        authenticator_id,
+        signer_identity_type,
+        signer_identity_bytes,
+        authenticator_value_length,
+        footer_length,
+    )
+}
+
+pub fn root_auth_descriptor_digest_for_revision(
+    format_version: u16,
+    volume_format_rev: u16,
+    authenticator_id: u16,
+    signer_identity_type: u16,
+    signer_identity_bytes: &[u8],
+    authenticator_value_length: u32,
+    footer_length: u32,
+) -> Result<[u8; 32], FormatError> {
+    let params = root_auth_revision_params(format_version, volume_format_rev)?;
     let signer_identity_length = u32::try_from(signer_identity_bytes.len())
         .map_err(|_| FormatError::InvalidArchive("root-auth signer identity length overflow"))?;
     let signer_identity_hash = sha256_bytes(signer_identity_bytes);
     let mut bytes = Vec::new();
     bytes.extend_from_slice(ROOT_AUTH_DESCRIPTOR_DOMAIN);
-    bytes.extend_from_slice(&ROOT_AUTH_SPEC_ID);
+    bytes.extend_from_slice(&params.root_auth_spec_id);
     push_u16(&mut bytes, authenticator_id);
     push_u16(&mut bytes, signer_identity_type);
     push_u32(&mut bytes, signer_identity_length);
@@ -126,21 +200,22 @@ pub fn signer_identity_digest(
 pub fn critical_metadata_digest(
     inputs: CriticalMetadataDigestInputs<'_>,
 ) -> Result<[u8; 32], FormatError> {
+    let params = root_auth_revision_params(inputs.format_version, inputs.volume_format_rev)?;
     let crypto_header_pre_hmac_digest = len_prefixed_digest(
-        CRYPTO_HEADER_PRE_HMAC_DOMAIN,
+        params.crypto_header_pre_hmac_domain,
         inputs.crypto_header_pre_hmac_bytes,
     )?;
     let manifest_footer_global_pre_hmac_digest = len_prefixed_digest(
-        MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN,
+        params.manifest_footer_global_pre_hmac_domain,
         inputs.manifest_footer_global_pre_hmac_bytes,
     )?;
 
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(CRITICAL_METADATA_DOMAIN);
+    bytes.extend_from_slice(params.critical_metadata_domain);
     bytes.extend_from_slice(&inputs.archive_uuid);
     bytes.extend_from_slice(&inputs.session_id);
-    push_u16(&mut bytes, FORMAT_VERSION);
-    push_u16(&mut bytes, VOLUME_FORMAT_REV);
+    push_u16(&mut bytes, inputs.format_version);
+    push_u16(&mut bytes, inputs.volume_format_rev);
     push_u32(&mut bytes, inputs.stripe_width);
     push_u32(&mut bytes, inputs.total_volumes);
     push_u16(&mut bytes, inputs.compression_algo as u16);
@@ -171,17 +246,36 @@ pub fn critical_metadata_digest(
 }
 
 pub fn index_digest(index_root_plaintext: &[u8]) -> [u8; 32] {
+    index_digest_for_revision(FORMAT_VERSION, VOLUME_FORMAT_REV, index_root_plaintext)
+        .expect("default RootAuth revision is supported")
+}
+
+pub fn index_digest_for_revision(
+    format_version: u16,
+    volume_format_rev: u16,
+    index_root_plaintext: &[u8],
+) -> Result<[u8; 32], FormatError> {
+    let params = root_auth_revision_params(format_version, volume_format_rev)?;
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(INDEX_ROOT_DOMAIN);
+    bytes.extend_from_slice(params.index_root_domain);
     bytes.extend_from_slice(index_root_plaintext);
-    sha256_bytes(&bytes)
+    Ok(sha256_bytes(&bytes))
 }
 
 pub fn fec_layout_digest(rows: &[FecLayoutObjectRow]) -> Result<[u8; 32], FormatError> {
+    fec_layout_digest_for_revision(FORMAT_VERSION, VOLUME_FORMAT_REV, rows)
+}
+
+pub fn fec_layout_digest_for_revision(
+    format_version: u16,
+    volume_format_rev: u16,
+    rows: &[FecLayoutObjectRow],
+) -> Result<[u8; 32], FormatError> {
+    let params = root_auth_revision_params(format_version, volume_format_rev)?;
     let row_count = u32::try_from(rows.len())
         .map_err(|_| FormatError::InvalidArchive("root-auth FEC row count overflow"))?;
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(FEC_LAYOUT_DOMAIN);
+    bytes.extend_from_slice(params.fec_layout_domain);
     push_u32(&mut bytes, row_count);
     for row in rows {
         bytes.push(row.object_class);
@@ -198,20 +292,75 @@ pub fn fec_layout_digest(rows: &[FecLayoutObjectRow]) -> Result<[u8; 32], Format
 }
 
 pub fn data_block_merkle_root(leaves: &[DataBlockMerkleLeaf]) -> [u8; 32] {
+    data_block_merkle_root_for_revision(FORMAT_VERSION, VOLUME_FORMAT_REV, leaves)
+        .expect("default RootAuth revision is supported")
+}
+
+pub fn data_block_merkle_root_for_revision(
+    format_version: u16,
+    volume_format_rev: u16,
+    leaves: &[DataBlockMerkleLeaf],
+) -> Result<[u8; 32], FormatError> {
+    let params = root_auth_revision_params(format_version, volume_format_rev)?;
     if leaves.is_empty() {
-        return empty_data_block_merkle_root();
+        return Ok(empty_data_block_merkle_root(params));
     }
 
     let leaf_hashes = leaves
         .iter()
         .map(|leaf| {
-            data_block_merkle_leaf_hash(leaf.block_index, leaf.kind, leaf.flags, &leaf.payload)
+            data_block_merkle_leaf_hash_with_params(
+                params,
+                leaf.block_index,
+                leaf.kind,
+                leaf.flags,
+                &leaf.payload,
+            )
         })
         .collect::<Vec<_>>();
-    data_block_merkle_root_from_leaf_hashes(&leaf_hashes)
+    Ok(data_block_merkle_root_from_leaf_hashes_with_params(
+        params,
+        &leaf_hashes,
+    ))
 }
 
 pub fn data_block_merkle_leaf_hash(
+    block_index: u64,
+    kind: BlockKind,
+    flags: u8,
+    payload: &[u8],
+) -> [u8; 32] {
+    data_block_merkle_leaf_hash_for_revision(
+        FORMAT_VERSION,
+        VOLUME_FORMAT_REV,
+        block_index,
+        kind,
+        flags,
+        payload,
+    )
+    .expect("default RootAuth revision is supported")
+}
+
+pub fn data_block_merkle_leaf_hash_for_revision(
+    format_version: u16,
+    volume_format_rev: u16,
+    block_index: u64,
+    kind: BlockKind,
+    flags: u8,
+    payload: &[u8],
+) -> Result<[u8; 32], FormatError> {
+    let params = root_auth_revision_params(format_version, volume_format_rev)?;
+    Ok(data_block_merkle_leaf_hash_with_params(
+        params,
+        block_index,
+        kind,
+        flags,
+        payload,
+    ))
+}
+
+fn data_block_merkle_leaf_hash_with_params(
+    params: RootAuthRevisionParams,
     block_index: u64,
     kind: BlockKind,
     flags: u8,
@@ -225,14 +374,38 @@ pub fn data_block_merkle_leaf_hash(
 
     let mut bytes = Vec::new();
     bytes.push(0x00);
-    bytes.extend_from_slice(DATA_BLOCK_MERKLE_DOMAIN);
+    bytes.extend_from_slice(params.data_block_merkle_domain);
     bytes.extend_from_slice(&leaf_payload);
     sha256_bytes(&bytes)
 }
 
 pub fn data_block_merkle_root_from_leaf_hashes(leaf_hashes: &[[u8; 32]]) -> [u8; 32] {
+    data_block_merkle_root_from_leaf_hashes_for_revision(
+        FORMAT_VERSION,
+        VOLUME_FORMAT_REV,
+        leaf_hashes,
+    )
+    .expect("default RootAuth revision is supported")
+}
+
+pub fn data_block_merkle_root_from_leaf_hashes_for_revision(
+    format_version: u16,
+    volume_format_rev: u16,
+    leaf_hashes: &[[u8; 32]],
+) -> Result<[u8; 32], FormatError> {
+    let params = root_auth_revision_params(format_version, volume_format_rev)?;
+    Ok(data_block_merkle_root_from_leaf_hashes_with_params(
+        params,
+        leaf_hashes,
+    ))
+}
+
+fn data_block_merkle_root_from_leaf_hashes_with_params(
+    params: RootAuthRevisionParams,
+    leaf_hashes: &[[u8; 32]],
+) -> [u8; 32] {
     if leaf_hashes.is_empty() {
-        return empty_data_block_merkle_root();
+        return empty_data_block_merkle_root(params);
     }
 
     let mut level = leaf_hashes.to_vec();
@@ -246,7 +419,7 @@ pub fn data_block_merkle_root_from_leaf_hashes(leaf_hashes: &[[u8; 32]]) -> [u8;
             } else {
                 let mut bytes = Vec::new();
                 bytes.push(0x01);
-                bytes.extend_from_slice(DATA_BLOCK_MERKLE_DOMAIN);
+                bytes.extend_from_slice(params.data_block_merkle_domain);
                 bytes.extend_from_slice(&level[idx]);
                 bytes.extend_from_slice(&level[idx + 1]);
                 next.push(sha256_bytes(&bytes));
@@ -258,17 +431,22 @@ pub fn data_block_merkle_root_from_leaf_hashes(leaf_hashes: &[[u8; 32]]) -> [u8;
     level[0]
 }
 
-fn empty_data_block_merkle_root() -> [u8; 32] {
+fn empty_data_block_merkle_root(params: RootAuthRevisionParams) -> [u8; 32] {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(EMPTY_MERKLE_DOMAIN);
-    bytes.extend_from_slice(DATA_BLOCK_MERKLE_DOMAIN);
+    bytes.extend_from_slice(params.data_block_merkle_domain);
     sha256_bytes(&bytes)
 }
 
 pub fn archive_root(inputs: ArchiveRootInputs) -> [u8; 32] {
+    archive_root_for_revision(inputs).expect("ArchiveRootInputs revision is supported")
+}
+
+pub fn archive_root_for_revision(inputs: ArchiveRootInputs) -> Result<[u8; 32], FormatError> {
+    let params = root_auth_revision_params(inputs.format_version, inputs.volume_format_rev)?;
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(ARCHIVE_ROOT_DOMAIN);
-    bytes.extend_from_slice(&ROOT_AUTH_SPEC_ID);
+    bytes.extend_from_slice(params.archive_root_domain);
+    bytes.extend_from_slice(&params.root_auth_spec_id);
     bytes.extend_from_slice(&inputs.archive_uuid);
     bytes.extend_from_slice(&inputs.session_id);
     push_u16(&mut bytes, inputs.format_version);
@@ -284,7 +462,7 @@ pub fn archive_root(inputs: ArchiveRootInputs) -> [u8; 32] {
     bytes.extend_from_slice(&inputs.data_block_merkle_root);
     bytes.extend_from_slice(&inputs.root_auth_descriptor_digest);
     bytes.extend_from_slice(&inputs.signer_identity_digest);
-    sha256_bytes(&bytes)
+    Ok(sha256_bytes(&bytes))
 }
 
 fn len_prefixed_digest(domain: &[u8], payload: &[u8]) -> Result<[u8; 32], FormatError> {
@@ -314,4 +492,170 @@ fn push_u32(bytes: &mut Vec<u8>, value: u32) {
 
 fn push_u64(bytes: &mut Vec<u8>, value: u64) {
     bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_archive_inputs(
+        volume_format_rev: u16,
+        kdf_algo: KdfAlgo,
+        critical_metadata_digest: [u8; 32],
+    ) -> ArchiveRootInputs {
+        ArchiveRootInputs {
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            format_version: FORMAT_VERSION,
+            volume_format_rev,
+            compression_algo: CompressionAlgo::None,
+            aead_algo: AeadAlgo::None,
+            fec_algo: FecAlgo::None,
+            kdf_algo,
+            critical_metadata_digest,
+            index_digest: [3; 32],
+            fec_layout_digest: [4; 32],
+            total_data_block_count: 2,
+            data_block_merkle_root: [5; 32],
+            root_auth_descriptor_digest: [6; 32],
+            signer_identity_digest: [7; 32],
+        }
+    }
+
+    fn sample_critical_inputs<'a>(
+        volume_format_rev: u16,
+        kdf_algo: KdfAlgo,
+        crypto_header_pre_hmac_bytes: &'a [u8],
+        root_auth_descriptor_digest: [u8; 32],
+    ) -> CriticalMetadataDigestInputs<'a> {
+        CriticalMetadataDigestInputs {
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            format_version: FORMAT_VERSION,
+            volume_format_rev,
+            stripe_width: 1,
+            total_volumes: 1,
+            compression_algo: CompressionAlgo::None,
+            aead_algo: AeadAlgo::None,
+            fec_algo: FecAlgo::None,
+            kdf_algo,
+            crypto_header_pre_hmac_bytes,
+            chunk_size: 256 * 1024,
+            envelope_target_size: 1024 * 1024,
+            block_size: 64 * 1024,
+            fec_data_shards: 1,
+            fec_parity_shards: 0,
+            index_fec_data_shards: 1,
+            index_fec_parity_shards: 0,
+            index_root_fec_data_shards: 1,
+            index_root_fec_parity_shards: 0,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            has_dictionary: 0,
+            manifest_footer_global_pre_hmac_bytes: b"manifest-footer-pre-hmac",
+            index_root_first_block: 0,
+            index_root_data_block_count: 1,
+            index_root_parity_block_count: 0,
+            index_root_encrypted_size: 4096,
+            index_root_decompressed_size: 256,
+            root_auth_descriptor_digest,
+        }
+    }
+
+    #[test]
+    fn v43_root_auth_wrappers_preserve_existing_domains() {
+        let descriptor = root_auth_descriptor_digest(1, 1, b"identity", 64, 512).unwrap();
+        assert_eq!(
+            descriptor,
+            root_auth_descriptor_digest_for_revision(
+                FORMAT_VERSION,
+                VOLUME_FORMAT_REV,
+                1,
+                1,
+                b"identity",
+                64,
+                512,
+            )
+            .unwrap()
+        );
+
+        assert_eq!(
+            index_digest(b"index-root"),
+            index_digest_for_revision(FORMAT_VERSION, VOLUME_FORMAT_REV, b"index-root").unwrap()
+        );
+        assert_eq!(
+            data_block_merkle_root_from_leaf_hashes(&[[9; 32], [10; 32]]),
+            data_block_merkle_root_from_leaf_hashes_for_revision(
+                FORMAT_VERSION,
+                VOLUME_FORMAT_REV,
+                &[[9; 32], [10; 32]],
+            )
+            .unwrap()
+        );
+
+        let inputs = sample_archive_inputs(VOLUME_FORMAT_REV, KdfAlgo::None, [8; 32]);
+        assert_eq!(archive_root(inputs), archive_root_for_revision(inputs).unwrap());
+    }
+
+    #[test]
+    fn v44_no_key_archive_root_uses_v44_domains() {
+        let v43 = archive_root_for_revision(sample_archive_inputs(
+            VOLUME_FORMAT_REV_43,
+            KdfAlgo::None,
+            [8; 32],
+        ))
+        .unwrap();
+        let v44 = archive_root_for_revision(sample_archive_inputs(
+            VOLUME_FORMAT_REV_44,
+            KdfAlgo::None,
+            [8; 32],
+        ))
+        .unwrap();
+
+        assert_ne!(v43, v44);
+    }
+
+    #[test]
+    fn v44_recipient_wrap_archive_root_commits_keywrap_table_digest() {
+        let descriptor = root_auth_descriptor_digest_for_revision(
+            FORMAT_VERSION,
+            VOLUME_FORMAT_REV_44,
+            1,
+            1,
+            b"identity",
+            64,
+            512,
+        )
+        .unwrap();
+        let critical_a = critical_metadata_digest(sample_critical_inputs(
+            VOLUME_FORMAT_REV_44,
+            KdfAlgo::RecipientWrap,
+            b"crypto-header-pre-hmac keywrap-table-digest A",
+            descriptor,
+        ))
+        .unwrap();
+        let critical_b = critical_metadata_digest(sample_critical_inputs(
+            VOLUME_FORMAT_REV_44,
+            KdfAlgo::RecipientWrap,
+            b"crypto-header-pre-hmac keywrap-table-digest B",
+            descriptor,
+        ))
+        .unwrap();
+
+        assert_ne!(critical_a, critical_b);
+        assert_ne!(
+            archive_root_for_revision(sample_archive_inputs(
+                VOLUME_FORMAT_REV_44,
+                KdfAlgo::RecipientWrap,
+                critical_a,
+            ))
+            .unwrap(),
+            archive_root_for_revision(sample_archive_inputs(
+                VOLUME_FORMAT_REV_44,
+                KdfAlgo::RecipientWrap,
+                critical_b,
+            ))
+            .unwrap(),
+        );
+    }
 }

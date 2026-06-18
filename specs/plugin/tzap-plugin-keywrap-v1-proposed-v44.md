@@ -4,10 +4,9 @@ Specification for the first recipient key-wrap plugin profile for tzap v44
 archives with `KdfAlgo::RecipientWrap`.
 
 Status: proposed v44 implementation target for the RecipientWrap key-wrap
-profile. The current released v43 core/CLI do not implement `RecipientWrap` or
-`--encrypt-to-cert`. A dedicated `tzap-plugin-keywrap` crate may host this
-profile, and the `--encrypt-to-cert` CLI semantics below describe the v44 target
-behavior. Targets `specs/tzap-format-revisedv44.md`, especially
+profile. The v44 implementation exposes a dedicated `tzap-plugin-keywrap` crate
+and CLI `--recipient-cert` / `--recipient-key` key-source flags for the initial
+single-recipient workflow. Targets `specs/tzap-format-revisedv44.md`, especially
 `KeyWrapTableV1` and `RecipientRecordV1`.
 
 ## 1. Scope
@@ -293,22 +292,25 @@ record targeting the same private key as a hard failure.
 
 ## 12. CLI/API Wording
 
-Target create flags:
+Initial create/open flags:
 
 ```text
-tzap create --encrypt-to-cert bob-device.pem --encrypt-to-cert ops.pem -o backup.tzap ./data
+tzap create --recipient-cert bob-device.pem -o backup.tzap ./data
+tzap extract --recipient-key bob-device.key backup.tzap -C restored
 ```
 
-Target extract behavior:
+Future multi-recipient create flags may allow repeating recipient certificate
+inputs:
 
 ```text
-tzap extract backup.tzap -C restored
+tzap create --recipient-cert bob-device.pem --recipient-cert ops.pem -o backup.tzap ./data
 ```
 
 The reader may discover a matching private key from the OS certificate store,
-hardware token, or configured key path. A UI may still require OS login, PIN,
-Touch ID, hardware-token touch, or enterprise approval. That is not a tzap
-archive password.
+hardware token, or configured key path. The current CLI uses an explicit
+`--recipient-key` path. A UI may still require OS login, PIN, Touch ID,
+hardware-token touch, or enterprise approval. That is not a tzap archive
+password.
 
 Diagnostics SHOULD distinguish:
 
