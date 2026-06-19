@@ -716,7 +716,10 @@ where
         &parsed_crypto.kdf_params,
         key_source,
     ) {
-        (false, _, _) => Subkeys::unencrypted_placeholder(),
+        (false, _, NonSeekableKeySource::RecipientWrap(_)) => {
+            return Err(FormatError::KeyMaterialMismatch);
+        }
+        (false, _, NonSeekableKeySource::MasterKey(_)) => Subkeys::unencrypted_placeholder(),
         (
             true,
             crate::crypto::KdfParams::RecipientWrap { .. },

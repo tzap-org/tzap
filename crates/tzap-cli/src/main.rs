@@ -2071,7 +2071,13 @@ fn run(cli: Cli) -> Result<()> {
                                 "format_version": FORMAT_VERSION,
                                 "volume_format_rev": report.volume_format_rev,
                                 "header_base_integrity": "verified",
-                                "decryption_keywrap": if keyfile.is_some() { "key_holding_decrypted" } else { "plaintext_opened" },
+                                "decryption_keywrap": if recipient_key.is_some() {
+                                    "recipientwrap_opened"
+                                } else if keyfile.is_some() {
+                                    "key_holding_decrypted"
+                                } else {
+                                    "plaintext_opened"
+                                },
                                 "root_auth_signer": match report.root_auth {
                                     SequentialRootAuthStatus::Absent => "absent",
                                     SequentialRootAuthStatus::WireValidOnly => "wire_valid_only",

@@ -6785,12 +6785,7 @@ where
     {
         return Err(FormatError::KeyMaterialMismatch);
     }
-    parsed_crypto.validate_extension_semantics()?;
-    validate_seekable_supported_volume(
-        &volume_header,
-        &parsed_crypto.fixed,
-        &parsed_crypto.extensions,
-    )?;
+    validate_seekable_supported_volume(&volume_header, &parsed_crypto.fixed, &[])?;
     validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
     if parsed_crypto.fixed.bit_rot_buffer_pct == 0 {
         return Err(FormatError::InvalidArchive(
@@ -12578,6 +12573,29 @@ mod tests {
         assert_eq!(report.file_count, 1);
         assert_eq!(report.total_volumes, 1);
         assert_eq!(report.root_auth, SequentialRootAuthStatus::Absent);
+    }
+
+    #[test]
+    fn live_non_seekable_recipientwrap_resolver_rejects_unencrypted_archive() {
+        let archive = write_archive_unencrypted(
+            &[RegularFile::new("plain-live.txt", b"plaintext payload")],
+            single_stream_options(),
+        )
+        .unwrap();
+
+        let mut called = false;
+        let err = verify_non_seekable_stream_with_recipient_wrap_resolver_options(
+            std::io::Cursor::new(archive.bytes),
+            |_| {
+                called = true;
+                Ok(vec![master_key().0])
+            },
+            NonSeekableReaderOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(!called);
+        assert_eq!(err, FormatError::KeyMaterialMismatch);
     }
 
     #[test]

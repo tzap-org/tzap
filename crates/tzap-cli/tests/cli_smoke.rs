@@ -3798,6 +3798,7 @@ fn cli_create_list_verify_and_extract_with_recipient_wrap() {
     let wrong_key_path = temp.path().join("wrong-recipient.key");
     let input = temp.path().join("recipient.txt");
     let archive = temp.path().join("recipient-wrap.tzap");
+    let plaintext_archive = temp.path().join("plaintext.tzap");
     let extract_dir = temp.path().join("out");
 
     let (recipient_cert, recipient_key) = test_x25519_recipient_cert();
@@ -3824,6 +3825,18 @@ fn cli_create_list_verify_and_extract_with_recipient_wrap() {
     Command::cargo_bin("tzap")
         .unwrap()
         .args([
+            "create",
+            "--no-encryption",
+            "-o",
+            plaintext_archive.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
             "list",
             "--recipient-key",
             recipient_key_path.to_str().unwrap(),
@@ -3844,6 +3857,40 @@ fn cli_create_list_verify_and_extract_with_recipient_wrap() {
         .assert()
         .success()
         .stdout(predicate::str::contains("OK"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--json",
+            "--recipient-key",
+            recipient_key_path.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(fs::read(&archive).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            r#""decryption_keywrap":"recipientwrap_opened""#,
+        ));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--json",
+            "--recipient-key",
+            recipient_key_path.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(fs::read(&plaintext_archive).unwrap())
+        .assert()
+        .code(10)
+        .stdout(
+            predicate::str::contains(r#""ok":false"#)
+                .and(predicate::str::contains(r#""label":"wrong-key""#))
+                .and(predicate::str::contains("recipientwrap_opened").not()),
+        );
 
     Command::cargo_bin("tzap")
         .unwrap()
