@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
+use memmap2::Mmap;
 use openssl::pkey::PKey;
 use openssl::x509::X509;
 use rand::RngCore;
@@ -33,6 +34,7 @@ use tzap_core::{
     list_non_seekable_stream_with_recipient_wrap_resolver_and_bootstrap_sidecar,
     list_unencrypted_non_seekable_stream,
     list_unencrypted_non_seekable_stream_with_bootstrap_sidecar, open_seekable_archive,
+    open_seekable_archive_volumes_with_recipient_wrap_resolver_options,
     open_seekable_archive_with_bootstrap_sidecar_options,
     public_no_key_verify_volumes_with_options, verify_non_seekable_stream_with_bootstrap_sidecar,
     verify_non_seekable_stream_with_options,
@@ -4024,10 +4026,39 @@ fn resolve_archive_input_paths(
     })
 }
 
-fn read_volume_inputs_from_paths(paths: &[String]) -> Result<Vec<Vec<u8>>> {
+enum MappedVolumeInput {
+    Empty(Vec<u8>),
+    Mapped(Mmap),
+}
+
+impl MappedVolumeInput {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Empty(bytes) => bytes,
+            Self::Mapped(map) => map.as_ref(),
+        }
+    }
+}
+
+fn map_volume_inputs_from_paths(paths: &[String]) -> Result<Vec<MappedVolumeInput>> {
     paths
         .iter()
-        .map(|path| fs::read(path).with_context(|| format!("failed to read archive {path}")))
+        .map(|path| {
+            let file =
+                File::open(path).with_context(|| format!("failed to read archive {path}"))?;
+            if file
+                .metadata()
+                .with_context(|| format!("failed to inspect archive {path}"))?
+                .len()
+                == 0
+            {
+                return Ok(MappedVolumeInput::Empty(Vec::new()));
+            }
+            // SAFETY: the mapping is read-only and retained while verifier slices are in use.
+            let map = unsafe { Mmap::map(&file) }
+                .with_context(|| format!("failed to map archive {path}"))?;
+            Ok(MappedVolumeInput::Mapped(map))
+        })
         .collect()
 }
 
@@ -4402,25 +4433,16 @@ fn open_selection_with_recipient_key(
             "--recipient-key is not currently supported with --bootstrap",
         )));
     }
-    if selection.paths.len() != 1 {
-        return Err(anyhow!(FormatError::ReaderUnsupported(
-            "--recipient-key currently supports one seekable archive path",
-        )));
-    }
-    let path = selection
-        .paths
-        .first()
-        .ok_or_else(|| anyhow!("at least one archive volume is required"))?;
-    let bytes = fs::read(path).with_context(|| format!("failed to read archive {path}"))?;
+    let volume_files = open_volume_inputs_from_paths(&selection.paths)?;
     let lookup = load_recipient_private_key_lookup(recipient_key)?;
     let mut stats = RecipientWrapOpenStats::default();
-    let opened = OpenedArchive::open_with_recipient_wrap_resolver_options(
-        &bytes,
+    let opened = open_seekable_archive_volumes_with_recipient_wrap_resolver_options(
+        volume_files,
         |context| recipient_wrap_candidates_for_record(context, &lookup, &mut stats),
         options,
     )
     .map_err(|err| recipient_wrap_open_error(err, &stats))
-    .with_context(|| format!("failed to open RecipientWrap archive {path}"))?;
+    .with_context(|| "failed to open RecipientWrap archive")?;
     Ok(OpenedArchiveSelection {
         paths: selection.paths.clone(),
         opened,
@@ -4599,8 +4621,8 @@ fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()>
         }
     };
     let archive_paths = selection.paths;
-    let volume_bytes = match read_volume_inputs_from_paths(&archive_paths) {
-        Ok(volume_bytes) => volume_bytes,
+    let volume_inputs = match map_volume_inputs_from_paths(&archive_paths) {
+        Ok(volume_inputs) => volume_inputs,
         Err(err) => {
             if request.json {
                 emit_verify_json_error(&archive_paths, None, None, &err)?;
@@ -4608,7 +4630,10 @@ fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()>
             return Err(err);
         }
     };
-    let borrowed = volume_bytes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let borrowed = volume_inputs
+        .iter()
+        .map(MappedVolumeInput::as_slice)
+        .collect::<Vec<_>>();
     let mut x509_report = None;
     let mut x509_error = None;
     let verification = match public_no_key_verify_volumes_with_options(

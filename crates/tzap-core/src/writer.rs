@@ -200,6 +200,40 @@ fn resolve_key_wrap_artifacts(
     }
 }
 
+fn recipient_wrap_kdf_params_for_record_count(
+    record_count: usize,
+) -> Result<KdfParams, FormatError> {
+    Ok(KdfParams::RecipientWrap {
+        key_wrap_table_length: 0,
+        key_wrap_table_record_count: u32_len(
+            record_count,
+            "KeyWrapTableV1 recipient_record_count",
+        )?,
+        key_wrap_table_version: 1,
+        key_wrap_table_digest: [0u8; 32],
+    })
+}
+
+fn stabilized_key_wrap_record_source(
+    kdf_params: &KdfParams,
+    key_wrap_records: Option<&KeyWrapRecordSource>,
+) -> Result<Option<KeyWrapRecordSource>, FormatError> {
+    if !matches!(kdf_params, KdfParams::RecipientWrap { .. }) {
+        return Ok(None);
+    }
+    let Some(records) = key_wrap_records
+        .ok_or(FormatError::WriterUnsupported(
+            "RecipientWrap requires key-wrap records",
+        ))?
+        .resolve()?
+    else {
+        return Err(FormatError::WriterUnsupported(
+            "RecipientWrap requires key-wrap records",
+        ));
+    };
+    Ok(Some(KeyWrapRecordSource::fixed(records)))
+}
+
 fn should_emit_directory_hints(file_count: usize) -> bool {
     file_count > DIRECTORY_HINT_REQUIRED_FILE_COUNT
 }
@@ -706,6 +740,59 @@ struct PayloadEnvelopeBuilder {
     plaintext: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PayloadFrameMetadataInput {
+    frame_index: u64,
+    envelope_index: u64,
+    member_index: usize,
+    offset_in_envelope: u32,
+    compressed_size: usize,
+    decompressed_size: usize,
+    member_start: u64,
+    member_offset: u64,
+    member_group_size: u64,
+}
+
+fn payload_envelope_needs_flush(
+    envelope: &PayloadEnvelopeBuilder,
+    frame_len: usize,
+    options: WriterOptions,
+) -> Result<bool, FormatError> {
+    let next_len = checked_usize_add(envelope.plaintext.len(), frame_len, "payload")?;
+    Ok(!envelope.plaintext.is_empty()
+        && (next_len > options.envelope_target_size as usize
+            || !payload_object_can_fit(next_len, options)?))
+}
+
+fn payload_frame_metadata(input: PayloadFrameMetadataInput) -> Result<PayloadFrame, FormatError> {
+    let mut flags = 0u32;
+    if input.member_offset == 0 {
+        flags |= 0x0000_0001;
+    }
+    if checked_u64_add(
+        input.member_offset,
+        input.decompressed_size as u64,
+        "payload chunk",
+    )? == input.member_group_size
+    {
+        flags |= 0x0000_0002;
+    }
+    Ok(PayloadFrame {
+        frame_index: input.frame_index,
+        envelope_index: input.envelope_index,
+        member_index: input.member_index,
+        offset_in_envelope: input.offset_in_envelope,
+        compressed_size: u32_len(input.compressed_size, "FrameEntry.compressed_size")?,
+        decompressed_size: u32_len(input.decompressed_size, "FrameEntry.decompressed_size")?,
+        flags,
+        tar_stream_offset: checked_u64_add(
+            input.member_start,
+            input.member_offset,
+            "PayloadFrame.tar_stream_offset",
+        )?,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StreamingRegularMember {
     pub archive_path: Vec<u8>,
@@ -793,13 +880,7 @@ pub fn write_archive_with_recipient_wrap_records(
     options: WriterOptions,
     records: Vec<RecipientRecordV1>,
 ) -> Result<WrittenArchive, FormatError> {
-    let record_count = u32_len(records.len(), "KeyWrapTableV1 recipient_record_count")?;
-    let kdf_params = KdfParams::RecipientWrap {
-        key_wrap_table_length: 0,
-        key_wrap_table_record_count: record_count,
-        key_wrap_table_version: 1,
-        key_wrap_table_digest: [0u8; 32],
-    };
+    let kdf_params = recipient_wrap_kdf_params_for_record_count(records.len())?;
     let key_wrap_records = KeyWrapRecordSource::fixed(records);
     write_archive_inner(
         files,
@@ -824,13 +905,7 @@ pub fn write_archive_with_root_auth_and_recipient_wrap_records<F>(
 where
     F: FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError>,
 {
-    let record_count = u32_len(records.len(), "KeyWrapTableV1 recipient_record_count")?;
-    let kdf_params = KdfParams::RecipientWrap {
-        key_wrap_table_length: 0,
-        key_wrap_table_record_count: record_count,
-        key_wrap_table_version: 1,
-        key_wrap_table_digest: [0u8; 32],
-    };
+    let kdf_params = recipient_wrap_kdf_params_for_record_count(records.len())?;
     let key_wrap_records = KeyWrapRecordSource::fixed(records);
     write_archive_inner(
         files,
@@ -1086,6 +1161,51 @@ where
         kdf_params,
         root_auth,
         authenticator,
+        None,
+        sink,
+        |writer| {
+            for file in files {
+                let archive_path =
+                    normalize_lookup_file_path(file.archive_path(), options.max_path_length)?;
+                let mut reader = file.open()?;
+                writer.write_regular_member_from_reader(
+                    StreamingRegularMember {
+                        archive_path,
+                        file_data_size: file.file_data_size(),
+                        mode: file.mode(),
+                        mtime: file.mtime(),
+                    },
+                    reader.as_mut(),
+                )?;
+            }
+            Ok(())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_archive_sources_to_sink_single_pass_with_recipient_wrap_records<S, O>(
+    files: &[S],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    records: Vec<RecipientRecordV1>,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    sink: &mut O,
+) -> Result<WrittenArchiveSummary, ArchiveWriteError>
+where
+    S: RegularFileSource,
+    O: ArchiveWriteSink,
+{
+    let kdf_params = recipient_wrap_kdf_params_for_record_count(records.len())?;
+    let key_wrap_records = KeyWrapRecordSource::fixed(records);
+    write_single_pass_archive_to_sink(
+        master_key,
+        options,
+        &kdf_params,
+        root_auth,
+        authenticator,
+        Some(&key_wrap_records),
         sink,
         |writer| {
             for file in files {
@@ -1155,6 +1275,35 @@ where
         kdf_params,
         root_auth,
         authenticator,
+        None,
+        sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_archive_sources_to_sink_ordered_parallel_with_recipient_wrap_records<S, O>(
+    files: &[S],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    records: Vec<RecipientRecordV1>,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    sink: &mut O,
+) -> Result<WrittenArchiveSummary, ArchiveWriteError>
+where
+    S: RegularFileSource,
+    O: ArchiveWriteSink,
+{
+    let kdf_params = recipient_wrap_kdf_params_for_record_count(records.len())?;
+    let key_wrap_records = KeyWrapRecordSource::fixed(records);
+    write_ordered_parallel_archive_to_sink(
+        files,
+        master_key,
+        options,
+        &kdf_params,
+        root_auth,
+        authenticator,
+        Some(&key_wrap_records),
         sink,
     )
 }
@@ -1182,6 +1331,7 @@ where
         kdf_params,
         root_auth,
         authenticator,
+        None,
         sink,
     )
 }
@@ -1722,6 +1872,7 @@ pub(crate) fn write_single_pass_archive_to_sink<O, F>(
     kdf_params: &KdfParams,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    key_wrap_records: Option<&KeyWrapRecordSource>,
     sink: &mut O,
     drive_members: F,
 ) -> Result<WrittenArchiveSummary, ArchiveWriteError>
@@ -1741,7 +1892,12 @@ where
     let session_id = options
         .session_id
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
-    let volume_format_rev = volume_format_revision_for_options(&options, kdf_params);
+    let stabilized_key_wrap_records =
+        stabilized_key_wrap_record_source(kdf_params, key_wrap_records)?;
+    let key_wrap_records = stabilized_key_wrap_records.as_ref().or(key_wrap_records);
+    let (resolved_kdf_params, key_wrap_table) =
+        resolve_key_wrap_artifacts(kdf_params, &archive_uuid, &session_id, key_wrap_records)?;
+    let volume_format_rev = volume_format_revision_for_options(&options, &resolved_kdf_params);
     let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
     let crypto_header = build_crypto_header(
         options,
@@ -1750,13 +1906,13 @@ where
         &subkeys,
         &archive_uuid,
         &session_id,
-        kdf_params,
+        &resolved_kdf_params,
     )?;
     let emission_state = begin_writer_emission_state(
         sink,
         options,
         &crypto_header,
-        None,
+        key_wrap_table.as_deref(),
         archive_uuid,
         session_id,
         volume_format_rev,
@@ -1786,7 +1942,13 @@ where
     let emit_payload_started = Instant::now();
     drive_members(&mut writer)?;
     let emit_payload = emit_payload_started.elapsed();
-    let mut summary = writer.finish(master_key, kdf_params, root_auth, authenticator)?;
+    let mut summary = writer.finish(
+        master_key,
+        &resolved_kdf_params,
+        key_wrap_records,
+        root_auth,
+        authenticator,
+    )?;
     summary.timings.emit_payload += emit_payload;
     summary.timings.total = total_started.elapsed();
     Ok(summary)
@@ -1882,283 +2044,40 @@ fn write_ordered_parallel_archive_to_sink<S, O>(
     kdf_params: &KdfParams,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    key_wrap_records: Option<&KeyWrapRecordSource>,
     sink: &mut O,
 ) -> Result<WrittenArchiveSummary, ArchiveWriteError>
 where
     S: RegularFileSource,
     O: ArchiveWriteSink,
 {
-    let total_started = Instant::now();
-    validate_single_pass_writer_options(options)?;
-    if let Some(root_auth) = root_auth {
-        validate_root_auth_writer_config(root_auth)?;
-    }
-    let options = plan_single_pass_writer_options(options)?;
-    let archive_uuid = options
-        .archive_uuid
-        .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
-    let session_id = options
-        .session_id
-        .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
-    let volume_format_rev = volume_format_revision_for_options(&options, kdf_params);
-    let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
-    let crypto_header = build_crypto_header(
-        options,
-        volume_format_rev,
-        false,
-        &subkeys,
-        &archive_uuid,
-        &session_id,
-        kdf_params,
-    )?;
-    let mut emission_state = begin_writer_emission_state(
-        sink,
-        options,
-        &crypto_header,
-        None,
-        archive_uuid,
-        session_id,
-        volume_format_rev,
-        root_auth.is_some(),
-    )?;
-
-    let emit_payload_started = Instant::now();
-    let mut ordered = OrderedParallelState::new(files.len());
-    let worker_count = options.jobs.max(1);
-    let frame_job_buffer = worker_count.saturating_mul(4).max(1);
-    let envelope_job_buffer = worker_count.saturating_mul(2).max(1);
-    let subkeys_for_workers = std::sync::Arc::new(subkeys.clone());
-
-    std::thread::scope(|scope| -> Result<(), ArchiveWriteError> {
-        let (frame_job_tx, frame_job_rx) =
-            std::sync::mpsc::sync_channel::<OrderedFrameJob>(frame_job_buffer);
-        let (frame_result_tx, frame_result_rx) =
-            std::sync::mpsc::channel::<Result<OrderedFrameResult, ArchiveWriteError>>();
-        let frame_job_rx = std::sync::Arc::new(std::sync::Mutex::new(frame_job_rx));
-
-        let (envelope_job_tx, envelope_job_rx) =
-            std::sync::mpsc::sync_channel::<OrderedEnvelopeJob>(envelope_job_buffer);
-        let (envelope_result_tx, envelope_result_rx) =
-            std::sync::mpsc::channel::<Result<OrderedEnvelopeResult, ArchiveWriteError>>();
-        let envelope_job_rx = std::sync::Arc::new(std::sync::Mutex::new(envelope_job_rx));
-
-        let frame_handles = (0..worker_count)
-            .map(|_| {
-                let frame_job_rx = std::sync::Arc::clone(&frame_job_rx);
-                let frame_result_tx = frame_result_tx.clone();
-                scope.spawn(move || loop {
-                    let job = {
-                        let receiver = frame_job_rx
-                            .lock()
-                            .expect("ordered frame receiver poisoned");
-                        receiver.recv()
-                    };
-                    let Ok(job) = job else {
-                        break;
-                    };
-                    let is_error = match build_ordered_frame_result(job, options) {
-                        Ok(result) => frame_result_tx.send(Ok(result)).is_err(),
-                        Err(error) => {
-                            let _ = frame_result_tx.send(Err(error));
-                            true
-                        }
-                    };
-                    if is_error {
-                        break;
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        drop(frame_result_tx);
-
-        let envelope_handles = (0..worker_count)
-            .map(|_| {
-                let envelope_job_rx = std::sync::Arc::clone(&envelope_job_rx);
-                let envelope_result_tx = envelope_result_tx.clone();
-                let subkeys = std::sync::Arc::clone(&subkeys_for_workers);
-                scope.spawn(move || loop {
-                    let job = {
-                        let receiver = envelope_job_rx
-                            .lock()
-                            .expect("ordered envelope receiver poisoned");
-                        receiver.recv()
-                    };
-                    let Ok(job) = job else {
-                        break;
-                    };
-                    let is_error = match build_ordered_envelope_result(
-                        job,
-                        &subkeys,
-                        options,
-                        archive_uuid,
-                        session_id,
-                    ) {
-                        Ok(result) => envelope_result_tx.send(Ok(result)).is_err(),
-                        Err(error) => {
-                            let _ = envelope_result_tx.send(Err(error));
-                            true
-                        }
-                    };
-                    if is_error {
-                        break;
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        drop(envelope_result_tx);
-
-        for (member_index, file) in files.iter().enumerate() {
-            let path = normalize_lookup_file_path(file.archive_path(), options.max_path_length)?;
-            let prefix = build_regular_file_member_prefix(
-                &path,
-                file.file_data_size(),
-                file.mode(),
-                file.mtime(),
-            )?;
-            let member_start = ordered.tar_total_size;
-            let member_group_size = checked_u64_add(
-                prefix.len() as u64,
-                checked_u64_add(
-                    file.file_data_size(),
-                    padding_to_512_u64(file.file_data_size()),
-                    "tar member",
-                )?,
-                "tar member",
-            )?;
-            ordered.tar_members.push(TarMember {
-                path,
-                tar_member_group_start: member_start,
-                tar_member_group_size: member_group_size,
-                file_data_size: file.file_data_size(),
-                mode: file.mode(),
-                mtime: file.mtime(),
-            });
-            let mut reader =
-                StreamingMemberReader::new(file.open()?, prefix, file.file_data_size());
-            let mut member_offset = 0u64;
-            while member_offset < member_group_size {
-                let remaining = member_group_size - member_offset;
-                let read_len = remaining.min(options.chunk_size as u64);
-                let mut plaintext = vec![0u8; to_usize_writer(read_len, "payload chunk")?];
-                reader
-                    .read_exact(&mut plaintext)
-                    .map_err(ArchiveWriteError::Io)?;
-                ordered.hasher.update(&plaintext);
-                let frame_index = ordered.next_frame_job_index;
-                ordered.next_frame_job_index =
-                    checked_u64_add(ordered.next_frame_job_index, 1, "PayloadFrame.frame_index")?;
-                send_ordered_frame_job(
-                    OrderedFrameJob {
-                        frame_index,
-                        member_index,
-                        member_start,
-                        member_offset,
-                        member_group_size,
-                        plaintext,
-                    },
-                    &frame_job_tx,
-                    &frame_result_rx,
-                    &envelope_job_tx,
-                    &envelope_result_rx,
-                    &mut ordered,
-                    sink,
-                    options,
-                    &mut emission_state,
-                )?;
-                member_offset = checked_u64_add(member_offset, read_len, "payload chunk")?;
-                ordered.tar_total_size =
-                    checked_u64_add(ordered.tar_total_size, read_len, "tar stream")?;
-            }
-        }
-        drop(frame_job_tx);
-
-        while ordered.next_frame_result_index < ordered.next_frame_job_index {
-            receive_ordered_frame_result(
-                &frame_result_rx,
-                &envelope_job_tx,
-                &envelope_result_rx,
-                &mut ordered,
-                sink,
-                options,
-                &mut emission_state,
-                true,
-            )?;
-        }
-        flush_ordered_parallel_envelope(
-            &envelope_job_tx,
-            &envelope_result_rx,
-            &mut ordered,
-            sink,
-            options,
-            &mut emission_state,
-        )?;
-        drop(envelope_job_tx);
-        while ordered.next_envelope_result_index < ordered.envelope.envelope_index {
-            receive_ordered_envelope_result(
-                &envelope_result_rx,
-                &mut ordered,
-                sink,
-                options,
-                &mut emission_state,
-                true,
-            )?;
-        }
-
-        for handle in frame_handles {
-            handle
-                .join()
-                .map_err(|_| FormatError::WriterInvariant("ordered frame worker panicked"))?;
-        }
-        for handle in envelope_handles {
-            handle
-                .join()
-                .map_err(|_| FormatError::WriterInvariant("ordered envelope worker panicked"))?;
-        }
-        Ok(())
-    })?;
-    let emit_payload = emit_payload_started.elapsed();
-
-    emission_state.next_block_index = ordered.next_payload_block_index;
-    let digest = ordered.hasher.finalize();
-    let mut content_sha256 = [0u8; 32];
-    content_sha256.copy_from_slice(&digest);
-    let payload = PayloadPlanning {
-        tar_members: ordered.tar_members,
-        frames: ordered.frames,
-        payload_objects: ordered.payload_objects,
-        payload_block_count: ordered.payload_block_count,
-        tar_total_size: ordered.tar_total_size,
-        content_sha256,
-    };
-    let plan = build_writer_plan_from_payload(
-        payload,
-        emission_state.next_block_index,
+    write_ordered_parallel_stream_archive_to_sink(
         master_key,
         options,
-        None,
         kdf_params,
-        None,
-        archive_uuid,
-        session_id,
-        root_auth,
-    )?;
-    if plan.options != options || plan.crypto_header != crypto_header {
-        return Err(FormatError::WriterUnsupported(
-            "ordered parallel metadata exceeded the predeclared header class",
-        )
-        .into());
-    }
-    let mut summary = emit_writer_plan_suffix(
-        &subkeys,
         root_auth,
         authenticator,
-        plan,
+        key_wrap_records,
         sink,
-        emission_state,
-    )?;
-    summary.timings.emit_payload += emit_payload;
-    summary.timings.total = total_started.elapsed();
-    Ok(summary)
+        |writer| {
+            writer.reserve_member_capacity(files.len());
+            for file in files {
+                let archive_path =
+                    normalize_lookup_file_path(file.archive_path(), options.max_path_length)?;
+                let mut reader = file.open()?;
+                writer.write_regular_member_from_reader(
+                    StreamingRegularMember {
+                        archive_path,
+                        file_data_size: file.file_data_size(),
+                        mode: file.mode(),
+                        mtime: file.mtime(),
+                    },
+                    reader.as_mut(),
+                )?;
+            }
+            Ok(())
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2168,6 +2087,7 @@ pub(crate) fn write_ordered_parallel_stream_archive_to_sink<O, F>(
     kdf_params: &KdfParams,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    key_wrap_records: Option<&KeyWrapRecordSource>,
     sink: &mut O,
     drive_members: F,
 ) -> Result<WrittenArchiveSummary, ArchiveWriteError>
@@ -2187,7 +2107,12 @@ where
     let session_id = options
         .session_id
         .unwrap_or_else(|| *Uuid::new_v4().as_bytes());
-    let volume_format_rev = volume_format_revision_for_options(&options, kdf_params);
+    let stabilized_key_wrap_records =
+        stabilized_key_wrap_record_source(kdf_params, key_wrap_records)?;
+    let key_wrap_records = stabilized_key_wrap_records.as_ref().or(key_wrap_records);
+    let (resolved_kdf_params, key_wrap_table) =
+        resolve_key_wrap_artifacts(kdf_params, &archive_uuid, &session_id, key_wrap_records)?;
+    let volume_format_rev = volume_format_revision_for_options(&options, &resolved_kdf_params);
     let subkeys = writer_subkeys(master_key, options.aead_algo, &archive_uuid, &session_id)?;
     let crypto_header = build_crypto_header(
         options,
@@ -2196,13 +2121,13 @@ where
         &subkeys,
         &archive_uuid,
         &session_id,
-        kdf_params,
+        &resolved_kdf_params,
     )?;
     let mut emission_state = begin_writer_emission_state(
         sink,
         options,
         &crypto_header,
-        None,
+        key_wrap_table.as_deref(),
         archive_uuid,
         session_id,
         volume_format_rev,
@@ -2373,8 +2298,8 @@ where
         master_key,
         options,
         None,
-        kdf_params,
-        None,
+        &resolved_kdf_params,
+        key_wrap_records,
         archive_uuid,
         session_id,
         root_auth,
@@ -2411,6 +2336,10 @@ pub(crate) struct OrderedParallelArchiveWriter<'a, O: ArchiveWriteSink> {
 }
 
 impl<O: ArchiveWriteSink> OrderedParallelArchiveWriter<'_, O> {
+    fn reserve_member_capacity(&mut self, additional: usize) {
+        self.ordered.tar_members.reserve(additional);
+    }
+
     pub(crate) fn write_regular_member_from_reader(
         &mut self,
         member: StreamingRegularMember,
@@ -2622,15 +2551,7 @@ fn append_ordered_frame_result<O: ArchiveWriteSink>(
     options: WriterOptions,
     emission_state: &mut WriterEmissionState,
 ) -> Result<(), ArchiveWriteError> {
-    let next_len = checked_usize_add(
-        ordered.envelope.plaintext.len(),
-        result.frame.len(),
-        "payload",
-    )?;
-    if !ordered.envelope.plaintext.is_empty()
-        && (next_len > options.envelope_target_size as usize
-            || !payload_object_can_fit(next_len, options)?)
-    {
+    if payload_envelope_needs_flush(&ordered.envelope, result.frame.len(), options)? {
         flush_ordered_parallel_envelope(
             envelope_job_tx,
             envelope_result_rx,
@@ -2652,32 +2573,19 @@ fn append_ordered_frame_result<O: ArchiveWriteSink>(
         "FrameEntry.offset_in_envelope",
     )?;
     ordered.envelope.plaintext.extend_from_slice(&result.frame);
-    let mut flags = 0u32;
-    if result.member_offset == 0 {
-        flags |= 0x0000_0001;
-    }
-    if checked_u64_add(
-        result.member_offset,
-        result.decompressed_size as u64,
-        "payload chunk",
-    )? == result.member_group_size
-    {
-        flags |= 0x0000_0002;
-    }
-    ordered.frames.push(PayloadFrame {
-        frame_index: ordered.next_frame_metadata_index,
-        envelope_index: ordered.envelope.envelope_index,
-        member_index: result.member_index,
-        offset_in_envelope: offset,
-        compressed_size: u32_len(result.frame.len(), "FrameEntry.compressed_size")?,
-        decompressed_size: u32_len(result.decompressed_size, "FrameEntry.decompressed_size")?,
-        flags,
-        tar_stream_offset: checked_u64_add(
-            result.member_start,
-            result.member_offset,
-            "PayloadFrame.tar_stream_offset",
-        )?,
-    });
+    ordered
+        .frames
+        .push(payload_frame_metadata(PayloadFrameMetadataInput {
+            frame_index: ordered.next_frame_metadata_index,
+            envelope_index: ordered.envelope.envelope_index,
+            member_index: result.member_index,
+            offset_in_envelope: offset,
+            compressed_size: result.frame.len(),
+            decompressed_size: result.decompressed_size,
+            member_start: result.member_start,
+            member_offset: result.member_offset,
+            member_group_size: result.member_group_size,
+        })?);
     ordered.next_frame_metadata_index = checked_u64_add(
         ordered.next_frame_metadata_index,
         1,
@@ -3109,11 +3017,7 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
         member_offset: u64,
         member_group_size: u64,
     ) -> Result<(), ArchiveWriteError> {
-        let next_len = checked_usize_add(self.envelope.plaintext.len(), frame.len(), "payload")?;
-        if !self.envelope.plaintext.is_empty()
-            && (next_len > self.options.envelope_target_size as usize
-                || !payload_object_can_fit(next_len, self.options)?)
-        {
+        if payload_envelope_needs_flush(&self.envelope, frame.len(), self.options)? {
             self.flush_payload_envelope()?;
         }
         if self.envelope.plaintext.is_empty() && !payload_object_can_fit(frame.len(), self.options)?
@@ -3128,29 +3032,18 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
             "FrameEntry.offset_in_envelope",
         )?;
         self.envelope.plaintext.extend_from_slice(frame);
-        let mut flags = 0u32;
-        if member_offset == 0 {
-            flags |= 0x0000_0001;
-        }
-        if checked_u64_add(member_offset, decompressed_size as u64, "payload chunk")?
-            == member_group_size
-        {
-            flags |= 0x0000_0002;
-        }
-        self.frames.push(PayloadFrame {
-            frame_index: self.next_frame_index,
-            envelope_index: self.envelope.envelope_index,
-            member_index,
-            offset_in_envelope: offset,
-            compressed_size: u32_len(frame.len(), "FrameEntry.compressed_size")?,
-            decompressed_size: u32_len(decompressed_size, "FrameEntry.decompressed_size")?,
-            flags,
-            tar_stream_offset: checked_u64_add(
+        self.frames
+            .push(payload_frame_metadata(PayloadFrameMetadataInput {
+                frame_index: self.next_frame_index,
+                envelope_index: self.envelope.envelope_index,
+                member_index,
+                offset_in_envelope: offset,
+                compressed_size: frame.len(),
+                decompressed_size,
                 member_start,
                 member_offset,
-                "PayloadFrame.tar_stream_offset",
-            )?,
-        });
+                member_group_size,
+            })?);
         self.next_frame_index =
             checked_u64_add(self.next_frame_index, 1, "PayloadFrame.frame_index")?;
         Ok(())
@@ -3220,6 +3113,7 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
         mut self,
         master_key: &MasterKey,
         kdf_params: &KdfParams,
+        key_wrap_records: Option<&KeyWrapRecordSource>,
         root_auth: Option<RootAuthWriterConfig<'_>>,
         authenticator: Option<&mut RootAuthAuthenticator<'_>>,
     ) -> Result<WrittenArchiveSummary, ArchiveWriteError> {
@@ -3242,7 +3136,7 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
             self.options,
             None,
             kdf_params,
-            None,
+            key_wrap_records,
             self.archive_uuid,
             self.session_id,
             root_auth,
@@ -3287,11 +3181,7 @@ fn append_payload_frame_to_plan(
     state: PayloadFramePlanState<'_>,
     input: PayloadFramePlanInput<'_>,
 ) -> Result<(), FormatError> {
-    let next_len = checked_usize_add(state.envelope.plaintext.len(), input.frame.len(), "payload")?;
-    if !state.envelope.plaintext.is_empty()
-        && (next_len > state.options.envelope_target_size as usize
-            || !payload_object_can_fit(next_len, state.options)?)
-    {
+    if payload_envelope_needs_flush(state.envelope, input.frame.len(), state.options)? {
         flush_payload_envelope_plan(
             state.envelope,
             state.payload_objects,
@@ -3312,32 +3202,19 @@ fn append_payload_frame_to_plan(
         "FrameEntry.offset_in_envelope",
     )?;
     state.envelope.plaintext.extend_from_slice(input.frame);
-    let mut flags = 0u32;
-    if input.member_offset == 0 {
-        flags |= 0x0000_0001;
-    }
-    if checked_u64_add(
-        input.member_offset,
-        input.decompressed_size as u64,
-        "payload chunk",
-    )? == input.member_group_size
-    {
-        flags |= 0x0000_0002;
-    }
-    state.frames.push(PayloadFrame {
-        frame_index: *state.next_frame_index,
-        envelope_index: state.envelope.envelope_index,
-        member_index: input.member_index,
-        offset_in_envelope: offset,
-        compressed_size: u32_len(input.frame.len(), "FrameEntry.compressed_size")?,
-        decompressed_size: u32_len(input.decompressed_size, "FrameEntry.decompressed_size")?,
-        flags,
-        tar_stream_offset: checked_u64_add(
-            input.member_start,
-            input.member_offset,
-            "PayloadFrame.tar_stream_offset",
-        )?,
-    });
+    state
+        .frames
+        .push(payload_frame_metadata(PayloadFrameMetadataInput {
+            frame_index: *state.next_frame_index,
+            envelope_index: state.envelope.envelope_index,
+            member_index: input.member_index,
+            offset_in_envelope: offset,
+            compressed_size: input.frame.len(),
+            decompressed_size: input.decompressed_size,
+            member_start: input.member_start,
+            member_offset: input.member_offset,
+            member_group_size: input.member_group_size,
+        })?);
     *state.next_frame_index =
         checked_u64_add(*state.next_frame_index, 1, "PayloadFrame.frame_index")?;
     Ok(())
@@ -4153,11 +4030,7 @@ fn append_payload_frame_to_emit<O: ArchiveWriteSink>(
     record_counts: &mut [u64],
     data_leaf_hashes: &mut Option<Vec<(u64, [u8; 32])>>,
 ) -> Result<(), ArchiveWriteError> {
-    let next_len = checked_usize_add(envelope.plaintext.len(), frame.len(), "payload")?;
-    if !envelope.plaintext.is_empty()
-        && (next_len > plan.options.envelope_target_size as usize
-            || !payload_object_can_fit(next_len, plan.options)?)
-    {
+    if payload_envelope_needs_flush(envelope, frame.len(), plan.options)? {
         flush_payload_envelope_emit(
             envelope,
             subkeys,
@@ -4175,33 +4048,30 @@ fn append_payload_frame_to_emit<O: ArchiveWriteSink>(
         );
     }
     let offset = u32_len(envelope.plaintext.len(), "FrameEntry.offset_in_envelope")?;
-    let mut flags = 0u32;
-    if member_offset == 0 {
-        flags |= 0x0000_0001;
-    }
-    if checked_u64_add(member_offset, decompressed_size as u64, "payload chunk")?
-        == member_group_size
-    {
-        flags |= 0x0000_0002;
-    }
+    let actual = payload_frame_metadata(PayloadFrameMetadataInput {
+        frame_index: *next_frame_index,
+        envelope_index: envelope.envelope_index,
+        member_index,
+        offset_in_envelope: offset,
+        compressed_size: frame.len(),
+        decompressed_size,
+        member_start,
+        member_offset,
+        member_group_size,
+    })?;
     let expected =
         plan.frames
             .get(*next_frame_index as usize)
             .ok_or(FormatError::WriterInvariant(
                 "planned payload frame is missing",
             ))?;
-    let tar_stream_offset = checked_u64_add(
-        member_start,
-        member_offset,
-        "PayloadFrame.tar_stream_offset",
-    )?;
-    if expected.envelope_index != envelope.envelope_index
-        || expected.member_index != member_index
-        || expected.offset_in_envelope != offset
-        || expected.compressed_size != u32_len(frame.len(), "FrameEntry.compressed_size")?
-        || expected.decompressed_size != u32_len(decompressed_size, "FrameEntry.decompressed_size")?
-        || expected.flags != flags
-        || expected.tar_stream_offset != tar_stream_offset
+    if expected.envelope_index != actual.envelope_index
+        || expected.member_index != actual.member_index
+        || expected.offset_in_envelope != actual.offset_in_envelope
+        || expected.compressed_size != actual.compressed_size
+        || expected.decompressed_size != actual.decompressed_size
+        || expected.flags != actual.flags
+        || expected.tar_stream_offset != actual.tar_stream_offset
     {
         return Err(
             FormatError::WriterInvariant("emitted payload frame does not match plan").into(),
@@ -4709,14 +4579,14 @@ fn build_index_shard_plaintexts(
 ) -> Result<Vec<PlannedIndexShard>, FormatError> {
     let mut planned = Vec::new();
     for rows in shard_rows {
-        append_index_shards_for_rows(&mut planned, rows.clone(), frames, payloads, options)?;
+        append_index_shards_for_rows(&mut planned, rows, frames, payloads, options)?;
     }
     Ok(planned)
 }
 
 fn append_index_shards_for_rows(
     planned: &mut Vec<PlannedIndexShard>,
-    rows: Vec<FileRow>,
+    rows: &[FileRow],
     frames: &[PayloadFrame],
     payloads: &[PayloadObject],
     options: WriterOptions,
@@ -4736,20 +4606,8 @@ fn append_index_shards_for_rows(
         ));
     }
     let split_at = split_sorted_file_rows_for_object_limit(&rows);
-    append_index_shards_for_rows(
-        planned,
-        rows[..split_at].to_vec(),
-        frames,
-        payloads,
-        options,
-    )?;
-    append_index_shards_for_rows(
-        planned,
-        rows[split_at..].to_vec(),
-        frames,
-        payloads,
-        options,
-    )
+    append_index_shards_for_rows(planned, &rows[..split_at], frames, payloads, options)?;
+    append_index_shards_for_rows(planned, &rows[split_at..], frames, payloads, options)
 }
 
 fn split_sorted_file_rows_for_object_limit(rows: &[FileRow]) -> usize {
@@ -4939,14 +4797,14 @@ fn build_directory_hint_plaintexts(
 
     let mut planned = Vec::new();
     for chunk in rows.chunks(DEFAULT_DIRECTORY_HINT_ENTRIES_PER_SHARD) {
-        append_directory_hint_shards_for_rows(&mut planned, chunk.to_vec(), options)?;
+        append_directory_hint_shards_for_rows(&mut planned, chunk, options)?;
     }
     Ok(planned)
 }
 
 fn append_directory_hint_shards_for_rows(
     planned: &mut Vec<PlannedDirectoryHintShard>,
-    rows: Vec<([u8; 8], Vec<u8>, BTreeSet<u32>)>,
+    rows: &[([u8; 8], Vec<u8>, BTreeSet<u32>)],
     options: WriterOptions,
 ) -> Result<(), FormatError> {
     let hint_shard_index = u64::try_from(planned.len())
@@ -4964,8 +4822,8 @@ fn append_directory_hint_shards_for_rows(
         ));
     }
     let split_at = rows.len() / 2;
-    append_directory_hint_shards_for_rows(planned, rows[..split_at].to_vec(), options)?;
-    append_directory_hint_shards_for_rows(planned, rows[split_at..].to_vec(), options)
+    append_directory_hint_shards_for_rows(planned, &rows[..split_at], options)?;
+    append_directory_hint_shards_for_rows(planned, &rows[split_at..], options)
 }
 
 fn add_directory_hint_rows(
@@ -6704,7 +6562,7 @@ mod tests {
     use super::*;
     use crate::crypto::{verify_hmac, Subkeys};
     use crate::metadata::{DirectoryHintTable, MetadataLimits};
-    use crate::reader::open_archive;
+    use crate::reader::{open_archive, open_archive_with_recipient_wrap_resolver};
     use crate::tar_model::parse_tar_member_group;
     use crate::wire::{CriticalRecoveryLocator, CryptoHeader};
     use std::cell::RefCell;
@@ -7557,6 +7415,20 @@ mod tests {
         assert_eq!(serialized, expected);
     }
 
+    fn recipient_wrap_test_record() -> RecipientRecordV1 {
+        RecipientRecordV1 {
+            record_length: 0,
+            profile_id: 1,
+            recipient_identity_type: 2,
+            flags: 0,
+            recipient_identity_length: 0,
+            profile_payload_length: 0,
+            recipient_identity_digest: [0u8; 32],
+            recipient_identity_bytes: b"recipient-a".to_vec(),
+            profile_payload_bytes: b"profile-payload".to_vec(),
+        }
+    }
+
     #[test]
     fn writer_options_reject_reader_resource_cap_excesses() {
         assert_eq!(
@@ -7721,6 +7593,166 @@ mod tests {
             opened.extract_file("nested/beta.txt").unwrap(),
             Some(b"beta payload".to_vec())
         );
+    }
+
+    #[test]
+    fn ordered_sink_writer_round_trips_recipientwrap_records() {
+        let files = [RegularFile::new("wrapped.txt", b"recipient sink payload")];
+        let master_key = MasterKey::from_raw_key(&[9u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+
+        let summary = write_archive_sources_to_sink_ordered_parallel_with_recipient_wrap_records(
+            &files,
+            &master_key,
+            single_volume_metadata_test_options(),
+            vec![recipient_wrap_test_record()],
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(summary.volume_count, 1);
+        let opened =
+            open_archive_with_recipient_wrap_resolver(&sink.volumes[0], |_| Ok(vec![master_key.0]))
+                .unwrap();
+        assert_eq!(
+            opened.extract_file("wrapped.txt").unwrap(),
+            Some(b"recipient sink payload".to_vec())
+        );
+    }
+
+    #[test]
+    fn single_pass_sink_writer_round_trips_recipientwrap_records() {
+        let files = [RegularFile::new(
+            "wrapped.txt",
+            b"recipient single-pass sink payload",
+        )];
+        let master_key = MasterKey::from_raw_key(&[9u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+
+        let summary = write_archive_sources_to_sink_single_pass_with_recipient_wrap_records(
+            &files,
+            &master_key,
+            single_volume_metadata_test_options(),
+            vec![recipient_wrap_test_record()],
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(summary.volume_count, 1);
+        let opened =
+            open_archive_with_recipient_wrap_resolver(&sink.volumes[0], |_| Ok(vec![master_key.0]))
+                .unwrap();
+        assert_eq!(
+            opened.extract_file("wrapped.txt").unwrap(),
+            Some(b"recipient single-pass sink payload".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn single_pass_sink_writer_round_trips_recipientwrap_root_auth() {
+        let files = [RegularFile::new(
+            "wrapped.txt",
+            b"recipient single-pass signed payload",
+        )];
+        let master_key = MasterKey::from_raw_key(&[9u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+
+        let summary = write_archive_sources_to_sink_single_pass_with_recipient_wrap_records(
+            &files,
+            &master_key,
+            single_volume_metadata_test_options(),
+            vec![recipient_wrap_test_record()],
+            Some(RootAuthWriterConfig {
+                authenticator_id: 0x44,
+                signer_identity_type: 1,
+                signer_identity: b"recipient-wrap-single-pass",
+                authenticator_value_length: 32,
+            }),
+            Some(&mut |request| Ok(request.archive_root.to_vec())),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(summary.volume_count, 1);
+        let opened =
+            open_archive_with_recipient_wrap_resolver(&sink.volumes[0], |_| Ok(vec![master_key.0]))
+                .unwrap();
+        let verification = opened
+            .verify_root_auth_with(|footer, archive_root| {
+                Ok(footer.authenticator_id == 0x44
+                    && footer.authenticator_value.as_slice() == archive_root)
+            })
+            .unwrap();
+        assert_eq!(verification.volume_format_rev, VOLUME_FORMAT_REV_44);
+    }
+
+    #[test]
+    fn single_pass_writer_rejects_recipientwrap_kdf_without_records_before_writing() {
+        let files = [RegularFile::new("wrapped.txt", b"recipient sink payload")];
+        let master_key = MasterKey::from_raw_key(&[9u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+        let kdf_params = KdfParams::RecipientWrap {
+            key_wrap_table_length: 0,
+            key_wrap_table_record_count: 1,
+            key_wrap_table_version: 1,
+            key_wrap_table_digest: [0u8; 32],
+        };
+
+        let err = write_archive_sources_to_sink_single_pass(
+            &files,
+            &master_key,
+            single_volume_metadata_test_options(),
+            &kdf_params,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap_err();
+
+        match err {
+            ArchiveWriteError::Format(FormatError::WriterUnsupported(message)) => {
+                assert_eq!(message, "RecipientWrap requires key-wrap records");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(sink.volumes.is_empty());
+    }
+
+    #[test]
+    fn ordered_sink_writer_rejects_recipientwrap_kdf_without_records_before_writing() {
+        let files = [RegularFile::new("wrapped.txt", b"recipient sink payload")];
+        let master_key = MasterKey::from_raw_key(&[9u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+        let kdf_params = KdfParams::RecipientWrap {
+            key_wrap_table_length: 0,
+            key_wrap_table_record_count: 1,
+            key_wrap_table_version: 1,
+            key_wrap_table_digest: [0u8; 32],
+        };
+
+        let err = write_archive_sources_to_sink_ordered_parallel(
+            &files,
+            &master_key,
+            single_volume_metadata_test_options(),
+            &kdf_params,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap_err();
+
+        match err {
+            ArchiveWriteError::Format(FormatError::WriterUnsupported(message)) => {
+                assert_eq!(message, "RecipientWrap requires key-wrap records");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(sink.volumes.is_empty());
     }
 
     #[test]

@@ -193,8 +193,8 @@ Notes:
   random-access reader. Selecting one path reads the authenticated terminal,
   index metadata, and the payload envelopes needed for that path; it does not
   load the whole archive into memory first.
-- RecipientWrap extract currently requires one seekable archive path and does
-  not combine with `--bootstrap` or archive stdin.
+- RecipientWrap extract supports seekable archive paths and multi-volume input
+  sets, and does not combine with `--bootstrap` or archive stdin.
 - Selected regular-file payloads stream from the needed envelopes to stdout or
   the destination file with memory bounded by the current envelope, current
   frame, and small tar metadata buffers.
@@ -248,8 +248,8 @@ Notes:
 - Key-holding list opens archive files through the core file-backed
   random-access reader. Default output reads terminal and index metadata rather
   than loading every payload block.
-- RecipientWrap list currently requires one seekable archive path and does not
-  combine with `--bootstrap` or archive stdin.
+- RecipientWrap list supports seekable archive paths and multi-volume input
+  sets, and does not combine with `--bootstrap` or archive stdin.
 - `--bootstrap` is for single-volume open paths. Multi-volume open paths should
   pass volume files and omit the sidecar; combining multiple archive inputs
   with `--bootstrap` rejects before reading archive files with
@@ -349,8 +349,8 @@ Notes:
   `--bootstrap`. Archive stdin does not support `--password-stdin`,
   passphrase KDF discovery, RootAuth external verification flags,
   `--recipient-key`, `--public-no-key`, or multi-volume recovery.
-- RecipientWrap verification currently requires one seekable archive path and
-  does not combine with `--bootstrap`.
+- RecipientWrap verification supports seekable archive paths and multi-volume
+  input sets, and does not combine with `--bootstrap`.
 - `--bootstrap` is for single-volume open paths. Multi-volume open paths should
   pass volume files and omit the sidecar; combining multiple archive inputs
   with `--bootstrap` rejects before reading archive files with

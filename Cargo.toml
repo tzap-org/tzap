@@ -32,6 +32,7 @@ hex = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
 hpke = "0.13"
+memmap2 = "0.9"
 rand = "0.8"
 openssl = { version = "0.10", features = ["vendored"] }
 sha2 = "0.10"

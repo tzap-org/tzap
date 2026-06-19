@@ -14,14 +14,18 @@ use predicates::prelude::*;
 use serde_json::Value;
 use tempfile::tempdir;
 use tzap_core::format::{
-    BlockKind, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN, VOLUME_HEADER_LEN,
-    VOLUME_TRAILER_LEN,
+    BlockKind, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN, FORMAT_VERSION,
+    VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use tzap_core::wire::{
     BlockRecord, BootstrapSidecarHeader, CriticalRecoveryLocator, CryptoHeader, VolumeHeader,
     VolumeTrailer,
 };
-use tzap_core::{crypto::compute_hmac, HmacDomain, MasterKey, Subkeys};
+use tzap_core::{
+    crypto::compute_hmac, write_archive_with_recipient_wrap_records, HmacDomain, MasterKey,
+    RegularFile, Subkeys, WriterOptions,
+};
+use tzap_plugin_keywrap::{wrap_master_key_for_recipient, ArchiveIdentity, KeyWrapSuite};
 
 const KEY_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 const BAD_KEY_HEX: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
@@ -3938,6 +3942,64 @@ fn cli_create_list_verify_and_extract_with_recipient_wrap() {
         fs::read(extract_dir.join("recipient.txt")).unwrap(),
         b"recipient wrapped\n"
     );
+}
+
+#[test]
+fn cli_verify_accepts_multivolume_recipient_wrap() {
+    let temp = tempdir().unwrap();
+    let recipient_key_path = temp.path().join("recipient.key");
+    let output_base = temp.path().join("recipient-wrap.tzap");
+    let volume0 = numbered_volume_path(&output_base, 0);
+    let volume1 = numbered_volume_path(&output_base, 1);
+    let archive_uuid = [0x31; 16];
+    let session_id = [0x42; 16];
+    let master = MasterKey::from_raw_key(&[0x77; 32]).unwrap();
+    let (recipient_cert, recipient_key) = test_x25519_recipient_cert();
+    fs::write(&recipient_key_path, recipient_key).unwrap();
+    let record = wrap_master_key_for_recipient(
+        ArchiveIdentity {
+            archive_uuid,
+            session_id,
+            format_version: FORMAT_VERSION,
+            volume_format_rev: VOLUME_FORMAT_REV_44,
+        },
+        &recipient_cert.to_der().unwrap(),
+        &master.0,
+        KeyWrapSuite::X25519HkdfSha256ChaCha20Poly1305,
+    )
+    .unwrap();
+    let archive = write_archive_with_recipient_wrap_records(
+        &[RegularFile::new(
+            "wrapped.txt",
+            b"multi recipient wrapped\n",
+        )],
+        &master,
+        WriterOptions {
+            stripe_width: 2,
+            volume_loss_tolerance: 0,
+            archive_uuid: Some(archive_uuid),
+            session_id: Some(session_id),
+            ..WriterOptions::default()
+        },
+        vec![record],
+    )
+    .unwrap();
+    assert_eq!(archive.volumes.len(), 2);
+    fs::write(&volume0, &archive.volumes[0]).unwrap();
+    fs::write(&volume1, &archive.volumes[1]).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--recipient-key",
+            recipient_key_path.to_str().unwrap(),
+            volume0.to_str().unwrap(),
+            volume1.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK"));
 }
 
 #[test]

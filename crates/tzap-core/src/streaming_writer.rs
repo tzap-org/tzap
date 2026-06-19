@@ -130,6 +130,7 @@ where
         kdf_params,
         root_auth,
         authenticator,
+        None,
         sink,
         |writer| {
             let mut payload = SizedRawPayloadReader {
@@ -183,6 +184,7 @@ where
         kdf_params,
         root_auth,
         authenticator,
+        None,
         sink,
         |writer| {
             let summary = stream_tar_stdin_regulars(

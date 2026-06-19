@@ -593,12 +593,11 @@ impl SeekableVolumeSource {
 
     fn read_slot(&self, slot: u64, expected_block_index: u64) -> Result<BlockRecord, FormatError> {
         let record_offset = self.record_offset(slot)?;
-        let raw = read_at_vec(
+        let raw = read_at_vec_unchecked(
             self.reader.as_ref(),
             record_offset,
             usize::try_from(self.record_len)
                 .map_err(|_| FormatError::InvalidArchive("BlockRecord length overflow"))?,
-            "BlockRecord",
         )?;
         let record = BlockRecord::parse(&raw, self.block_size)?;
         if record.block_index != expected_block_index {
@@ -789,6 +788,36 @@ pub fn open_seekable_archive_with_bootstrap_sidecar_options<R: ArchiveReadAt>(
     )
 }
 
+pub fn open_seekable_archive_with_recipient_wrap_resolver_options<R, F>(
+    reader: R,
+    resolver: F,
+    options: ReaderOptions,
+) -> Result<OpenedArchive, FormatError>
+where
+    R: ArchiveReadAt,
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    OpenedArchive::open_seekable_with_recipient_wrap_resolver_options(reader, resolver, options)
+}
+
+pub fn open_seekable_archive_volumes_with_recipient_wrap_resolver_options<R, F>(
+    readers: Vec<R>,
+    resolver: F,
+    options: ReaderOptions,
+) -> Result<OpenedArchive, FormatError>
+where
+    R: ArchiveReadAt,
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    OpenedArchive::open_seekable_volumes_with_recipient_wrap_resolver_options(
+        readers, resolver, options,
+    )
+}
+
 pub fn open_non_seekable_archive(
     bytes: &[u8],
     master_key: &MasterKey,
@@ -967,6 +996,334 @@ impl OpenedArchive {
             manifest_footer,
             volume_trailer: Some(volume_trailer),
             root_auth_footer,
+            index_root,
+            payload_dictionary,
+        })
+    }
+
+    pub fn open_seekable_with_recipient_wrap_resolver_options<R, F>(
+        reader: R,
+        mut resolver: F,
+        options: ReaderOptions,
+    ) -> Result<Self, FormatError>
+    where
+        R: ArchiveReadAt,
+        F: FnMut(
+            RecipientWrapRecordContext<'_>,
+        ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+    {
+        validate_reader_options(options)?;
+        let reader = Arc::new(reader) as Arc<dyn ArchiveReadAt>;
+        let observed_len = reader.len()?;
+        let observed_archive_bytes = observed_archive_size([observed_len])?;
+        let mut parsed = parse_seekable_read_at_volume_with_recipient_wrap_resolver(
+            reader.clone(),
+            &mut resolver,
+            options,
+        )?;
+        let manifest_footer = match parsed.manifest_footer.take() {
+            Some(footer) => footer,
+            None => {
+                return Err(parsed.manifest_footer_error.take().unwrap_or(
+                    FormatError::InvalidArchive("no authenticated ManifestFooter found"),
+                ));
+            }
+        };
+        let observed_volume_count = 1;
+        let missing_volume_count = parsed
+            .crypto_header
+            .stripe_width
+            .checked_sub(observed_volume_count)
+            .ok_or(FormatError::InvalidArchive("volume count overflow"))?;
+        if missing_volume_count > parsed.crypto_header.volume_loss_tolerance as u32 {
+            return Err(FormatError::InvalidArchive(
+                "missing volume count exceeds volume_loss_tolerance",
+            ));
+        }
+
+        let record_len = block_record_len(parsed.crypto_header.block_size as usize)?;
+        let mut lazy_volume_slots = Vec::new();
+        lazy_volume_slots.resize_with(parsed.crypto_header.stripe_width as usize, || None);
+        let slot = parsed.volume_header.volume_index as usize;
+        if slot >= lazy_volume_slots.len() {
+            return Err(FormatError::InvalidArchive(
+                "authenticated volume index exceeds stripe_width",
+            ));
+        }
+        lazy_volume_slots[slot] = Some(SeekableVolumeSource {
+            reader: parsed.reader.clone(),
+            volume_index: parsed.volume_header.volume_index,
+            block_records_start: parsed.block_records_start,
+            block_count: parsed.volume_trailer.block_count,
+            record_len,
+            block_size: parsed.crypto_header.block_size as usize,
+        });
+        let lazy_source = Arc::new(SeekableBlockSource {
+            stripe_width: parsed.crypto_header.stripe_width,
+            volumes: lazy_volume_slots,
+        });
+        let blocks = BTreeMap::new();
+        let block_provider = OpenedBlockProvider {
+            memory_blocks: &blocks,
+            lazy_blocks: Some(lazy_source.as_ref()),
+        };
+        let limits = metadata_limits(&parsed.crypto_header);
+        let index_root_plaintext = load_metadata_object_from_parts(
+            &block_provider,
+            ObjectLoadContext::index_root(
+                &parsed.volume_header,
+                &parsed.crypto_header,
+                &parsed.subkeys,
+                index_root_extent_from_manifest(&manifest_footer),
+            ),
+            manifest_footer.index_root_decompressed_size,
+        )?;
+        let index_root = IndexRoot::parse(
+            &index_root_plaintext,
+            parsed.crypto_header.has_dictionary != 0,
+            limits,
+        )?;
+        let block_provider = OpenedBlockProvider {
+            memory_blocks: &blocks,
+            lazy_blocks: Some(lazy_source.as_ref()),
+        };
+        let payload_dictionary = load_archive_dictionary(
+            &block_provider,
+            &parsed.subkeys,
+            &parsed.volume_header,
+            &parsed.crypto_header,
+            &index_root,
+        )?;
+
+        Ok(Self {
+            options,
+            observed_archive_bytes,
+            observed_volume_count,
+            subkeys: parsed.subkeys,
+            blocks,
+            lazy_blocks: Some(lazy_source),
+            crypto_header_bytes: parsed.crypto_header_bytes,
+            volume_header: parsed.volume_header,
+            crypto_header: parsed.crypto_header,
+            manifest_footer,
+            volume_trailer: Some(parsed.volume_trailer),
+            root_auth_footer: parsed.root_auth_footer,
+            index_root,
+            payload_dictionary,
+        })
+    }
+
+    pub fn open_seekable_volumes_with_recipient_wrap_resolver_options<R, F>(
+        readers: Vec<R>,
+        mut resolver: F,
+        options: ReaderOptions,
+    ) -> Result<Self, FormatError>
+    where
+        R: ArchiveReadAt,
+        F: FnMut(
+            RecipientWrapRecordContext<'_>,
+        ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+    {
+        validate_reader_options(options)?;
+        if readers.is_empty() {
+            return Err(FormatError::InvalidArchive("no volumes supplied"));
+        }
+        let readers = readers
+            .into_iter()
+            .map(|reader| Arc::new(reader) as Arc<dyn ArchiveReadAt>)
+            .collect::<Vec<_>>();
+        let observed_archive_bytes = observed_archive_size(
+            readers
+                .iter()
+                .map(|reader| reader.len())
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter(),
+        )?;
+        let mut first: Option<ParsedSeekableReadAtVolume> = None;
+        let mut manifest_authority: Option<ManifestFooter> = None;
+        let mut manifest_authority_volume_header: Option<VolumeHeader> = None;
+        let mut manifest_authority_volume_trailer: Option<VolumeTrailer> = None;
+        let mut root_auth_authority: Option<RootAuthFooterV1> = None;
+        let mut root_auth_authority_bytes: Option<Vec<u8>> = None;
+        let mut saw_root_auth_absent = false;
+        let mut first_manifest_footer_error: Option<FormatError> = None;
+        let mut seen_volume_indexes = BTreeSet::new();
+        let mut lazy_volume_slots: Vec<Option<SeekableVolumeSource>> = Vec::new();
+
+        for reader in readers {
+            let mut parsed = parse_seekable_read_at_volume_with_recipient_wrap_resolver(
+                reader,
+                &mut resolver,
+                options,
+            )?;
+            if !seen_volume_indexes.insert(parsed.volume_header.volume_index) {
+                return Err(FormatError::InvalidArchive(
+                    "duplicate authenticated volume index",
+                ));
+            }
+
+            if let Some(first) = &first {
+                validate_volume_set_member_metadata(
+                    &first.volume_header,
+                    &first.crypto_header,
+                    &first.crypto_header_bytes,
+                    &parsed.volume_header,
+                    &parsed.crypto_header,
+                    &parsed.crypto_header_bytes,
+                )?;
+                validate_key_wrap_table_bytes_match(
+                    &first.key_wrap_table_bytes,
+                    &parsed.key_wrap_table_bytes,
+                )?;
+            } else {
+                lazy_volume_slots.resize_with(parsed.crypto_header.stripe_width as usize, || None);
+            }
+
+            if let Some(footer) = &parsed.manifest_footer {
+                if let Some(authority) = &manifest_authority {
+                    if !manifest_bootstrap_fields_match(authority, footer) {
+                        return Err(FormatError::InvalidArchive(
+                            "ManifestFooter bootstrap fields differ",
+                        ));
+                    }
+                } else {
+                    manifest_authority = Some(footer.clone());
+                    manifest_authority_volume_header = Some(parsed.volume_header.clone());
+                    manifest_authority_volume_trailer = Some(parsed.volume_trailer.clone());
+                }
+            } else if first_manifest_footer_error.is_none() {
+                first_manifest_footer_error = parsed.manifest_footer_error.take();
+            }
+
+            match (&parsed.root_auth_footer, &parsed.root_auth_footer_bytes) {
+                (Some(footer), Some(bytes)) => {
+                    if saw_root_auth_absent {
+                        return Err(FormatError::InvalidArchive(
+                            "root-auth footer presence differs across volumes",
+                        ));
+                    }
+                    if let Some(authority_bytes) = &root_auth_authority_bytes {
+                        if authority_bytes != bytes {
+                            return Err(FormatError::InvalidArchive(
+                                "RootAuthFooter copies differ",
+                            ));
+                        }
+                    } else {
+                        root_auth_authority = Some(footer.clone());
+                        root_auth_authority_bytes = Some(bytes.clone());
+                    }
+                }
+                (None, None) => {
+                    if root_auth_authority_bytes.is_some() {
+                        return Err(FormatError::InvalidArchive(
+                            "root-auth footer presence differs across volumes",
+                        ));
+                    }
+                    saw_root_auth_absent = true;
+                }
+                _ => {
+                    return Err(FormatError::InvalidArchive(
+                        "root-auth footer terminal state is inconsistent",
+                    ));
+                }
+            }
+
+            let record_len = block_record_len(parsed.crypto_header.block_size as usize)?;
+            let source = SeekableVolumeSource {
+                reader: parsed.reader.clone(),
+                volume_index: parsed.volume_header.volume_index,
+                block_records_start: parsed.block_records_start,
+                block_count: parsed.volume_trailer.block_count,
+                record_len,
+                block_size: parsed.crypto_header.block_size as usize,
+            };
+            let slot = parsed.volume_header.volume_index as usize;
+            if slot >= lazy_volume_slots.len() || lazy_volume_slots[slot].replace(source).is_some()
+            {
+                return Err(FormatError::InvalidArchive(
+                    "duplicate authenticated volume index",
+                ));
+            }
+
+            if first.is_none() {
+                first = Some(parsed);
+            }
+        }
+
+        let first = first.ok_or(FormatError::InvalidArchive("no volumes supplied"))?;
+        let manifest_footer = manifest_authority.ok_or(match first_manifest_footer_error {
+            Some(err) => err,
+            None => FormatError::InvalidArchive("no authenticated ManifestFooter found"),
+        })?;
+        let authority_volume_header = manifest_authority_volume_header.ok_or(
+            FormatError::InvalidArchive("no authenticated ManifestFooter found"),
+        )?;
+        let authority_volume_trailer = manifest_authority_volume_trailer.ok_or(
+            FormatError::InvalidArchive("no authenticated ManifestFooter found"),
+        )?;
+        let observed_volume_count = u32::try_from(seen_volume_indexes.len())
+            .map_err(|_| FormatError::InvalidArchive("volume count overflow"))?;
+        let missing_volume_count = first
+            .crypto_header
+            .stripe_width
+            .checked_sub(observed_volume_count)
+            .ok_or(FormatError::InvalidArchive("volume count overflow"))?;
+        if missing_volume_count > first.crypto_header.volume_loss_tolerance as u32 {
+            return Err(FormatError::InvalidArchive(
+                "missing volume count exceeds volume_loss_tolerance",
+            ));
+        }
+
+        let blocks = BTreeMap::new();
+        let lazy_source = Arc::new(SeekableBlockSource {
+            stripe_width: first.crypto_header.stripe_width,
+            volumes: lazy_volume_slots,
+        });
+        let block_provider = OpenedBlockProvider {
+            memory_blocks: &blocks,
+            lazy_blocks: Some(lazy_source.as_ref()),
+        };
+        let limits = metadata_limits(&first.crypto_header);
+        let index_root_plaintext = load_metadata_object_from_parts(
+            &block_provider,
+            ObjectLoadContext::index_root(
+                &first.volume_header,
+                &first.crypto_header,
+                &first.subkeys,
+                index_root_extent_from_manifest(&manifest_footer),
+            ),
+            manifest_footer.index_root_decompressed_size,
+        )?;
+        let index_root = IndexRoot::parse(
+            &index_root_plaintext,
+            first.crypto_header.has_dictionary != 0,
+            limits,
+        )?;
+        let block_provider = OpenedBlockProvider {
+            memory_blocks: &blocks,
+            lazy_blocks: Some(lazy_source.as_ref()),
+        };
+        let payload_dictionary = load_archive_dictionary(
+            &block_provider,
+            &first.subkeys,
+            &first.volume_header,
+            &first.crypto_header,
+            &index_root,
+        )?;
+
+        Ok(Self {
+            options,
+            observed_archive_bytes,
+            observed_volume_count,
+            subkeys: first.subkeys,
+            blocks,
+            lazy_blocks: Some(lazy_source),
+            crypto_header_bytes: first.crypto_header_bytes,
+            volume_header: authority_volume_header,
+            crypto_header: first.crypto_header,
+            manifest_footer,
+            volume_trailer: Some(authority_volume_trailer),
+            root_auth_footer: root_auth_authority,
             index_root,
             payload_dictionary,
         })
@@ -4114,6 +4471,62 @@ fn parse_seekable_read_at_volume(
     }
 }
 
+fn parse_seekable_read_at_volume_with_recipient_wrap_resolver<F>(
+    reader: Arc<dyn ArchiveReadAt>,
+    resolver: &mut F,
+    options: ReaderOptions,
+) -> Result<ParsedSeekableReadAtVolume, FormatError>
+where
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    let observed_len = reader.len()?;
+    if observed_len < (VOLUME_HEADER_LEN + VOLUME_TRAILER_LEN) as u64 {
+        return Err(FormatError::InvalidLength {
+            structure: "archive",
+            expected: VOLUME_HEADER_LEN + VOLUME_TRAILER_LEN,
+            actual: to_usize(observed_len, "archive")?,
+        });
+    }
+
+    let prefix = match parse_read_at_open_prefix_with_recipient_wrap_resolver(
+        reader.as_ref(),
+        resolver,
+    ) {
+        Ok(prefix) => prefix,
+        Err(prefix_err) => {
+            if recipient_wrap_prefix_error_precludes_recovery(&prefix_err) {
+                return Err(prefix_err);
+            }
+            return parse_seekable_read_at_volume_with_recipient_wrap_resolver_from_recovered_terminal(
+                reader,
+                observed_len,
+                resolver,
+                options,
+            )
+            .or(Err(prefix_err));
+        }
+    };
+    let physical_crypto_header_bytes = prefix.crypto_header_bytes.clone();
+    match parse_seekable_read_at_volume_with_prefix(reader.clone(), observed_len, prefix, options) {
+        Ok(parsed) => Ok(parsed),
+        Err(prefix_err) => {
+            match parse_seekable_read_at_volume_with_recipient_wrap_resolver_from_recovered_terminal(
+                reader,
+                observed_len,
+                resolver,
+                options,
+            ) {
+                Ok(recovered) if recovered.crypto_header_bytes == physical_crypto_header_bytes => {
+                    Ok(recovered)
+                }
+                Ok(_) | Err(_) => Err(prefix_err),
+            }
+        }
+    }
+}
+
 fn parse_seekable_read_at_volume_with_prefix(
     reader: Arc<dyn ArchiveReadAt>,
     observed_len: u64,
@@ -4181,6 +4594,35 @@ fn parse_seekable_read_at_volume_from_recovered_terminal(
     )
 }
 
+fn parse_seekable_read_at_volume_with_recipient_wrap_resolver_from_recovered_terminal<F>(
+    reader: Arc<dyn ArchiveReadAt>,
+    observed_len: u64,
+    resolver: &mut F,
+    options: ReaderOptions,
+) -> Result<ParsedSeekableReadAtVolume, FormatError>
+where
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    let authority = locate_v41_recipient_wrap_terminal_authority_read_at(
+        reader.as_ref(),
+        observed_len,
+        resolver,
+        options,
+    )?;
+    finish_parse_seekable_read_at_volume(
+        reader,
+        authority.volume_header,
+        authority.crypto_header,
+        authority.crypto_header_bytes,
+        Some(authority.key_wrap_table_bytes),
+        authority.block_records_start,
+        authority.subkeys,
+        authority.terminal,
+    )
+}
+
 fn parse_read_at_open_prefix(
     reader: &dyn ArchiveReadAt,
     master_key: &MasterKey,
@@ -4235,6 +4677,66 @@ fn parse_read_at_open_prefix(
         crypto_header,
         crypto_header_bytes: crypto_bytes,
         key_wrap_table_bytes: None,
+        block_records_start,
+        subkeys,
+    })
+}
+
+fn parse_read_at_open_prefix_with_recipient_wrap_resolver<F>(
+    reader: &dyn ArchiveReadAt,
+    resolver: &mut F,
+) -> Result<ParsedReadAtOpenPrefix, FormatError>
+where
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    let volume_header_bytes = read_at_vec(reader, 0, VOLUME_HEADER_LEN, "archive")?;
+    let volume_header = VolumeHeader::parse(&volume_header_bytes)?;
+    parse_volume_format_dispatch(&volume_header)?;
+    let crypto_start = volume_header.crypto_header_offset as u64;
+    let crypto_len = volume_header.crypto_header_length as u64;
+    let crypto_bytes = read_at_vec(
+        reader,
+        crypto_start,
+        to_usize(crypto_len, "CryptoHeader")?,
+        "CryptoHeader",
+    )?;
+    let parsed_crypto = CryptoHeader::parse(&crypto_bytes, volume_header.crypto_header_length)?;
+    if !matches!(parsed_crypto.kdf_params, KdfParams::RecipientWrap { .. })
+        || !parsed_crypto.fixed.aead_algo.is_encrypted()
+    {
+        return Err(FormatError::KeyMaterialMismatch);
+    }
+
+    validate_seekable_supported_volume(&volume_header, &parsed_crypto.fixed, &[])?;
+    validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
+
+    let startup_key_wrap_table = startup_key_wrap_table(
+        &volume_header,
+        &parsed_crypto.kdf_params,
+        |start, length| read_at_vec(reader, start, length, "KeyWrapTableV1"),
+    )?
+    .ok_or(FormatError::KeyMaterialMismatch)?;
+    let key_wrap_table = startup_key_wrap_table.table;
+    let key_wrap_table_bytes = Some(startup_key_wrap_table.bytes);
+    let block_records_start = startup_key_wrap_table.block_records_start;
+
+    let subkeys = recipient_wrap_subkeys_from_table(
+        &volume_header,
+        &parsed_crypto,
+        &key_wrap_table,
+        resolver,
+    )?;
+    parsed_crypto.validate_extension_semantics()?;
+    reject_unsupported_raw_stream_profile(&parsed_crypto.extensions)?;
+
+    let crypto_header = parsed_crypto.fixed.clone();
+    Ok(ParsedReadAtOpenPrefix {
+        volume_header,
+        crypto_header,
+        crypto_header_bytes: crypto_bytes,
+        key_wrap_table_bytes,
         block_records_start,
         subkeys,
     })
@@ -5079,6 +5581,77 @@ where
         .map(|candidate| candidate.authority)
 }
 
+fn locate_v41_recipient_wrap_terminal_authority_read_at<F>(
+    reader: &dyn ArchiveReadAt,
+    len: u64,
+    resolver: &mut F,
+    options: ReaderOptions,
+) -> Result<RecoveredRecipientWrapTerminalAuthority, FormatError>
+where
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    let mut candidates = Vec::new();
+    if len >= CRITICAL_RECOVERY_LOCATOR_LEN as u64 {
+        let final_offset = len - CRITICAL_RECOVERY_LOCATOR_LEN as u64;
+        collect_v41_recipient_wrap_locator_authority_candidate_read_at(
+            reader,
+            final_offset,
+            0,
+            resolver,
+            &mut candidates,
+        );
+    }
+    if len >= LOCATOR_PAIR_LEN as u64 {
+        let mirror_offset = len - LOCATOR_PAIR_LEN as u64;
+        collect_v41_recipient_wrap_locator_authority_candidate_read_at(
+            reader,
+            mirror_offset,
+            1,
+            resolver,
+            &mut candidates,
+        );
+    }
+
+    if candidates.is_empty() {
+        let scan = max_critical_recovery_scan(options)? as u64;
+        let scan_start = len.saturating_sub(scan);
+        let scan_len = to_usize(len.saturating_sub(scan_start), "CMRA scan")?;
+        let tail = read_at_vec(reader, scan_start, scan_len, "CMRA scan")?;
+        let mut offset = tail.len().saturating_sub(4);
+        while offset < tail.len() {
+            let absolute_offset = checked_u64_add(scan_start, offset as u64, "CMRA scan")?;
+            if tail.get(offset..offset + 4) == Some(b"TZCL") {
+                collect_v41_recipient_wrap_locator_authority_candidate_read_at(
+                    reader,
+                    absolute_offset,
+                    2,
+                    resolver,
+                    &mut candidates,
+                );
+            } else if tail.get(offset..offset + 4) == Some(b"TZCR") {
+                if let Ok(candidate) =
+                    parse_locatorless_cmra_recipient_wrap_authority_candidate_read_at(
+                        reader,
+                        absolute_offset,
+                        resolver,
+                    )
+                {
+                    candidates.push(candidate);
+                }
+            }
+            if offset == 0 {
+                break;
+            }
+            offset -= 1;
+        }
+    }
+
+    choose_v41_recipient_wrap_terminal_authority_candidate(candidates)
+        .map(|candidate| candidate.authority)
+}
+
 fn locate_v41_terminal_authority_read_at(
     reader: &dyn ArchiveReadAt,
     len: u64,
@@ -5336,6 +5909,38 @@ fn collect_v41_recipient_wrap_locator_authority_candidate<F>(
     if let Ok(candidate) =
         parse_locator_cmra_recipient_wrap_authority_candidate(bytes, offset, locator, resolver)
     {
+        candidates.push(candidate);
+    }
+}
+
+fn collect_v41_recipient_wrap_locator_authority_candidate_read_at<F>(
+    reader: &dyn ArchiveReadAt,
+    offset: u64,
+    expected_sequence: u32,
+    resolver: &mut F,
+    candidates: &mut Vec<RecipientWrapTerminalAuthorityCandidate>,
+) where
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    let Ok(raw) = read_at_vec(
+        reader,
+        offset,
+        CRITICAL_RECOVERY_LOCATOR_LEN,
+        "CriticalRecoveryLocator",
+    ) else {
+        return;
+    };
+    let Ok(locator) = CriticalRecoveryLocator::parse(&raw) else {
+        return;
+    };
+    if expected_sequence <= 1 && locator.locator_sequence != expected_sequence {
+        return;
+    }
+    if let Ok(candidate) = parse_locator_cmra_recipient_wrap_authority_candidate_read_at(
+        reader, offset, locator, resolver,
+    ) {
         candidates.push(candidate);
     }
 }
@@ -5664,6 +6269,67 @@ where
     })
 }
 
+fn parse_locator_cmra_recipient_wrap_authority_candidate_read_at<F>(
+    reader: &dyn ArchiveReadAt,
+    locator_offset: u64,
+    locator: CriticalRecoveryLocator,
+    resolver: &mut F,
+) -> Result<RecipientWrapTerminalAuthorityCandidate, FormatError>
+where
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    let tuple = CmraDecoderTuple::from(locator);
+    validate_cmra_decoder_tuple(tuple)?;
+    let expected_cmra_length = cmra_serialized_length(tuple)?;
+    if locator.cmra_length as u64 != expected_cmra_length {
+        return Err(FormatError::InvalidArchive("locator CMRA length mismatch"));
+    }
+    validate_locator_position(
+        to_usize(locator_offset, "CriticalRecoveryLocator")?,
+        locator,
+    )?;
+    let recovered = recover_cmra_read_at(
+        reader,
+        locator.cmra_offset,
+        Some(tuple),
+        CmraRecoveryMode::KeyHolding,
+    )?;
+    if recovered.tuple != tuple {
+        return Err(FormatError::InvalidArchive("CMRA decoder tuple mismatch"));
+    }
+    if expected_cmra_length != recovered.cmra_length {
+        return Err(FormatError::InvalidArchive("locator CMRA length mismatch"));
+    }
+    validate_locator_image_boundary(locator, &recovered.image)?;
+    validate_cmra_identity_hints(
+        recovered.header_hints,
+        Some(CmraIdentityHints::from(locator)),
+        &recovered.image,
+    )?;
+    let cmra_length = recovered.cmra_length;
+    let authority = validate_recovered_recipient_wrap_terminal_authority(
+        recovered.image,
+        recovered.tuple,
+        resolver,
+        false,
+    )?;
+    Ok(RecipientWrapTerminalAuthorityCandidate {
+        authority,
+        anchor: to_usize(
+            checked_u64_add(
+                locator_offset,
+                CRITICAL_RECOVERY_LOCATOR_LEN as u64,
+                "locator anchor overflow",
+            )?,
+            "locator anchor overflow",
+        )?,
+        cmra_offset: locator.cmra_offset,
+        cmra_length,
+    })
+}
+
 fn parse_locator_cmra_authority_candidate_read_at(
     reader: &dyn ArchiveReadAt,
     locator_offset: u64,
@@ -5935,6 +6601,52 @@ where
             .checked_add(to_usize(cmra_length, "CMRA")?)
             .ok_or(FormatError::InvalidArchive("CMRA anchor overflow"))?,
         cmra_offset: cmra_offset as u64,
+        cmra_length,
+    })
+}
+
+fn parse_locatorless_cmra_recipient_wrap_authority_candidate_read_at<F>(
+    reader: &dyn ArchiveReadAt,
+    cmra_offset: u64,
+    resolver: &mut F,
+) -> Result<RecipientWrapTerminalAuthorityCandidate, FormatError>
+where
+    F: FnMut(
+        RecipientWrapRecordContext<'_>,
+    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+{
+    let recovered = recover_cmra_read_at(reader, cmra_offset, None, CmraRecoveryMode::KeyHolding)?;
+    if recovered.image.body_bytes_before_cmra != cmra_offset {
+        return Err(FormatError::InvalidArchive(
+            "locatorless CMRA boundary mismatch",
+        ));
+    }
+    if recovered
+        .image
+        .volume_trailer_offset
+        .checked_add(VOLUME_TRAILER_LEN as u64)
+        .ok_or(FormatError::InvalidArchive("CMRA boundary overflow"))?
+        != cmra_offset
+    {
+        return Err(FormatError::InvalidArchive(
+            "locatorless trailer boundary mismatch",
+        ));
+    }
+    validate_cmra_identity_hints(recovered.header_hints, None, &recovered.image)?;
+    let cmra_length = recovered.cmra_length;
+    let authority = validate_recovered_recipient_wrap_terminal_authority(
+        recovered.image,
+        recovered.tuple,
+        resolver,
+        true,
+    )?;
+    Ok(RecipientWrapTerminalAuthorityCandidate {
+        authority,
+        anchor: to_usize(
+            checked_u64_add(cmra_offset, cmra_length, "CMRA anchor overflow")?,
+            "CMRA anchor overflow",
+        )?,
+        cmra_offset,
         cmra_length,
     })
 }
@@ -9395,6 +10107,16 @@ fn read_at_vec(
     Ok(out)
 }
 
+fn read_at_vec_unchecked(
+    reader: &dyn ArchiveReadAt,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>, FormatError> {
+    let mut out = vec![0u8; len];
+    reader.read_exact_at(offset, &mut out)?;
+    Ok(out)
+}
+
 fn parallel_map_ref<T, U, F>(items: &[T], jobs: usize, f: F) -> Result<Vec<U>, FormatError>
 where
     T: Sync,
@@ -10900,6 +11622,80 @@ mod tests {
         })
         .unwrap();
 
+        assert_eq!(
+            opened.extract_file("wrapped.txt").unwrap(),
+            Some(b"recipient payload".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn recipientwrap_seekable_open_uses_lazy_block_source() {
+        let master = master_key();
+        let archive = write_archive_with_recipient_wrap_records(
+            &[RegularFile::new("wrapped.txt", b"recipient payload")],
+            &master,
+            single_stream_options(),
+            vec![recipient_wrap_test_record()],
+        )
+        .unwrap();
+
+        let opened = open_seekable_archive_with_recipient_wrap_resolver_options(
+            CountingReadAt::new(archive.bytes, vec![]),
+            |context| {
+                assert_eq!(
+                    context.archive_identity.volume_format_rev,
+                    VOLUME_FORMAT_REV_44
+                );
+                assert_eq!(context.record.profile_id, 1);
+                Ok(vec![master.0])
+            },
+            ReaderOptions::default(),
+        )
+        .unwrap();
+
+        assert!(opened.blocks.is_empty());
+        assert!(opened.lazy_blocks.is_some());
+        assert_eq!(
+            opened.extract_file("wrapped.txt").unwrap(),
+            Some(b"recipient payload".to_vec())
+        );
+        opened.verify().unwrap();
+    }
+
+    #[test]
+    fn recipientwrap_seekable_volume_set_opens_with_resolver() {
+        let master = master_key();
+        let archive = write_archive_with_recipient_wrap_records(
+            &[RegularFile::new("wrapped.txt", b"recipient payload")],
+            &master,
+            WriterOptions {
+                stripe_width: 2,
+                volume_loss_tolerance: 0,
+                ..WriterOptions::default()
+            },
+            vec![recipient_wrap_test_record()],
+        )
+        .unwrap();
+        assert_eq!(archive.volumes.len(), 2);
+
+        let opened = open_seekable_archive_volumes_with_recipient_wrap_resolver_options(
+            archive.volumes,
+            |context| {
+                assert_eq!(
+                    context.archive_identity.volume_format_rev,
+                    VOLUME_FORMAT_REV_44
+                );
+                assert_eq!(context.record.profile_id, 1);
+                Ok(vec![master.0])
+            },
+            ReaderOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(opened.observed_volume_count, 2);
+        assert!(opened.blocks.is_empty());
+        assert!(opened.lazy_blocks.is_some());
         assert_eq!(
             opened.extract_file("wrapped.txt").unwrap(),
             Some(b"recipient payload".to_vec())
