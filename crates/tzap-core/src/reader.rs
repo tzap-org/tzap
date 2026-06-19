@@ -3518,10 +3518,10 @@ struct ParsedReadAtOpenPrefix {
     subkeys: Subkeys,
 }
 
-struct StartupKeyWrapTable {
-    table: KeyWrapTableV1,
-    bytes: Vec<u8>,
-    block_records_start: u64,
+pub(crate) struct StartupKeyWrapTable {
+    pub(crate) table: KeyWrapTableV1,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) block_records_start: u64,
 }
 
 pub(crate) fn startup_block_records_start(
@@ -3539,7 +3539,7 @@ pub(crate) fn startup_block_records_start(
     )
 }
 
-fn startup_key_wrap_table(
+pub(crate) fn startup_key_wrap_table(
     volume_header: &VolumeHeader,
     kdf_params: &KdfParams,
     mut read_key_wrap_table: impl FnMut(u64, usize) -> Result<Vec<u8>, FormatError>,
@@ -3576,7 +3576,7 @@ fn startup_key_wrap_table(
     }
 }
 
-fn parse_startup_key_wrap_table_bytes(
+pub(crate) fn parse_startup_key_wrap_table_bytes(
     volume_header: &VolumeHeader,
     kdf_params: &KdfParams,
     key_wrap_table_bytes: Vec<u8>,
@@ -3908,12 +3908,7 @@ where
         return Err(FormatError::KeyMaterialMismatch);
     }
 
-    parsed_crypto.validate_extension_semantics()?;
-    validate_seekable_supported_volume(
-        &volume_header,
-        &parsed_crypto.fixed,
-        &parsed_crypto.extensions,
-    )?;
+    validate_seekable_supported_volume(&volume_header, &parsed_crypto.fixed, &[])?;
     validate_crypto_class_parity_exactness(&parsed_crypto.fixed)?;
 
     let startup_key_wrap_table = startup_key_wrap_table(
@@ -3935,6 +3930,8 @@ where
         &key_wrap_table,
         resolver,
     )?;
+    parsed_crypto.validate_extension_semantics()?;
+    reject_unsupported_raw_stream_profile(&parsed_crypto.extensions)?;
 
     let crypto_header = parsed_crypto.fixed.clone();
     Ok(ParsedOpenPrefix {
@@ -3947,7 +3944,7 @@ where
     })
 }
 
-fn recipient_wrap_subkeys_from_table<F>(
+pub(crate) fn recipient_wrap_subkeys_from_table<F>(
     volume_header: &VolumeHeader,
     parsed_crypto: &CryptoHeader<'_>,
     key_wrap_table: &KeyWrapTableV1,
@@ -3955,8 +3952,9 @@ fn recipient_wrap_subkeys_from_table<F>(
 ) -> Result<Subkeys, FormatError>
 where
     F: FnMut(
-        RecipientWrapRecordContext<'_>,
-    ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>,
+            RecipientWrapRecordContext<'_>,
+        ) -> Result<Vec<RecipientWrapCandidateMasterKey>, FormatError>
+        + ?Sized,
 {
     let archive_identity = RecipientWrapArchiveIdentity {
         archive_uuid: volume_header.archive_uuid,
@@ -6815,6 +6813,8 @@ where
         &startup_key_wrap_table.table,
         resolver,
     )?;
+    parsed_crypto.validate_extension_semantics()?;
+    reject_unsupported_raw_stream_profile(&parsed_crypto.extensions)?;
     let crypto_header = parsed_crypto.fixed.clone();
 
     let terminal = validate_recovered_terminal_inner(
@@ -9461,7 +9461,8 @@ mod tests {
     use crate::non_seekable_reader::{
         extract_non_seekable_stream_to_dir, list_non_seekable_stream, verify_non_seekable_stream,
         verify_non_seekable_stream_with_bootstrap_sidecar, verify_non_seekable_stream_with_options,
-        NonSeekableReaderOptions, SequentialRootAuthStatus,
+        verify_non_seekable_stream_with_recipient_wrap_resolver_options, NonSeekableReaderOptions,
+        SequentialRootAuthStatus,
     };
     use crate::raw_stream_profile::{
         serialize_raw_stream_content_model_extension, RAW_STREAM_UNSUPPORTED_MESSAGE,
@@ -9567,6 +9568,23 @@ mod tests {
         header.crypto_header_length = new_crypto_len;
         volume[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
         volume[crypto_start + 4..crypto_start + 8].copy_from_slice(&new_crypto_len.to_le_bytes());
+    }
+
+    fn recompute_physical_crypto_header_hmac(volume: &mut [u8], master_key: &MasterKey) {
+        let header = VolumeHeader::parse(&volume[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_start = header.crypto_header_offset as usize;
+        let crypto_end = crypto_start + header.crypto_header_length as usize;
+        let hmac_start = crypto_end - CRYPTO_HEADER_HMAC_LEN;
+        let subkeys =
+            Subkeys::derive(master_key, &header.archive_uuid, &header.session_id).unwrap();
+        let hmac = compute_hmac(
+            HmacDomain::CryptoHeader,
+            &subkeys.mac_key,
+            &header.archive_uuid,
+            &header.session_id,
+            &volume[crypto_start..hmac_start],
+        );
+        volume[hmac_start..crypto_end].copy_from_slice(&hmac);
     }
 
     #[test]
@@ -11018,25 +11036,27 @@ mod tests {
     }
 
     #[test]
-    fn recipientwrap_raw_stream_profile_rejects_before_resolver_callback() {
+    fn recipientwrap_defers_raw_stream_profile_rejection_until_after_resolver_callback() {
+        let master = master_key();
         let archive = write_archive_with_recipient_wrap_records(
             &[RegularFile::new("wrapped.txt", b"recipient payload")],
-            &master_key(),
+            &master,
             single_stream_options(),
             vec![recipient_wrap_test_record()],
         )
         .unwrap();
         let mut bytes = archive.bytes;
         add_raw_stream_profile_to_physical_crypto_header(&mut bytes);
+        recompute_physical_crypto_header_hmac(&mut bytes, &master);
 
         let mut called = false;
         let err = open_archive_with_recipient_wrap_resolver(&bytes, |_| {
             called = true;
-            Ok(vec![master_key().0])
+            Ok(vec![master.0])
         })
         .unwrap_err();
 
-        assert!(!called);
+        assert!(called);
         assert_eq!(
             err,
             FormatError::ReaderUnsupported(RAW_STREAM_UNSUPPORTED_MESSAGE)
@@ -12522,6 +12542,42 @@ mod tests {
         assert_eq!(report.total_volumes, 1);
         assert_eq!(report.root_auth, SequentialRootAuthStatus::Absent);
         assert!(report.payload_block_count > 0);
+    }
+
+    #[test]
+    fn live_non_seekable_verify_stream_accepts_recipientwrap_archive() {
+        let master = master_key();
+        let archive = write_archive_with_recipient_wrap_records(
+            &[RegularFile::new(
+                "wrapped-live.txt",
+                b"stream recipient verify",
+            )],
+            &master,
+            single_stream_options(),
+            vec![recipient_wrap_test_record()],
+        )
+        .unwrap();
+
+        let mut called = false;
+        let report = verify_non_seekable_stream_with_recipient_wrap_resolver_options(
+            std::io::Cursor::new(archive.bytes),
+            |context| {
+                called = true;
+                assert_eq!(
+                    context.archive_identity.volume_format_rev,
+                    VOLUME_FORMAT_REV_44
+                );
+                assert_eq!(context.record.profile_id, 1);
+                Ok(vec![master.0])
+            },
+            NonSeekableReaderOptions::default(),
+        )
+        .unwrap();
+
+        assert!(called);
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.total_volumes, 1);
+        assert_eq!(report.root_auth, SequentialRootAuthStatus::Absent);
     }
 
     #[test]

@@ -26,12 +26,18 @@ pub use format::{
 };
 pub use non_seekable_reader::{
     extract_non_seekable_stream_to_dir, extract_non_seekable_stream_to_dir_with_bootstrap_sidecar,
+    extract_non_seekable_stream_to_dir_with_recipient_wrap_resolver,
+    extract_non_seekable_stream_to_dir_with_recipient_wrap_resolver_and_bootstrap_sidecar,
     extract_unencrypted_non_seekable_stream_to_dir,
     extract_unencrypted_non_seekable_stream_to_dir_with_bootstrap_sidecar,
     list_non_seekable_stream, list_non_seekable_stream_with_bootstrap_sidecar,
+    list_non_seekable_stream_with_recipient_wrap_resolver,
+    list_non_seekable_stream_with_recipient_wrap_resolver_and_bootstrap_sidecar,
     list_unencrypted_non_seekable_stream,
     list_unencrypted_non_seekable_stream_with_bootstrap_sidecar, verify_non_seekable_stream,
     verify_non_seekable_stream_with_bootstrap_sidecar, verify_non_seekable_stream_with_options,
+    verify_non_seekable_stream_with_recipient_wrap_resolver_and_bootstrap_sidecar,
+    verify_non_seekable_stream_with_recipient_wrap_resolver_options,
     verify_unencrypted_non_seekable_stream_with_bootstrap_sidecar,
     verify_unencrypted_non_seekable_stream_with_options, NonSeekableReaderOptions,
     SequentialExtractReport, SequentialListReport, SequentialRootAuthStatus,

@@ -3850,6 +3850,19 @@ fn cli_create_list_verify_and_extract_with_recipient_wrap() {
         .args([
             "verify",
             "--recipient-key",
+            recipient_key_path.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(fs::read(&archive).unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK"));
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "verify",
+            "--recipient-key",
             wrong_key_path.to_str().unwrap(),
             archive.to_str().unwrap(),
         ])

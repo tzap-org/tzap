@@ -24,14 +24,20 @@ use tzap_core::reader::{ArchiveEntry, ArchiveIndexEntry, RecipientWrapRecordCont
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
 use tzap_core::{
     extract_non_seekable_stream_to_dir, extract_non_seekable_stream_to_dir_with_bootstrap_sidecar,
+    extract_non_seekable_stream_to_dir_with_recipient_wrap_resolver,
+    extract_non_seekable_stream_to_dir_with_recipient_wrap_resolver_and_bootstrap_sidecar,
     extract_unencrypted_non_seekable_stream_to_dir,
     extract_unencrypted_non_seekable_stream_to_dir_with_bootstrap_sidecar,
     list_non_seekable_stream, list_non_seekable_stream_with_bootstrap_sidecar,
+    list_non_seekable_stream_with_recipient_wrap_resolver,
+    list_non_seekable_stream_with_recipient_wrap_resolver_and_bootstrap_sidecar,
     list_unencrypted_non_seekable_stream,
     list_unencrypted_non_seekable_stream_with_bootstrap_sidecar, open_seekable_archive,
     open_seekable_archive_with_bootstrap_sidecar_options,
     public_no_key_verify_volumes_with_options, verify_non_seekable_stream_with_bootstrap_sidecar,
     verify_non_seekable_stream_with_options,
+    verify_non_seekable_stream_with_recipient_wrap_resolver_and_bootstrap_sidecar,
+    verify_non_seekable_stream_with_recipient_wrap_resolver_options,
     verify_unencrypted_non_seekable_stream_with_bootstrap_sidecar,
     verify_unencrypted_non_seekable_stream_with_options, write_archive,
     write_archive_sources_to_sink_ordered_parallel, write_archive_with_dictionary,
@@ -1512,6 +1518,27 @@ fn run(cli: Cli) -> Result<()> {
                             options,
                         )
                     }
+                } else if let Some(recipient_key) = recipient_key.as_deref() {
+                    let lookup = load_recipient_private_key_lookup(recipient_key)?;
+                    let mut stats = RecipientWrapOpenStats::default();
+                    if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+                        extract_non_seekable_stream_to_dir_with_recipient_wrap_resolver_and_bootstrap_sidecar(
+                            stdin.lock(),
+                            bootstrap_bytes,
+                            |context| recipient_wrap_candidates_for_record(context, &lookup, &mut stats),
+                            Path::new(&directory),
+                            non_seekable_reader_options(reader_options),
+                            options,
+                        )
+                    } else {
+                        extract_non_seekable_stream_to_dir_with_recipient_wrap_resolver(
+                            stdin.lock(),
+                            |context| recipient_wrap_candidates_for_record(context, &lookup, &mut stats),
+                            Path::new(&directory),
+                            non_seekable_reader_options(reader_options),
+                            options,
+                        )
+                    }
                 } else {
                     if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
                         extract_unencrypted_non_seekable_stream_to_dir_with_bootstrap_sidecar(
@@ -1688,6 +1715,27 @@ fn run(cli: Cli) -> Result<()> {
                         list_non_seekable_stream(
                             stdin.lock(),
                             &master_key,
+                            non_seekable_reader_options(reader_options),
+                        )
+                    }
+                } else if let Some(recipient_key) = recipient_key.as_deref() {
+                    let lookup = load_recipient_private_key_lookup(recipient_key)?;
+                    let mut stats = RecipientWrapOpenStats::default();
+                    if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+                        list_non_seekable_stream_with_recipient_wrap_resolver_and_bootstrap_sidecar(
+                            stdin.lock(),
+                            bootstrap_bytes,
+                            |context| {
+                                recipient_wrap_candidates_for_record(context, &lookup, &mut stats)
+                            },
+                            non_seekable_reader_options(reader_options),
+                        )
+                    } else {
+                        list_non_seekable_stream_with_recipient_wrap_resolver(
+                            stdin.lock(),
+                            |context| {
+                                recipient_wrap_candidates_for_record(context, &lookup, &mut stats)
+                            },
                             non_seekable_reader_options(reader_options),
                         )
                     }
@@ -1959,6 +2007,31 @@ fn run(cli: Cli) -> Result<()> {
                         verify_non_seekable_stream_with_options(
                             stdin.lock(),
                             &master_key,
+                            non_seekable_reader_options(reader_options),
+                        )
+                    }
+                } else if let Some(recipient_key) = recipient_key.as_deref() {
+                    let lookup = match load_recipient_private_key_lookup(recipient_key) {
+                        Ok(lookup) => lookup,
+                        Err(err) => {
+                            if json {
+                                emit_verify_json_error(&archive_paths, None, None, &err)?;
+                            }
+                            return Err(err);
+                        }
+                    };
+                    let mut stats = RecipientWrapOpenStats::default();
+                    if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+                        verify_non_seekable_stream_with_recipient_wrap_resolver_and_bootstrap_sidecar(
+                            stdin.lock(),
+                            bootstrap_bytes,
+                            |context| recipient_wrap_candidates_for_record(context, &lookup, &mut stats),
+                            non_seekable_reader_options(reader_options),
+                        )
+                    } else {
+                        verify_non_seekable_stream_with_recipient_wrap_resolver_options(
+                            stdin.lock(),
+                            |context| recipient_wrap_candidates_for_record(context, &lookup, &mut stats),
                             non_seekable_reader_options(reader_options),
                         )
                     }
@@ -4200,7 +4273,7 @@ fn reject_archive_stdin_key_options(
     password_stdin: bool,
     password: bool,
     _keyfile: Option<&str>,
-    recipient_key: Option<&str>,
+    _recipient_key: Option<&str>,
     insecure_zero_key: bool,
 ) -> Result<()> {
     if insecure_zero_key {
@@ -4208,12 +4281,7 @@ fn reject_archive_stdin_key_options(
     }
     if password_stdin || password {
         return Err(anyhow!(FormatError::ReaderUnsupported(
-            "archive stdin currently supports raw --keyfile or no-key unencrypted archives only",
-        )));
-    }
-    if recipient_key.is_some() {
-        return Err(anyhow!(FormatError::ReaderUnsupported(
-            "--recipient-key requires a seekable archive path",
+            "archive stdin currently supports raw --keyfile, --recipient-key, or no-key unencrypted archives only",
         )));
     }
     Ok(())
