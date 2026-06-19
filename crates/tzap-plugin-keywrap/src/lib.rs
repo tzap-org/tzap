@@ -777,6 +777,25 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct MatchingLookup {
+        matches: Vec<(Vec<u8>, Vec<u8>)>,
+    }
+
+    impl PrivateKeyLookup for MatchingLookup {
+        fn lookup_private_key(
+            &self,
+            _: &ArchiveIdentity,
+            _: &RecipientRecordMetadata,
+            recipient_identity_bytes: &[u8],
+        ) -> Option<Vec<u8>> {
+            self.matches
+                .iter()
+                .find(|(identity, _)| identity.as_slice() == recipient_identity_bytes)
+                .map(|(_, private_key)| private_key.clone())
+        }
+    }
+
     fn archive_identity() -> ArchiveIdentity {
         let mut archive_uuid = [0u8; 16];
         let mut session_id = [0u8; 16];
@@ -1353,6 +1372,64 @@ mod tests {
     }
 
     #[test]
+    fn multi_recipient_records_open_independently_with_matching_private_key() {
+        let archive_identity = archive_identity();
+        let master_key = [0x33u8; 32];
+        let (bob_cert, bob_key) = x25519_recipient_material();
+        let (carol_cert, carol_key) = p256_recipient_material();
+        let (ops_cert, ops_key) = x25519_recipient_material();
+        let recipients = [
+            (
+                bob_cert,
+                bob_key,
+                KeyWrapSuite::X25519HkdfSha256ChaCha20Poly1305,
+            ),
+            (carol_cert, carol_key, KeyWrapSuite::P256HkdfSha256Aes256Gcm),
+            (
+                ops_cert,
+                ops_key,
+                KeyWrapSuite::X25519HkdfSha256ChaCha20Poly1305,
+            ),
+        ];
+        let records = recipients
+            .iter()
+            .map(|(cert_der, _, suite)| {
+                wrap_master_key_for_recipient(
+                    archive_identity.clone(),
+                    cert_der,
+                    &master_key,
+                    *suite,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        for (cert_der, private_key, _) in recipients {
+            let lookup = MatchingLookup {
+                matches: vec![(cert_der.clone(), private_key)],
+            };
+            let unwrapped = records
+                .clone()
+                .into_iter()
+                .filter_map(|record| {
+                    let input =
+                        recipient_record_input_from_record(archive_identity.clone(), record);
+                    match dispatch_key_wrap_record(input, &lookup) {
+                        KeyWrapOutcome::UnwrappedCandidateMasterKey {
+                            master_key: candidate,
+                            ..
+                        } => Some(candidate),
+                        KeyWrapOutcome::NoMatchingPrivateKey => None,
+                        other => panic!("unexpected key-wrap outcome: {other:?}"),
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(unwrapped, vec![master_key]);
+        }
+    }
+
+    #[test]
     fn wrong_private_key_is_invalid_record() {
         let (cert_der, _private_key) = x25519_recipient_material();
         let (_wrong_cert_der, wrong_private_key) = x25519_recipient_material();
@@ -1375,5 +1452,20 @@ mod tests {
         );
 
         assert!(matches!(result, KeyWrapOutcome::InvalidRecord));
+    }
+
+    #[test]
+    fn signing_certificate_key_usage_does_not_satisfy_recipient_wrap() {
+        let cert_der = test_certificate_der_with_bad_key_usage();
+        let master_key = [0x42u8; 32];
+
+        let result = wrap_master_key_for_recipient(
+            archive_identity(),
+            &cert_der,
+            &master_key,
+            KeyWrapSuite::X25519HkdfSha256ChaCha20Poly1305,
+        );
+
+        assert!(matches!(result, Err(KeyWrapOutcome::InvalidRecord)));
     }
 }

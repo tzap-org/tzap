@@ -17,8 +17,9 @@ use sha2::{Digest, Sha256, Sha512};
 use tzap_core::format::{root_auth_spec_id_for_revision, ROOT_AUTH_SPEC_ID};
 use tzap_core::wire::RootAuthFooterV1;
 use tzap_core::writer::{RootAuthSigningRequest, RootAuthWriterConfig};
-use x509_parser::signature_algorithm::SignatureAlgorithm;
 use x509_parser::prelude::FromDer;
+use x509_parser::signature_algorithm::{RsaSsaPssParams, SignatureAlgorithm};
+use x509_parser::x509::AlgorithmIdentifier;
 
 pub const X509_AUTHENTICATOR_ID: u16 = 0x0003;
 pub const X509_SIGNER_IDENTITY_TYPE_DER_CERT: u16 = 2;
@@ -28,6 +29,10 @@ const VERSION: u16 = 1;
 const SIG_SCHEME_RSA_PKCS1_SHA256: u16 = 1;
 const SIG_SCHEME_ECDSA_SHA256_DER: u16 = 2;
 const SIG_SCHEME_RSA_PSS_SHA256: u16 = 3;
+const OID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
+const OID_RSASSA_PSS: &str = "1.2.840.113549.1.1.10";
+const OID_MGF1: &str = "1.2.840.113549.1.1.8";
+const OID_SHA256: &str = "2.16.840.1.101.3.4.2.1";
 const X509_SIGNING_DOMAIN: &[u8] = b"tzap-sig-x509-v1\0";
 const X509_CHAIN_DOMAIN: &[u8] = b"tzap-x509-chain-v1\0";
 const AUTHENTICATOR_FIXED_LEN: usize = 60;
@@ -180,6 +185,7 @@ impl X509RootAuthSigner {
             }
             None => signature_scheme_for_private_key(&private_key)?,
         };
+        validate_rsa_spki_signature_scheme(sig_scheme, &leaf_certificate_der)?;
         let chain_certificate_der = normalize_certificate_der_chain(chain_certificate_der)?;
         let signature_capacity = private_key.size();
         let signer = Self {
@@ -376,7 +382,7 @@ pub fn verify_root_auth_footer(
         &parsed.chain_digest,
     );
     let leaf_public_key = leaf_certificate.public_key()?;
-    validate_rsa_pss_signature_algorithm(footer.signer_identity_bytes.as_slice())?;
+    validate_rsa_spki_signature_scheme(parsed.sig_scheme, footer.signer_identity_bytes.as_slice())?;
     validate_public_key_matches_scheme(parsed.sig_scheme, &leaf_public_key)?;
     validate_signature_for_scheme(parsed.sig_scheme, &leaf_public_key, &parsed.signature)?;
     let mut verifier = verifier_for_scheme(parsed.sig_scheme, &leaf_public_key)?;
@@ -428,51 +434,102 @@ pub fn verify_root_auth_footer(
     })
 }
 
-fn validate_rsa_pss_signature_algorithm(
+fn validate_rsa_spki_signature_scheme(
+    sig_scheme: u16,
     leaf_certificate_bytes: &[u8],
 ) -> Result<(), X509RootAuthError> {
-    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(leaf_certificate_bytes)
-        .map_err(|_| X509RootAuthError::Invalid("failed to parse leaf certificate"))?;
+    let (remaining, certificate) =
+        x509_parser::certificate::X509Certificate::from_der(leaf_certificate_bytes)
+            .map_err(|_| X509RootAuthError::Invalid("failed to parse leaf certificate"))?;
+    if !remaining.is_empty() {
+        return Err(X509RootAuthError::Invalid(
+            "leaf certificate has trailing data",
+        ));
+    }
 
-    let signature_algorithm = SignatureAlgorithm::try_from(&certificate.tbs_certificate.signature_algorithm)
-        .map_err(|_| X509RootAuthError::Invalid("unsupported leaf signature algorithm"))?;
+    validate_rsa_spki_algorithm_for_scheme(
+        sig_scheme,
+        &certificate.tbs_certificate.subject_pki.algorithm,
+    )
+}
 
-    let SignatureAlgorithm::RSASSA_PSS(params) = signature_algorithm else {
-        return Ok(());
-    };
+fn validate_rsa_spki_algorithm_for_scheme(
+    sig_scheme: u16,
+    spki_algorithm: &AlgorithmIdentifier<'_>,
+) -> Result<(), X509RootAuthError> {
+    let spki_oid = spki_algorithm.algorithm.to_id_string();
+    match sig_scheme {
+        SIG_SCHEME_RSA_PKCS1_SHA256 => {
+            if spki_oid != OID_RSA_ENCRYPTION {
+                return Err(X509RootAuthError::Invalid(
+                    "rsa-pkcs1-sha256 requires unconstrained rsaEncryption SubjectPublicKeyInfo",
+                ));
+            }
+        }
+        SIG_SCHEME_RSA_PSS_SHA256 => {
+            if spki_oid == OID_RSA_ENCRYPTION {
+                return Ok(());
+            }
+            if spki_oid != OID_RSASSA_PSS {
+                return Err(X509RootAuthError::Invalid(
+                    "rsa-pss-sha256 requires RSA SubjectPublicKeyInfo",
+                ));
+            }
 
+            let signature_algorithm =
+                SignatureAlgorithm::try_from(spki_algorithm).map_err(|_| {
+                    X509RootAuthError::Invalid(
+                        "unsupported leaf SubjectPublicKeyInfo RSA-PSS parameters",
+                    )
+                })?;
+            let SignatureAlgorithm::RSASSA_PSS(params) = signature_algorithm else {
+                return Err(X509RootAuthError::Invalid(
+                    "rsa-pss-sha256 requires RSA-PSS SubjectPublicKeyInfo parameters",
+                ));
+            };
+            validate_rsa_pss_params(params.as_ref())?;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn validate_rsa_pss_params(params: &RsaSsaPssParams<'_>) -> Result<(), X509RootAuthError> {
     let hash_algorithm = params.hash_algorithm_oid();
-    if hash_algorithm.to_id_string() != "2.16.840.1.101.3.4.2.1" {
+    if hash_algorithm.to_id_string() != OID_SHA256 {
         return Err(X509RootAuthError::Invalid(
-            "leaf RSA-PSS signature algorithm must be sha256withRSA-PSS",
+            "leaf RSA-PSS SubjectPublicKeyInfo must use SHA-256",
         ));
     }
 
-    let mask_generation = params
-        .mask_gen_algorithm()
-        .map_err(|_| X509RootAuthError::Invalid("leaf RSA-PSS signature algorithm is missing mask generation parameters"))?;
-    if mask_generation.mgf.to_id_string() != "1.2.840.113549.1.1.8" {
+    let mask_generation = params.mask_gen_algorithm().map_err(|_| {
+        X509RootAuthError::Invalid(
+            "leaf RSA-PSS SubjectPublicKeyInfo is missing mask generation parameters",
+        )
+    })?;
+    if mask_generation.mgf.to_id_string() != OID_MGF1 {
         return Err(X509RootAuthError::Invalid(
-            "leaf RSA-PSS signature algorithm must use MGF1 in mask generation parameters",
+            "leaf RSA-PSS SubjectPublicKeyInfo must use MGF1",
         ));
     }
-    if mask_generation.hash.to_id_string() != "2.16.840.1.101.3.4.2.1" {
+    if mask_generation.hash.to_id_string() != OID_SHA256 {
         return Err(X509RootAuthError::Invalid(
-            "leaf RSA-PSS signature algorithm must use SHA-256 as MGF1 digest",
+            "leaf RSA-PSS SubjectPublicKeyInfo must use SHA-256 as MGF1 digest",
         ));
     }
 
     let salt_length = params.salt_length();
     if salt_length != 32 {
         return Err(X509RootAuthError::Invalid(
-            "leaf RSA-PSS signature algorithm must use saltLength=32",
+            "leaf RSA-PSS SubjectPublicKeyInfo must use saltLength=32",
         ));
     }
 
     let trailer = params.trailer_field();
     if trailer != 1 {
         return Err(X509RootAuthError::Invalid(
-            "leaf RSA-PSS signature algorithm must use trailerField=1",
+            "leaf RSA-PSS SubjectPublicKeyInfo must use trailerField=1",
         ));
     }
 
@@ -1450,6 +1507,92 @@ mod tests {
     }
 
     #[test]
+    fn ecdsa_verifier_rejects_high_s_signature_variant() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_ec_leaf_cert(
+            "Acme EC Release Signing",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+            Nid::SECP384R1,
+        );
+        let signed_at = now_unix_seconds();
+        let signer =
+            X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), signed_at)
+                .unwrap();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V44,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let mut footer =
+            signed_footer_for_request(&signer, &leaf_cert, &request, VOLUME_FORMAT_REV_44);
+        let leaf_public_key = leaf_cert.public_key().unwrap();
+        let signature = x509_signature_bytes(&footer.authenticator_value);
+        let high_s = high_s_ecdsa_signature(signature, &leaf_public_key);
+        replace_x509_signature(&mut footer.authenticator_value, &high_s);
+
+        let err = verify_root_auth_footer(
+            &footer,
+            &request.archive_root,
+            &[root_cert.to_der().unwrap()],
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("high-S"));
+    }
+
+    #[test]
+    fn ecdsa_verifier_rejects_noncanonical_and_trailing_der_signatures() {
+        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
+        let (leaf_cert, leaf_key) = test_ec_leaf_cert(
+            "Acme EC Release Signing",
+            root_cert.as_ref(),
+            root_key.as_ref(),
+            Nid::SECP384R1,
+        );
+        let signed_at = now_unix_seconds();
+        let signer =
+            X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), signed_at)
+                .unwrap();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V44,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let footer = signed_footer_for_request(&signer, &leaf_cert, &request, VOLUME_FORMAT_REV_44);
+
+        let mut nonminimal_footer = footer.clone();
+        let nonminimal = nonminimal_ecdsa_integer_encoding(x509_signature_bytes(
+            &nonminimal_footer.authenticator_value,
+        ));
+        replace_x509_signature(&mut nonminimal_footer.authenticator_value, &nonminimal);
+        let err = verify_root_auth_footer(
+            &nonminimal_footer,
+            &request.archive_root,
+            &[root_cert.to_der().unwrap()],
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("canonical DER") || err.to_string().contains("valid DER"));
+
+        let mut trailing_footer = footer;
+        let mut trailing = x509_signature_bytes(&trailing_footer.authenticator_value).to_vec();
+        trailing.push(0);
+        replace_x509_signature(&mut trailing_footer.authenticator_value, &trailing);
+        let err = verify_root_auth_footer(
+            &trailing_footer,
+            &request.archive_root,
+            &[root_cert.to_der().unwrap()],
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("canonical DER") || err.to_string().contains("valid DER"));
+    }
+
+    #[test]
     fn signer_honors_explicit_rsa_pss_scheme() {
         let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
         let (leaf_cert, leaf_key) = test_leaf_cert(
@@ -1508,13 +1651,8 @@ mod tests {
     }
 
     #[test]
-    fn signer_rejects_rsa_pss_certs_with_nonstandard_pss_parameters() {
-        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
-        let (leaf_cert, leaf_key) = test_leaf_cert(
-            "Acme RSA PSS Release Signing",
-            root_cert.as_ref(),
-            root_key.as_ref(),
-        );
+    fn rsa_pss_constrained_spki_verifies_through_footer_path() {
+        let (leaf_cert, leaf_key) = rsa_pss_leaf_cert_and_key();
         let signed_at = now_unix_seconds();
         let signer = X509RootAuthSigner::new_with_signature_scheme(
             leaf_cert.to_der().unwrap(),
@@ -1530,31 +1668,128 @@ mod tests {
             session_id: [2; 16],
             archive_root: [3; 32],
         };
-        let mut footer = signed_footer_for_request(&signer, &leaf_cert, &request, VOLUME_FORMAT_REV_44);
+        let footer = signed_footer_for_request(&signer, &leaf_cert, &request, VOLUME_FORMAT_REV_44);
 
-        let sha256_with_rsa_encryption = [
-            0x06, 0x09, 0x60, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B,
-        ];
-        let rsa_pss_no_params = [
-            0x06, 0x09, 0x60, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A,
-        ];
-        let mutated_leaf_identity = replace_first_subsequence(
-            &footer.signer_identity_bytes,
-            &sha256_with_rsa_encryption,
-            &rsa_pss_no_params,
+        let report = verify_root_auth_footer(
+            &footer,
+            &request.archive_root,
+            &[leaf_cert.to_der().unwrap()],
+            false,
         )
         .unwrap();
-        footer.signer_identity_bytes = mutated_leaf_identity;
 
+        assert_eq!(report.signature_scheme, "rsa-pss-sha256");
+    }
+
+    #[test]
+    fn rsa_verifier_rejects_pss_spki_mismatch_through_footer_path() {
+        let (leaf_cert, leaf_key) = rsa_pss_leaf_cert_and_key();
+        let signer = X509RootAuthSigner::new_with_signature_scheme(
+            leaf_cert.to_der().unwrap(),
+            leaf_key,
+            Vec::new(),
+            now_unix_seconds(),
+            Some(X509SignatureScheme::RsaPssSha256),
+        )
+        .unwrap();
+        let request = RootAuthSigningRequest {
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V44,
+            archive_uuid: [1; 16],
+            session_id: [2; 16],
+            archive_root: [3; 32],
+        };
+        let mut footer =
+            signed_footer_for_request(&signer, &leaf_cert, &request, VOLUME_FORMAT_REV_44);
+
+        footer.authenticator_value[6..8]
+            .copy_from_slice(&SIG_SCHEME_RSA_PKCS1_SHA256.to_le_bytes());
         let err = verify_root_auth_footer(
             &footer,
             &request.archive_root,
-            &[root_cert.to_der().unwrap()],
+            &[leaf_cert.to_der().unwrap()],
             false,
         )
         .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("requires unconstrained rsaEncryption"));
 
-        assert!(matches!(err, X509RootAuthError::Invalid(_)));
+        footer.authenticator_value[6..8].copy_from_slice(&SIG_SCHEME_RSA_PSS_SHA256.to_le_bytes());
+        footer.signer_identity_bytes = replace_nth_subsequence(
+            &footer.signer_identity_bytes,
+            &RSA_PSS_SHA256_SALT32_ALGORITHM,
+            &RSA_PSS_SHA256_SALT20_ALGORITHM,
+            1,
+        )
+        .unwrap();
+        let err = verify_root_auth_footer(
+            &footer,
+            &request.archive_root,
+            &[leaf_cert.to_der().unwrap()],
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("saltLength=32"));
+    }
+
+    #[test]
+    fn signer_rejects_nonstandard_rsa_pss_spki_parameters() {
+        let (leaf_cert, leaf_key) = rsa_pss_leaf_cert_and_key();
+        let nonstandard_leaf_der = replace_nth_subsequence(
+            &leaf_cert.to_der().unwrap(),
+            &RSA_PSS_SHA256_SALT32_ALGORITHM,
+            &RSA_PSS_SHA256_SALT20_ALGORITHM,
+            1,
+        )
+        .unwrap();
+
+        let err = X509RootAuthSigner::new_with_signature_scheme(
+            nonstandard_leaf_der,
+            leaf_key,
+            Vec::new(),
+            now_unix_seconds(),
+            Some(X509SignatureScheme::RsaPssSha256),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("saltLength=32"), "{err}");
+    }
+
+    #[test]
+    fn rsa_pkcs1_scheme_rejects_pss_constrained_spki() {
+        let pss_algorithm = parse_algorithm_identifier(&RSA_PSS_SHA256_SALT32_ALGORITHM);
+
+        let err =
+            validate_rsa_spki_algorithm_for_scheme(SIG_SCHEME_RSA_PKCS1_SHA256, &pss_algorithm)
+                .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("requires unconstrained rsaEncryption"));
+    }
+
+    #[test]
+    fn rsa_pss_scheme_accepts_unconstrained_rsa_spki() {
+        let rsa_algorithm = parse_algorithm_identifier(&RSA_ENCRYPTION_ALGORITHM);
+
+        validate_rsa_spki_algorithm_for_scheme(SIG_SCHEME_RSA_PSS_SHA256, &rsa_algorithm).unwrap();
+    }
+
+    #[test]
+    fn rsa_pss_scheme_accepts_matching_pss_spki_parameters() {
+        let pss_algorithm = parse_algorithm_identifier(&RSA_PSS_SHA256_SALT32_ALGORITHM);
+
+        validate_rsa_spki_algorithm_for_scheme(SIG_SCHEME_RSA_PSS_SHA256, &pss_algorithm).unwrap();
+    }
+
+    #[test]
+    fn rsa_pss_scheme_rejects_nonstandard_pss_spki_parameters() {
+        let pss_algorithm = parse_algorithm_identifier(&RSA_PSS_SHA256_SALT20_ALGORITHM);
+
+        let err = validate_rsa_spki_algorithm_for_scheme(SIG_SCHEME_RSA_PSS_SHA256, &pss_algorithm)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("saltLength=32"));
     }
 
     #[test]
@@ -1755,25 +1990,157 @@ mod tests {
         assert!(err.to_string().contains("chain count"));
     }
 
-    fn replace_first_subsequence(
+    const RSA_ENCRYPTION_ALGORITHM: [u8; 15] = [
+        0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01, 0x05, 0x00,
+    ];
+    const RSA_PSS_SHA256_SALT32_ALGORITHM: [u8; 67] = [
+        0x30, 0x41, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A, 0x30, 0x34,
+        0xA0, 0x0F, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+        0x05, 0x00, 0xA1, 0x1C, 0x30, 0x1A, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01,
+        0x01, 0x08, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+        0x05, 0x00, 0xA2, 0x03, 0x02, 0x01, 0x20,
+    ];
+    const RSA_PSS_SHA256_SALT20_ALGORITHM: [u8; 67] = [
+        0x30, 0x41, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A, 0x30, 0x34,
+        0xA0, 0x0F, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+        0x05, 0x00, 0xA1, 0x1C, 0x30, 0x1A, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01,
+        0x01, 0x08, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+        0x05, 0x00, 0xA2, 0x03, 0x02, 0x01, 0x14,
+    ];
+
+    fn parse_algorithm_identifier(bytes: &[u8]) -> AlgorithmIdentifier<'_> {
+        let (remaining, algorithm) = AlgorithmIdentifier::from_der(bytes).unwrap();
+        assert!(remaining.is_empty());
+        algorithm
+    }
+
+    fn x509_signature_bytes(authenticator_value: &[u8]) -> &[u8] {
+        let signature_len =
+            u32::from_le_bytes(authenticator_value[48..52].try_into().unwrap()) as usize;
+        &authenticator_value[AUTHENTICATOR_FIXED_LEN..AUTHENTICATOR_FIXED_LEN + signature_len]
+    }
+
+    fn replace_x509_signature(authenticator_value: &mut [u8], signature: &[u8]) {
+        let signature_capacity =
+            u32::from_le_bytes(authenticator_value[52..56].try_into().unwrap()) as usize;
+        assert!(signature.len() <= signature_capacity);
+        authenticator_value[48..52].copy_from_slice(&(signature.len() as u32).to_le_bytes());
+        let signature_start = AUTHENTICATOR_FIXED_LEN;
+        let signature_end = signature_start + signature_capacity;
+        authenticator_value[signature_start..signature_end].fill(0);
+        authenticator_value[signature_start..signature_start + signature.len()]
+            .copy_from_slice(signature);
+    }
+
+    fn high_s_ecdsa_signature<T>(signature: &[u8], public_key: &PKeyRef<T>) -> Vec<u8>
+    where
+        T: HasParams,
+    {
+        let sig = EcdsaSig::from_der(signature).unwrap();
+        let (_, order, half_order) = ec_curve_order(public_key).unwrap();
+        let mut high_s = BigNum::new().unwrap();
+        high_s.checked_sub(&order, sig.s()).unwrap();
+        assert_eq!(high_s.ucmp(&half_order), Ordering::Greater);
+        EcdsaSig::from_private_components(sig.r().to_owned().unwrap(), high_s)
+            .unwrap()
+            .to_der()
+            .unwrap()
+    }
+
+    fn nonminimal_ecdsa_integer_encoding(signature: &[u8]) -> Vec<u8> {
+        assert_eq!(signature[0], 0x30);
+        assert_eq!(signature[2], 0x02);
+        assert!(signature[1] < 0x80);
+        assert!(signature[3] < 0x80);
+        let mut out = signature.to_vec();
+        out[1] += 1;
+        out[3] += 1;
+        out.insert(4, 0);
+        out
+    }
+
+    fn replace_nth_subsequence(
         haystack: &[u8],
         needle: &[u8],
         replacement: &[u8],
+        nth_zero_based: usize,
     ) -> Option<Vec<u8>> {
         if needle.is_empty() {
             return None;
         }
-        let Some(found) = haystack.windows(needle.len()).position(|window| window == needle) else {
-            return None;
-        };
+        let mut seen = 0usize;
+        for found in 0..=haystack.len().saturating_sub(needle.len()) {
+            if &haystack[found..found + needle.len()] == needle {
+                if seen == nth_zero_based {
+                    let mut output =
+                        Vec::with_capacity(haystack.len() - needle.len() + replacement.len());
+                    output.extend_from_slice(&haystack[..found]);
+                    output.extend_from_slice(replacement);
+                    output.extend_from_slice(&haystack[found + needle.len()..]);
+                    return Some(output);
+                }
+                seen += 1;
+            }
+        }
+        None
+    }
 
-        let mut output = Vec::with_capacity(
-            haystack.len() - needle.len() + replacement.len(),
-        );
-        output.extend_from_slice(&haystack[..found]);
-        output.extend_from_slice(replacement);
-        output.extend_from_slice(&haystack[found + needle.len()..]);
-        Some(output)
+    fn rsa_pss_leaf_cert_and_key() -> (X509, PKey<Private>) {
+        const CERT_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----\n\
+MIIDszCCAmegAwIBAgIUPv/ZXhnr0d/fIsy7XZNStUFzFoUwQQYJKoZIhvcNAQEK\n\
+MDSgDzANBglghkgBZQMEAgEFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgEF\n\
+AKIDAgEgMBMxETAPBgNVBAMMCFBTUyBUZXN0MB4XDTI2MDYxOTA5MDEwOVoXDTM2\n\
+MDYxNjA5MDEwOVowEzERMA8GA1UEAwwIUFNTIFRlc3QwggFWMEEGCSqGSIb3DQEB\n\
+CjA0oA8wDQYJYIZIAWUDBAIBBQChHDAaBgkqhkiG9w0BAQgwDQYJYIZIAWUDBAIB\n\
+BQCiAwIBIAOCAQ8AMIIBCgKCAQEAqbR7puu5pPH9QXREJYqeIMeCfiZcdxshMkUV\n\
+U6ga3oV1082Hu71v65gep1ld9TAUx+qTf7eOWhnnGVwr4KiWnaA3UnrUW9N/AxA3\n\
+0ag7OrjPAO0EsFyqqmTz2LfK/QI/yjqF+fLT8f2LerJg/K/nI0tytk51f0MOXHGO\n\
+BB6HhQ9wbzKsVWyXB5EcfVarSzOVls3ANp72MXZqZ6e0LNyFt7GYmxZbNCCt/1+a\n\
+vW+IlTkJ8Qf/MOpoIBtbxXOvHJn9vL84e3l8RXMTe6P/rrVodu6E7+U/mO6TDJOi\n\
+RbrXSI3d9tp/JK3BJnfxoNwFPZivcoaLlkQ32ea6cozdunw0yQIDAQABo2MwYTAd\n\
+BgNVHQ4EFgQUQ3i67w0yj6iaLNye7CUJwnzAnfEwHwYDVR0jBBgwFoAUQ3i67w0y\n\
+j6iaLNye7CUJwnzAnfEwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAoQw\n\
+QQYJKoZIhvcNAQEKMDSgDzANBglghkgBZQMEAgEFAKEcMBoGCSqGSIb3DQEBCDAN\n\
+BglghkgBZQMEAgEFAKIDAgEgA4IBAQAhKtXhU7fGxr9I8EjnLJ5h2/KEKZOs+ZeR\n\
+GGV83xp5IQGni2D9XdsOo9NVQHPXsgz8U+b+9+JbzAUCLQM2JOQxCxodyIhSIULS\n\
+1xR5OjcANPHe0eQyWNXhD67jqLF46IyQ5RMW07t/cs9a2Y5tWNAVfF/4xL2v0SF3\n\
+ufyMkxPU1eC8Rc8g3faaDFkrkoL1HxXaI7lygw9YdNyKZwMOOod87VZF8SxoBgZo\n\
+UDRz5eKKcZBZML3nXWgqidPnDWf+XIq++nTpewW7cxZREGO8IjaWCEegsJ/fNqCc\n\
+jY2ZKxwTG9mQLube2UA9t0QHyJA1jpfBOI4GB3spRuCEInPhbXa4\n\
+-----END CERTIFICATE-----\n";
+        const KEY_PEM: &[u8] = b"-----BEGIN PRIVATE KEY-----\n\
+MIIE8QIBADBBBgkqhkiG9w0BAQowNKAPMA0GCWCGSAFlAwQCAQUAoRwwGgYJKoZI\n\
+hvcNAQEIMA0GCWCGSAFlAwQCAQUAogMCASAEggSnMIIEowIBAAKCAQEAqbR7puu5\n\
+pPH9QXREJYqeIMeCfiZcdxshMkUVU6ga3oV1082Hu71v65gep1ld9TAUx+qTf7eO\n\
+WhnnGVwr4KiWnaA3UnrUW9N/AxA30ag7OrjPAO0EsFyqqmTz2LfK/QI/yjqF+fLT\n\
+8f2LerJg/K/nI0tytk51f0MOXHGOBB6HhQ9wbzKsVWyXB5EcfVarSzOVls3ANp72\n\
+MXZqZ6e0LNyFt7GYmxZbNCCt/1+avW+IlTkJ8Qf/MOpoIBtbxXOvHJn9vL84e3l8\n\
+RXMTe6P/rrVodu6E7+U/mO6TDJOiRbrXSI3d9tp/JK3BJnfxoNwFPZivcoaLlkQ3\n\
+2ea6cozdunw0yQIDAQABAoIBAARd5ewlxutDBFGnupyuMFM22wlgtpKkhrJG042J\n\
+ZvaYn89tS5u1vFBnQ8up2ah2XiSGSVkZGa9BGSCejez8HZMNBTtouHfr7WngZBVP\n\
+o0WHraDwGGWq3sPfcORf11fzE73iC2JDALfqfqkvt53s71FJztf41R5rFO6lR+Kc\n\
+f/95G1PRrH0V8wbdykT27+OrO2YadoSc/hreu6IaFDou+sQ2cWL/exfiqJ8RHRDr\n\
+OZX+Cr+zXhGMbQf+3uAwQKwYw2CHUcflke/18l99vyG2BkvJNLopETPAs9cbSSjL\n\
+9f/kMfKktgnKleDAnjjVyq58TXICjPhynbOTsJMtkrVn/GECgYEA5fcNU+Xujn3x\n\
+YfL44gAIy6xZHdJp08IZuhc8SgghqzPT5uq7rDJ85WLPuoUQk70ZNG2vEypiTuVR\n\
+TFLySRQEWp44leKalANM10zLgtf8nDGiQsebIj2vwLHkpJmPiZZnyP5UdRuh+kt6\n\
+IKpvfddN8q2VWpX0RZyeVLWfOZU+sCkCgYEAvOryuo6Vc34/VLd1gk8J6aYqFGeB\n\
++Lp9/Y0NapjUSdqSXWOjD81mTTeE6CDMBwv7+LHqMkRa4vPMJfGCPFQ7Kloi7aHB\n\
+Rgf82wSuwrahHYPcNJdT+99xqYdaHE49lsZAmKXq56uNqHsqTIn1Dk/iWBNBTzXs\n\
+mvD13k9lxiclc6ECgYEA0tzGtsBmDvhCpnrBZZF8fy1ohaTTbt1S88SsfoGYRcB/\n\
+NATW0x10Um1ZZoDu41kITH+qghtiC0/QTPjdus6E84aTAjTHYqLoCZ8cGLztn1cP\n\
+nsYiZLJFfp5fteIssI9eWPmD/eG5k6UztdIx6yTKD5TFF0vasR3cPHZRKt7DnYkC\n\
+gYAM0987b6cSOoZOWE6wVHGV3eSJkiWvH+qiJsu8azgu85pwoO1Xi1jg8V4i7Oct\n\
+q1CmqF4An8eUFX3NLcLsGcQSsiAhBpS7DpvKu1yqeAAkoul24LehKKDtI/Woal+g\n\
+N0H3m3yB0pJB2Gsc21k6aY4y8MvEdyLjumzXdYixlcLjQQKBgCYL845ZwI2aa0SG\n\
+UYmOb4/v/bM2BnDhU6S083QojMs7wNTPJ5UvDv9f6YflMj0nR1qpNuuQY7c8bVrU\n\
+5giem1/deEviE8uzTJHzIKCWjJy3K08bFaK4Apn8A1mrElj6WCrmdsZJVCGZvAwz\n\
+4pTHYNm4Z32/udjVnPLQxkN0iicu\n\
+-----END PRIVATE KEY-----\n";
+        (
+            X509::from_pem(CERT_PEM).unwrap(),
+            PKey::private_key_from_pem(KEY_PEM).unwrap(),
+        )
     }
 
     fn test_ca_cert(cn: &str) -> (X509, PKey<Private>) {

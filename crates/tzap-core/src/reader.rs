@@ -1816,7 +1816,10 @@ impl OpenedArchive {
     }
 
     pub fn verify_content(&self) -> Result<ArchiveContentVerification<'_>, FormatError> {
-        self.verify_content_with_parity_policy(ParityReadPolicy::Always)
+        self.verify_content_with_parity_policy(
+            ParityReadPolicy::Always,
+            ContentVerificationMode::Full,
+        )
     }
 
     pub fn verify_content_fast(&self) -> Result<ArchiveContentVerification<'_>, FormatError> {
@@ -1827,7 +1830,10 @@ impl OpenedArchive {
                 mode: ContentVerificationMode::Fast,
             });
         }
-        self.verify_content_with_parity_policy(ParityReadPolicy::RepairOnly)
+        self.verify_content_with_parity_policy(
+            ParityReadPolicy::RepairOnly,
+            ContentVerificationMode::Fast,
+        )
     }
 
     pub fn fast_verify_defers_payload_semantics(&self) -> bool {
@@ -1885,6 +1891,7 @@ impl OpenedArchive {
     fn verify_content_with_parity_policy(
         &self,
         parity_policy: ParityReadPolicy,
+        mode: ContentVerificationMode,
     ) -> Result<ArchiveContentVerification<'_>, FormatError> {
         let tables = self.load_payload_index_tables()?;
         let streamed = self.scan_seekable_payload(
@@ -1895,10 +1902,6 @@ impl OpenedArchive {
             parity_policy,
         )?;
         self.validate_streamed_payload_summary(&tables, &streamed, false, true)?;
-        let mode = match parity_policy {
-            ParityReadPolicy::Always => ContentVerificationMode::Full,
-            ParityReadPolicy::RepairOnly => ContentVerificationMode::Fast,
-        };
         Ok(ArchiveContentVerification {
             archive: self,
             mode,
@@ -10920,10 +10923,7 @@ mod tests {
 
         assert_eq!(
             attempts,
-            vec![
-                b"first-candidate".to_vec(),
-                b"second-candidate".to_vec(),
-            ]
+            vec![b"first-candidate".to_vec(), b"second-candidate".to_vec(),]
         );
         assert_eq!(
             opened.extract_file("wrapped.txt").unwrap(),
@@ -10935,10 +10935,14 @@ mod tests {
     #[test]
     fn recipientwrap_startup_rejects_malformed_record_length() {
         let master = master_key();
+        let options = WriterOptions {
+            bit_rot_buffer_pct: 0,
+            ..single_stream_options()
+        };
         let archive = write_archive_with_recipient_wrap_records(
             &[RegularFile::new("wrapped.txt", b"recipient payload")],
             &master,
-            single_stream_options(),
+            options,
             vec![recipient_wrap_test_record()],
         )
         .unwrap();
@@ -10947,10 +10951,8 @@ mod tests {
         bytes[table_start + 96..table_start + 100].copy_from_slice(&1u32.to_le_bytes());
 
         assert_eq!(
-            open_archive_with_recipient_wrap_resolver(&bytes, |_| {
-                Ok(vec![master.0])
-            })
-            .unwrap_err(),
+            open_archive_with_recipient_wrap_resolver(&bytes, |_| { Ok(vec![master.0]) })
+                .unwrap_err(),
             FormatError::InvalidArchive("RecipientRecordV1 record_length is too small")
         );
     }
@@ -11817,7 +11819,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_verify_root_auth_archive_does_not_defer_payload_semantics() {
+    fn fast_verify_root_auth_archive_requires_full_root_auth_scan() {
         let archive = write_archive_with_root_auth(
             &[RegularFile::new("signed.txt", b"root-auth payload")],
             &master_key(),
@@ -11836,7 +11838,7 @@ mod tests {
         assert!(!opened.fast_verify_defers_payload_semantics());
         assert!(matches!(
             opened.verify_content_fast().unwrap().mode,
-            ContentVerificationMode::Full
+            ContentVerificationMode::Fast
         ));
     }
 
