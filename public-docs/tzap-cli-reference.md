@@ -3,7 +3,8 @@
 This document is a compact command reference for `tzap` operators and automation.
 
 - **Version**: from binary metadata (`tzap --version`)
-- **Revision**: v0.44 writers and readers, with v0.43 reader compatibility
+- **Revision**: v0.44-compliant writers and readers for documented supported
+  workflows, with v0.43 reader compatibility
 
 ## Global options
 

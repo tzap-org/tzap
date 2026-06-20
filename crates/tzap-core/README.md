@@ -1,9 +1,9 @@
 # tzap-core
 
-`tzap-core` is the Rust library implementation of the tzap v0.44 archive format.
-It owns wire parsing, metadata validation, compression, optional encryption, FEC
-recovery structures, archive writing, archive opening, and safe extraction
-primitives.
+`tzap-core` is the v44-compliant Rust reference library for documented
+supported tzap archive workflows, with v43 reader compatibility. It owns wire
+parsing, metadata validation, compression, optional encryption, FEC recovery
+structures, archive writing, archive opening, and safe extraction primitives.
 
 Use this crate as the direct Rust API for tzap archives in applications,
 services, backup tools, and custom workflows. Add companion RootAuth signing

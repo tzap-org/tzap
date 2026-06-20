@@ -1,8 +1,9 @@
 # tzap-plugin-signing
 
-`tzap-plugin-signing` adds RootAuth signing profiles for tzap archives. It is
-the companion crate for applications that want signed v44 RootAuth archives on
-top of the standalone `tzap-core` archive foundation.
+`tzap-plugin-signing` adds v44-compliant RootAuth signing profiles for
+documented supported tzap workflows. It is the companion crate for applications
+that want signed v44 RootAuth archives on top of the standalone `tzap-core`
+archive foundation.
 
 The `ed25519_raw` profile implements the Ed25519 RootAuth
 authenticator (`authenticator_id = 0x0002`). The `x509_chain` profile adds an

@@ -3,6 +3,10 @@
 This document explains what `tzap` is trying to protect in everyday language.
 The full wire-level rules live in the v0.44 format specification.
 
+The current implementation is v44-compliant for documented supported security
+workflows, including encrypted archives, explicit plaintext archives, safe
+extraction, RootAuth verification, and RecipientWrap opening.
+
 ## Plain-English promise
 
 `tzap` is built so an archive can be private when encrypted, public when

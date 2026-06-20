@@ -498,7 +498,8 @@ fn traceability_materials_live_under_requested_folder_and_cover_claim_gates() {
     let signing = read_workspace_file("public-docs/traceability/signing-plugin-traceability.md");
     let runbook = read_workspace_file("public-docs/traceability/verification-runbook.md");
 
-    assert!(index.contains("implements v44 for documented writer workflows"));
+    assert!(index.contains("v44-compliant reference implementation"));
+    assert!(index.contains("documented supported"));
     assert!(index.contains("public-docs/traceability"));
     assert!(index.contains("cargo fmt --check"));
     assert!(index.contains("cargo clippy --workspace --all-targets -- -D warnings"));

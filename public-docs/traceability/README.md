@@ -1,9 +1,9 @@
 # tzap traceability pack
 
-This folder is the working evidence set for v44 implementation, v43 reader
-compatibility, and RootAuth signing-plugin compliance. The root README stays
-product-facing; this folder carries the
-review map, verification gates, and audit notes.
+This folder is the working evidence set for the v44-compliant reference
+implementation, v43 reader compatibility, RootAuth signing-plugin compliance,
+and RecipientWrap support. The root README stays product-facing; this folder
+carries the review map, verification gates, and audit notes.
 
 The folder name is `public-docs/traceability`.
 
@@ -12,8 +12,9 @@ The folder name is `public-docs/traceability`.
 Allowed after all required gates pass:
 
 ```text
-tzap implements v44 for documented writer workflows and preserves v43 reader
-compatibility for the workflows covered by this matrix.
+tzap is a v44-compliant reference implementation for documented supported
+writer, reader, recovery, RootAuth, and RecipientWrap workflows, and preserves
+v43 reader compatibility for workflows covered by this matrix.
 ```
 
 Avoid without a separate external conformance program:

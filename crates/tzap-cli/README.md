@@ -7,6 +7,9 @@ fast, recoverable, and easy to restore. It packs zstd compression, optional
 authenticated encryption, safe extraction defaults, multi-volume recovery, and
 instant selected-file restores into one practical command.
 
+This release is the v44-compliant reference CLI for documented supported
+workflows, with v43 reader compatibility.
+
 Use it for project folders, private datasets, media collections, cold storage,
 cloud object storage, and long-lived backup sets where "just zip it" is not
 enough.
@@ -147,6 +150,7 @@ archive data; raw-key archives require the original 32-byte key.
 - Benchmark results: <https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-benchmark-results.md>
 - CLI reference: <https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-cli-reference.md>
 - Operational boundaries: <https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-operational-boundaries.md>
+- v44 compliance traceability: <https://github.com/tzap-org/tzap/blob/main/public-docs/traceability/README.md>
 
 ## More information
 

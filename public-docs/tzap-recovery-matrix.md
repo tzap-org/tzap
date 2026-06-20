@@ -4,6 +4,10 @@ This document explains what `tzap` recovery means for normal archive users.
 The detailed implementation rules live in the v0.44 format specification and
 the operational boundaries document.
 
+The current implementation is v44-compliant for documented supported recovery
+workflows, including payload repair, critical-metadata-first recovery, and
+multi-volume loss tolerance within the chosen recovery budget.
+
 ## Plain-English promise
 
 `tzap` writes extra recovery data into the archive. When storage damage happens,

@@ -29,6 +29,11 @@ opened. The v0.44 spec defines the wire structures, optional-encryption
 registry, integrity model, FEC layout, bootstrap behavior, and reader/writer
 requirements.
 
+The current reference implementation is v44-compliant for documented supported
+writer, reader, recovery, RootAuth, and RecipientWrap workflows. It also
+preserves v43 reader compatibility for the workflows covered by the traceability
+pack.
+
 ## Library usage
 
 `tzap-core` exposes the reference read/write primitives for applications that

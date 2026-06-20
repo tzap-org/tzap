@@ -39,9 +39,11 @@ new corpus artifacts that represent unreduced failures.
 The audit pass has two layers:
 
 - Dependency vulnerability scan: `cargo audit`.
-- Traceability audit: confirm every row in the v43 and signing matrices has a
-  status, implementation pointer, and evidence pointer, and that all
-  unsupported rows point to public operational docs or stable tests.
+- Traceability audit: confirm every row in the v43 compatibility and signing
+  matrices has a status, implementation pointer, and evidence pointer; confirm
+  supported v44 workflow evidence in the public docs and verification record;
+  and confirm all unsupported rows point to public operational docs or stable
+  tests.
 
 If `cargo audit` is unavailable, install it before treating the dependency
 audit gate as passed:
@@ -71,9 +73,10 @@ Tools installed during this local pass:
 
 ## Claim decision
 
-When all required local gates pass and the matrix still has no
-`Evidence gap` or `Implementation gap` rows, the supported-workflow compliance
-claim in [README.md](README.md) may be used.
+When all required local gates pass and the matrices still have no
+`Evidence gap` or `Implementation gap` rows, the supported-workflow v44
+compliance claim in [the root README](../../README.md) and
+[traceability README](README.md) may be used.
 
 The stronger bounded-fuzz result should be recorded before using the claim for a
 release announcement or external certification package.
