@@ -4593,7 +4593,7 @@ fn append_index_shards_for_rows(
 ) -> Result<(), FormatError> {
     let shard_index =
         u64::try_from(planned.len()).map_err(|_| FormatError::WriterUnsupported("shard_index"))?;
-    let candidate = build_index_shard_plaintext(shard_index, &rows, frames, payloads, options)?;
+    let candidate = build_index_shard_plaintext(shard_index, rows, frames, payloads, options)?;
     let compressed =
         compress_zstd_frame_with_jobs(&candidate.plaintext, options.zstd_level, options.jobs)?;
     if index_object_can_fit(compressed.len(), options)? {
@@ -4605,7 +4605,7 @@ fn append_index_shards_for_rows(
             "single-file IndexShard exceeds index object limits",
         ));
     }
-    let split_at = split_sorted_file_rows_for_object_limit(&rows);
+    let split_at = split_sorted_file_rows_for_object_limit(rows);
     append_index_shards_for_rows(planned, &rows[..split_at], frames, payloads, options)?;
     append_index_shards_for_rows(planned, &rows[split_at..], frames, payloads, options)
 }
@@ -4809,7 +4809,7 @@ fn append_directory_hint_shards_for_rows(
 ) -> Result<(), FormatError> {
     let hint_shard_index = u64::try_from(planned.len())
         .map_err(|_| FormatError::WriterUnsupported("hint_shard_index"))?;
-    let candidate = build_directory_hint_plaintext(hint_shard_index, &rows)?;
+    let candidate = build_directory_hint_plaintext(hint_shard_index, rows)?;
     let compressed =
         compress_zstd_frame_with_jobs(&candidate.plaintext, options.zstd_level, options.jobs)?;
     if index_object_can_fit(compressed.len(), options)? {

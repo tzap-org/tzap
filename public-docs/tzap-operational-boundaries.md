@@ -35,7 +35,7 @@ What to do:
 ## Writer shape validation
 
 The writer validates archive layout choices before writing bytes. If a request
-cannot produce a valid v0.43 archive with this implementation, `tzap` exits with
+cannot produce a valid v0.44 archive with this implementation, `tzap` exits with
 `16 unsupported-feature`.
 
 Examples:
@@ -77,7 +77,7 @@ What to do:
 - Keep `--chunk-size <= --envelope-size`.
 - Increase very small `--volume-size` values.
 - Large regular-file input sets are supported. The writer emits multiple
-  IndexShard objects and directory-hint shards when the v0.43 layout requires
+  IndexShard objects and directory-hint shards when the v0.44 layout requires
   them.
 - If `tzap create` still returns `unsupported-feature`, check the exact resource
   choice in the diagnostic and the additional boundaries below.
@@ -316,7 +316,7 @@ file-backed `ArchiveReadAt` APIs benefit from the same repair behavior.
 ## Verify repaired copies
 
 Key-holding `tzap verify` can write repaired sibling copies for volumes that
-contain recoverable BlockRecord damage. For file-backed v43 inputs, this
+contain recoverable BlockRecord damage. For file-backed v43/v44 inputs, this
 includes CRC failures and malformed fixed slots such as a damaged `TZBK` marker
 or reserved BlockRecord bytes after `tzap` has recovered the archive layout:
 

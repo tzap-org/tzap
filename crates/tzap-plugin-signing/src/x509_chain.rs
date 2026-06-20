@@ -459,12 +459,10 @@ fn validate_rsa_spki_algorithm_for_scheme(
 ) -> Result<(), X509RootAuthError> {
     let spki_oid = spki_algorithm.algorithm.to_id_string();
     match sig_scheme {
-        SIG_SCHEME_RSA_PKCS1_SHA256 => {
-            if spki_oid != OID_RSA_ENCRYPTION {
-                return Err(X509RootAuthError::Invalid(
-                    "rsa-pkcs1-sha256 requires unconstrained rsaEncryption SubjectPublicKeyInfo",
-                ));
-            }
+        SIG_SCHEME_RSA_PKCS1_SHA256 if spki_oid != OID_RSA_ENCRYPTION => {
+            return Err(X509RootAuthError::Invalid(
+                "rsa-pkcs1-sha256 requires unconstrained rsaEncryption SubjectPublicKeyInfo",
+            ));
         }
         SIG_SCHEME_RSA_PSS_SHA256 => {
             if spki_oid == OID_RSA_ENCRYPTION {

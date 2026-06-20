@@ -1136,8 +1136,7 @@ impl OpenedArchive {
             readers
                 .iter()
                 .map(|reader| reader.len())
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter(),
+                .collect::<Result<Vec<_>, _>>()?,
         )?;
         let mut first: Option<ParsedSeekableReadAtVolume> = None;
         let mut manifest_authority: Option<ManifestFooter> = None;

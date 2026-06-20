@@ -1,6 +1,6 @@
 # Verification runbook and record
 
-Review date: 2026-05-29
+Review date: 2026-06-20
 
 This runbook defines the reproducible gate for the traceability matrices in
 this folder.
@@ -52,16 +52,16 @@ cargo install cargo-audit --locked
 
 ## Current record
 
-This record is updated by the 2026-05-29 traceability pass.
+This record is updated by the 2026-06-20 release-readiness pass.
 
 | Gate | Command | Result |
 |---|---|---|
 | Format | `cargo fmt --check` | Passed |
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| Workspace tests | `cargo test --workspace` | Passed: 523 tests across workspace suites and doc tests |
+| Workspace tests | `cargo test --workspace` | Passed: 666 tests across workspace suites and doc tests |
 | Deterministic fuzz smoke | `cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked` | Passed: 39 deterministic seeds |
-| Dependency audit | `cargo audit` | Passed: 1098 advisories loaded, 191 locked dependencies scanned, no vulnerabilities reported |
-| Bounded libFuzzer extension | `cargo +nightly fuzz run --features libfuzzer <target> -- -max_total_time=60` for all three parser targets | Passed: `parse_fixed_structures` 4426027 runs, `parse_metadata` 16378275 runs, `parse_compressed_and_padding` 18739453 runs |
+| Dependency audit | `cargo audit` | Passed: 1134 advisories loaded, 219 locked dependencies scanned, no vulnerabilities reported |
+| Bounded libFuzzer extension | `cargo +nightly fuzz run --features libfuzzer <target> -- -max_total_time=60` for all three parser targets | Passed: `parse_fixed_structures` 3569750 runs, `parse_metadata` 15079282 runs, `parse_compressed_and_padding` 16725498 runs |
 
 Tools installed during this local pass:
 
