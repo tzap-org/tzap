@@ -6774,7 +6774,8 @@ fn validate_locator_image_boundary(
     locator: CriticalRecoveryLocator,
     image: &CriticalMetadataImage,
 ) -> Result<(), FormatError> {
-    if locator.volume_trailer_offset != image.volume_trailer_offset
+    if locator.volume_format_rev != image.volume_format_rev
+        || locator.volume_trailer_offset != image.volume_trailer_offset
         || locator.body_bytes_before_cmra != image.body_bytes_before_cmra
         || image
             .volume_trailer_offset
@@ -7317,7 +7318,8 @@ fn validate_image_identity(
     volume_header: &VolumeHeader,
     crypto_header: &CryptoHeaderFixed,
 ) -> Result<(), FormatError> {
-    if image.archive_uuid != volume_header.archive_uuid
+    if image.volume_format_rev != volume_header.volume_format_rev
+        || image.archive_uuid != volume_header.archive_uuid
         || image.session_id != volume_header.session_id
         || image.volume_index != volume_header.volume_index
         || image.stripe_width != volume_header.stripe_width
@@ -7665,6 +7667,13 @@ fn validate_recovered_terminal_inner(
             .region(4)
             .ok_or(FormatError::InvalidArchive("missing RootAuthFooter region"))?;
         let footer = RootAuthFooterV1::parse(&root_auth_region.bytes)?;
+        if footer.format_version != volume_header.format_version
+            || footer.volume_format_rev != volume_header.volume_format_rev
+        {
+            return Err(FormatError::InvalidArchive(
+                "RootAuthFooter format/revision does not match VolumeHeader",
+            ));
+        }
         if footer.archive_uuid != volume_header.archive_uuid
             || footer.session_id != volume_header.session_id
             || footer.footer_length()? != image.root_auth_footer_length
@@ -7757,6 +7766,13 @@ fn validate_recovered_public_terminal(
         .region(4)
         .ok_or(FormatError::InvalidArchive("missing RootAuthFooter region"))?;
     let root_auth_footer = RootAuthFooterV1::parse(&root_auth_region.bytes)?;
+    if root_auth_footer.format_version != volume_header.format_version
+        || root_auth_footer.volume_format_rev != volume_header.volume_format_rev
+    {
+        return Err(FormatError::InvalidArchive(
+            "public RootAuthFooter format/revision does not match VolumeHeader",
+        ));
+    }
     if root_auth_footer.archive_uuid != volume_header.archive_uuid
         || root_auth_footer.session_id != volume_header.session_id
         || root_auth_footer.footer_length()? != image.root_auth_footer_length
@@ -10169,7 +10185,7 @@ mod tests {
     use crate::format::{
         AeadAlgo, CompressionAlgo, FecAlgo, KdfAlgo, CRYPTO_EXTENSION_HEADER_LEN,
         CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION, READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
-        VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44,
+        VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_43, VOLUME_FORMAT_REV_44,
     };
     use crate::metadata::{
         DirectoryHintEntry, DirectoryHintTableHeader, IndexRootHeader, IndexShardHeader,
@@ -10705,6 +10721,118 @@ mod tests {
     }
 
     #[test]
+    fn public_no_key_rejects_public_header_revision_mismatch() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("public.txt", b"public v44 only")],
+            &master_key(),
+            single_stream_options(),
+            RootAuthWriterConfig {
+                authenticator_id: 0x2222,
+                signer_identity_type: 1,
+                signer_identity: b"public verifier",
+                authenticator_value_length: 32,
+            },
+            |request| Ok(request.archive_root.to_vec()),
+        )
+        .unwrap();
+        let mut bytes = archive.bytes;
+        let mut header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
+        header.volume_format_rev = VOLUME_FORMAT_REV_43;
+        bytes[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
+
+        let mut called = false;
+        let err = public_no_key_verify_archive_with(&bytes, |_, _| {
+            called = true;
+            Ok(true)
+        })
+        .unwrap_err();
+
+        assert!(!called);
+        assert_eq!(
+            err,
+            FormatError::InvalidArchive("no valid v41 public CMRA candidate found")
+        );
+    }
+
+    #[test]
+    fn public_no_key_rejects_recovered_footer_revision_mismatch() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("public.txt", b"public footer mismatch")],
+            &master_key(),
+            single_stream_options(),
+            RootAuthWriterConfig {
+                authenticator_id: 0x2222,
+                signer_identity_type: 1,
+                signer_identity: b"public verifier",
+                authenticator_value_length: 32,
+            },
+            |request| Ok(request.archive_root.to_vec()),
+        )
+        .unwrap();
+        let mut bytes = archive.bytes;
+        rewrite_public_cmra_image(&mut bytes, |image| {
+            let root_auth_region = image
+                .regions
+                .iter_mut()
+                .find(|region| region.region_type == 4)
+                .unwrap();
+            let mut footer = RootAuthFooterV1::parse(&root_auth_region.bytes).unwrap();
+            footer.volume_format_rev = VOLUME_FORMAT_REV_43;
+            root_auth_region.bytes = footer.to_bytes().unwrap();
+        });
+
+        let mut called = false;
+        let err = public_no_key_verify_archive_with(&bytes, |_, _| {
+            called = true;
+            Ok(true)
+        })
+        .unwrap_err();
+
+        assert!(!called);
+        assert_eq!(
+            err,
+            FormatError::InvalidArchive("no valid v41 public CMRA candidate found")
+        );
+    }
+
+    #[test]
+    fn public_no_key_rejects_recovered_image_revision_mismatch() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("public.txt", b"public image mismatch")],
+            &master_key(),
+            single_stream_options(),
+            RootAuthWriterConfig {
+                authenticator_id: 0x2222,
+                signer_identity_type: 1,
+                signer_identity: b"public verifier",
+                authenticator_value_length: 32,
+            },
+            |request| Ok(request.archive_root.to_vec()),
+        )
+        .unwrap();
+        let bytes = rewrite_cmra_image_variable_len(
+            &archive.bytes,
+            CmraRecoveryMode::PublicNoKey,
+            |image| {
+                image.volume_format_rev = VOLUME_FORMAT_REV_43;
+            },
+        );
+
+        let mut called = false;
+        let err = public_no_key_verify_archive_with(&bytes, |_, _| {
+            called = true;
+            Ok(true)
+        })
+        .unwrap_err();
+
+        assert!(!called);
+        assert_eq!(
+            err,
+            FormatError::InvalidArchive("no valid v41 public CMRA candidate found")
+        );
+    }
+
+    #[test]
     fn public_no_key_ignores_untrusted_manifest_and_trailer_block_count_fields() {
         let archive = write_archive_with_root_auth(
             &[RegularFile::new(
@@ -11025,6 +11153,107 @@ mod tests {
             Some(payload)
         );
         opened.verify().unwrap();
+    }
+
+    #[test]
+    fn key_holding_rejects_recovered_image_revision_mismatch() {
+        let archive = write_archive(
+            &[RegularFile::new("cmra-image-revision.txt", b"payload")],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+        let mut mutated = rewrite_cmra_image_variable_len(
+            &archive.bytes,
+            CmraRecoveryMode::KeyHolding,
+            |image| {
+                image.volume_format_rev = VOLUME_FORMAT_REV_43;
+            },
+        );
+        mutated[0] ^= 0x55;
+
+        assert!(open_archive(&mutated, &master_key()).is_err());
+    }
+
+    #[test]
+    fn key_holding_rejects_recovered_footer_revision_mismatch() {
+        let archive = write_archive_with_root_auth(
+            &[RegularFile::new("cmra-footer-revision.txt", b"payload")],
+            &master_key(),
+            single_stream_options(),
+            test_root_auth_config(),
+            |request| Ok(test_root_auth_value(request)),
+        )
+        .unwrap();
+        let mut mutated = archive.bytes;
+        rewrite_cmra_image(&mut mutated, CmraRecoveryMode::KeyHolding, |image| {
+            let root_auth_region = image
+                .regions
+                .iter_mut()
+                .find(|region| region.region_type == 4)
+                .unwrap();
+            let mut footer = RootAuthFooterV1::parse(&root_auth_region.bytes).unwrap();
+            footer.volume_format_rev = VOLUME_FORMAT_REV_43;
+            root_auth_region.bytes = footer.to_bytes().unwrap();
+        });
+        mutated[0] ^= 0x55;
+
+        assert!(open_archive(&mutated, &master_key()).is_err());
+    }
+
+    #[test]
+    fn key_holding_rejects_locator_image_revision_mismatch() {
+        let archive = write_archive(
+            &[RegularFile::new("cmra-locator-revision.txt", b"payload")],
+            &master_key(),
+            small_block_recovery_options(),
+        )
+        .unwrap();
+        let mut mutated = archive.bytes;
+        let locator = final_recovery_locator(&mutated);
+        let mirror_offset = mutated.len() - LOCATOR_PAIR_LEN;
+        let final_offset = mutated.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
+        for offset in [mirror_offset, final_offset] {
+            rewrite_recovery_locator(&mut mutated, offset, |locator| {
+                locator.volume_format_rev = VOLUME_FORMAT_REV_43;
+            });
+        }
+        mutated[0] ^= 0x55;
+        mutated[locator.cmra_offset as usize] ^= 0x55;
+
+        assert!(open_archive(&mutated, &master_key()).is_err());
+    }
+
+    #[test]
+    fn image_identity_allows_matching_v43_revision() {
+        let archive = write_archive(
+            &[RegularFile::new("matching-v43.txt", b"payload")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let locator = final_recovery_locator(&archive.bytes);
+        let recovered = recover_cmra(
+            &archive.bytes,
+            locator.cmra_offset,
+            Some(CmraDecoderTuple::from(locator)),
+            CmraRecoveryMode::KeyHolding,
+        )
+        .unwrap();
+        let mut image = recovered.image;
+        let mut header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
+        let crypto_start = header.crypto_header_offset as usize;
+        let crypto_end = crypto_start + header.crypto_header_length as usize;
+        let crypto = CryptoHeader::parse(
+            &archive.bytes[crypto_start..crypto_end],
+            header.crypto_header_length,
+        )
+        .unwrap();
+
+        image.volume_format_rev = VOLUME_FORMAT_REV_43;
+        header.volume_format_rev = VOLUME_FORMAT_REV_43;
+
+        validate_image_identity(&image, &header, &crypto.fixed).unwrap();
     }
 
     #[test]
@@ -16547,6 +16776,130 @@ mod tests {
         rewrite_locator_image_sha(volume, final_offset, image_sha256);
         let mirror_offset = final_offset - CRITICAL_RECOVERY_LOCATOR_LEN;
         rewrite_locator_image_sha(volume, mirror_offset, image_sha256);
+    }
+
+    fn rewrite_cmra_image_variable_len(
+        volume: &[u8],
+        mode: CmraRecoveryMode,
+        mutate: impl FnOnce(&mut CriticalMetadataImage),
+    ) -> Vec<u8> {
+        let locator = final_recovery_locator(volume);
+        let tuple = CmraDecoderTuple::from(locator);
+        let recovered = recover_cmra(volume, locator.cmra_offset, Some(tuple), mode).unwrap();
+        let mut image = recovered.image;
+        mutate(&mut image);
+        refresh_critical_image_region_digests(&mut image);
+        let image_bytes = image.to_bytes().unwrap();
+
+        let shard_size = tuple.shard_size as usize;
+        let data_shard_count = image_bytes.len().div_ceil(shard_size);
+        let parity_shard_count = tuple.parity_shard_count as usize;
+        assert!(data_shard_count > 0);
+        assert!(image_bytes.len() <= data_shard_count * shard_size);
+
+        let mut data_shards = Vec::with_capacity(data_shard_count);
+        for idx in 0..data_shard_count {
+            let start = idx * shard_size;
+            let end = (start + shard_size).min(image_bytes.len());
+            let mut payload = vec![0u8; shard_size];
+            if start < image_bytes.len() {
+                payload[..end - start].copy_from_slice(&image_bytes[start..end]);
+            }
+            data_shards.push(payload);
+        }
+        let parity_shards = encode_parity_gf16(&data_shards, parity_shard_count).unwrap();
+        let image_sha256 = sha256_bytes(&image_bytes);
+        let data_shard_count_u16 = u16::try_from(data_shard_count).unwrap();
+        let image_length_u32 = u32::try_from(image_bytes.len()).unwrap();
+
+        let header = CriticalMetadataRecoveryHeader {
+            shard_size: tuple.shard_size,
+            data_shard_count: data_shard_count_u16,
+            parity_shard_count: tuple.parity_shard_count,
+            image_length: image_length_u32,
+            archive_uuid_hint: locator.archive_uuid_hint,
+            session_id_hint: locator.session_id_hint,
+            volume_index_hint: locator.volume_index_hint,
+            image_sha256,
+            header_crc32c: 0,
+        };
+        let mut cmra = Vec::new();
+        cmra.extend_from_slice(&header.to_bytes());
+        for (idx, payload) in data_shards.into_iter().enumerate() {
+            let payload_len = if idx + 1 == data_shard_count {
+                image_bytes.len() - idx * shard_size
+            } else {
+                shard_size
+            };
+            cmra.extend_from_slice(
+                &CriticalMetadataRecoveryShard {
+                    shard_index: idx as u16,
+                    shard_role: 0,
+                    shard_payload_length: payload_len as u32,
+                    payload,
+                    shard_crc32c: 0,
+                }
+                .to_bytes(shard_size)
+                .unwrap(),
+            );
+        }
+        for (idx, payload) in parity_shards.into_iter().enumerate() {
+            cmra.extend_from_slice(
+                &CriticalMetadataRecoveryShard {
+                    shard_index: (data_shard_count + idx) as u16,
+                    shard_role: 1,
+                    shard_payload_length: shard_size as u32,
+                    payload,
+                    shard_crc32c: 0,
+                }
+                .to_bytes(shard_size)
+                .unwrap(),
+            );
+        }
+
+        let locator_base = CriticalRecoveryLocator {
+            volume_format_rev: image.volume_format_rev,
+            cmra_offset: locator.cmra_offset,
+            cmra_length: cmra.len() as u32,
+            volume_trailer_offset: locator.volume_trailer_offset,
+            body_bytes_before_cmra: locator.body_bytes_before_cmra,
+            archive_uuid_hint: locator.archive_uuid_hint,
+            session_id_hint: locator.session_id_hint,
+            volume_index_hint: locator.volume_index_hint,
+            locator_sequence: 1,
+            cmra_shard_size: tuple.shard_size,
+            cmra_data_shard_count: data_shard_count_u16,
+            cmra_parity_shard_count: tuple.parity_shard_count,
+            cmra_image_length: image_length_u32,
+            cmra_image_sha256: image_sha256,
+            locator_crc32c: 0,
+        };
+
+        let cmra_offset = locator.cmra_offset as usize;
+        let mut out = Vec::new();
+        out.extend_from_slice(&volume[..cmra_offset]);
+        out.extend_from_slice(&cmra);
+        out.extend_from_slice(&locator_base.to_bytes());
+        out.extend_from_slice(
+            &CriticalRecoveryLocator {
+                locator_sequence: 0,
+                ..locator_base
+            }
+            .to_bytes(),
+        );
+        out
+    }
+
+    fn rewrite_recovery_locator(
+        volume: &mut [u8],
+        offset: usize,
+        mutate: impl FnOnce(&mut CriticalRecoveryLocator),
+    ) {
+        let mut locator =
+            CriticalRecoveryLocator::parse(&volume[offset..offset + CRITICAL_RECOVERY_LOCATOR_LEN])
+                .unwrap();
+        mutate(&mut locator);
+        volume[offset..offset + CRITICAL_RECOVERY_LOCATOR_LEN].copy_from_slice(&locator.to_bytes());
     }
 
     fn refresh_critical_image_region_digests(image: &mut CriticalMetadataImage) {
