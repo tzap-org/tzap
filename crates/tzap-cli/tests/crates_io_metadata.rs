@@ -124,7 +124,9 @@ fn publish_dependencies_are_versioned() {
     assert!(manifest.contains(
         r#"tzap-plugin-keywrap = { path = "../tzap-plugin-keywrap", version = "0.1.8" }"#
     ));
-    assert!(plugin_manifest.contains(r#"tzap-core = { path = "../tzap-core", version = "0.1.8" }"#));
+    assert!(
+        plugin_manifest.contains(r#"tzap-core = { path = "../tzap-core", version = "0.1.8" }"#)
+    );
 
     let keywrap_manifest = read_workspace_file("crates/tzap-plugin-keywrap/Cargo.toml");
     assert!(keywrap_manifest.contains(r#"tzap-core = { path = "../tzap-core", version = "0.1.8" }"#));
