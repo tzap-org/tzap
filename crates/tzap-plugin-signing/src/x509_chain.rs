@@ -1042,8 +1042,7 @@ fn name_to_string(name: &X509NameRef) -> String {
         let key = entry.object().nid().short_name().unwrap_or("OID");
         let value = entry
             .data()
-            .as_utf8()
-            .map(|value| value.to_string())
+            .to_string()
             .unwrap_or_else(|_| encode_hex(entry.data().as_slice()));
         parts.push(format!("{key}={value}"));
     }
