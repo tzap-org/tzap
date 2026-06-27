@@ -34,7 +34,7 @@ hmac = "0.12"
 hpke = "0.13"
 memmap2 = "0.9"
 rand = "0.8"
-openssl = { version = "0.10", features = ["vendored"] }
+openssl = { version = "0.10.81", features = ["vendored"] }
 sha2 = "0.10"
 tar = "0.4"
 thiserror = "2"
