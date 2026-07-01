@@ -588,6 +588,37 @@ fn cli_signing_keygen_help_includes_keypair_outputs() {
 }
 
 #[test]
+fn cli_trust_info_reports_embedded_official_root() {
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["trust-info"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("official-tzap-root-source: embedded").and(
+                predicate::str::contains(
+                    "official-tzap-root-sha256: sha256:f57f5a7778d1c3fdb555c43c6c7d16cdb7f4f8160a4a70d6964b3a7b5016e4a1",
+                ),
+            ),
+        );
+
+    let output = Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["trust-info", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        value["official_tzap_root_certificate_sha256"],
+        "sha256:f57f5a7778d1c3fdb555c43c6c7d16cdb7f4f8160a4a70d6964b3a7b5016e4a1"
+    );
+    assert_eq!(value["official_tzap_root_source"], "embedded");
+}
+
+#[test]
 fn cli_create_requires_key_source_before_running() {
     let temp = tempdir().unwrap();
     let output = temp.path().join("sample.tzap");

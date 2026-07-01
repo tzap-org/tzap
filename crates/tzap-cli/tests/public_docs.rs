@@ -82,6 +82,7 @@ fn public_reference_file_exists_and_covers_commands() {
         "verify",
         "keygen",
         "signing-keygen",
+        "trust-info",
     ] {
         assert!(reference.contains(&format!("## Command: {command}")));
     }
@@ -92,6 +93,9 @@ fn public_reference_file_exists_and_covers_commands() {
     assert!(reference.contains("--trusted-public-key"));
     assert!(reference.contains("--trusted-ca-cert"));
     assert!(reference.contains("--public-no-key"));
+    assert!(reference.contains("embedded official TZAP"));
+    assert!(reference.contains("root certificate by default"));
+    assert!(reference.contains("tzap trust-info --json"));
     assert!(reference.contains("--volume"));
     assert!(reference.contains("--jobs"));
     assert!(reference.contains("--timings"));

@@ -64,12 +64,29 @@ else
   ASSET="tzap-${VERSION}-${OS}-${ARCH}.tar.gz"
 fi
 # On Windows, pick the ".zip" artifact name from the table below.
-curl -L -o tzap.tar.gz \
+curl -L -o "$ASSET" \
   "https://github.com/tzap-org/tzap/releases/download/${VERSION}/${ASSET}"
-tar -xzf tzap.tar.gz
+curl -L -O "https://github.com/tzap-org/tzap/releases/download/${VERSION}/SHA256SUMS"
+curl -L -O "https://github.com/tzap-org/tzap/releases/download/${VERSION}/SHA256SUMS.sigstore.json"
+
+sha256sum -c --ignore-missing SHA256SUMS
+cosign verify-blob \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp 'https://github.com/tzap-org/tzap/.github/workflows/release.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  SHA256SUMS
+gh attestation verify "$ASSET" -R tzap-org/tzap
+
+tar -xzf "$ASSET"
 chmod +x tzap
 ./tzap --version
+./tzap trust-info
 ```
+
+On Windows, download the `.zip` asset plus `SHA256SUMS` and
+`SHA256SUMS.sigstore.json`, then verify the hash with `Get-FileHash`, verify
+the Sigstore bundle with `cosign verify-blob`, and verify provenance with
+`gh attestation verify`.
 
 Supported target artifacts:
 
@@ -88,3 +105,13 @@ Release artifacts are built on pinned baseline runners instead of moving
 x86_64 and `MACOSX_DEPLOYMENT_TARGET=11.0` for aarch64. Linux publishes
 static musl artifacts for x86_64 and aarch64; Windows release builds use the
 static CRT.
+
+Release artifacts are accompanied by:
+
+- individual `.sha256` files
+- a merged `SHA256SUMS` manifest
+- a keyless Sigstore bundle for `SHA256SUMS`
+- GitHub artifact attestations for release assets
+
+The `tzap trust-info` command prints the embedded official TZAP root
+fingerprint and build identity for the binary you are running.

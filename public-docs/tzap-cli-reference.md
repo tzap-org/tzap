@@ -275,6 +275,7 @@ tzap verify --json --keyfile project.key backup.vol001.tzap
 tzap verify --fast backup.tzap
 tzap verify --keyfile project.key --trusted-public-key root.public.hex backup.tzap
 tzap verify --keyfile project.key --trusted-ca-cert root-ca.pem backup.tzap
+tzap verify --public-no-key backup.tzap
 tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap
 ```
 
@@ -337,10 +338,13 @@ Notes:
   `verification_mode = "fast"` / `OK fast`; signed archives report
   `root_auth_deferred_full_archive_scan_required` instead of
   `root_auth_content_verified`.
-- Public no-key verification requires `--public-no-key` plus one trust source:
-  `--trusted-public-key`, `--trusted-ca-cert`, or `--trusted-system-roots`.
-  It does not use archive key material or bootstrap sidecars, and reports
-  metadata-only public diagnostics `public_data_block_commitment_verified`,
+- Official TZAP X.509 RootAuth verification uses the embedded official TZAP
+  root certificate by default. Custom Ed25519 roots still require
+  `--trusted-public-key`; custom X.509 roots can be supplied with
+  `--trusted-ca-cert` or `--trusted-system-roots`.
+- Public no-key verification with `--public-no-key` uses the same trust rules
+  without archive key material or bootstrap sidecars, and reports metadata-only
+  public diagnostics `public_data_block_commitment_verified`,
   `public_physical_completeness_unverified`, and
   `public_recovery_margin_unchecked` on success.
 - Verification reports unsupported local tar metadata profiles to stderr as
@@ -388,6 +392,23 @@ Useful flags:
 - `--secret-output`: write the 32-byte signing seed as 64 lowercase hex chars
 - `--public-output`: write the 32-byte public key as 64 lowercase hex chars
 - `--force`: replace existing keypair outputs
+
+## Command: trust-info
+
+Show the official trust material embedded in this `tzap` binary:
+
+```sh
+tzap trust-info
+tzap trust-info --json
+```
+
+Use this after download verification to compare the binary's embedded official
+TZAP root fingerprint with the value published in release notes or deployment
+docs.
+
+Useful flags:
+
+- `--json`: emit stable machine-readable JSON output
 
 ## Operational boundaries
 

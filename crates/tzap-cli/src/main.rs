@@ -88,6 +88,9 @@ const DEFAULT_ARGON2_PARALLELISM: u32 = 4;
 const DEFAULT_ARGON2_SALT_LEN: usize = 16;
 const INSECURE_ZERO_KEY: [u8; 32] = [0; 32];
 const LARGE_CREATE_LAYOUT_THRESHOLD: u64 = 100 * 1024 * 1024 * 1024;
+const OFFICIAL_TZAP_ROOT_CERT_SHA256: &str =
+    "sha256:f57f5a7778d1c3fdb555c43c6c7d16cdb7f4f8160a4a70d6964b3a7b5016e4a1";
+const OFFICIAL_TZAP_ROOT_CERT_PEM: &[u8] = include_bytes!("trust/tzap-production-root-ca-2026.pem");
 
 type CliRootAuthAuthenticator<'a> =
     dyn FnMut(&RootAuthSigningRequest) -> std::result::Result<Vec<u8>, FormatError> + 'a;
@@ -605,8 +608,8 @@ enum Command {
     },
     #[command(
         about = "Verify archive integrity",
-        long_about = "Verify archive signatures and checksum integrity. No payload changes are made unless --write-repaired is set; original archive files are never modified.\n\nEncrypted archives need --keyfile, --password, --password-stdin, or --recipient-key for v44 RecipientWrap archives. Unencrypted archives need no key source. With --public-no-key, verify uses the public RootAuth profile and does not require the archive key.",
-        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --recipient-key recipient.key backup.tzap\n  tzap verify --keyfile key.hex --write-repaired backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --public-no-key --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --keyfile key.hex backup.vol000.tzap backup.vol001.tzap\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives named `.volNNN.tzap`, passing any one volume discovers matching siblings in the same directory. Additional positionals are explicit extra volumes."
+        long_about = "Verify archive signatures and checksum integrity. No payload changes are made unless --write-repaired is set; original archive files are never modified.\n\nEncrypted archives need --keyfile, --password, --password-stdin, or --recipient-key for v44 RecipientWrap archives. Unencrypted archives need no key source. Official TZAP X.509 RootAuth uses the embedded TZAP root by default. With --public-no-key, verify uses the public RootAuth profile and does not require the archive key.",
+        after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --recipient-key recipient.key backup.tzap\n  tzap verify --keyfile key.hex --write-repaired backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --public-no-key --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --keyfile key.hex backup.vol000.tzap backup.vol001.tzap\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives named `.volNNN.tzap`, passing any one volume discovers matching siblings in the same directory. Additional positionals are explicit extra volumes."
     )]
     Verify {
         #[arg(
@@ -768,6 +771,15 @@ enum Command {
 
         #[arg(long = "force", help = "Overwrite existing keypair output files.")]
         force: bool,
+    },
+    #[command(
+        name = "trust-info",
+        about = "Show embedded official TZAP trust and build identity",
+        long_about = "Show the embedded official TZAP root certificate fingerprint and build identity used by this tzap binary."
+    )]
+    TrustInfo {
+        #[arg(long = "json", help = "Emit stable machine-readable JSON output.")]
+        json: bool,
     },
 }
 
@@ -2428,7 +2440,44 @@ fn run(cli: Cli) -> Result<()> {
             )?;
             Ok(())
         }
+        Command::TrustInfo { json } => emit_trust_info(json).map_err(Into::into),
     }
+}
+
+fn emit_trust_info(json_output: bool) -> io::Result<()> {
+    let build_profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "official_tzap_root_certificate_sha256": OFFICIAL_TZAP_ROOT_CERT_SHA256,
+                "official_tzap_root_source": "embedded",
+                "package": env!("CARGO_PKG_NAME"),
+                "version": env!("CARGO_PKG_VERSION"),
+                "repository": env!("CARGO_PKG_REPOSITORY"),
+                "build_profile": build_profile,
+                "target_os": std::env::consts::OS,
+                "target_arch": std::env::consts::ARCH,
+            }))
+            .expect("trust-info JSON is serializable")
+        );
+        return Ok(());
+    }
+    println!("tzap {}", env!("CARGO_PKG_VERSION"));
+    println!("repository: {}", env!("CARGO_PKG_REPOSITORY"));
+    println!("build-profile: {build_profile}");
+    println!(
+        "target: {}-{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    println!("official-tzap-root-source: embedded");
+    println!("official-tzap-root-sha256: {OFFICIAL_TZAP_ROOT_CERT_SHA256}");
+    Ok(())
 }
 
 fn emit_success_summary(quiet: bool, message: &str) -> io::Result<()> {
@@ -4747,12 +4796,6 @@ fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) -> Result<()>
 fn load_public_no_key_trust(request: &PublicNoKeyVerifyRequest<'_>) -> Result<PublicNoKeyTrust> {
     let wants_ed25519 = request.trusted_public_key.is_some();
     let wants_x509 = !request.trusted_ca_cert.is_empty() || request.trusted_system_roots;
-    if !wants_ed25519 && !wants_x509 {
-        return Err(UsageError(
-            "--public-no-key requires --trusted-public-key FILE, --trusted-ca-cert FILE, or --trusted-system-roots",
-        )
-        .into());
-    }
     if wants_ed25519 && wants_x509 {
         return Err(UsageError(
             "use either --trusted-public-key or X.509 trust options with --public-no-key, not both",
@@ -4781,7 +4824,7 @@ fn load_public_no_key_trust(request: &PublicNoKeyVerifyRequest<'_>) -> Result<Pu
         });
     }
     Ok(PublicNoKeyTrust::X509 {
-        trusted_roots_der: load_x509_certificate_files(request.trusted_ca_cert)?,
+        trusted_roots_der: load_x509_trusted_roots(request.trusted_ca_cert, !wants_x509)?,
         trusted_system_roots: request.trusted_system_roots,
     })
 }
@@ -4815,19 +4858,23 @@ fn verify_opened_root_auth(
     trusted_system_roots: bool,
 ) -> Result<Option<VerifiedRootAuth>> {
     let wants_ed25519 = trusted_public_key.is_some();
-    let wants_x509 = !trusted_ca_cert.is_empty() || trusted_system_roots;
-    if !wants_ed25519 && !wants_x509 {
-        return Ok(None);
-    }
-    if wants_ed25519 && wants_x509 {
+    let wants_explicit_x509 = !trusted_ca_cert.is_empty() || trusted_system_roots;
+    if wants_ed25519 && wants_explicit_x509 {
         return Err(
             UsageError("use either --trusted-public-key or X.509 trust options, not both").into(),
         );
     }
-    let footer = opened
-        .root_auth_footer
-        .as_ref()
-        .ok_or(FormatError::InvalidArchive("missing RootAuthFooter"))?;
+    let Some(footer) = opened.root_auth_footer.as_ref() else {
+        if wants_ed25519 || wants_explicit_x509 {
+            return Err(FormatError::InvalidArchive("missing RootAuthFooter").into());
+        }
+        return Ok(None);
+    };
+    let wants_official_x509 =
+        !wants_ed25519 && !wants_explicit_x509 && footer.authenticator_id == X509_AUTHENTICATOR_ID;
+    if !wants_ed25519 && !wants_explicit_x509 && !wants_official_x509 {
+        return Ok(None);
+    }
     match footer.authenticator_id {
         ED25519_AUTHENTICATOR_ID if wants_ed25519 => {
             let public_key = trusted_public_key.expect("checked Ed25519 trust request");
@@ -4835,8 +4882,8 @@ fn verify_opened_root_auth(
                 verify_opened_root_auth_ed25519(opened, content_verification, public_key)?,
             )))
         }
-        X509_AUTHENTICATOR_ID if wants_x509 => {
-            let trusted_roots_der = load_x509_certificate_files(trusted_ca_cert)?;
+        X509_AUTHENTICATOR_ID if wants_explicit_x509 || wants_official_x509 => {
+            let trusted_roots_der = load_x509_trusted_roots(trusted_ca_cert, wants_official_x509)?;
             Ok(Some(verify_opened_root_auth_x509(
                 opened,
                 content_verification,
@@ -5467,6 +5514,25 @@ fn load_x509_certificate_files(paths: &[String]) -> Result<Vec<Vec<u8>>> {
                 .with_context(|| format!("failed to parse certificate {path}"))?,
         );
     }
+    Ok(certificates)
+}
+
+fn load_x509_trusted_roots(
+    paths: &[String],
+    include_official_tzap_root: bool,
+) -> Result<Vec<Vec<u8>>> {
+    let mut certificates = Vec::new();
+    if include_official_tzap_root {
+        certificates.push(
+            x509_chain::certificate_der_from_pem_or_der(OFFICIAL_TZAP_ROOT_CERT_PEM)
+                .with_context(|| {
+                    format!(
+                        "failed to parse embedded TZAP root certificate {OFFICIAL_TZAP_ROOT_CERT_SHA256}"
+                    )
+                })?,
+        );
+    }
+    certificates.extend(load_x509_certificate_files(paths)?);
     Ok(certificates)
 }
 

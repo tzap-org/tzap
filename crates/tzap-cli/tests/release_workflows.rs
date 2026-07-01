@@ -159,12 +159,25 @@ fn release_workflow_has_smoke_checks() {
 fn release_workflow_uploads_checksum_artifacts() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
 
+    assert!(workflow.contains("id-token: write"));
+    assert!(workflow.contains("attestations: write"));
+    assert!(workflow.contains("artifact-metadata: write"));
     assert!(workflow.contains("Generate checksum (Unix)"));
     assert!(workflow.contains("Generate checksum (Windows)"));
     assert!(workflow.contains("${{ matrix.archive }}.sha256"));
     assert!(workflow.contains("dist/${{ matrix.archive }}.sha256"));
     assert!(workflow.contains("Merge checksum manifest"));
     assert!(workflow.contains("SHA256SUMS"));
+    assert!(workflow.contains("Attest release artifact"));
+    assert!(workflow.contains("uses: actions/attest@v4"));
+    assert!(workflow.contains("subject-path: dist/*"));
+    assert!(workflow.contains("Install cosign"));
+    assert!(workflow.contains("uses: sigstore/cosign-installer@v3"));
+    assert!(
+        workflow.contains("cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS")
+    );
+    assert!(workflow.contains("Attest checksum manifest"));
+    assert!(workflow.contains("subject-path: dist/SHA256SUMS"));
     assert_contains_in_order(
         &workflow,
         &["homebrew:", "needs: build", "brew install --formula"],
@@ -180,6 +193,8 @@ fn release_workflow_uploads_checksum_artifacts() {
             "- build",
             "- homebrew",
             "Merge checksum manifest",
+            "Sign checksum manifest",
+            "Attest checksum manifest",
             "Publish release",
         ],
     );

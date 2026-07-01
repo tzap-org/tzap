@@ -7,6 +7,9 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   preflight:
@@ -223,6 +226,11 @@ jobs:
           $hash = Get-FileHash -Path "dist/${{ matrix.archive }}" -Algorithm SHA256
           "{0}  {1}" -f $hash.Hash.ToLowerInvariant(), "${{ matrix.archive }}" | Set-Content -Path "dist/${{ matrix.archive }}.sha256"
 
+      - name: Attest release artifact
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*
+
       - name: Upload asset
         uses: actions/upload-artifact@v4
         with:
@@ -384,6 +392,19 @@ jobs:
         run: |
           cd dist
           (sha256sum *.tar.gz *.zip 2>/dev/null || shasum -a 256 *.tar.gz *.zip 2>/dev/null) > SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign checksum manifest
+        run: |
+          cd dist
+          cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+
+      - name: Attest checksum manifest
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/SHA256SUMS
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
