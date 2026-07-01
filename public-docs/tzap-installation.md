@@ -5,7 +5,7 @@ This document collects install paths and release artifact details for `tzap`.
 ## Homebrew
 
 ```sh
-brew tap tzap-org/tzap
+brew tap tzap-org/homebrew-tzap
 brew install tzap
 ```
 
