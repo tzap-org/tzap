@@ -89,7 +89,7 @@ const DEFAULT_ARGON2_SALT_LEN: usize = 16;
 const INSECURE_ZERO_KEY: [u8; 32] = [0; 32];
 const LARGE_CREATE_LAYOUT_THRESHOLD: u64 = 100 * 1024 * 1024 * 1024;
 const OFFICIAL_TZAP_ROOT_CERT_SHA256: &str =
-    "sha256:f57f5a7778d1c3fdb555c43c6c7d16cdb7f4f8160a4a70d6964b3a7b5016e4a1";
+    "sha256:d80d318f6cd6096dc791e314ec6f41434caa47feb75e85ad6f87d5bf72bbd53d";
 const OFFICIAL_TZAP_ROOT_CERT_PEM: &[u8] = include_bytes!("trust/tzap-production-root-ca-2026.pem");
 
 type CliRootAuthAuthenticator<'a> =
@@ -6636,6 +6636,18 @@ mod tests {
         assert_eq!(
             status["public_no_key_metadata_only"],
             serde_json::json!("metadata_commitments_verified")
+        );
+    }
+
+    #[test]
+    fn embedded_official_root_fingerprint_matches_certificate() {
+        let der = x509_chain::certificate_der_from_pem_or_der(OFFICIAL_TZAP_ROOT_CERT_PEM).unwrap();
+        let cert = X509::from_der(&der).unwrap();
+        let digest = cert.digest(openssl::hash::MessageDigest::sha256()).unwrap();
+
+        assert_eq!(
+            OFFICIAL_TZAP_ROOT_CERT_SHA256,
+            format!("sha256:{}", encode_hex(&digest))
         );
     }
 

@@ -597,7 +597,7 @@ fn cli_trust_info_reports_embedded_official_root() {
         .stdout(
             predicate::str::contains("official-tzap-root-source: embedded").and(
                 predicate::str::contains(
-                    "official-tzap-root-sha256: sha256:f57f5a7778d1c3fdb555c43c6c7d16cdb7f4f8160a4a70d6964b3a7b5016e4a1",
+                    "official-tzap-root-sha256: sha256:d80d318f6cd6096dc791e314ec6f41434caa47feb75e85ad6f87d5bf72bbd53d",
                 ),
             ),
         );
@@ -613,7 +613,7 @@ fn cli_trust_info_reports_embedded_official_root() {
     let value: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(
         value["official_tzap_root_certificate_sha256"],
-        "sha256:f57f5a7778d1c3fdb555c43c6c7d16cdb7f4f8160a4a70d6964b3a7b5016e4a1"
+        "sha256:d80d318f6cd6096dc791e314ec6f41434caa47feb75e85ad6f87d5bf72bbd53d"
     );
     assert_eq!(value["official_tzap_root_source"], "embedded");
 }
