@@ -159,9 +159,32 @@ fn release_workflow_has_smoke_checks() {
 fn release_workflow_uploads_checksum_artifacts() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
 
+    assert!(workflow.contains("permissions:\n  contents: read\n\njobs:"));
+    assert_contains_in_order(
+        &workflow,
+        &[
+            "build:",
+            "permissions:",
+            "contents: read",
+            "id-token: write",
+            "attestations: write",
+            "strategy:",
+        ],
+    );
+    assert_contains_in_order(
+        &workflow,
+        &[
+            "publish:",
+            "permissions:",
+            "contents: write",
+            "id-token: write",
+            "attestations: write",
+            "steps:",
+        ],
+    );
     assert!(workflow.contains("id-token: write"));
     assert!(workflow.contains("attestations: write"));
-    assert!(workflow.contains("artifact-metadata: write"));
+    assert!(!workflow.contains("artifact-metadata: write"));
     assert!(workflow.contains("Generate checksum (Unix)"));
     assert!(workflow.contains("Generate checksum (Windows)"));
     assert!(workflow.contains("${{ matrix.archive }}.sha256"));

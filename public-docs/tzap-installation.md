@@ -69,7 +69,11 @@ curl -L -o "$ASSET" \
 curl -L -O "https://github.com/tzap-org/tzap/releases/download/${VERSION}/SHA256SUMS"
 curl -L -O "https://github.com/tzap-org/tzap/releases/download/${VERSION}/SHA256SUMS.sigstore.json"
 
-sha256sum -c --ignore-missing SHA256SUMS
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c --ignore-missing SHA256SUMS
+else
+  grep "  ${ASSET}$" SHA256SUMS | shasum -a 256 -c -
+fi
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
   --certificate-identity-regexp 'https://github.com/tzap-org/tzap/.github/workflows/release.yml@refs/tags/v.*' \

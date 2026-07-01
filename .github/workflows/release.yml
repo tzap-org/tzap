@@ -6,10 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
-  artifact-metadata: write
+  contents: read
 
 jobs:
   preflight:
@@ -47,6 +44,10 @@ jobs:
     name: Build ${{ matrix.name }}
     needs: preflight
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
 
     strategy:
       fail-fast: false
@@ -380,6 +381,10 @@ jobs:
     needs:
       - build
       - homebrew
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Download assets
