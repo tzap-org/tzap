@@ -1258,6 +1258,7 @@ fn file_entry(
         offset_in_first_frame_plaintext,
         tar_member_group_size,
         file_data_size,
+        mtime: None,
         flags: 0,
     }
 }

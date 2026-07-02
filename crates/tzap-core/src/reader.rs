@@ -216,6 +216,7 @@ pub struct ArchiveEntry {
 pub struct ArchiveIndexEntry {
     pub path: String,
     pub file_data_size: u64,
+    pub mtime: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +399,7 @@ pub(crate) struct StreamedArchiveOpenParts {
 struct WinningIndexEntry {
     start: u64,
     file_data_size: u64,
+    mtime: Option<u64>,
     shard_index: usize,
     file_index: usize,
 }
@@ -2019,6 +2021,7 @@ impl OpenedArchive {
                 Ok(ArchiveIndexEntry {
                     path,
                     file_data_size: winner.file_data_size,
+                    mtime: winner.mtime,
                 })
             })
             .collect()
@@ -3787,6 +3790,7 @@ fn final_index_entry_winners(
                 if start >= winner.start {
                     winner.start = start;
                     winner.file_data_size = file.file_data_size;
+                    winner.mtime = file.mtime;
                     winner.shard_index = shard_index;
                     winner.file_index = idx;
                 }
@@ -3796,6 +3800,7 @@ fn final_index_entry_winners(
                     WinningIndexEntry {
                         start,
                         file_data_size: file.file_data_size,
+                        mtime: file.mtime,
                         shard_index,
                         file_index: idx,
                     },
@@ -3822,6 +3827,7 @@ fn archive_index_entry_from_loaded_file(
     Ok(ArchiveIndexEntry {
         path,
         file_data_size: file.file_data_size,
+        mtime: file.mtime,
     })
 }
 
@@ -10188,7 +10194,7 @@ mod tests {
     };
     use crate::metadata::{
         DirectoryHintEntry, DirectoryHintTableHeader, IndexRootHeader, IndexShardHeader,
-        ENVELOPE_ENTRY_LEN, FILE_ENTRY_LEN, FRAME_ENTRY_LEN, INDEX_SHARD_HEADER_LEN,
+        ENVELOPE_ENTRY_LEN, FILE_ENTRY_V2_LEN, FRAME_ENTRY_LEN, INDEX_SHARD_HEADER_LEN,
     };
     use crate::non_seekable_reader::{
         extract_non_seekable_stream_to_dir, list_non_seekable_stream, verify_non_seekable_stream,
@@ -12367,8 +12373,14 @@ mod tests {
     fn list_and_extract_use_final_view_for_duplicate_paths() {
         let archive = write_archive(
             &[
-                RegularFile::new("same.txt", b"old"),
-                RegularFile::new("same.txt", b"newer"),
+                RegularFile {
+                    mtime: 1_700_000_000,
+                    ..RegularFile::new("same.txt", b"old")
+                },
+                RegularFile {
+                    mtime: 1_700_000_100,
+                    ..RegularFile::new("same.txt", b"newer")
+                },
             ],
             &master_key(),
             single_stream_options(),
@@ -12381,6 +12393,7 @@ mod tests {
             vec![ArchiveIndexEntry {
                 path: "same.txt".to_string(),
                 file_data_size: 5,
+                mtime: Some(1_700_000_100),
             }]
         );
         assert_eq!(
@@ -12388,6 +12401,7 @@ mod tests {
             Some(ArchiveIndexEntry {
                 path: "same.txt".to_string(),
                 file_data_size: 5,
+                mtime: Some(1_700_000_100),
             })
         );
         assert_eq!(opened.lookup_index_entry("missing.txt").unwrap(), None);
@@ -12398,7 +12412,7 @@ mod tests {
                 file_data_size: 5,
                 kind: TarEntryKind::Regular,
                 mode: 0o644,
-                mtime: 0,
+                mtime: 1_700_000_100,
                 diagnostics: Vec::new(),
             }]
         );
@@ -12420,10 +12434,12 @@ mod tests {
                 ArchiveIndexEntry {
                     path: "broken.txt".to_string(),
                     file_data_size: b"broken payload\n".len() as u64,
+                    mtime: Some(0),
                 },
                 ArchiveIndexEntry {
                     path: "healthy.txt".to_string(),
                     file_data_size: b"healthy payload\n".len() as u64,
+                    mtime: Some(0),
                 },
             ]
         );
@@ -12432,6 +12448,7 @@ mod tests {
             Some(ArchiveIndexEntry {
                 path: "broken.txt".to_string(),
                 file_data_size: b"broken payload\n".len() as u64,
+                mtime: Some(0),
             })
         );
         assert_eq!(opened.list_files().unwrap_err(), FormatError::AeadFailure);
@@ -17940,24 +17957,25 @@ mod tests {
                 offset_in_first_frame_plaintext: 0,
                 tar_member_group_size: file.member_group_size,
                 file_data_size: file.file_data_size,
+                mtime: Some(0),
                 flags: 0,
             });
         }
 
         let header = IndexShardHeader {
-            version: 1,
+            version: 2,
             shard_index: 0,
             file_count: file_entries.len() as u32,
             frame_count: frames.len() as u32,
             envelope_count: envelopes.len() as u32,
             file_table_offset: INDEX_SHARD_HEADER_LEN as u32,
-            frame_table_offset: (INDEX_SHARD_HEADER_LEN + file_entries.len() * FILE_ENTRY_LEN)
+            frame_table_offset: (INDEX_SHARD_HEADER_LEN + file_entries.len() * FILE_ENTRY_V2_LEN)
                 as u32,
             envelope_table_offset: (INDEX_SHARD_HEADER_LEN
-                + file_entries.len() * FILE_ENTRY_LEN
+                + file_entries.len() * FILE_ENTRY_V2_LEN
                 + frames.len() * FRAME_ENTRY_LEN) as u32,
             string_pool_offset: (INDEX_SHARD_HEADER_LEN
-                + file_entries.len() * FILE_ENTRY_LEN
+                + file_entries.len() * FILE_ENTRY_V2_LEN
                 + frames.len() * FRAME_ENTRY_LEN
                 + envelopes.len() * ENVELOPE_ENTRY_LEN) as u32,
             string_pool_size: string_pool.len() as u32,
@@ -17966,7 +17984,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&header.to_bytes());
         for entry in &file_entries {
-            bytes.extend_from_slice(&entry.to_bytes());
+            bytes.extend_from_slice(&entry.to_bytes_for_index_shard_version(header.version));
         }
         for entry in frames {
             bytes.extend_from_slice(&entry.to_bytes());

@@ -15,10 +15,14 @@ pub const DIRECTORY_HINT_SHARD_ENTRY_LEN: usize = 56;
 pub const ENVELOPE_ENTRY_LEN: usize = 48;
 pub const FRAME_ENTRY_LEN: usize = 44;
 pub const INDEX_SHARD_HEADER_LEN: usize = 64;
-pub const FILE_ENTRY_LEN: usize = 56;
+pub const FILE_ENTRY_V1_LEN: usize = 56;
+pub const FILE_ENTRY_LEN: usize = FILE_ENTRY_V1_LEN;
+pub const FILE_ENTRY_V2_LEN: usize = 64;
 pub const DIRECTORY_HINT_TABLE_LEN: usize = 72;
 pub const DIRECTORY_HINT_ENTRY_LEN: usize = 40;
 
+const INDEX_SHARD_VERSION_V1: u32 = 1;
+const INDEX_SHARD_VERSION_V2: u32 = 2;
 const FRAME_KNOWN_FLAGS: u32 = 0x0000_0003;
 const DEFAULT_MAX_HASH_COLLISION_SHARD_SCAN: usize = 16;
 const REED_SOLOMON_GF16_MAX_TOTAL_SHARDS: u64 = 65_535;
@@ -175,6 +179,7 @@ pub struct FileEntry {
     pub offset_in_first_frame_plaintext: u32,
     pub tar_member_group_size: u64,
     pub file_data_size: u64,
+    pub mtime: Option<u64>,
     pub flags: u32,
 }
 
@@ -464,7 +469,10 @@ impl IndexShard {
             string_pool_size: read_u32(bytes, 44, structure)?,
         };
 
-        if header.version != 1 {
+        if !matches!(
+            header.version,
+            INDEX_SHARD_VERSION_V1 | INDEX_SHARD_VERSION_V2
+        ) {
             return invalid(structure, "unsupported version");
         }
         if header.file_count == 0 {
@@ -481,6 +489,8 @@ impl IndexShard {
         }
 
         let mut cursor = INDEX_SHARD_HEADER_LEN;
+        let file_entry_len = file_entry_len_for_index_shard_version(header.version)?;
+        let parse_file_entry = file_entry_parser_for_index_shard_version(header.version)?;
         let files = parse_counted_table(
             bytes,
             CountedTableSpec {
@@ -488,7 +498,7 @@ impl IndexShard {
                 name: "file table",
                 count: header.file_count as u64,
                 offset: header.file_table_offset as u64,
-                entry_len: FILE_ENTRY_LEN,
+                entry_len: file_entry_len,
                 parse: parse_file_entry,
             },
             &mut cursor,
@@ -569,7 +579,9 @@ impl IndexShard {
 
         let mut cursor = INDEX_SHARD_HEADER_LEN;
         header.file_table_offset = table_offset(self.files.len(), cursor);
-        cursor += self.files.len() * FILE_ENTRY_LEN;
+        let file_entry_len =
+            file_entry_len_for_index_shard_version(header.version).unwrap_or(FILE_ENTRY_LEN);
+        cursor += self.files.len() * file_entry_len;
         header.frame_table_offset = table_offset(self.frames.len(), cursor);
         cursor += self.frames.len() * FRAME_ENTRY_LEN;
         header.envelope_table_offset = table_offset(self.envelopes.len(), cursor);
@@ -580,7 +592,7 @@ impl IndexShard {
         let mut bytes = Vec::with_capacity(cursor + self.string_pool.len());
         bytes.extend_from_slice(&header.to_bytes());
         for entry in &self.files {
-            bytes.extend_from_slice(&entry.to_bytes());
+            bytes.extend_from_slice(&entry.to_bytes_for_index_shard_version(header.version));
         }
         for entry in &self.frames {
             bytes.extend_from_slice(&entry.to_bytes());
@@ -653,7 +665,19 @@ impl IndexShardHeader {
 
 impl FileEntry {
     pub fn to_bytes(&self) -> [u8; FILE_ENTRY_LEN] {
-        let mut bytes = [0u8; FILE_ENTRY_LEN];
+        self.to_bytes_v1()
+    }
+
+    pub(crate) fn to_bytes_for_index_shard_version(&self, version: u32) -> Vec<u8> {
+        match version {
+            INDEX_SHARD_VERSION_V1 => self.to_bytes_v1().to_vec(),
+            INDEX_SHARD_VERSION_V2 => self.to_bytes_v2().to_vec(),
+            _ => self.to_bytes_v1().to_vec(),
+        }
+    }
+
+    fn to_bytes_v1(&self) -> [u8; FILE_ENTRY_V1_LEN] {
+        let mut bytes = [0u8; FILE_ENTRY_V1_LEN];
         bytes[0..8].copy_from_slice(&self.path_hash);
         write_u32(&mut bytes, 8, self.path_offset);
         write_u32(&mut bytes, 12, self.path_length);
@@ -663,6 +687,21 @@ impl FileEntry {
         write_u64(&mut bytes, 32, self.tar_member_group_size);
         write_u64(&mut bytes, 40, self.file_data_size);
         write_u32(&mut bytes, 48, self.flags);
+        bytes
+    }
+
+    fn to_bytes_v2(&self) -> [u8; FILE_ENTRY_V2_LEN] {
+        let mut bytes = [0u8; FILE_ENTRY_V2_LEN];
+        bytes[0..8].copy_from_slice(&self.path_hash);
+        write_u32(&mut bytes, 8, self.path_offset);
+        write_u32(&mut bytes, 12, self.path_length);
+        write_u64(&mut bytes, 16, self.first_frame_index);
+        write_u32(&mut bytes, 24, self.frame_count);
+        write_u32(&mut bytes, 28, self.offset_in_first_frame_plaintext);
+        write_u64(&mut bytes, 32, self.tar_member_group_size);
+        write_u64(&mut bytes, 40, self.file_data_size);
+        write_u32(&mut bytes, 48, self.flags);
+        write_u64(&mut bytes, 56, self.mtime.unwrap_or(0));
         bytes
     }
 }
@@ -1090,7 +1129,31 @@ fn parse_directory_hint_shard_entries(
     Ok(entries)
 }
 
-fn parse_file_entry(bytes: &[u8]) -> Result<FileEntry, FormatError> {
+fn file_entry_len_for_index_shard_version(version: u32) -> Result<usize, FormatError> {
+    match version {
+        INDEX_SHARD_VERSION_V1 => Ok(FILE_ENTRY_V1_LEN),
+        INDEX_SHARD_VERSION_V2 => Ok(FILE_ENTRY_V2_LEN),
+        _ => Err(FormatError::InvalidMetadata {
+            structure: "IndexShard",
+            reason: "unsupported version",
+        }),
+    }
+}
+
+fn file_entry_parser_for_index_shard_version(
+    version: u32,
+) -> Result<fn(&[u8]) -> Result<FileEntry, FormatError>, FormatError> {
+    match version {
+        INDEX_SHARD_VERSION_V1 => Ok(parse_file_entry_v1),
+        INDEX_SHARD_VERSION_V2 => Ok(parse_file_entry_v2),
+        _ => Err(FormatError::InvalidMetadata {
+            structure: "IndexShard",
+            reason: "unsupported version",
+        }),
+    }
+}
+
+fn parse_file_entry_v1(bytes: &[u8]) -> Result<FileEntry, FormatError> {
     expect_zero("FileEntry", slice(bytes, 52, 4, "FileEntry")?)?;
     Ok(FileEntry {
         path_hash: read_array::<8>(bytes, 0, "FileEntry")?,
@@ -1101,6 +1164,23 @@ fn parse_file_entry(bytes: &[u8]) -> Result<FileEntry, FormatError> {
         offset_in_first_frame_plaintext: read_u32(bytes, 28, "FileEntry")?,
         tar_member_group_size: read_u64(bytes, 32, "FileEntry")?,
         file_data_size: read_u64(bytes, 40, "FileEntry")?,
+        mtime: None,
+        flags: read_u32(bytes, 48, "FileEntry")?,
+    })
+}
+
+fn parse_file_entry_v2(bytes: &[u8]) -> Result<FileEntry, FormatError> {
+    expect_zero("FileEntry", slice(bytes, 52, 4, "FileEntry")?)?;
+    Ok(FileEntry {
+        path_hash: read_array::<8>(bytes, 0, "FileEntry")?,
+        path_offset: read_u32(bytes, 8, "FileEntry")?,
+        path_length: read_u32(bytes, 12, "FileEntry")?,
+        first_frame_index: read_u64(bytes, 16, "FileEntry")?,
+        frame_count: read_u32(bytes, 24, "FileEntry")?,
+        offset_in_first_frame_plaintext: read_u32(bytes, 28, "FileEntry")?,
+        tar_member_group_size: read_u64(bytes, 32, "FileEntry")?,
+        file_data_size: read_u64(bytes, 40, "FileEntry")?,
+        mtime: Some(read_u64(bytes, 56, "FileEntry")?),
         flags: read_u32(bytes, 48, "FileEntry")?,
     })
 }
@@ -2641,6 +2721,7 @@ mod tests {
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: 512,
             file_data_size: 0,
+            mtime: None,
             flags: 0,
         };
         let frame = FrameEntry {
@@ -2695,7 +2776,7 @@ mod tests {
         };
 
         let mut unsupported_version = shard.to_bytes();
-        write_u32(&mut unsupported_version, 4, 2);
+        write_u32(&mut unsupported_version, 4, 3);
         assert_eq!(
             IndexShard::parse(&unsupported_version, &locating, MetadataLimits::default())
                 .unwrap_err(),
@@ -2808,6 +2889,7 @@ mod tests {
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: 512,
             file_data_size: 0,
+            mtime: None,
             flags: 0,
         };
         let frame = FrameEntry {
@@ -3042,6 +3124,7 @@ mod tests {
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: 512,
             file_data_size: 0,
+            mtime: None,
             flags: 0,
         };
         let frame = FrameEntry {
@@ -3295,6 +3378,7 @@ mod tests {
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: 512,
             file_data_size: 0,
+            mtime: None,
             flags: 0,
         };
         let frame = FrameEntry {

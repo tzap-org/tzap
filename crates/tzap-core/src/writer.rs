@@ -29,7 +29,7 @@ use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, validate_file_path_bytes, DirectoryHintEntry,
     DirectoryHintShardEntry, DirectoryHintTableHeader, EnvelopeEntry, FileEntry, FrameEntry,
     IndexRoot, IndexRootHeader, IndexShardHeader, ShardEntry, DIRECTORY_HINT_ENTRY_LEN,
-    DIRECTORY_HINT_TABLE_LEN, ENVELOPE_ENTRY_LEN, FILE_ENTRY_LEN, FRAME_ENTRY_LEN,
+    DIRECTORY_HINT_TABLE_LEN, ENVELOPE_ENTRY_LEN, FILE_ENTRY_V2_LEN, FRAME_ENTRY_LEN,
     INDEX_SHARD_HEADER_LEN,
 };
 use crate::padding::suffix_pad_for_aead;
@@ -4665,6 +4665,7 @@ fn build_index_shard_plaintext(
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: row.member.tar_member_group_size,
             file_data_size: row.member.file_data_size,
+            mtime: Some(row.member.mtime),
             flags: 0,
         });
     }
@@ -4740,7 +4741,7 @@ fn serialize_index_shard(
 ) -> Result<Vec<u8>, FormatError> {
     let mut cursor = INDEX_SHARD_HEADER_LEN;
     let file_table_offset = table_offset(files.len(), cursor)?;
-    cursor = checked_usize_add(cursor, files.len() * FILE_ENTRY_LEN, "IndexShard")?;
+    cursor = checked_usize_add(cursor, files.len() * FILE_ENTRY_V2_LEN, "IndexShard")?;
     let frame_table_offset = table_offset(frames.len(), cursor)?;
     cursor = checked_usize_add(cursor, frames.len() * FRAME_ENTRY_LEN, "IndexShard")?;
     let envelope_table_offset = table_offset(envelopes.len(), cursor)?;
@@ -4748,7 +4749,7 @@ fn serialize_index_shard(
     let string_pool_offset = table_offset(string_pool.len(), cursor)?;
 
     let header = IndexShardHeader {
-        version: 1,
+        version: 2,
         shard_index,
         file_count: u32_len(files.len(), "IndexShard.file_count")?,
         frame_count: u32_len(frames.len(), "IndexShard.frame_count")?,
@@ -4763,7 +4764,7 @@ fn serialize_index_shard(
     let mut bytes = Vec::with_capacity(cursor + string_pool.len());
     bytes.extend_from_slice(&header.to_bytes());
     for entry in files {
-        bytes.extend_from_slice(&entry.to_bytes());
+        bytes.extend_from_slice(&entry.to_bytes_for_index_shard_version(header.version));
     }
     for entry in frames {
         bytes.extend_from_slice(&entry.to_bytes());
