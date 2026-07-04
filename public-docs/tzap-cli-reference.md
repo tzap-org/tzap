@@ -4,7 +4,7 @@ This document is a compact command reference for `tzap` operators and automation
 
 - **Version**: from binary metadata (`tzap --version`)
 - **Revision**: v0.44-compliant writers and readers for documented supported
-  workflows, with v0.43 reader compatibility
+  workflows, with legacy reader compatibility
 
 ## Global options
 
@@ -110,7 +110,7 @@ Notes:
   uses `aead_algo = None`, `kdf_algo = None`, and unkeyed v44 integrity
   digests for fixed metadata. RootAuth signing can still authenticate the
   archive and signer provenance.
-- `--insecure-zero-key` was removed in v43. Use `--no-encryption` when the
+- `--insecure-zero-key` was removed in a legacy revision. Use `--no-encryption` when the
   archive is intentionally public plaintext.
 - `--recipient-cert` creates a v44 RecipientWrap archive for one certificate.
   The current CLI supports this path for file-backed, single-volume archives
@@ -327,7 +327,7 @@ Notes:
 - RootAuth success reports a trusted signer over the recomputed archive root,
   but it does not imply the signer can decrypt the archive.
 - `revision_mode` is explicit: supported v44 archives report `v44`; legacy
-  v43 archives are rejected as `unsupported-revision`.
+  revisions are rejected as `unsupported-revision`.
 - Fast verification is available only for seekable archive paths, not archive
   stdin. For plaintext, unsigned, dictionary-free archives with no recovery
   parity, it validates metadata and payload BlockRecord integrity without

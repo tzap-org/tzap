@@ -30,8 +30,8 @@ registry, integrity model, FEC layout, bootstrap behavior, and reader/writer
 requirements.
 
 The current reference implementation is v44-compliant for documented supported
-writer, reader, recovery, RootAuth, and RecipientWrap workflows. Legacy v43
-archives are rejected as unsupported revisions.
+writer, reader, recovery, RootAuth, and RecipientWrap workflows. Legacy
+revisions are rejected as unsupported revisions.
 
 ## Library usage
 

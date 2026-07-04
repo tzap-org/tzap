@@ -249,7 +249,7 @@ Operational shape:
   archives without `--keyfile`, `--password`, or `--password-stdin`.
 - `--public-no-key` remains separate because it verifies public RootAuth
   commitments without opening archive contents.
-- The old `--insecure-zero-key` flag was removed in v43 and now exits with a
+- The old `--insecure-zero-key` flag is no longer supported and now exits with a
   usage error; use `--no-encryption` for plaintext archives.
 
 ## Archive stdin and file paths
@@ -564,11 +564,11 @@ surface metadata fidelity should use `list_files`, `extract_member`,
 
 ## Cloud directory-prefix optimization
 
-The v0.43 spec defines a cloud/object-store optimized directory-prefix mode
+The legacy cloud/object-store spec defines a directory-prefix optimization mode
 that requires directory hints even for small archives. The current CLI/API does
 not expose that mode and does not claim optimized directory-prefix operations.
 Directory hints are emitted automatically for large regular-file archives when
-the v0.43 threshold requires them.
+the legacy threshold requires them.
 
 Example:
 

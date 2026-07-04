@@ -6563,7 +6563,7 @@ mod tests {
             FormatError::UnsupportedVolumeFormatRevision {
                 format_version: 1,
                 volume_format_rev: 44,
-                reader_max_supported_revision: 43,
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
             },
         ] {
             let diagnostic = classify_format_error(&err);

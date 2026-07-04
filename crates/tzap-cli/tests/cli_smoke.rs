@@ -638,7 +638,7 @@ fn cli_create_requires_key_source_before_running() {
 }
 
 #[test]
-fn cli_insecure_zero_key_is_removed_in_v43() {
+fn cli_insecure_zero_key_is_removed() {
     let temp = tempdir().unwrap();
     let output = temp.path().join("sample.tzap");
     let input = temp.path().join("hello.txt");
@@ -656,7 +656,7 @@ fn cli_insecure_zero_key_is_removed_in_v43() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains(
-            "--insecure-zero-key was removed in v43",
+            "--insecure-zero-key was removed",
         ));
 }
 

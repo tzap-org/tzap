@@ -503,7 +503,7 @@ fn traceability_materials_live_under_requested_folder_and_cover_claim_gates() {
 
     assert!(index.contains("v44-compliant reference implementation"));
     assert!(index.contains("documented supported"));
-    assert!(index.contains("Legacy v43"));
+    assert!(index.contains("Legacy"));
     assert!(index.contains("archives fail closed as unsupported revisions"));
     assert!(index.contains("public-docs/traceability"));
     assert!(index.contains("cargo fmt --check"));
