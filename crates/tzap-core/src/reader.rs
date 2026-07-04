@@ -15,12 +15,11 @@ use crate::fec::{encode_parity_gf16, repair_data_gf16};
 use crate::format::{
     AeadAlgo, BlockKind, ExtractError, FormatError, KdfAlgo, VolumeFormatRevision,
     BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN, CRITICAL_METADATA_IMAGE_FIXED_LEN,
-    CRITICAL_METADATA_IMAGE_FIXED_LEN_V43, CRITICAL_METADATA_RECOVERY_HEADER_LEN,
-    CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN, CRITICAL_RECOVERY_LOCATOR_LEN,
-    CRYPTO_HEADER_HMAC_LEN, IMAGE_CRC_LEN, LOCATOR_PAIR_LEN, MANIFEST_FOOTER_LEN, MASTER_KEY_LEN,
-    READER_MAX_CMRA_PARITY_PCT, READER_MAX_CRYPTO_HEADER_LEN, READER_MAX_KEY_WRAP_TABLE_LEN,
-    READER_MAX_ROOT_AUTH_FOOTER_LEN, SERIALIZED_REGION_HEADER_LEN, VOLUME_FORMAT_REV_44,
-    VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    CRITICAL_METADATA_RECOVERY_HEADER_LEN, CRITICAL_METADATA_RECOVERY_SHARD_HEADER_LEN,
+    CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_HEADER_HMAC_LEN, IMAGE_CRC_LEN, LOCATOR_PAIR_LEN,
+    MANIFEST_FOOTER_LEN, MASTER_KEY_LEN, READER_MAX_CMRA_PARITY_PCT, READER_MAX_CRYPTO_HEADER_LEN,
+    READER_MAX_KEY_WRAP_TABLE_LEN, READER_MAX_ROOT_AUTH_FOOTER_LEN, SERIALIZED_REGION_HEADER_LEN,
+    VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, DirectoryHintShardEntry, DirectoryHintTable,
@@ -656,7 +655,7 @@ fn parse_volume_format_dispatch(
 ) -> Result<VolumeFormatRevision, FormatError> {
     let revision = volume_header.parse_volume_format_revision()?;
     match revision {
-        VolumeFormatRevision::V43 | VolumeFormatRevision::V44 => Ok(revision),
+        VolumeFormatRevision::V44 => Ok(revision),
     }
 }
 
@@ -3911,31 +3910,26 @@ pub(crate) fn startup_key_wrap_table(
         volume_header.crypto_header_length as u64,
         "CryptoHeader",
     )?;
-    // v43 is still supported by the reader for legacy compatibility.
-    // Key-wrap table recovery is only enabled for v44 archives.
-    if volume_header.volume_format_rev == VOLUME_FORMAT_REV_44 {
-        let &KdfParams::RecipientWrap {
-            key_wrap_table_length,
-            ..
-        } = kdf_params
-        else {
-            return Ok(None);
-        };
-        let key_wrap_table_length_usize =
-            to_usize(u64::from(key_wrap_table_length), "KeyWrapTableV1 length")?;
-        let key_wrap_table_bytes = read_key_wrap_table(crypto_end, key_wrap_table_length_usize)?;
-        Ok(Some(parse_startup_key_wrap_table_bytes(
-            volume_header,
-            kdf_params,
-            key_wrap_table_bytes,
-        )?))
-    } else if matches!(kdf_params, KdfParams::RecipientWrap { .. }) {
-        Err(FormatError::InvalidArchive(
+    let &KdfParams::RecipientWrap {
+        key_wrap_table_length,
+        ..
+    } = kdf_params
+    else {
+        return Ok(None);
+    };
+    if volume_header.volume_format_rev != VOLUME_FORMAT_REV_44 {
+        return Err(FormatError::InvalidArchive(
             "RecipientWrap KdfParams require volume_format_rev 44",
-        ))
-    } else {
-        Ok(None)
+        ));
     }
+    let key_wrap_table_length_usize =
+        to_usize(u64::from(key_wrap_table_length), "KeyWrapTableV1 length")?;
+    let key_wrap_table_bytes = read_key_wrap_table(crypto_end, key_wrap_table_length_usize)?;
+    Ok(Some(parse_startup_key_wrap_table_bytes(
+        volume_header,
+        kdf_params,
+        key_wrap_table_bytes,
+    )?))
 }
 
 pub(crate) fn parse_startup_key_wrap_table_bytes(
@@ -7069,26 +7063,12 @@ fn validate_critical_metadata_image(
     let root_auth_present = image.layout_flags & 0x0000_0001 != 0;
     let key_wrap_layout_present = image.layout_flags & 0x0000_0002 != 0;
     let key_wrap_region = image.region(6);
-    let key_wrap_present = if image.volume_format_rev == VOLUME_FORMAT_REV_44 {
-        if key_wrap_layout_present != key_wrap_region.is_some() {
-            return Err(FormatError::InvalidArchive(
-                "CriticalMetadataImage key-wrap layout flag mismatch",
-            ));
-        }
-        key_wrap_layout_present
-    } else {
-        if key_wrap_layout_present
-            || key_wrap_region.is_some()
-            || image.key_wrap_table_offset != 0
-            || image.key_wrap_table_length != 0
-            || image.key_wrap_table_sha256 != [0u8; 32]
-        {
-            return Err(FormatError::InvalidArchive(
-                "v43 CriticalMetadataImage cannot contain KeyWrapTableV1",
-            ));
-        }
-        false
-    };
+    if key_wrap_layout_present != key_wrap_region.is_some() {
+        return Err(FormatError::InvalidArchive(
+            "CriticalMetadataImage key-wrap layout flag mismatch",
+        ));
+    }
+    let key_wrap_present = key_wrap_layout_present;
     if image.volume_header_offset != 0
         || image.volume_header_length != VOLUME_HEADER_LEN as u32
         || image.crypto_header_offset != VOLUME_HEADER_LEN as u64
@@ -7349,8 +7329,7 @@ fn validate_image_key_wrap_table(
             key_wrap_table_digest,
             ..
         } => {
-            if image.volume_format_rev != VOLUME_FORMAT_REV_44
-                || image.layout_flags & 0x0000_0002 == 0
+            if image.layout_flags & 0x0000_0002 == 0
                 || image.key_wrap_table_length != *key_wrap_table_length
             {
                 return Err(FormatError::InvalidArchive(
@@ -7897,7 +7876,7 @@ fn validate_v41_public_trailer_profile(
 
 fn critical_image_min() -> u64 {
     const MIN_CRYPTO_HEADER_LEN: u64 = 116;
-    CRITICAL_METADATA_IMAGE_FIXED_LEN_V43 as u64
+    CRITICAL_METADATA_IMAGE_FIXED_LEN as u64
         + 4 * SERIALIZED_REGION_HEADER_LEN as u64
         + VOLUME_HEADER_LEN as u64
         + MIN_CRYPTO_HEADER_LEN
@@ -10190,7 +10169,7 @@ mod tests {
     use crate::format::{
         AeadAlgo, CompressionAlgo, FecAlgo, KdfAlgo, CRYPTO_EXTENSION_HEADER_LEN,
         CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION, READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
-        VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_43, VOLUME_FORMAT_REV_44,
+        VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44,
     };
     use crate::metadata::{
         DirectoryHintEntry, DirectoryHintTableHeader, IndexRootHeader, IndexShardHeader,
@@ -10742,7 +10721,7 @@ mod tests {
         .unwrap();
         let mut bytes = archive.bytes;
         let mut header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
-        header.volume_format_rev = VOLUME_FORMAT_REV_43;
+        header.volume_format_rev = 43;
         bytes[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
 
         let mut called = false;
@@ -10755,7 +10734,11 @@ mod tests {
         assert!(!called);
         assert_eq!(
             err,
-            FormatError::InvalidArchive("no valid v41 public CMRA candidate found")
+            FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
+                volume_format_rev: 43,
+                reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
+            }
         );
     }
 
@@ -10781,9 +10764,7 @@ mod tests {
                 .iter_mut()
                 .find(|region| region.region_type == 4)
                 .unwrap();
-            let mut footer = RootAuthFooterV1::parse(&root_auth_region.bytes).unwrap();
-            footer.volume_format_rev = VOLUME_FORMAT_REV_43;
-            root_auth_region.bytes = footer.to_bytes().unwrap();
+            rewrite_root_auth_footer_revision_bytes(&mut root_auth_region.bytes, 43);
         });
 
         let mut called = false;
@@ -10801,7 +10782,7 @@ mod tests {
     }
 
     #[test]
-    fn public_no_key_rejects_recovered_image_revision_mismatch() {
+    fn public_no_key_rejects_recovered_image_with_unknown_layout_flags() {
         let archive = write_archive_with_root_auth(
             &[RegularFile::new("public.txt", b"public image mismatch")],
             &master_key(),
@@ -10819,7 +10800,7 @@ mod tests {
             &archive.bytes,
             CmraRecoveryMode::PublicNoKey,
             |image| {
-                image.volume_format_rev = VOLUME_FORMAT_REV_43;
+                image.layout_flags |= 0x8000_0000;
             },
         );
 
@@ -11161,7 +11142,7 @@ mod tests {
     }
 
     #[test]
-    fn key_holding_rejects_recovered_image_revision_mismatch() {
+    fn key_holding_rejects_recovered_image_with_unknown_layout_flags() {
         let archive = write_archive(
             &[RegularFile::new("cmra-image-revision.txt", b"payload")],
             &master_key(),
@@ -11172,7 +11153,7 @@ mod tests {
             &archive.bytes,
             CmraRecoveryMode::KeyHolding,
             |image| {
-                image.volume_format_rev = VOLUME_FORMAT_REV_43;
+                image.layout_flags |= 0x8000_0000;
             },
         );
         mutated[0] ^= 0x55;
@@ -11197,9 +11178,7 @@ mod tests {
                 .iter_mut()
                 .find(|region| region.region_type == 4)
                 .unwrap();
-            let mut footer = RootAuthFooterV1::parse(&root_auth_region.bytes).unwrap();
-            footer.volume_format_rev = VOLUME_FORMAT_REV_43;
-            root_auth_region.bytes = footer.to_bytes().unwrap();
+            rewrite_root_auth_footer_revision_bytes(&mut root_auth_region.bytes, 43);
         });
         mutated[0] ^= 0x55;
 
@@ -11220,7 +11199,7 @@ mod tests {
         let final_offset = mutated.len() - CRITICAL_RECOVERY_LOCATOR_LEN;
         for offset in [mirror_offset, final_offset] {
             rewrite_recovery_locator(&mut mutated, offset, |locator| {
-                locator.volume_format_rev = VOLUME_FORMAT_REV_43;
+                locator.volume_format_rev = 43;
             });
         }
         mutated[0] ^= 0x55;
@@ -11230,9 +11209,9 @@ mod tests {
     }
 
     #[test]
-    fn image_identity_allows_matching_v43_revision() {
+    fn image_identity_allows_matching_current_revision() {
         let archive = write_archive(
-            &[RegularFile::new("matching-v43.txt", b"payload")],
+            &[RegularFile::new("matching-v44.txt", b"payload")],
             &master_key(),
             single_stream_options(),
         )
@@ -11245,8 +11224,8 @@ mod tests {
             CmraRecoveryMode::KeyHolding,
         )
         .unwrap();
-        let mut image = recovered.image;
-        let mut header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
+        let image = recovered.image;
+        let header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
         let crypto_start = header.crypto_header_offset as usize;
         let crypto_end = crypto_start + header.crypto_header_length as usize;
         let crypto = CryptoHeader::parse(
@@ -11254,9 +11233,6 @@ mod tests {
             header.crypto_header_length,
         )
         .unwrap();
-
-        image.volume_format_rev = VOLUME_FORMAT_REV_43;
-        header.volume_format_rev = VOLUME_FORMAT_REV_43;
 
         validate_image_identity(&image, &header, &crypto.fixed).unwrap();
     }
@@ -16706,6 +16682,13 @@ mod tests {
         mutate: impl FnOnce(&mut CriticalMetadataImage),
     ) {
         rewrite_cmra_image(volume, CmraRecoveryMode::PublicNoKey, mutate);
+    }
+
+    fn rewrite_root_auth_footer_revision_bytes(bytes: &mut [u8], revision: u16) {
+        bytes[72..74].copy_from_slice(&revision.to_le_bytes());
+        let crc_offset = bytes.len() - 4;
+        let crc = crc32c::crc32c(&bytes[..crc_offset]);
+        bytes[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
     }
 
     fn rewrite_cmra_image(

@@ -498,33 +498,19 @@ fn traceability_materials_live_under_requested_folder_and_cover_claim_gates() {
     assert!(root.is_dir());
 
     let index = read_workspace_file("public-docs/traceability/README.md");
-    let v43 = read_workspace_file("public-docs/traceability/v43-core-traceability.md");
     let signing = read_workspace_file("public-docs/traceability/signing-plugin-traceability.md");
     let runbook = read_workspace_file("public-docs/traceability/verification-runbook.md");
 
     assert!(index.contains("v44-compliant reference implementation"));
     assert!(index.contains("documented supported"));
+    assert!(index.contains("Legacy v43"));
+    assert!(index.contains("archives fail closed as unsupported revisions"));
     assert!(index.contains("public-docs/traceability"));
     assert!(index.contains("cargo fmt --check"));
     assert!(index.contains("cargo clippy --workspace --all-targets -- -D warnings"));
     assert!(index.contains("cargo test --workspace"));
     assert!(index.contains("cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked"));
     assert!(index.contains("cargo audit"));
-
-    for required in [
-        "V43-001",
-        "V43-014",
-        "V43-019",
-        "V43-022",
-        "V43-027",
-        "Unsupported and documented",
-        "No implementation gap is recorded",
-    ] {
-        assert!(
-            v43.contains(required),
-            "missing v43 traceability marker {required}"
-        );
-    }
 
     for required in [
         "SIGN-001",

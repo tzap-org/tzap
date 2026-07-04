@@ -330,7 +330,7 @@ fn cli_top_level_help_contains_product_description_and_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Create, list, verify, and extract v43/v44 archives",
+            "Create, list, verify, and extract v44 archives",
         ))
         .stdout(predicate::str::contains("create"))
         .stdout(predicate::str::contains("extract"))
@@ -2407,7 +2407,7 @@ fn cli_extract_reads_unencrypted_archive_without_key_source() {
     let input = temp.path().join("sample.txt");
     let archive = temp.path().join("sample.tzap");
     let output = temp.path().join("out");
-    fs::write(&input, b"plaintext v43\n").unwrap();
+    fs::write(&input, b"plaintext v44\n").unwrap();
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -2434,7 +2434,7 @@ fn cli_extract_reads_unencrypted_archive_without_key_source() {
 
     assert_eq!(
         fs::read(output.join("sample.txt")).unwrap(),
-        b"plaintext v43\n"
+        b"plaintext v44\n"
     );
 }
 
@@ -2443,7 +2443,7 @@ fn cli_list_reads_unencrypted_archive_without_key_source() {
     let temp = tempdir().unwrap();
     let input = temp.path().join("sample.txt");
     let archive = temp.path().join("sample.tzap");
-    fs::write(&input, b"plaintext v43\n").unwrap();
+    fs::write(&input, b"plaintext v44\n").unwrap();
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -2470,7 +2470,7 @@ fn cli_verify_reads_unencrypted_archive_without_key_source() {
     let temp = tempdir().unwrap();
     let input = temp.path().join("sample.txt");
     let archive = temp.path().join("sample.tzap");
-    fs::write(&input, b"plaintext v43\n").unwrap();
+    fs::write(&input, b"plaintext v44\n").unwrap();
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -2535,7 +2535,7 @@ fn cli_plaintext_header_digest_corruption_is_corrupt_archive_not_wrong_key() {
     let input = temp.path().join("sample.txt");
     let archive = temp.path().join("sample.tzap");
 
-    fs::write(&input, b"plaintext v43\n").unwrap();
+    fs::write(&input, b"plaintext v44\n").unwrap();
     Command::cargo_bin("tzap")
         .unwrap()
         .args([

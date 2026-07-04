@@ -8,7 +8,7 @@ authenticated encryption, safe extraction defaults, multi-volume recovery, and
 instant selected-file restores into one practical command.
 
 This release is the v44-compliant reference CLI for documented supported
-workflows, with v43 reader compatibility.
+workflows. Legacy v43 inputs fail closed with an unsupported revision error.
 
 Use it for project folders, private datasets, media collections, cold storage,
 cloud object storage, and long-lived backup sets where "just zip it" is not

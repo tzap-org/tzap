@@ -36,7 +36,7 @@ checksums, parity files, split-volume naming, and restore logic.
   tests, and fuzz targets are in this repository.
 - **It is v44-compliant for the supported workflows.** The documented writer,
   reader, recovery, RootAuth, and RecipientWrap workflows are covered by the
-  traceability gates, with v43 reader compatibility preserved.
+  traceability gates. Legacy v43 archives now fail closed as unsupported.
 
 ## Built for
 
@@ -127,7 +127,6 @@ See the [recovery matrix](public-docs/tzap-recovery-matrix.md) for the simple
 - Core library: [crates.io/crates/tzap-core](https://crates.io/crates/tzap-core)
 - Signing plugin: [crates.io/crates/tzap-plugin-signing](https://crates.io/crates/tzap-plugin-signing)
 - Implemented format spec: [specs/tzap-format-revisedv44.md](specs/tzap-format-revisedv44.md)
-- v43 compatibility spec: [specs/tzap-format-revisedv43.md](specs/tzap-format-revisedv43.md)
 - v44 compliance traceability: [public-docs/traceability/README.md](public-docs/traceability/README.md)
 - Development guide: [public-docs/tzap-development.md](public-docs/tzap-development.md)
 

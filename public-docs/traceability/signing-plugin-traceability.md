@@ -4,7 +4,7 @@ Source scope:
 
 - `crates/tzap-plugin-signing`
 - `crates/tzap-cli` RootAuth signing and verification integration
-- v44 RootAuth carriage and v43 compatibility verification APIs in `tzap-core`
+- v44 RootAuth carriage and verification APIs in `tzap-core`
 
 This matrix covers the supported signing profiles. Timestamp authority,
 transparency logs, revocation checking, EdDSA certificates in the X.509 profile,

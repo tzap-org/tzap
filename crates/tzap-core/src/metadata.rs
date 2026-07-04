@@ -1140,9 +1140,9 @@ fn file_entry_len_for_index_shard_version(version: u32) -> Result<usize, FormatE
     }
 }
 
-fn file_entry_parser_for_index_shard_version(
-    version: u32,
-) -> Result<fn(&[u8]) -> Result<FileEntry, FormatError>, FormatError> {
+type FileEntryParser = fn(&[u8]) -> Result<FileEntry, FormatError>;
+
+fn file_entry_parser_for_index_shard_version(version: u32) -> Result<FileEntryParser, FormatError> {
     match version {
         INDEX_SHARD_VERSION_V1 => Ok(parse_file_entry_v1),
         INDEX_SHARD_VERSION_V2 => Ok(parse_file_entry_v2),

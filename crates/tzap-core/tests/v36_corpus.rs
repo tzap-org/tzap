@@ -6,7 +6,7 @@ use tzap_core::fec::encode_parity_gf16;
 use tzap_core::format::{
     AeadAlgo, FormatError, CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION,
     MASTER_KEY_LEN, READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, SUBKEY_LEN, VOLUME_FORMAT_REV,
-    VOLUME_FORMAT_REV_43, VOLUME_HEADER_LEN,
+    VOLUME_HEADER_LEN,
 };
 use tzap_core::metadata::{
     hash_prefix, normalize_lookup_directory_path, normalize_lookup_file_path,
@@ -82,7 +82,7 @@ fn mutation_fixture_generator_rejects_authentication_and_revision_mutations() {
     .unwrap();
 
     for revision in [
-        VOLUME_FORMAT_REV_43 - 1,
+        VOLUME_FORMAT_REV - 1,
         READER_MAX_SUPPORTED_VOLUME_FORMAT_REV + 1,
     ] {
         let mut mutated = archive.bytes.clone();
@@ -955,7 +955,7 @@ fn volume_format_revision_freshness_is_pinned_to_current_revision() {
     VolumeHeader::parse(&base.to_bytes()).unwrap();
 
     for rev in [
-        VOLUME_FORMAT_REV_43 - 1,
+        VOLUME_FORMAT_REV - 1,
         READER_MAX_SUPPORTED_VOLUME_FORMAT_REV + 1,
     ] {
         let mut mutated = base.clone();

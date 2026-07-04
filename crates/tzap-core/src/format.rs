@@ -1,7 +1,6 @@
 use thiserror::Error;
 
 pub const FORMAT_VERSION: u16 = 1;
-pub const VOLUME_FORMAT_REV_43: u16 = 43;
 pub const VOLUME_FORMAT_REV_44: u16 = 44;
 pub const READER_MAX_SUPPORTED_VOLUME_FORMAT_REV: u16 = VOLUME_FORMAT_REV_44;
 pub const VOLUME_FORMAT_REV: u16 = VOLUME_FORMAT_REV_44;
@@ -11,10 +10,8 @@ pub const CRYPTO_HEADER_FIXED_LEN: usize = 76;
 pub const MANIFEST_FOOTER_LEN: usize = 136;
 pub const VOLUME_TRAILER_LEN: usize = 128;
 pub const ROOT_AUTH_FOOTER_FIXED_LEN: usize = 318;
-pub const ROOT_AUTH_SPEC_ID_V43: [u8; 24] = *b"tzap-root-auth-v0.43\0\0\0\0";
 pub const ROOT_AUTH_SPEC_ID_V44: [u8; 24] = *b"tzap-root-auth-v0.44\0\0\0\0";
 pub const ROOT_AUTH_SPEC_ID: [u8; 24] = ROOT_AUTH_SPEC_ID_V44;
-pub const CRITICAL_METADATA_IMAGE_FIXED_LEN_V43: usize = 320;
 pub const CRITICAL_METADATA_IMAGE_FIXED_LEN: usize = 364;
 pub const SERIALIZED_REGION_HEADER_LEN: usize = 16;
 pub const IMAGE_CRC_LEN: usize = 4;
@@ -40,14 +37,12 @@ pub const READER_MAX_ARGON2ID_M_COST_KIB: u32 = 4 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum VolumeFormatRevision {
-    V43 = VOLUME_FORMAT_REV_43,
     V44 = VOLUME_FORMAT_REV_44,
 }
 
 impl VolumeFormatRevision {
     pub const fn from_u16(value: u16) -> Option<Self> {
         match value {
-            VOLUME_FORMAT_REV_43 => Some(Self::V43),
             VOLUME_FORMAT_REV_44 => Some(Self::V44),
             _ => None,
         }
@@ -304,13 +299,13 @@ pub enum FormatError {
     )]
     CryptoHeaderLengthMismatch { fixed: u32, volume: u32 },
 
-    #[error("compression algorithm {0:?} is not valid for v0.43")]
+    #[error("compression algorithm {0:?} is not valid for v0.44")]
     UnsupportedCompression(CompressionAlgo),
 
-    #[error("FEC algorithm {0:?} is not valid for v0.43")]
+    #[error("FEC algorithm {0:?} is not valid for v0.44")]
     UnsupportedFec(FecAlgo),
 
-    #[error("invalid v0.43 protection mode: aead_algo={aead_algo:?}, kdf_algo={kdf_algo:?}")]
+    #[error("invalid v0.44 protection mode: aead_algo={aead_algo:?}, kdf_algo={kdf_algo:?}")]
     InvalidProtectionMode {
         aead_algo: AeadAlgo,
         kdf_algo: KdfAlgo,
@@ -343,7 +338,7 @@ pub enum FormatError {
         envelope_target_size: u32,
     },
 
-    #[error("block_size {0} is below the v0.43 minimum")]
+    #[error("block_size {0} is below the v0.44 minimum")]
     BlockSizeTooSmall(u32),
 
     #[error("block_size {0} must be even")]
@@ -558,7 +553,6 @@ pub fn root_auth_spec_id_for_revision(
         return Err(FormatError::UnsupportedFormatVersion(format_version));
     }
     match volume_format_rev {
-        VOLUME_FORMAT_REV_43 => Ok(ROOT_AUTH_SPEC_ID_V43),
         VOLUME_FORMAT_REV_44 => Ok(ROOT_AUTH_SPEC_ID_V44),
         other => Err(FormatError::UnsupportedVolumeFormatRevision {
             format_version,

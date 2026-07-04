@@ -326,8 +326,8 @@ Notes:
   recipient key, but it does not imply RootAuth signing or signer trust.
 - RootAuth success reports a trusted signer over the recomputed archive root,
   but it does not imply the signer can decrypt the archive.
-- `revision_mode` is explicit: v43 archives report `v43-compatibility`; v44
-  archives report `v44`.
+- `revision_mode` is explicit: supported v44 archives report `v44`; legacy
+  v43 archives are rejected as `unsupported-revision`.
 - Fast verification is available only for seekable archive paths, not archive
   stdin. For plaintext, unsigned, dictionary-free archives with no recovery
   parity, it validates metadata and payload BlockRecord integrity without

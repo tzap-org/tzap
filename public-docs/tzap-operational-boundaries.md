@@ -12,10 +12,10 @@ layout rules. If an archive was written by a newer tzap format revision than
 the installed reader supports, `tzap` exits with `12 unsupported-revision`
 instead of reporting a wrong key or corrupt archive.
 
-Example during a v43-to-v44 migration:
+Example with a future archive revision:
 
 ```sh
-tzap list --keyfile project.key future-v44.tzap
+tzap list --keyfile project.key future-v45.tzap
 # exit 12: unsupported-revision
 ```
 
@@ -316,7 +316,7 @@ file-backed `ArchiveReadAt` APIs benefit from the same repair behavior.
 ## Verify repaired copies
 
 Key-holding `tzap verify` can write repaired sibling copies for volumes that
-contain recoverable BlockRecord damage. For file-backed v43/v44 inputs, this
+contain recoverable BlockRecord damage. For file-backed v44 inputs, this
 includes CRC failures and malformed fixed slots such as a damaged `TZBK` marker
 or reserved BlockRecord bytes after `tzap` has recovered the archive layout:
 

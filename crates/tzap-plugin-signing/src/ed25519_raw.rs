@@ -212,8 +212,8 @@ mod tests {
     use super::*;
     use rand::rngs::OsRng;
     use tzap_core::format::{
-        FORMAT_VERSION, ROOT_AUTH_SPEC_ID, ROOT_AUTH_SPEC_ID_V43, ROOT_AUTH_SPEC_ID_V44,
-        VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44,
+        FORMAT_VERSION, ROOT_AUTH_SPEC_ID, ROOT_AUTH_SPEC_ID_V44, VOLUME_FORMAT_REV,
+        VOLUME_FORMAT_REV_44,
     };
 
     #[test]
@@ -334,7 +334,7 @@ mod tests {
         );
 
         let wrong_spec_request = RootAuthSigningRequest {
-            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V43,
+            root_auth_spec_id: [0xA5; 24],
             ..request
         };
         let mut wrong_spec_footer = footer;

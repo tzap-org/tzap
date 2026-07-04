@@ -18,8 +18,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tzap_core::format::{
     FormatError, CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION, READER_MAX_ARGON2ID_M_COST_KIB,
     READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST,
-    READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_43, VOLUME_FORMAT_REV_44,
-    VOLUME_HEADER_LEN,
+    READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN,
 };
 use tzap_core::reader::{ArchiveEntry, ArchiveIndexEntry, RecipientWrapRecordContext};
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
@@ -98,9 +97,9 @@ type CliRootAuthAuthenticator<'a> =
 #[derive(Debug, Parser)]
 #[command(name = "tzap")]
 #[command(version)]
-#[command(about = "Create, list, verify, and extract v43/v44 archives")]
+#[command(about = "Create, list, verify, and extract v44 archives")]
 #[command(
-    long_about = "Create, list, verify, and extract v43/v44 archives.\n\nCreate selects one protection mode: `--keyfile` for encrypted raw-key archives, `--password` or `--password-stdin` for encrypted passphrase archives, `--recipient-cert` for encrypted v44 RecipientWrap archives, or `--no-encryption` for explicit plaintext archives. Plaintext archives can be listed, verified, and extracted without a password or keyfile. RecipientWrap archives are opened with `--recipient-key`. The `verify --public-no-key` mode verifies signed public RootAuth commitments without the archive key.\n\nSize suffixes accepted by size flags:\n  0-9 (bytes), K/KB/KiB, M/MB/MiB, G/GB/GiB.\n\nMulti-volume output naming for this CLI:\n  - one volume: --output writes exactly that path\n  - multiple volumes: --output backup.tzap writes backup.vol000.tzap, backup.vol001.tzap, ...\n\nExit codes:\n  2  usage / argument error\n  3  I/O failure (missing file, permission denied, etc.)\n  10 wrong key\n  11 archive corruption or integrity mismatch\n  12 unsupported archive revision / format version\n  13 unsafe extraction attempt\n  14 missing required bootstrap metadata\n  16 unsupported feature in this CLI/core version\n  1  generic failure\n\nSubcommands:\n  create   Build a new archive\n  extract  Extract files from an archive\n  list     List archive contents\n  verify   Validate archive integrity\n  keygen   Generate a random raw keyfile\n  signing-keygen Generate an Ed25519 RootAuth signing keypair"
+    long_about = "Create, list, verify, and extract v44 archives.\n\nCreate selects one protection mode: `--keyfile` for encrypted raw-key archives, `--password` or `--password-stdin` for encrypted passphrase archives, `--recipient-cert` for encrypted v44 RecipientWrap archives, or `--no-encryption` for explicit plaintext archives. Plaintext archives can be listed, verified, and extracted without a password or keyfile. RecipientWrap archives are opened with `--recipient-key`. The `verify --public-no-key` mode verifies signed public RootAuth commitments without the archive key.\n\nSize suffixes accepted by size flags:\n  0-9 (bytes), K/KB/KiB, M/MB/MiB, G/GB/GiB.\n\nMulti-volume output naming for this CLI:\n  - one volume: --output writes exactly that path\n  - multiple volumes: --output backup.tzap writes backup.vol000.tzap, backup.vol001.tzap, ...\n\nExit codes:\n  2  usage / argument error\n  3  I/O failure (missing file, permission denied, etc.)\n  10 wrong key\n  11 archive corruption or integrity mismatch\n  12 unsupported archive revision / format version\n  13 unsafe extraction attempt\n  14 missing required bootstrap metadata\n  16 unsupported feature in this CLI/core version\n  1  generic failure\n\nSubcommands:\n  create   Build a new archive\n  extract  Extract files from an archive\n  list     List archive contents\n  verify   Validate archive integrity\n  keygen   Generate a random raw keyfile\n  signing-keygen Generate an Ed25519 RootAuth signing keypair"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -4946,7 +4945,6 @@ fn verify_opened_root_auth_x509(
 
 fn revision_mode_label(volume_format_rev: u16) -> &'static str {
     match volume_format_rev {
-        VOLUME_FORMAT_REV_43 => "v43-compatibility",
         VOLUME_FORMAT_REV_44 => "v44",
         _ => "unsupported",
     }

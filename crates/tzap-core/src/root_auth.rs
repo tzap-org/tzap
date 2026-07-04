@@ -2,25 +2,17 @@ use sha2::{Digest, Sha256};
 
 use crate::format::{
     root_auth_spec_id_for_revision, AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, FormatError,
-    KdfAlgo, FORMAT_VERSION, VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_43, VOLUME_FORMAT_REV_44,
+    KdfAlgo, FORMAT_VERSION, VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44,
 };
 
 const ROOT_AUTH_DESCRIPTOR_DOMAIN: &[u8] = b"tzap-root-auth-descriptor-v1\0";
-const ARCHIVE_ROOT_DOMAIN_V43: &[u8] = b"tzap-archive-root-v43\0";
 const ARCHIVE_ROOT_DOMAIN_V44: &[u8] = b"tzap-archive-root-v44\0";
-const CRYPTO_HEADER_PRE_HMAC_DOMAIN_V43: &[u8] = b"tzap-crypto-header-pre-hmac-v43\0";
 const CRYPTO_HEADER_PRE_HMAC_DOMAIN_V44: &[u8] = b"tzap-crypto-header-pre-hmac-v44\0";
-const MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN_V43: &[u8] =
-    b"tzap-manifest-footer-global-pre-hmac-v43\0";
 const MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN_V44: &[u8] =
     b"tzap-manifest-footer-global-pre-hmac-v44\0";
-const CRITICAL_METADATA_DOMAIN_V43: &[u8] = b"tzap-critical-metadata-v43\0";
 const CRITICAL_METADATA_DOMAIN_V44: &[u8] = b"tzap-critical-metadata-v44\0";
-const INDEX_ROOT_DOMAIN_V43: &[u8] = b"tzap-index-root-v43\0";
 const INDEX_ROOT_DOMAIN_V44: &[u8] = b"tzap-index-root-v44\0";
-const FEC_LAYOUT_DOMAIN_V43: &[u8] = b"tzap-fec-layout-v43\0";
 const FEC_LAYOUT_DOMAIN_V44: &[u8] = b"tzap-fec-layout-v44\0";
-const DATA_BLOCK_MERKLE_DOMAIN_V43: &[u8] = b"tzap-data-block-merkle-v43\0";
 const DATA_BLOCK_MERKLE_DOMAIN_V44: &[u8] = b"tzap-data-block-merkle-v44\0";
 const EMPTY_MERKLE_DOMAIN: &[u8] = b"tzap-empty-merkle-tree-v1\0";
 const SIGNER_IDENTITY_DOMAIN: &[u8] = b"tzap-signer-identity-v1\0";
@@ -115,29 +107,23 @@ fn root_auth_revision_params(
     volume_format_rev: u16,
 ) -> Result<RootAuthRevisionParams, FormatError> {
     let root_auth_spec_id = root_auth_spec_id_for_revision(format_version, volume_format_rev)?;
-    match volume_format_rev {
-        VOLUME_FORMAT_REV_43 => Ok(RootAuthRevisionParams {
-            root_auth_spec_id,
-            archive_root_domain: ARCHIVE_ROOT_DOMAIN_V43,
-            crypto_header_pre_hmac_domain: CRYPTO_HEADER_PRE_HMAC_DOMAIN_V43,
-            manifest_footer_global_pre_hmac_domain: MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN_V43,
-            critical_metadata_domain: CRITICAL_METADATA_DOMAIN_V43,
-            index_root_domain: INDEX_ROOT_DOMAIN_V43,
-            fec_layout_domain: FEC_LAYOUT_DOMAIN_V43,
-            data_block_merkle_domain: DATA_BLOCK_MERKLE_DOMAIN_V43,
-        }),
-        VOLUME_FORMAT_REV_44 => Ok(RootAuthRevisionParams {
-            root_auth_spec_id,
-            archive_root_domain: ARCHIVE_ROOT_DOMAIN_V44,
-            crypto_header_pre_hmac_domain: CRYPTO_HEADER_PRE_HMAC_DOMAIN_V44,
-            manifest_footer_global_pre_hmac_domain: MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN_V44,
-            critical_metadata_domain: CRITICAL_METADATA_DOMAIN_V44,
-            index_root_domain: INDEX_ROOT_DOMAIN_V44,
-            fec_layout_domain: FEC_LAYOUT_DOMAIN_V44,
-            data_block_merkle_domain: DATA_BLOCK_MERKLE_DOMAIN_V44,
-        }),
-        _ => unreachable!("root_auth_spec_id_for_revision accepted unsupported revision"),
+    if volume_format_rev != VOLUME_FORMAT_REV_44 {
+        return Err(FormatError::UnsupportedVolumeFormatRevision {
+            format_version,
+            volume_format_rev,
+            reader_max_supported_revision: VOLUME_FORMAT_REV_44,
+        });
     }
+    Ok(RootAuthRevisionParams {
+        root_auth_spec_id,
+        archive_root_domain: ARCHIVE_ROOT_DOMAIN_V44,
+        crypto_header_pre_hmac_domain: CRYPTO_HEADER_PRE_HMAC_DOMAIN_V44,
+        manifest_footer_global_pre_hmac_domain: MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN_V44,
+        critical_metadata_domain: CRITICAL_METADATA_DOMAIN_V44,
+        index_root_domain: INDEX_ROOT_DOMAIN_V44,
+        fec_layout_domain: FEC_LAYOUT_DOMAIN_V44,
+        data_block_merkle_domain: DATA_BLOCK_MERKLE_DOMAIN_V44,
+    })
 }
 
 pub fn root_auth_descriptor_digest(
@@ -601,21 +587,22 @@ mod tests {
     }
 
     #[test]
-    fn v44_no_key_archive_root_uses_v44_domains() {
-        let v43 = archive_root_for_revision(sample_archive_inputs(
-            VOLUME_FORMAT_REV_43,
-            KdfAlgo::None,
-            [8; 32],
-        ))
-        .unwrap();
-        let v44 = archive_root_for_revision(sample_archive_inputs(
+    fn archive_root_rejects_legacy_revision_43() {
+        assert_eq!(
+            archive_root_for_revision(sample_archive_inputs(43, KdfAlgo::None, [8; 32]))
+                .unwrap_err(),
+            FormatError::UnsupportedVolumeFormatRevision {
+                format_version: FORMAT_VERSION,
+                volume_format_rev: 43,
+                reader_max_supported_revision: VOLUME_FORMAT_REV_44,
+            }
+        );
+        archive_root_for_revision(sample_archive_inputs(
             VOLUME_FORMAT_REV_44,
             KdfAlgo::None,
             [8; 32],
         ))
         .unwrap();
-
-        assert_ne!(v43, v44);
     }
 
     #[test]

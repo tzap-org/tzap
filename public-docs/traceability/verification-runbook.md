@@ -39,8 +39,8 @@ new corpus artifacts that represent unreduced failures.
 The audit pass has two layers:
 
 - Dependency vulnerability scan: `cargo audit`.
-- Traceability audit: confirm every row in the v43 compatibility and signing
-  matrices has a status, implementation pointer, and evidence pointer; confirm
+- Traceability audit: confirm every row in the signing matrix has a status,
+  implementation pointer, and evidence pointer; confirm
   supported v44 workflow evidence in the public docs and verification record;
   and confirm all unsupported rows point to public operational docs or stable
   tests.

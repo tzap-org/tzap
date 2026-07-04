@@ -39,9 +39,7 @@ const DEFAULT_MAX_STREAMED_MEMBER_COUNT: u64 = 1_000_000;
 fn parse_volume_format_dispatch(volume_header: &VolumeHeader) -> Result<(), FormatError> {
     let revision = volume_header.parse_volume_format_revision()?;
     match revision {
-        crate::format::VolumeFormatRevision::V43 | crate::format::VolumeFormatRevision::V44 => {
-            Ok(())
-        }
+        crate::format::VolumeFormatRevision::V44 => Ok(()),
     }
 }
 
