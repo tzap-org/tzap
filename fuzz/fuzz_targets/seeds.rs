@@ -519,6 +519,7 @@ fn valid_index_shard() -> Vec<u8> {
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: 512,
             file_data_size: 0,
+            mtime: None,
             flags: 0,
         }
         .to_bytes(),

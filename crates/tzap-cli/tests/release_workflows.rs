@@ -114,8 +114,11 @@ fn release_workflow_has_smoke_checks() {
         "cargo fmt --all -- --check",
         "cargo check --workspace --all-targets --locked",
         "cargo test --workspace --locked",
+        "cargo clippy --workspace --all-targets -- -D warnings",
         "cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked",
         "cargo check --manifest-path fuzz/Cargo.toml --bins --features libfuzzer --locked",
+        "cargo install cargo-audit --locked",
+        "cargo audit",
     ] {
         assert!(
             workflow.contains(command),

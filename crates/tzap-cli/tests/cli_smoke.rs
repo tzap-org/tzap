@@ -655,9 +655,7 @@ fn cli_insecure_zero_key_is_removed() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains(
-            "--insecure-zero-key was removed",
-        ));
+        .stderr(predicate::str::contains("--insecure-zero-key was removed"));
 }
 
 #[test]
@@ -5685,6 +5683,33 @@ fn cli_create_rejects_existing_bootstrap_output_without_force() {
 }
 
 #[test]
+fn cli_create_rejects_archive_bootstrap_output_alias_even_with_force() {
+    let temp = tempdir().unwrap();
+    let input = temp.path().join("hello.txt");
+    let output = temp.path().join("sample.tzap");
+    let aliased_bootstrap = temp.path().join(".").join("sample.tzap");
+
+    fs::write(&input, b"hello from tzap\n").unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--no-encryption",
+            "--force",
+            "--bootstrap-out",
+            aliased_bootstrap.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("must be different paths"));
+    assert!(!output.exists());
+}
+
+#[test]
 fn cli_create_rejects_volume_size_output_collisions_for_dotted_base() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
@@ -6267,6 +6292,28 @@ fn cli_signing_keygen_writes_restrictive_secret_output() {
         let mode = fs::metadata(&secret).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
+}
+
+#[test]
+fn cli_signing_keygen_rejects_aliased_secret_and_public_outputs() {
+    let temp = tempdir().unwrap();
+    let secret = temp.path().join("root.signing.hex");
+    let public_alias = temp.path().join(".").join("root.signing.hex");
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "signing-keygen",
+            "--force",
+            "--secret-output",
+            secret.to_str().unwrap(),
+            "--public-output",
+            public_alias.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("must be different paths"));
+    assert!(!secret.exists());
 }
 
 #[test]

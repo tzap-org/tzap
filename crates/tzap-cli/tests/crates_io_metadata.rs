@@ -130,6 +130,7 @@ fn publish_dependencies_are_versioned() {
     assert!(
         keywrap_manifest.contains(r#"tzap-core = { path = "../tzap-core", version = "0.1.9" }"#)
     );
+    assert!(keywrap_manifest.contains("x509-parser.workspace = true"));
 }
 
 #[test]

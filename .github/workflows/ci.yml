@@ -48,6 +48,10 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
+      - name: Run clippy
+        if: ${{ matrix.run_fmt }}
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: Run fuzz smoke
         if: ${{ matrix.run_fmt }}
         run: cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked

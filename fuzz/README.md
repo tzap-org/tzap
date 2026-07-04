@@ -18,10 +18,10 @@ through every parser harness. Add minimized repro bytes to the matching
 `fuzz/corpus/<target>/` directory before turning a fuzz failure into a
 regression test.
 
-The seed manifest at `fuzz/corpus/manifest.tsv` maps each target to the v0.36
-section 28.1 corpus cases it is intended to keep warm. Structured seeds are
-built deterministically in `fuzz/fuzz_targets/seeds.rs`; small file seeds live
-under `fuzz/corpus/<target>/`.
+The seed manifest at `fuzz/corpus/manifest.tsv` maps each target to the legacy
+v0.36 section 28.1 corpus cases it keeps warm and the current v44 structured
+seeds it builds deterministically in `fuzz/fuzz_targets/seeds.rs`. Small file
+seeds live under `fuzz/corpus/<target>/`.
 
 ## Longer local fuzzing
 
@@ -36,7 +36,8 @@ cargo fuzz run --features libfuzzer parse_compressed_and_padding -- -max_total_t
 Targets:
 
 - `parse_fixed_structures`: VolumeHeader, CryptoHeader, extension TLVs,
-  BlockRecord, ManifestFooter, VolumeTrailer, and BootstrapSidecarHeader.
+  BlockRecord, ManifestFooter, RootAuthFooter, VolumeTrailer, critical
+  recovery structures, and BootstrapSidecarHeader.
 - `parse_metadata`: IndexRoot, IndexShard, and DirectoryHintTable.
 - `parse_compressed_and_padding`: exact zstd frame validation/decompression and
   suffix depadding.

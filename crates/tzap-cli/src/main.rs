@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1099,7 +1099,13 @@ fn run(cli: Cli) -> Result<()> {
                         )
                         .into());
                     }
-                    write_bootstrap_output(path, &bootstrap_sidecar, force)?;
+                    write_bootstrap_output_with_archive_rollback(
+                        path,
+                        &bootstrap_sidecar,
+                        &output,
+                        1,
+                        force,
+                    )?;
                 }
                 let write_outputs = write_outputs_started.elapsed();
                 emit_success_summary(quiet, &summary_text)?;
@@ -1206,16 +1212,13 @@ fn run(cli: Cli) -> Result<()> {
                 }
 
                 let write_outputs_started = Instant::now();
-                write_archive_outputs(&output, &archive.volumes, force)?;
-                if let Some(path) = bootstrap_out {
-                    if archive.bootstrap_sidecar.is_empty() {
-                        return Err(FormatError::WriterUnsupported(
-                            "bootstrap output is unavailable for this archive shape",
-                        )
-                        .into());
-                    }
-                    write_bootstrap_output(&path, &archive.bootstrap_sidecar, force)?;
-                }
+                write_archive_outputs_with_optional_bootstrap(
+                    &output,
+                    &archive.volumes,
+                    bootstrap_out.as_deref(),
+                    &archive.bootstrap_sidecar,
+                    force,
+                )?;
                 let write_outputs = write_outputs_started.elapsed();
                 let summary = format!(
                     "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
@@ -1288,16 +1291,13 @@ fn run(cli: Cli) -> Result<()> {
                 let core_writer = core_writer_started.elapsed();
 
                 let write_outputs_started = Instant::now();
-                write_archive_outputs(&output, &sink.volumes, force)?;
-                if let Some(path) = bootstrap_out.as_deref() {
-                    if sink.bootstrap_sidecar.is_empty() {
-                        return Err(FormatError::WriterUnsupported(
-                            "bootstrap output is unavailable for this archive shape",
-                        )
-                        .into());
-                    }
-                    write_bootstrap_output(path, &sink.bootstrap_sidecar, force)?;
-                }
+                write_archive_outputs_with_optional_bootstrap(
+                    &output,
+                    &sink.volumes,
+                    bootstrap_out.as_deref(),
+                    &sink.bootstrap_sidecar,
+                    force,
+                )?;
                 let write_outputs = write_outputs_started.elapsed();
                 let summary = format!(
                     "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
@@ -1425,16 +1425,13 @@ fn run(cli: Cli) -> Result<()> {
             }
 
             let write_outputs_started = Instant::now();
-            write_archive_outputs(&output, &archive.volumes, force)?;
-            if let Some(path) = bootstrap_out {
-                if archive.bootstrap_sidecar.is_empty() {
-                    return Err(FormatError::WriterUnsupported(
-                        "bootstrap output is unavailable for this archive shape",
-                    )
-                    .into());
-                }
-                write_bootstrap_output(&path, &archive.bootstrap_sidecar, force)?;
-            }
+            write_archive_outputs_with_optional_bootstrap(
+                &output,
+                &archive.volumes,
+                bootstrap_out.as_deref(),
+                &archive.bootstrap_sidecar,
+                force,
+            )?;
             let write_outputs = write_outputs_started.elapsed();
             let summary = format!(
                 "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
@@ -2408,12 +2405,12 @@ fn run(cli: Cli) -> Result<()> {
             public_output,
             force,
         } => {
-            if Path::new(&secret_output) == Path::new(&public_output) {
-                return Err(UsageError(
-                    "--secret-output and --public-output must be different paths",
-                )
-                .into());
-            }
+            ensure_distinct_output_paths(
+                "signing secret output",
+                Path::new(&secret_output),
+                "signing public output",
+                Path::new(&public_output),
+            )?;
             if !force {
                 check_output_path_free("signing secret output", Path::new(&secret_output))?;
                 check_output_path_free("signing public output", Path::new(&public_output))?;
@@ -2421,16 +2418,19 @@ fn run(cli: Cli) -> Result<()> {
             let signing_key = generate_ed25519_signing_key();
             let secret_hex = format!("{}\n", encode_hex(&signing_key.to_bytes()));
             let public_hex = format!("{}\n", encode_hex(&signing_key.verifying_key().to_bytes()));
-            write_atomic_output_file(
-                "signing secret",
-                Path::new(&secret_output),
-                secret_hex.as_bytes(),
-                force,
-            )?;
-            write_atomic_output_file(
-                "signing public key",
-                Path::new(&public_output),
-                public_hex.as_bytes(),
+            write_atomic_output_files(
+                &[
+                    AtomicOutput {
+                        label: "signing secret",
+                        path: Path::new(&secret_output),
+                        bytes: secret_hex.as_bytes(),
+                    },
+                    AtomicOutput {
+                        label: "signing public key",
+                        path: Path::new(&public_output),
+                        bytes: public_hex.as_bytes(),
+                    },
+                ],
                 force,
             )?;
             emit_success_summary(
@@ -2823,6 +2823,7 @@ struct InputSpec {
     mode: u32,
     mtime: u64,
     size: u64,
+    identity: InputIdentity,
 }
 
 impl RegularFileSource for InputSpec {
@@ -2843,10 +2844,19 @@ impl RegularFileSource for InputSpec {
     }
 
     fn open(&self) -> std::result::Result<Box<dyn Read + '_>, ArchiveWriteError> {
-        File::open(&self.source)
-            .map(|file| Box::new(file) as Box<dyn Read + '_>)
-            .map_err(ArchiveWriteError::Io)
+        let file = File::open(&self.source).map_err(ArchiveWriteError::Io)?;
+        validate_opened_input_identity(&file, self.identity).map_err(ArchiveWriteError::Io)?;
+        Ok(Box::new(file) as Box<dyn Read + '_>)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InputIdentity {
+    len: u64,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
 }
 
 #[derive(Debug)]
@@ -2981,8 +2991,17 @@ fn input_specs_total_size(specs: &[InputSpec]) -> Result<u64> {
 fn collect_input_files(specs: &[InputSpec]) -> Result<Vec<InputFile>> {
     let mut out = Vec::new();
     for spec in specs {
-        let contents = fs::read(&spec.source)
+        let mut reader = spec
+            .open()
+            .map_err(|err| anyhow!(err))
             .with_context(|| format!("failed to read input {}", spec.source.display()))?;
+        let mut contents = Vec::new();
+        reader
+            .read_to_end(&mut contents)
+            .with_context(|| format!("failed to read input {}", spec.source.display()))?;
+        if contents.len() as u64 != spec.size {
+            bail!("input changed while reading {}", spec.source.display());
+        }
         out.push(InputFile {
             archive_path: spec.archive_path.clone(),
             contents,
@@ -3027,7 +3046,33 @@ fn collect_one_input_spec(
         mode: readonly_mode(&metadata),
         mtime: 0,
         size: metadata.len(),
+        identity: input_identity(&metadata),
     });
+    Ok(())
+}
+
+fn input_identity(metadata: &fs::Metadata) -> InputIdentity {
+    InputIdentity {
+        len: metadata.len(),
+        #[cfg(unix)]
+        dev: {
+            use std::os::unix::fs::MetadataExt;
+            metadata.dev()
+        },
+        #[cfg(unix)]
+        ino: {
+            use std::os::unix::fs::MetadataExt;
+            metadata.ino()
+        },
+    }
+}
+
+fn validate_opened_input_identity(file: &File, expected: InputIdentity) -> io::Result<()> {
+    let actual_metadata = file.metadata()?;
+    let actual = input_identity(&actual_metadata);
+    if actual != expected {
+        return Err(io::Error::other("input changed after scan"));
+    }
     Ok(())
 }
 
@@ -3150,6 +3195,51 @@ fn write_archive_outputs(output: &str, volumes: &[Vec<u8>], force: bool) -> Resu
     }
     flush_archive_output_temps(&mut temps, &output_paths)?;
     publish_archive_output_temps(temps, &output_paths, force)?;
+    Ok(())
+}
+
+fn write_archive_outputs_with_optional_bootstrap(
+    output: &str,
+    volumes: &[Vec<u8>],
+    bootstrap_out: Option<&str>,
+    bootstrap_sidecar: &[u8],
+    force: bool,
+) -> Result<()> {
+    if bootstrap_out.is_some() && bootstrap_sidecar.is_empty() {
+        return Err(FormatError::WriterUnsupported(
+            "bootstrap output is unavailable for this archive shape",
+        )
+        .into());
+    }
+
+    write_archive_outputs(output, volumes, force)?;
+    if let Some(path) = bootstrap_out {
+        write_bootstrap_output_with_archive_rollback(
+            path,
+            bootstrap_sidecar,
+            output,
+            volumes.len(),
+            force,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_bootstrap_output_with_archive_rollback(
+    path: &str,
+    bytes: &[u8],
+    output: &str,
+    volume_count: usize,
+    force: bool,
+) -> Result<()> {
+    if let Err(err) = write_bootstrap_output(path, bytes, force) {
+        for output_path in create_output_paths(output, volume_count) {
+            let _ = fs::remove_file(output_path);
+        }
+        return Err(err).with_context(|| {
+            "failed to publish bootstrap output; removed archive outputs published by this command"
+        });
+    }
     Ok(())
 }
 
@@ -3620,6 +3710,14 @@ fn ensure_create_output_paths_can_be_written(
     bootstrap_out: Option<&str>,
     force: bool,
 ) -> Result<()> {
+    if let Some(path) = bootstrap_out {
+        ensure_distinct_output_paths(
+            "archive output",
+            Path::new(output),
+            "bootstrap output",
+            Path::new(path),
+        )?;
+    }
     if let Some(volumes) = volumes {
         if volumes == 0 {
             bail!("--volumes must be at least 1");
@@ -3700,6 +3798,37 @@ fn check_archive_paths_free_for_write(paths: &[PathBuf]) -> Result<()> {
         check_output_path_free("archive output", path)?;
     }
     Ok(())
+}
+
+fn ensure_distinct_output_paths(
+    left_label: &str,
+    left: &Path,
+    right_label: &str,
+    right: &Path,
+) -> Result<()> {
+    let left_identity = output_identity_path(left)?;
+    let right_identity = output_identity_path(right)?;
+    if left_identity == right_identity {
+        bail!(
+            "{left_label} and {right_label} must be different paths: {}",
+            left.display()
+        );
+    }
+    Ok(())
+}
+
+fn output_identity_path(path: &Path) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("output path must include a file name: {}", path.display()))?;
+    let parent = parent
+        .canonicalize()
+        .with_context(|| format!("failed to inspect output directory {}", parent.display()))?;
+    Ok(parent.join(file_name))
 }
 
 fn resolve_create_volume_loss_tolerance(
@@ -4144,7 +4273,7 @@ fn write_repaired_archive_copies(
             .push(patch);
     }
 
-    let mut outputs = Vec::new();
+    let mut jobs = Vec::new();
     for (volume_index, volume_patches) in patches_by_volume {
         let input_path = path_by_volume.get(&volume_index).ok_or_else(|| {
             anyhow!("repair output references unavailable volume index {volume_index}")
@@ -4157,7 +4286,33 @@ fn write_repaired_archive_copies(
             )
             .into());
         }
-        fs::copy(input_path, &output_path).with_context(|| {
+        jobs.push((
+            volume_index,
+            input_path.clone(),
+            output_path,
+            volume_patches,
+        ));
+    }
+
+    let mut outputs: Vec<RepairedArchiveOutput> = Vec::new();
+    for (volume_index, input_path, output_path, volume_patches) in jobs {
+        let parent = output_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut temp = tempfile::Builder::new()
+            .prefix(".tzap-repaired-")
+            .suffix(".partial")
+            .tempfile_in(parent)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary repaired output in {}",
+                    parent.display()
+                )
+            })?;
+        let mut input = File::open(&input_path)
+            .with_context(|| format!("failed to open archive volume {}", input_path))?;
+        io::copy(&mut input, temp.as_file_mut()).with_context(|| {
             format!(
                 "failed to copy archive volume {} to {}",
                 input_path,
@@ -4165,12 +4320,8 @@ fn write_repaired_archive_copies(
             )
         })?;
 
-        let mut output = OpenOptions::new()
-            .write(true)
-            .open(&output_path)
-            .with_context(|| format!("failed to open repaired output {}", output_path.display()))?;
         for patch in &volume_patches {
-            output
+            temp.as_file_mut()
                 .seek(SeekFrom::Start(patch.record_offset))
                 .with_context(|| {
                     format!(
@@ -4179,17 +4330,34 @@ fn write_repaired_archive_copies(
                         patch.record_offset
                     )
                 })?;
-            output.write_all(&patch.record_bytes).with_context(|| {
-                format!(
-                    "failed to write repaired block {} to {}",
-                    patch.block_index,
-                    output_path.display()
-                )
-            })?;
+            temp.as_file_mut()
+                .write_all(&patch.record_bytes)
+                .with_context(|| {
+                    format!(
+                        "failed to write repaired block {} to {}",
+                        patch.block_index,
+                        output_path.display()
+                    )
+                })?;
         }
-        output.flush().with_context(|| {
+        temp.as_file_mut().flush().with_context(|| {
             format!("failed to flush repaired output {}", output_path.display())
         })?;
+        temp.as_file_mut()
+            .sync_all()
+            .with_context(|| format!("failed to sync repaired output {}", output_path.display()))?;
+
+        if let Err(error) = temp.persist_noclobber(&output_path) {
+            for output in &outputs {
+                let _ = fs::remove_file(&output.path);
+            }
+            return Err(error.error).with_context(|| {
+                format!(
+                    "failed to publish repaired output {}",
+                    output_path.display()
+                )
+            });
+        }
         outputs.push(RepairedArchiveOutput {
             path: output_path.to_string_lossy().into_owned(),
             volume_index,
@@ -5395,46 +5563,111 @@ fn write_keyfile(path: &str, key_hex: &str, force: bool) -> Result<()> {
     write_atomic_output_file("keyfile", Path::new(path), key_hex.as_bytes(), force)
 }
 
-fn write_atomic_output_file(label: &str, path: &Path, bytes: &[u8], force: bool) -> Result<()> {
-    if !force && path.exists() {
-        bail!(
-            "{label} already exists: {}; use --force to overwrite",
-            path.display()
-        );
-    }
-    let parent = path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut temp = tempfile::Builder::new()
-        .prefix(".tzap-write-")
-        .suffix(".partial")
-        .tempfile_in(parent)
-        .with_context(|| format!("failed to create temporary {label} in {}", parent.display()))?;
-    temp.as_file_mut()
-        .write_all(bytes)
-        .with_context(|| format!("failed to write temporary {label} {}", path.display()))?;
-    temp.as_file_mut()
-        .flush()
-        .with_context(|| format!("failed to flush temporary {label} {}", path.display()))?;
-    temp.as_file_mut()
-        .sync_all()
-        .with_context(|| format!("failed to sync temporary {label} {}", path.display()))?;
+struct AtomicOutput<'a> {
+    label: &'a str,
+    path: &'a Path,
+    bytes: &'a [u8],
+}
 
-    let publish_result = if force {
-        temp.persist(path)
-    } else {
-        temp.persist_noclobber(path)
-    };
-    match publish_result {
-        Ok(_) => Ok(()),
-        Err(error) if !force && error.error.kind() == io::ErrorKind::AlreadyExists => bail!(
-            "{label} already exists: {}; use --force to overwrite",
-            path.display()
-        ),
-        Err(error) => Err(error.error)
-            .with_context(|| format!("failed to publish {label} {}", path.display())),
+fn write_atomic_output_file(label: &str, path: &Path, bytes: &[u8], force: bool) -> Result<()> {
+    write_atomic_output_files(&[AtomicOutput { label, path, bytes }], force)
+}
+
+fn write_atomic_output_files(outputs: &[AtomicOutput<'_>], force: bool) -> Result<()> {
+    for (index, output) in outputs.iter().enumerate() {
+        for previous in &outputs[..index] {
+            ensure_distinct_output_paths(previous.label, previous.path, output.label, output.path)?;
+        }
+        if !force && output.path.exists() {
+            bail!(
+                "{} already exists: {}; use --force to overwrite",
+                output.label,
+                output.path.display()
+            );
+        }
     }
+
+    let mut temps = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let parent = output
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut temp = tempfile::Builder::new()
+            .prefix(".tzap-write-")
+            .suffix(".partial")
+            .tempfile_in(parent)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary {} in {}",
+                    output.label,
+                    parent.display()
+                )
+            })?;
+        temp.as_file_mut()
+            .write_all(output.bytes)
+            .with_context(|| {
+                format!(
+                    "failed to write temporary {} {}",
+                    output.label,
+                    output.path.display()
+                )
+            })?;
+        temp.as_file_mut().flush().with_context(|| {
+            format!(
+                "failed to flush temporary {} {}",
+                output.label,
+                output.path.display()
+            )
+        })?;
+        temp.as_file_mut().sync_all().with_context(|| {
+            format!(
+                "failed to sync temporary {} {}",
+                output.label,
+                output.path.display()
+            )
+        })?;
+        temps.push(Some(temp));
+    }
+
+    let mut persisted_paths = Vec::new();
+    for (index, output) in outputs.iter().enumerate() {
+        let temp = temps[index]
+            .take()
+            .ok_or_else(|| anyhow!("missing temporary {}", output.label))?;
+        let publish_result = if force {
+            temp.persist(output.path)
+        } else {
+            temp.persist_noclobber(output.path)
+        };
+        match publish_result {
+            Ok(_) => persisted_paths.push(output.path.to_path_buf()),
+            Err(error) if !force && error.error.kind() == io::ErrorKind::AlreadyExists => {
+                for path in &persisted_paths {
+                    let _ = fs::remove_file(path);
+                }
+                bail!(
+                    "{} already exists: {}; use --force to overwrite",
+                    output.label,
+                    output.path.display()
+                );
+            }
+            Err(error) => {
+                for path in &persisted_paths {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(error.error).with_context(|| {
+                    format!(
+                        "failed to publish {} {}",
+                        output.label,
+                        output.path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn load_ed25519_signing_key(path: &str) -> Result<SigningKey> {
