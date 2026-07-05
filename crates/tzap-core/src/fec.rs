@@ -1,7 +1,20 @@
 use crate::format::FormatError;
 
+use std::sync::OnceLock;
+
 const GF16_REDUCTION_POLY_LOW: u16 = 0x100b;
 const GF16_MAX_TOTAL_SHARDS: usize = 65_535;
+const GF16_FIELD_SIZE: usize = 1 << 16;
+const GF16_ORDER: usize = GF16_FIELD_SIZE - 1;
+const GF16_GENERATOR: u16 = 2;
+const GF16_LOG_ZERO: u16 = u16::MAX;
+
+struct Gf16Tables {
+    log: Box<[u16; GF16_FIELD_SIZE]>,
+    exp: Box<[u16; GF16_ORDER * 2]>,
+}
+
+static GF16_TABLES: OnceLock<Gf16Tables> = OnceLock::new();
 
 pub fn encode_parity_gf16(
     data_shards: &[Vec<u8>],
@@ -105,7 +118,16 @@ pub fn gf16_add(a: u16, b: u16) -> u16 {
     a ^ b
 }
 
-pub fn gf16_mul(mut a: u16, mut b: u16) -> u16 {
+pub fn gf16_mul(a: u16, b: u16) -> u16 {
+    if a == 0 || b == 0 {
+        return 0;
+    }
+    let tables = gf16_tables();
+    let exponent = tables.log[a as usize] as usize + tables.log[b as usize] as usize;
+    tables.exp[exponent]
+}
+
+fn gf16_mul_slow(mut a: u16, mut b: u16) -> u16 {
     let mut product = 0u16;
     for _ in 0..16 {
         if b & 1 != 0 {
@@ -119,6 +141,24 @@ pub fn gf16_mul(mut a: u16, mut b: u16) -> u16 {
         }
     }
     product
+}
+
+fn gf16_tables() -> &'static Gf16Tables {
+    GF16_TABLES.get_or_init(|| {
+        let mut log = Box::new([GF16_LOG_ZERO; GF16_FIELD_SIZE]);
+        let mut exp = Box::new([0u16; GF16_ORDER * 2]);
+        let mut value = 1u16;
+        for (power, slot) in exp.iter_mut().take(GF16_ORDER).enumerate() {
+            *slot = value;
+            log[value as usize] = power as u16;
+            value = gf16_mul_slow(value, GF16_GENERATOR);
+        }
+        debug_assert_eq!(value, 1);
+        for power in GF16_ORDER..(GF16_ORDER * 2) {
+            exp[power] = exp[power - GF16_ORDER];
+        }
+        Gf16Tables { log, exp }
+    })
 }
 
 pub fn gf16_pow(mut base: u16, mut exponent: u32) -> u16 {
@@ -256,6 +296,15 @@ mod tests {
         assert_eq!(gf16_mul(0x1234, 0x5678), 0x6324);
         let inv = gf16_inverse(0x5678).unwrap();
         assert_eq!(gf16_mul(0x5678, inv), 1);
+    }
+
+    #[test]
+    fn gf16_table_multiplication_matches_polynomial_multiplication() {
+        for a in [0, 1, 2, 3, 0x1234, 0x8000, 0xffff] {
+            for b in [0, 1, 2, 5, 0x5678, 0xabcd, 0xffff] {
+                assert_eq!(gf16_mul(a, b), gf16_mul_slow(a, b));
+            }
+        }
     }
 
     #[test]

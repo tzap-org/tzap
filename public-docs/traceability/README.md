@@ -14,7 +14,7 @@ Allowed after all required gates pass:
 ```text
 tzap is a v44-compliant reference implementation for documented supported
 writer, reader, recovery, RootAuth, and RecipientWrap workflows. Legacy
-revisions fail closed as unsupported revisions.
+archives fail closed as unsupported revisions.
 ```
 
 Avoid without a separate external conformance program:

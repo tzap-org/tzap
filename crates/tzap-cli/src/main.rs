@@ -41,11 +41,11 @@ use tzap_core::{
     verify_non_seekable_stream_with_recipient_wrap_resolver_options,
     verify_unencrypted_non_seekable_stream_with_bootstrap_sidecar,
     verify_unencrypted_non_seekable_stream_with_options, write_archive,
-    write_archive_sources_to_sink_ordered_parallel, write_archive_with_dictionary,
-    write_archive_with_dictionary_and_kdf, write_archive_with_dictionary_and_root_auth,
-    write_archive_with_dictionary_kdf_and_root_auth, write_archive_with_kdf,
-    write_archive_with_recipient_wrap_records, write_archive_with_root_auth,
-    write_archive_with_root_auth_and_kdf,
+    write_archive_sources_to_sink_ordered_parallel,
+    write_archive_sources_to_sink_ordered_parallel_with_recipient_wrap_records,
+    write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
+    write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
+    write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
     write_tar_stream_archive_to_sink_with_kdf_and_root_auth, AeadAlgo, ArchiveContentVerification,
     ArchiveRepairPatch, ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfAlgo, KdfParams,
@@ -1166,18 +1166,6 @@ fn run(cli: Cli) -> Result<()> {
             }
 
             if let Some(recipient_cert_path) = recipient_cert.as_deref() {
-                let read_inputs_started = Instant::now();
-                let inputs = collect_input_files(&input_specs)?;
-                let read_inputs = read_inputs_started.elapsed();
-                let regular_files = inputs
-                    .iter()
-                    .map(|file| RegularFile {
-                        path: file.archive_path.as_str(),
-                        contents: &file.contents,
-                        mode: file.mode,
-                        mtime: file.mtime,
-                    })
-                    .collect::<Vec<_>>();
                 let mut recipient_options = options;
                 let master_key = generate_random_master_key()?;
                 let recipient_record = build_recipient_wrap_record(
@@ -1186,43 +1174,33 @@ fn run(cli: Cli) -> Result<()> {
                     &mut recipient_options,
                 )?;
                 let core_writer_started = Instant::now();
-                let archive = write_archive_with_recipient_wrap_records(
-                    &regular_files,
+                let (archive, sink) = write_file_inputs_ordered_parallel_recipient_wrap_to_memory(
+                    &input_specs,
                     &master_key,
                     recipient_options,
-                    vec![recipient_record],
+                    recipient_record,
                 )
                 .context("failed to create recipient-wrap archive")?;
                 let core_writer = core_writer_started.elapsed();
 
-                let output_paths = create_output_paths(&output, archive.volumes.len());
-                if !force {
-                    check_archive_paths_free_for_write(&output_paths)?;
-                }
-                if let Some(bootstrap_path) = &bootstrap_output {
-                    if !force {
-                        check_output_path_free("bootstrap", Path::new(bootstrap_path))?;
-                    }
-                }
-
                 let write_outputs_started = Instant::now();
-                write_archive_outputs(&output, &archive.volumes, force)?;
+                write_archive_outputs(&output, &sink.volumes, force)?;
                 if let Some(path) = bootstrap_out {
-                    if archive.bootstrap_sidecar.is_empty() {
+                    if sink.bootstrap_sidecar.is_empty() {
                         return Err(FormatError::WriterUnsupported(
                             "bootstrap output is unavailable for this archive shape",
                         )
                         .into());
                     }
-                    write_bootstrap_output(&path, &archive.bootstrap_sidecar, force)?;
+                    write_bootstrap_output(&path, &sink.bootstrap_sidecar, force)?;
                 }
                 let write_outputs = write_outputs_started.elapsed();
                 let summary = format!(
                     "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
-                    regular_files.len(),
+                    input_specs.len(),
                     input_bytes,
-                    archive.volumes.iter().map(|volume| volume.len() as u64).sum::<u64>(),
-                    archive.volumes.len(),
+                    archive.archive_bytes,
+                    archive.volume_count,
                     resolved_volume_loss_tolerance,
                     bit_rot_buffer_pct
                 );
@@ -1234,7 +1212,7 @@ fn run(cli: Cli) -> Result<()> {
                 if timings {
                     emit_create_timing_report(
                         scan_inputs,
-                        read_inputs,
+                        Duration::default(),
                         core_writer,
                         write_outputs,
                         create_total_started.elapsed(),
@@ -3340,6 +3318,25 @@ fn write_file_inputs_ordered_parallel_to_memory_with_authenticator(
         &key.kdf_params,
         root_auth,
         authenticator,
+        &mut sink,
+    )?;
+    Ok((summary, sink))
+}
+
+fn write_file_inputs_ordered_parallel_recipient_wrap_to_memory(
+    input_specs: &[InputSpec],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    recipient_record: tzap_core::wire::RecipientRecordV1,
+) -> Result<(WrittenArchiveSummary, MemoryArchiveSink)> {
+    let mut sink = MemoryArchiveSink::default();
+    let summary = write_archive_sources_to_sink_ordered_parallel_with_recipient_wrap_records(
+        input_specs,
+        master_key,
+        options,
+        vec![recipient_record],
+        None,
+        None,
         &mut sink,
     )?;
     Ok((summary, sink))

@@ -655,9 +655,7 @@ fn cli_insecure_zero_key_is_removed() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains(
-            "--insecure-zero-key was removed",
-        ));
+        .stderr(predicate::str::contains("--insecure-zero-key was removed"));
 }
 
 #[test]
