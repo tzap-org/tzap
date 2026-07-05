@@ -15,7 +15,7 @@ pub const DIRECTORY_HINT_SHARD_ENTRY_LEN: usize = 56;
 pub const ENVELOPE_ENTRY_LEN: usize = 48;
 pub const FRAME_ENTRY_LEN: usize = 44;
 pub const INDEX_SHARD_HEADER_LEN: usize = 64;
-pub const FILE_ENTRY_LEN: usize = 64;
+pub const FILE_ENTRY_LEN: usize = 72;
 pub const DIRECTORY_HINT_TABLE_LEN: usize = 72;
 pub const DIRECTORY_HINT_ENTRY_LEN: usize = 40;
 
@@ -176,6 +176,8 @@ pub struct FileEntry {
     pub offset_in_first_frame_plaintext: u32,
     pub tar_member_group_size: u64,
     pub file_data_size: u64,
+    pub kind: crate::tar_model::TarEntryKind,
+    pub mode: u32,
     pub mtime: u64,
     pub flags: u32,
 }
@@ -665,7 +667,9 @@ impl FileEntry {
         write_u64(&mut bytes, 32, self.tar_member_group_size);
         write_u64(&mut bytes, 40, self.file_data_size);
         write_u32(&mut bytes, 48, self.flags);
+        bytes[52] = tar_entry_kind_to_file_entry_byte(self.kind);
         write_u64(&mut bytes, 56, self.mtime);
+        write_u32(&mut bytes, 64, self.mode);
         bytes
     }
 }
@@ -1094,7 +1098,8 @@ fn parse_directory_hint_shard_entries(
 }
 
 fn parse_file_entry(bytes: &[u8]) -> Result<FileEntry, FormatError> {
-    expect_zero("FileEntry", slice(bytes, 52, 4, "FileEntry")?)?;
+    expect_zero("FileEntry", slice(bytes, 53, 3, "FileEntry")?)?;
+    expect_zero("FileEntry", slice(bytes, 68, 4, "FileEntry")?)?;
     Ok(FileEntry {
         path_hash: read_array::<8>(bytes, 0, "FileEntry")?,
         path_offset: read_u32(bytes, 8, "FileEntry")?,
@@ -1104,9 +1109,30 @@ fn parse_file_entry(bytes: &[u8]) -> Result<FileEntry, FormatError> {
         offset_in_first_frame_plaintext: read_u32(bytes, 28, "FileEntry")?,
         tar_member_group_size: read_u64(bytes, 32, "FileEntry")?,
         file_data_size: read_u64(bytes, 40, "FileEntry")?,
+        kind: parse_file_entry_tar_kind(bytes[52])?,
+        mode: read_u32(bytes, 64, "FileEntry")?,
         flags: read_u32(bytes, 48, "FileEntry")?,
         mtime: read_u64(bytes, 56, "FileEntry")?,
     })
+}
+
+fn tar_entry_kind_to_file_entry_byte(kind: crate::tar_model::TarEntryKind) -> u8 {
+    match kind {
+        crate::tar_model::TarEntryKind::Regular => 0,
+        crate::tar_model::TarEntryKind::Directory => 1,
+        crate::tar_model::TarEntryKind::Symlink => 2,
+        crate::tar_model::TarEntryKind::Hardlink => 3,
+    }
+}
+
+fn parse_file_entry_tar_kind(value: u8) -> Result<crate::tar_model::TarEntryKind, FormatError> {
+    match value {
+        0 => Ok(crate::tar_model::TarEntryKind::Regular),
+        1 => Ok(crate::tar_model::TarEntryKind::Directory),
+        2 => Ok(crate::tar_model::TarEntryKind::Symlink),
+        3 => Ok(crate::tar_model::TarEntryKind::Hardlink),
+        _ => Err(FormatError::InvalidArchive("unknown FileEntry tar kind")),
+    }
 }
 
 fn parse_frame_entry(bytes: &[u8]) -> Result<FrameEntry, FormatError> {
@@ -2645,6 +2671,8 @@ mod tests {
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: 512,
             file_data_size: 0,
+            kind: crate::tar_model::TarEntryKind::Regular,
+            mode: 0o644,
             mtime: 0,
             flags: 0,
         };
@@ -2813,6 +2841,8 @@ mod tests {
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: 512,
             file_data_size: 0,
+            kind: crate::tar_model::TarEntryKind::Regular,
+            mode: 0o644,
             mtime: 0,
             flags: 0,
         };
@@ -3048,6 +3078,8 @@ mod tests {
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: 512,
             file_data_size: 0,
+            kind: crate::tar_model::TarEntryKind::Regular,
+            mode: 0o644,
             mtime: 0,
             flags: 0,
         };
@@ -3302,6 +3334,8 @@ mod tests {
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: 512,
             file_data_size: 0,
+            kind: crate::tar_model::TarEntryKind::Regular,
+            mode: 0o644,
             mtime: 0,
             flags: 0,
         };

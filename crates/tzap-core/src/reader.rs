@@ -216,6 +216,8 @@ pub struct ArchiveIndexEntry {
     pub path: String,
     pub name: String,
     pub file_data_size: u64,
+    pub kind: TarEntryKind,
+    pub mode: u32,
     pub mtime: u64,
     pub path_hash: [u8; 8],
     pub tar_member_group_size: u64,
@@ -3822,6 +3824,8 @@ fn archive_index_entry_from_loaded_file_with_path(
         name: archive_entry_name(&path),
         path,
         file_data_size: file.file_data_size,
+        kind: file.kind,
+        mode: file.mode,
         mtime: file.mtime,
         path_hash: file.path_hash,
         tar_member_group_size: file.tar_member_group_size,
@@ -12465,12 +12469,16 @@ mod tests {
         assert_eq!(listed[0].path, "same.txt");
         assert_eq!(listed[0].name, "same.txt");
         assert_eq!(listed[0].file_data_size, 5);
+        assert_eq!(listed[0].kind, TarEntryKind::Regular);
+        assert_eq!(listed[0].mode, 0o644);
         assert_eq!(listed[0].mtime, 1_700_000_100);
         assert_eq!(listed[0].frame_count, 1);
         assert!(listed[0].layout.compressed_size > 0);
         let looked_up = opened.lookup_index_entry("same.txt").unwrap().unwrap();
         assert_eq!(looked_up.path, "same.txt");
         assert_eq!(looked_up.file_data_size, 5);
+        assert_eq!(looked_up.kind, TarEntryKind::Regular);
+        assert_eq!(looked_up.mode, 0o644);
         assert_eq!(looked_up.mtime, 1_700_000_100);
         assert_eq!(opened.lookup_index_entry("missing.txt").unwrap(), None);
         assert_eq!(
@@ -12500,13 +12508,19 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].path, "broken.txt");
         assert_eq!(listed[0].file_data_size, b"broken payload\n".len() as u64);
+        assert_eq!(listed[0].kind, TarEntryKind::Regular);
+        assert_eq!(listed[0].mode, 0o644);
         assert_eq!(listed[0].mtime, 0);
         assert_eq!(listed[1].path, "healthy.txt");
         assert_eq!(listed[1].file_data_size, b"healthy payload\n".len() as u64);
+        assert_eq!(listed[1].kind, TarEntryKind::Regular);
+        assert_eq!(listed[1].mode, 0o644);
         assert_eq!(listed[1].mtime, 0);
         let looked_up = opened.lookup_index_entry("broken.txt").unwrap().unwrap();
         assert_eq!(looked_up.path, "broken.txt");
         assert_eq!(looked_up.file_data_size, b"broken payload\n".len() as u64);
+        assert_eq!(looked_up.kind, TarEntryKind::Regular);
+        assert_eq!(looked_up.mode, 0o644);
         assert_eq!(looked_up.mtime, 0);
         assert_eq!(opened.list_files().unwrap_err(), FormatError::AeadFailure);
     }
@@ -12578,6 +12592,8 @@ mod tests {
         assert_eq!(entry.path, "chunked.bin");
         assert_eq!(entry.name, "chunked.bin");
         assert_eq!(entry.file_data_size, payload.len() as u64);
+        assert_eq!(entry.kind, TarEntryKind::Regular);
+        assert_eq!(entry.mode, 0o644);
         assert_eq!(entry.tar_member_group_size, file.tar_member_group_size);
         assert_eq!(entry.first_frame_index, file.first_frame_index);
         assert_eq!(entry.frame_count, file.frame_count);
@@ -18127,6 +18143,8 @@ mod tests {
                 offset_in_first_frame_plaintext: 0,
                 tar_member_group_size: file.member_group_size,
                 file_data_size: file.file_data_size,
+                kind: crate::tar_model::TarEntryKind::Regular,
+                mode: 0o644,
                 mtime: 0,
                 flags: 0,
             });

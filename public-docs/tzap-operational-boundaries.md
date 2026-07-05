@@ -538,10 +538,10 @@ The supported reader profile is:
 
 Index-backed listing exposes authenticated index metadata without decoding
 payload envelopes. `list_index_entries`, `lookup_index_entry`, and
-`tzap list --json` include path, basename, payload size, integer mtime,
-tar-member group size, frame range, compressed frame size, and touched
-envelope/block layout metadata. These layout fields describe archive objects
-touched by the file; they are not a per-file ownership claim for shared
+`tzap list --json` include path, basename, payload size, tar kind, ustar mode,
+integer mtime, tar-member group size, frame range, compressed frame size, and
+touched envelope/block layout metadata. These layout fields describe archive
+objects touched by the file; they are not a per-file ownership claim for shared
 envelopes.
 
 Filesystem extraction writes file payloads and supported links safely under the

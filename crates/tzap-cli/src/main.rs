@@ -1766,12 +1766,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 if long {
                     for entry in report.entries {
-                        let kind = match entry.kind {
-                            TarEntryKind::Regular => "file",
-                            TarEntryKind::Directory => "directory",
-                            TarEntryKind::Symlink => "symlink",
-                            TarEntryKind::Hardlink => "hardlink",
-                        };
+                        let kind = archive_entry_kind_label(entry.kind);
                         println!(
                             "{}\t{}\t{}\t{}\t{}",
                             entry.file_data_size, kind, entry.mode, entry.mtime, entry.path
@@ -1828,12 +1823,7 @@ fn run(cli: Cli) -> Result<()> {
                 let entries = opened.list_files()?;
                 emit_entry_metadata_diagnostics(quiet, &entries)?;
                 for entry in entries {
-                    let kind = match entry.kind {
-                        TarEntryKind::Regular => "file",
-                        TarEntryKind::Directory => "directory",
-                        TarEntryKind::Symlink => "symlink",
-                        TarEntryKind::Hardlink => "hardlink",
-                    };
+                    let kind = archive_entry_kind_label(entry.kind);
                     println!(
                         "{}\t{}\t{}\t{}\t{}",
                         entry.file_data_size, kind, entry.mode, entry.mtime, entry.path
@@ -2673,7 +2663,9 @@ fn archive_index_entry_json(entry: &ArchiveIndexEntry) -> serde_json::Value {
     json!({
         "path": &entry.path,
         "name": &entry.name,
+        "kind": archive_entry_kind_label(entry.kind),
         "size": entry.file_data_size,
+        "mode": entry.mode,
         "mtime": entry.mtime,
         "path_hash": encode_hex(&entry.path_hash),
         "tar_member_group_size": entry.tar_member_group_size,
@@ -2692,6 +2684,15 @@ fn archive_index_entry_json(entry: &ArchiveIndexEntry) -> serde_json::Value {
             "payload_encrypted_size": entry.layout.payload_encrypted_size,
         },
     })
+}
+
+fn archive_entry_kind_label(kind: TarEntryKind) -> &'static str {
+    match kind {
+        TarEntryKind::Regular => "file",
+        TarEntryKind::Directory => "directory",
+        TarEntryKind::Symlink => "symlink",
+        TarEntryKind::Hardlink => "hardlink",
+    }
 }
 
 fn emit_verify_json_error(

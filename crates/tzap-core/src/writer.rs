@@ -4664,6 +4664,8 @@ fn build_index_shard_plaintext(
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: row.member.tar_member_group_size,
             file_data_size: row.member.file_data_size,
+            kind: row.member.kind,
+            mode: row.member.mode,
             mtime: row.member.mtime,
             flags: 0,
         });

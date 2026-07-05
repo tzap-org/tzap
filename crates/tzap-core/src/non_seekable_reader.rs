@@ -972,9 +972,9 @@ fn streamed_list_entries(
             Ok(ArchiveEntry {
                 path: entry.path.clone(),
                 file_data_size: entry.file_data_size,
-                kind: member.kind,
-                mode: member.mode,
-                mtime: member.mtime,
+                kind: entry.kind,
+                mode: entry.mode,
+                mtime: entry.mtime,
                 diagnostics: member.diagnostics.clone(),
             })
         })

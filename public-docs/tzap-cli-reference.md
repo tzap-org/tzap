@@ -244,12 +244,12 @@ Notes:
   after EOF, terminal authentication, and metadata/content conformance checks
   succeed.
 - For file-backed archives, default `list` output reads encrypted index entries
-  and prints archive paths. It does not decode payload envelopes for tar kind,
-  mode, or metadata diagnostics.
+  and prints archive paths. It does not decode payload envelopes for metadata
+  diagnostics.
 - `tzap list --json` is also index-backed. It exposes path, basename, payload
-  size, integer mtime, tar-member group size, frame range, compressed frame
-  size, and touched envelope/block layout metadata without reading payload
-  envelopes.
+  size, tar kind, ustar mode, integer mtime, tar-member group size, frame range,
+  compressed frame size, and touched envelope/block layout metadata without
+  reading payload envelopes.
 - Key-holding list opens archive files through the core file-backed
   random-access reader. Default output reads terminal and index metadata rather
   than loading every payload block.
