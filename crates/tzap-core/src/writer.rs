@@ -6561,7 +6561,7 @@ fn checked_u64_add(lhs: u64, rhs: u64, field: &'static str) -> Result<u64, Forma
 mod tests {
     use super::*;
     use crate::crypto::{verify_hmac, Subkeys};
-    use crate::metadata::{DirectoryHintTable, MetadataLimits};
+    use crate::metadata::{DirectoryHintTable, IndexShard, MetadataLimits};
     use crate::reader::{open_archive, open_archive_with_recipient_wrap_resolver};
     use crate::tar_model::parse_tar_member_group;
     use crate::wire::{CriticalRecoveryLocator, CryptoHeader};
@@ -7070,6 +7070,176 @@ mod tests {
         assert!(frames[1..frames.len() - 1]
             .iter()
             .all(|frame| frame.flags == 0));
+    }
+
+    #[test]
+    fn spanning_payload_derives_exact_multi_frame_multi_envelope_stats() {
+        let data = deterministic_bytes(13 * 1024);
+        let files = [RegularFile::new("spanning.bin", &data)];
+        let options = plan_writer_options(WriterOptions {
+            block_size: MIN_BLOCK_SIZE,
+            chunk_size: 1024,
+            envelope_target_size: 2500,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            fec_parity_shards: 0,
+            index_fec_parity_shards: 0,
+            index_root_fec_parity_shards: 0,
+            ..WriterOptions::default()
+        })
+        .unwrap();
+        let mut next_block_index = 0u64;
+
+        let payload = plan_payload_stream(&files, options, None, &mut next_block_index).unwrap();
+        let expected_tar_total_size =
+            TAR_BLOCK_LEN as u64 + data.len() as u64 + padding_to_512(data.len()) as u64;
+        let (tar_stream, _) = build_tar_stream(&files, options.max_path_length).unwrap();
+
+        assert_eq!(payload.tar_members.len(), 1);
+        assert_eq!(payload.tar_members[0].tar_member_group_start, 0);
+        assert_eq!(
+            payload.tar_members[0].tar_member_group_size,
+            expected_tar_total_size
+        );
+        assert_eq!(payload.tar_total_size, expected_tar_total_size);
+        assert_eq!(payload.content_sha256, sha256_bytes(&tar_stream));
+        assert_eq!(payload.frames.len(), 14);
+        assert_eq!(payload.payload_objects.len(), 7);
+        assert_eq!(payload.payload_block_count, 7);
+        assert_eq!(next_block_index, 7);
+
+        for (idx, frame) in payload.frames.iter().enumerate() {
+            let expected_envelope_index = (idx / 2) as u64;
+            let expected_decompressed_size = if idx == 13 { 512 } else { 1024 };
+            let expected_flags = match idx {
+                0 => 0x0000_0001,
+                13 => 0x0000_0002,
+                _ => 0,
+            };
+            let expected_offset = if idx % 2 == 0 {
+                0
+            } else {
+                payload.frames[idx - 1].compressed_size
+            };
+
+            assert_eq!(frame.frame_index, idx as u64);
+            assert_eq!(frame.member_index, 0);
+            assert_eq!(frame.envelope_index, expected_envelope_index);
+            assert_eq!(frame.offset_in_envelope, expected_offset);
+            assert_eq!(frame.decompressed_size, expected_decompressed_size);
+            assert_eq!(frame.flags, expected_flags);
+            assert_eq!(frame.tar_stream_offset, idx as u64 * 1024);
+        }
+
+        for (idx, object) in payload.payload_objects.iter().enumerate() {
+            let frame_start = idx * 2;
+            let expected_plaintext_size = payload.frames[frame_start..frame_start + 2]
+                .iter()
+                .map(|frame| frame.compressed_size)
+                .sum::<u32>();
+
+            assert_eq!(object.envelope_index, idx as u64);
+            assert_eq!(object.plaintext_size, expected_plaintext_size);
+            assert_eq!(object.object.first_block_index, idx as u64);
+            assert_eq!(object.object.data_block_count, 1);
+            assert_eq!(object.object.parity_block_count, 0);
+            assert_eq!(object.object.encrypted_size, options.block_size);
+        }
+
+        let shard_rows = partition_file_rows(sorted_file_rows(&payload.tar_members)).unwrap();
+        let planned_shards = build_index_shard_plaintexts(
+            &shard_rows,
+            &payload.frames,
+            &payload.payload_objects,
+            options,
+        )
+        .unwrap();
+        assert_eq!(planned_shards.len(), 1);
+        let locating_shard = ShardEntry {
+            shard_index: planned_shards[0].shard_index,
+            first_block_index: 0,
+            data_block_count: 1,
+            parity_block_count: 0,
+            encrypted_size: options.block_size,
+            decompressed_size: planned_shards[0].plaintext.len() as u32,
+            file_count: planned_shards[0].file_count,
+            first_path_hash: planned_shards[0].first_path_hash,
+            last_path_hash: planned_shards[0].last_path_hash,
+        };
+        let shard = IndexShard::parse(
+            &planned_shards[0].plaintext,
+            &locating_shard,
+            MetadataLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(shard.header.file_count, 1);
+        assert_eq!(shard.header.frame_count, 14);
+        assert_eq!(shard.header.envelope_count, 7);
+        assert_eq!(shard.files[0].first_frame_index, 0);
+        assert_eq!(shard.files[0].frame_count, 14);
+        assert_eq!(
+            shard.files[0].tar_member_group_size,
+            expected_tar_total_size
+        );
+        assert_eq!(shard.files[0].file_data_size, data.len() as u64);
+
+        for (idx, frame) in shard.frames.iter().enumerate() {
+            assert_eq!(frame.frame_index, idx as u64);
+            assert_eq!(frame.envelope_index, (idx / 2) as u64);
+            assert_eq!(
+                frame.offset_in_envelope,
+                payload.frames[idx].offset_in_envelope
+            );
+            assert_eq!(frame.compressed_size, payload.frames[idx].compressed_size);
+            assert_eq!(
+                frame.decompressed_size,
+                payload.frames[idx].decompressed_size
+            );
+            assert_eq!(frame.flags, payload.frames[idx].flags);
+            assert_eq!(
+                frame.tar_stream_offset,
+                payload.frames[idx].tar_stream_offset
+            );
+        }
+
+        for (idx, envelope) in shard.envelopes.iter().enumerate() {
+            assert_eq!(envelope.envelope_index, idx as u64);
+            assert_eq!(envelope.first_block_index, idx as u64);
+            assert_eq!(envelope.data_block_count, 1);
+            assert_eq!(envelope.parity_block_count, 0);
+            assert_eq!(envelope.encrypted_size, options.block_size);
+            assert_eq!(
+                envelope.plaintext_size,
+                payload.payload_objects[idx].plaintext_size
+            );
+            assert_eq!(envelope.first_frame_index, (idx * 2) as u64);
+            assert_eq!(envelope.frame_count, 2);
+        }
+
+        let master_key = MasterKey::from_raw_key(&[6u8; 32]).unwrap();
+        let plan = build_writer_plan_from_payload(
+            payload,
+            next_block_index,
+            &master_key,
+            options,
+            None,
+            &KdfParams::Raw,
+            None,
+            [0x44; 16],
+            [0x55; 16],
+            None,
+        )
+        .unwrap();
+        let index_root =
+            IndexRoot::parse(&plan.index_root_plaintext, false, MetadataLimits::default()).unwrap();
+
+        assert_eq!(index_root.header.frame_count, 14);
+        assert_eq!(index_root.header.envelope_count, 7);
+        assert_eq!(index_root.header.file_count, 1);
+        assert_eq!(index_root.header.payload_block_count, 7);
+        assert_eq!(index_root.header.tar_total_size, expected_tar_total_size);
+        assert_eq!(index_root.header.content_sha256, sha256_bytes(&tar_stream));
     }
 
     #[test]
