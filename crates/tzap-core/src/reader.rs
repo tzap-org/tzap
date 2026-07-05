@@ -2165,7 +2165,10 @@ impl OpenedArchive {
         }
 
         let shards = self.load_all_index_shards()?;
-        let entries = final_index_entry_winners(&shards)?.into_iter().collect();
+        let mut entries = final_index_entry_winners(&shards)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(_, entry)| entry.start);
         self.extract_winning_index_entries_to(&shards, entries, root, options, jobs)
     }
 
@@ -2306,6 +2309,15 @@ impl OpenedArchive {
             ));
         }
 
+        let dry_run = self.scan_seekable_payload(
+            &tables,
+            total_extraction_size_cap(self.options, self.observed_archive_bytes),
+            NoopTarStreamObserver,
+            false,
+            ParityReadPolicy::RepairOnly,
+        )?;
+        self.validate_streamed_payload_summary(&tables, &dry_run, true, false)?;
+
         let observer = TarStreamFilesystemRestoreObserver::new(root, options);
         let streamed = self.scan_seekable_payload(
             &tables,
@@ -2314,7 +2326,6 @@ impl OpenedArchive {
             false,
             ParityReadPolicy::RepairOnly,
         )?;
-        self.validate_streamed_payload_summary(&tables, &streamed, true, false)?;
         streamed
             .tar
             .members
@@ -3124,63 +3135,24 @@ impl OpenedArchive {
         entries: Vec<(String, WinningIndexEntry)>,
         root: &std::path::Path,
         options: SafeExtractionOptions,
-        jobs: usize,
+        _jobs: usize,
     ) -> Result<Vec<(String, Vec<MetadataDiagnostic>)>, FormatError> {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
-        if jobs <= 1 || entries.len() <= 1 {
-            return entries
-                .into_iter()
-                .map(|(path, entry)| {
-                    let shard =
-                        shards
-                            .get(entry.shard_index)
-                            .ok_or(FormatError::InvalidArchive(
-                                "winning FileEntry shard is out of bounds",
-                            ))?;
-                    let diagnostics =
-                        self.stream_loaded_file_to_path(shard, entry.file_index, root, options)?;
-                    Ok((path, diagnostics))
-                })
-                .collect();
-        }
-
-        let worker_count = jobs.min(entries.len());
-        let chunk_size = entries.len().div_ceil(worker_count);
-        std::thread::scope(|scope| {
-            let handles = entries
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    scope.spawn(move || {
-                        let mut out = Vec::with_capacity(chunk.len());
-                        for (path, entry) in chunk {
-                            let shard = shards.get(entry.shard_index).ok_or(
-                                FormatError::InvalidArchive(
-                                    "winning FileEntry shard is out of bounds",
-                                ),
-                            )?;
-                            let diagnostics = self.stream_loaded_file_to_path(
-                                shard,
-                                entry.file_index,
-                                root,
-                                options,
-                            )?;
-                            out.push((path.clone(), diagnostics));
-                        }
-                        Ok(out)
-                    })
-                })
-                .collect::<Vec<_>>();
-            let mut out = Vec::new();
-            for handle in handles {
-                let mut chunk = handle
-                    .join()
-                    .map_err(|_| FormatError::ReaderUnsupported("extract worker panicked"))??;
-                out.append(&mut chunk);
-            }
-            Ok(out)
-        })
+        entries
+            .into_iter()
+            .map(|(path, entry)| {
+                let shard = shards
+                    .get(entry.shard_index)
+                    .ok_or(FormatError::InvalidArchive(
+                        "winning FileEntry shard is out of bounds",
+                    ))?;
+                let diagnostics =
+                    self.stream_loaded_file_to_path(shard, entry.file_index, root, options)?;
+                Ok((path, diagnostics))
+            })
+            .collect()
     }
 
     fn decode_loaded_owned_tar_member(

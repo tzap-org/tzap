@@ -18,4 +18,4 @@ hpke = { workspace = true }
 openssl = { workspace = true }
 rand_core = { version = "0.9", features = ["os_rng"] }
 sha2 = { workspace = true }
-x509-parser = "0.18"
+x509-parser.workspace = true

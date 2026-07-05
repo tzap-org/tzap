@@ -1,5 +1,8 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
+use std::fs;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -1158,8 +1161,8 @@ impl<W: Write> TarMemberStreamHandler for RegularWriterHandler<'_, W> {
 struct FilesystemRestoreHandler<'a> {
     root: &'a Path,
     options: SafeExtractionOptions,
-    destination: Option<PathBuf>,
-    temp_path: Option<PathBuf>,
+    destination: Option<PreparedDestination>,
+    temp_leaf: Option<PathBuf>,
     file: Option<fs::File>,
 }
 
@@ -1169,7 +1172,7 @@ impl<'a> FilesystemRestoreHandler<'a> {
             root,
             options,
             destination: None,
-            temp_path: None,
+            temp_leaf: None,
             file: None,
         }
     }
@@ -1188,36 +1191,30 @@ impl<'a> FilesystemRestoreHandler<'a> {
         ))?;
         file.flush()
             .map_err(|_| FormatError::FilesystemExtractionFailed("failed to write regular file"))?;
+
+        let destination = self.destination.take().ok_or(FormatError::InvalidArchive(
+            "regular file destination is missing",
+        ))?;
+        let temp_leaf = self.temp_leaf.take().ok_or(FormatError::InvalidArchive(
+            "regular file temp path is missing",
+        ))?;
+        let file = publish_regular_file(&destination, &temp_leaf, file, self.options)?;
         apply_restored_regular_file_metadata_parts(
             &file,
             member.mode,
             member.mtime,
             &mut diagnostics,
         );
-        drop(file);
-
-        let destination = self.destination.take().ok_or(FormatError::InvalidArchive(
-            "regular file destination is missing",
-        ))?;
-        let temp_path = self.temp_path.take().ok_or(FormatError::InvalidArchive(
-            "regular file temp path is missing",
-        ))?;
-        if self.options.overwrite_existing && destination.exists() {
-            fs::remove_file(&destination).map_err(|_| {
-                FormatError::FilesystemExtractionFailed("failed to remove old file")
-            })?;
-        }
-        fs::rename(&temp_path, &destination).map_err(|_| {
-            FormatError::FilesystemExtractionFailed("failed to create regular file")
-        })?;
         Ok(diagnostics)
     }
 }
 
 impl Drop for FilesystemRestoreHandler<'_> {
     fn drop(&mut self) {
-        if let Some(path) = self.temp_path.take() {
-            let _ = fs::remove_file(path);
+        if let (Some(destination), Some(temp_leaf)) =
+            (self.destination.as_ref(), self.temp_leaf.take())
+        {
+            let _ = destination.parent.remove_file_or_symlink(temp_leaf);
         }
     }
 }
@@ -1227,9 +1224,9 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
         let destination = prepare_destination(self.root, &member.path, member.kind, self.options)?;
         match member.kind {
             TarEntryKind::Regular => {
-                let (temp_path, file) = create_temp_regular_file(&destination)?;
+                let (temp_leaf, file) = create_temp_regular_file(&destination)?;
                 self.destination = Some(destination);
-                self.temp_path = Some(temp_path);
+                self.temp_leaf = Some(temp_leaf);
                 self.file = Some(file);
             }
             TarEntryKind::Directory => create_directory(&destination)?,
@@ -1419,7 +1416,14 @@ pub fn restore_tar_member(
     let mut diagnostics = member.diagnostics.clone();
     match member.kind {
         TarEntryKind::Regular => {
-            let file = write_regular_file(&destination, &member.data, options)?;
+            let (temp_leaf, mut file) = create_temp_regular_file(&destination)?;
+            file.write_all(&member.data).map_err(|_| {
+                FormatError::FilesystemExtractionFailed("failed to write regular file")
+            })?;
+            file.flush().map_err(|_| {
+                FormatError::FilesystemExtractionFailed("failed to write regular file")
+            })?;
+            let file = publish_regular_file(&destination, &temp_leaf, file, options)?;
             apply_restored_regular_file_metadata(&file, member, &mut diagnostics);
         }
         TarEntryKind::Directory => create_directory(&destination)?,
@@ -1668,53 +1672,25 @@ fn validate_symlink_target(link_path: &[u8], target: &[u8]) -> Result<(), Format
     Ok(())
 }
 
+struct PreparedDestination {
+    parent: CapDir,
+    leaf: PathBuf,
+}
+
 fn prepare_destination(
     root: &Path,
     archive_path: &[u8],
     kind: TarEntryKind,
     options: SafeExtractionOptions,
-) -> Result<PathBuf, FormatError> {
+) -> Result<PreparedDestination, FormatError> {
     let components = path_components(archive_path)?;
-    validate_root(root)?;
-    let mut current = root.to_path_buf();
+    let mut parent = open_extraction_root(root)?;
     for component in &components[..components.len().saturating_sub(1)] {
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) => {
-                let file_type = metadata.file_type();
-                if file_type.is_symlink() || !file_type.is_dir() {
-                    return Err(FormatError::UnsafeArchivePath);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match fs::create_dir(&current) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(_) => {
-                        return Err(FormatError::FilesystemExtractionFailed(
-                            "failed to create parent directory",
-                        ));
-                    }
-                }
-                let metadata = fs::symlink_metadata(&current).map_err(|_| {
-                    FormatError::FilesystemExtractionFailed(
-                        "failed to inspect created parent directory",
-                    )
-                })?;
-                if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                    return Err(FormatError::UnsafeArchivePath);
-                }
-            }
-            Err(_) => {
-                return Err(FormatError::FilesystemExtractionFailed(
-                    "failed to inspect parent directory",
-                ));
-            }
-        }
+        parent = open_or_create_safe_child_dir(&parent, component)?;
     }
 
-    current.push(components.last().ok_or(FormatError::UnsafeArchivePath)?);
-    match fs::symlink_metadata(&current) {
+    let leaf = PathBuf::from(components.last().ok_or(FormatError::UnsafeArchivePath)?);
+    match parent.symlink_metadata(&leaf) {
         Ok(metadata) => {
             let file_type = metadata.file_type();
             if file_type.is_symlink() {
@@ -1722,7 +1698,7 @@ fn prepare_destination(
             }
             if kind == TarEntryKind::Directory {
                 if file_type.is_dir() {
-                    return Ok(current);
+                    return Ok(PreparedDestination { parent, leaf });
                 }
                 return Err(FormatError::UnsafeOverwrite);
             }
@@ -1740,69 +1716,86 @@ fn prepare_destination(
             ));
         }
     }
-    Ok(current)
+    Ok(PreparedDestination { parent, leaf })
 }
 
-fn validate_root(root: &Path) -> Result<(), FormatError> {
+fn open_extraction_root(root: &Path) -> Result<CapDir, FormatError> {
     let metadata = fs::symlink_metadata(root).map_err(|_| {
         FormatError::FilesystemExtractionFailed("extraction root must already exist")
     })?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
         return Err(FormatError::UnsafeArchivePath);
     }
-    Ok(())
+    CapDir::open_ambient_dir(root, ambient_authority())
+        .map_err(|_| FormatError::FilesystemExtractionFailed("extraction root must already exist"))
 }
 
-fn existing_safe_regular_path(root: &Path, archive_path: &[u8]) -> Result<PathBuf, FormatError> {
+fn open_or_create_safe_child_dir(parent: &CapDir, component: &str) -> Result<CapDir, FormatError> {
+    match parent.open_dir_nofollow(component) {
+        Ok(child) => return Ok(child),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(FormatError::UnsafeArchivePath),
+    }
+
+    match parent.create_dir(component) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => {
+            return Err(FormatError::FilesystemExtractionFailed(
+                "failed to create parent directory",
+            ));
+        }
+    }
+    parent
+        .open_dir_nofollow(component)
+        .map_err(|_| FormatError::UnsafeArchivePath)
+}
+
+fn existing_safe_regular_path(
+    root: &Path,
+    archive_path: &[u8],
+) -> Result<PreparedDestination, FormatError> {
     validate_file_path_bytes(archive_path, u32::MAX)?;
     let components = path_components(archive_path)?;
-    validate_root(root)?;
-    let mut current = root.to_path_buf();
-    for (idx, component) in components.iter().enumerate() {
-        current.push(component);
-        let metadata =
-            fs::symlink_metadata(&current).map_err(|_| FormatError::UnsafeArchivePath)?;
-        if metadata.file_type().is_symlink() {
-            return Err(FormatError::UnsafeArchivePath);
-        }
-        if idx + 1 != components.len() {
-            if !metadata.file_type().is_dir() {
-                return Err(FormatError::UnsafeArchivePath);
-            }
-        } else if !metadata.file_type().is_file() {
-            return Err(FormatError::UnsafeArchivePath);
-        }
+    let mut parent = open_extraction_root(root)?;
+    for component in &components[..components.len().saturating_sub(1)] {
+        parent = parent
+            .open_dir_nofollow(component)
+            .map_err(|_| FormatError::UnsafeArchivePath)?;
     }
-    Ok(current)
+
+    let leaf = PathBuf::from(components.last().ok_or(FormatError::UnsafeArchivePath)?);
+    let metadata = parent
+        .symlink_metadata(&leaf)
+        .map_err(|_| FormatError::UnsafeArchivePath)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(FormatError::UnsafeArchivePath);
+    }
+    Ok(PreparedDestination { parent, leaf })
 }
 
-fn write_regular_file(
-    destination: &Path,
-    data: &[u8],
-    options: SafeExtractionOptions,
-) -> Result<fs::File, FormatError> {
-    if options.overwrite_existing && destination.exists() {
-        fs::remove_file(destination)
-            .map_err(|_| FormatError::FilesystemExtractionFailed("failed to remove old file"))?;
-    }
-    let mut file = OpenOptions::new()
+fn create_new_file_options() -> CapOpenOptions {
+    let mut options = CapOpenOptions::new();
+    options
+        .read(true)
         .write(true)
         .create_new(true)
-        .open(destination)
-        .map_err(|_| FormatError::FilesystemExtractionFailed("failed to create regular file"))?;
-    file.write_all(data)
-        .map_err(|_| FormatError::FilesystemExtractionFailed("failed to write regular file"))?;
-    Ok(file)
+        .follow(FollowSymlinks::No);
+    options
 }
 
-fn create_temp_regular_file(destination: &Path) -> Result<(PathBuf, fs::File), FormatError> {
-    let pid = std::process::id();
-    for attempt in 0..1000u32 {
-        let mut candidate = destination.as_os_str().to_os_string();
-        candidate.push(format!(".tzap-tmp-{pid}-{attempt}"));
-        let path = PathBuf::from(candidate);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => return Ok((path, file)),
+fn create_temp_regular_file(
+    destination: &PreparedDestination,
+) -> Result<(PathBuf, fs::File), FormatError> {
+    for _ in 0..1000u32 {
+        let mut candidate = destination.leaf.as_os_str().to_os_string();
+        candidate.push(format!(".tzap-tmp-{}", uuid::Uuid::new_v4()));
+        let leaf = PathBuf::from(candidate);
+        match destination
+            .parent
+            .open_with(&leaf, &create_new_file_options())
+        {
+            Ok(file) => return Ok((leaf, file.into_std())),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(_) => {
                 return Err(FormatError::FilesystemExtractionFailed(
@@ -1816,13 +1809,80 @@ fn create_temp_regular_file(destination: &Path) -> Result<(PathBuf, fs::File), F
     ))
 }
 
-fn create_directory(destination: &Path) -> Result<(), FormatError> {
-    match fs::create_dir(destination) {
+fn publish_regular_file(
+    destination: &PreparedDestination,
+    temp_leaf: &Path,
+    mut temp_file: fs::File,
+    options: SafeExtractionOptions,
+) -> Result<fs::File, FormatError> {
+    if options.overwrite_existing {
+        remove_existing_leaf_if_needed(destination)?;
+    }
+
+    let mut output = match destination
+        .parent
+        .open_with(&destination.leaf, &create_new_file_options())
+    {
+        Ok(file) => file.into_std(),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = destination.parent.remove_file_or_symlink(temp_leaf);
+            return Err(FormatError::UnsafeOverwrite);
+        }
+        Err(_) => {
+            let _ = destination.parent.remove_file_or_symlink(temp_leaf);
+            return Err(FormatError::FilesystemExtractionFailed(
+                "failed to create regular file",
+            ));
+        }
+    };
+
+    let copy_result = temp_file
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| std::io::copy(&mut temp_file, &mut output))
+        .and_then(|_| output.flush());
+
+    if copy_result.is_err() {
+        let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
+        let _ = destination.parent.remove_file_or_symlink(temp_leaf);
+        return Err(FormatError::FilesystemExtractionFailed(
+            "failed to write regular file",
+        ));
+    }
+
+    let _ = destination.parent.remove_file_or_symlink(temp_leaf);
+    Ok(output)
+}
+
+fn remove_existing_leaf_if_needed(destination: &PreparedDestination) -> Result<(), FormatError> {
+    match destination.parent.symlink_metadata(&destination.leaf) {
+        Ok(metadata) => {
+            if metadata.file_type().is_dir() {
+                return Err(FormatError::UnsafeOverwrite);
+            }
+            destination
+                .parent
+                .remove_file_or_symlink(&destination.leaf)
+                .map_err(|_| FormatError::FilesystemExtractionFailed("failed to remove old file"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(FormatError::FilesystemExtractionFailed(
+            "failed to inspect destination",
+        )),
+    }
+}
+
+fn create_directory(destination: &PreparedDestination) -> Result<(), FormatError> {
+    match destination.parent.create_dir(&destination.leaf) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata =
-                fs::symlink_metadata(destination).map_err(|_| FormatError::UnsafeOverwrite)?;
-            if metadata.file_type().is_dir() {
+            let metadata = destination
+                .parent
+                .symlink_metadata(&destination.leaf)
+                .map_err(|_| FormatError::UnsafeOverwrite)?;
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                Err(FormatError::UnsafeArchivePath)
+            } else if file_type.is_dir() {
                 Ok(())
             } else {
                 Err(FormatError::UnsafeOverwrite)
@@ -1835,46 +1895,57 @@ fn create_directory(destination: &Path) -> Result<(), FormatError> {
 }
 
 fn create_hardlink(
-    destination: &Path,
-    target: &Path,
+    destination: &PreparedDestination,
+    target: &PreparedDestination,
     options: SafeExtractionOptions,
 ) -> Result<(), FormatError> {
-    if options.overwrite_existing && destination.exists() {
-        fs::remove_file(destination)
-            .map_err(|_| FormatError::FilesystemExtractionFailed("failed to remove old file"))?;
+    if options.overwrite_existing {
+        remove_existing_leaf_if_needed(destination)?;
     }
-    fs::hard_link(target, destination)
-        .map_err(|_| FormatError::FilesystemExtractionFailed("failed to create hardlink"))
+    match target
+        .parent
+        .hard_link(&target.leaf, &destination.parent, &destination.leaf)
+    {
+        Ok(()) => {
+            let metadata = destination
+                .parent
+                .symlink_metadata(&destination.leaf)
+                .map_err(|_| {
+                    FormatError::FilesystemExtractionFailed("failed to inspect hardlink")
+                })?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
+                return Err(FormatError::UnsafeArchivePath);
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(FormatError::UnsafeOverwrite)
+        }
+        Err(_) => Err(FormatError::FilesystemExtractionFailed(
+            "failed to create hardlink",
+        )),
+    }
 }
 
-#[cfg(unix)]
 fn create_symlink(
-    destination: &Path,
+    destination: &PreparedDestination,
     target: &[u8],
     options: SafeExtractionOptions,
 ) -> Result<(), FormatError> {
-    if options.overwrite_existing && destination.exists() {
-        fs::remove_file(destination)
-            .map_err(|_| FormatError::FilesystemExtractionFailed("failed to remove old file"))?;
+    if options.overwrite_existing {
+        remove_existing_leaf_if_needed(destination)?;
     }
     let target = std::str::from_utf8(target).map_err(|_| FormatError::UnsafeArchivePath)?;
-    std::os::unix::fs::symlink(target, destination)
-        .map_err(|_| FormatError::FilesystemExtractionFailed("failed to create symlink"))
-}
-
-#[cfg(windows)]
-fn create_symlink(
-    destination: &Path,
-    target: &[u8],
-    options: SafeExtractionOptions,
-) -> Result<(), FormatError> {
-    if options.overwrite_existing && destination.exists() {
-        fs::remove_file(destination)
-            .map_err(|_| FormatError::FilesystemExtractionFailed("failed to remove old file"))?;
+    match destination.parent.symlink_file(target, &destination.leaf) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(FormatError::UnsafeOverwrite)
+        }
+        Err(_) => Err(FormatError::FilesystemExtractionFailed(
+            "failed to create symlink",
+        )),
     }
-    let target = std::str::from_utf8(target).map_err(|_| FormatError::UnsafeArchivePath)?;
-    std::os::windows::fs::symlink_file(target, destination)
-        .map_err(|_| FormatError::FilesystemExtractionFailed("failed to create symlink"))
 }
 
 fn path_components(path: &[u8]) -> Result<Vec<String>, FormatError> {
@@ -2671,6 +2742,62 @@ mod tests {
             restore_tar_member(tmp.path(), &member, SafeExtractionOptions::default()).unwrap_err(),
             FormatError::UnsafeArchivePath
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_regular_file_uses_open_parent_after_parent_path_swap() {
+        let tmp = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let original_parent = tmp.path().join("a");
+        let held_parent = tmp.path().join("held");
+        fs::create_dir(&original_parent).unwrap();
+
+        let destination = prepare_destination(
+            tmp.path(),
+            b"a/file.txt",
+            TarEntryKind::Regular,
+            SafeExtractionOptions::default(),
+        )
+        .unwrap();
+
+        fs::rename(&original_parent, &held_parent).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &original_parent).unwrap();
+
+        let (temp_leaf, mut file) = create_temp_regular_file(&destination).unwrap();
+        file.write_all(b"inside").unwrap();
+        publish_regular_file(
+            &destination,
+            &temp_leaf,
+            file,
+            SafeExtractionOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(held_parent.join("file.txt")).unwrap(), b"inside");
+        assert!(!outside.path().join("file.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_directory_rechecks_leaf_without_following_symlink() {
+        let tmp = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let destination = prepare_destination(
+            tmp.path(),
+            b"dir",
+            TarEntryKind::Directory,
+            SafeExtractionOptions::default(),
+        )
+        .unwrap();
+
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("dir")).unwrap();
+
+        assert_eq!(
+            create_directory(&destination).unwrap_err(),
+            FormatError::UnsafeArchivePath
+        );
+        assert!(outside.path().read_dir().unwrap().next().is_none());
     }
 
     #[test]
