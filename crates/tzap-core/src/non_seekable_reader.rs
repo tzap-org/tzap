@@ -637,8 +637,8 @@ struct SequentialStreamOutcome {
 fn sequential_list_report(
     outcome: SequentialStreamOutcome,
 ) -> Result<SequentialListReport, FormatError> {
-    let entries = streamed_list_entries(&outcome.opened, &outcome.streamed_payload)?;
     let index_entries = outcome.opened.list_index_entries()?;
+    let entries = streamed_list_entries(&index_entries, &outcome.streamed_payload)?;
     Ok(SequentialListReport {
         verification: outcome.verification,
         entries,
@@ -946,7 +946,7 @@ fn degraded_metadata_count(payload: &StreamedPayloadSummary) -> Result<u64, Form
 }
 
 fn streamed_list_entries(
-    opened: &OpenedArchive,
+    index_entries: &[ArchiveIndexEntry],
     payload: &StreamedPayloadSummary,
 ) -> Result<Vec<ArchiveEntry>, FormatError> {
     let mut latest_by_path = BTreeMap::<Vec<u8>, &TarStreamMemberSummary>::new();
@@ -960,9 +960,8 @@ fn streamed_list_entries(
         }
     }
 
-    opened
-        .list_index_entries()?
-        .into_iter()
+    index_entries
+        .iter()
         .map(|entry| {
             let member =
                 latest_by_path
@@ -971,7 +970,7 @@ fn streamed_list_entries(
                         "streamed tar member missing from final index",
                     ))?;
             Ok(ArchiveEntry {
-                path: entry.path,
+                path: entry.path.clone(),
                 file_data_size: entry.file_data_size,
                 kind: member.kind,
                 mode: member.mode,

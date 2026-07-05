@@ -3196,13 +3196,7 @@ impl OpenedArchive {
         let mut decoded = Vec::new();
 
         for frame in frames {
-            let envelope = shard
-                .envelopes
-                .iter()
-                .find(|entry| entry.envelope_index == frame.envelope_index)
-                .ok_or(FormatError::InvalidArchive(
-                    "FrameEntry references missing EnvelopeEntry",
-                ))?;
+            let envelope = envelope_by_index(shard, frame.envelope_index)?;
             if let Entry::Vacant(entry) = envelope_cache.entry(envelope.envelope_index) {
                 entry.insert(self.load_payload_envelope(envelope, ParityReadPolicy::RepairOnly)?);
             }
@@ -3843,6 +3837,21 @@ fn archive_index_entry_layout(
     file: &FileEntry,
 ) -> Result<ArchiveIndexEntryLayout, FormatError> {
     let frames = frame_range_for_file(shard, file)?;
+    if let [frame] = frames {
+        let envelope = envelope_by_index(shard, frame.envelope_index)?;
+        return Ok(ArchiveIndexEntryLayout {
+            compressed_size: frame.compressed_size as u64,
+            decompressed_frame_size: frame.decompressed_size as u64,
+            envelope_count: 1,
+            first_envelope_index: Some(envelope.envelope_index),
+            last_envelope_index: Some(envelope.envelope_index),
+            first_payload_block_index: Some(envelope.first_block_index),
+            payload_data_block_count: envelope.data_block_count as u64,
+            payload_parity_block_count: envelope.parity_block_count as u64,
+            payload_encrypted_size: envelope.encrypted_size as u64,
+        });
+    }
+
     let mut compressed_size = 0u64;
     let mut decompressed_frame_size = 0u64;
     let mut envelope_indexes = BTreeSet::new();
@@ -3867,7 +3876,7 @@ fn archive_index_entry_layout(
     let mut payload_encrypted_size = 0u64;
 
     for envelope_index in &envelope_indexes {
-        let envelope = envelope_for_index(shard, *envelope_index)?;
+        let envelope = envelope_by_index(shard, *envelope_index)?;
         first_payload_block_index = Some(
             first_payload_block_index
                 .map(|existing| existing.min(envelope.first_block_index))
@@ -3903,19 +3912,6 @@ fn archive_index_entry_layout(
         payload_parity_block_count,
         payload_encrypted_size,
     })
-}
-
-fn envelope_for_index(
-    shard: &IndexShard,
-    envelope_index: u64,
-) -> Result<&EnvelopeEntry, FormatError> {
-    shard
-        .envelopes
-        .iter()
-        .find(|entry| entry.envelope_index == envelope_index)
-        .ok_or(FormatError::InvalidArchive(
-            "FrameEntry references missing EnvelopeEntry",
-        ))
 }
 
 fn archive_entry_name(path: &str) -> String {
@@ -9813,23 +9809,31 @@ fn ceil_div_u64(numerator: u64, denominator: u64) -> Result<u64, FormatError> {
 fn frame_range_for_file<'b>(
     shard: &'b IndexShard,
     file: &FileEntry,
-) -> Result<Vec<&'b FrameEntry>, FormatError> {
-    let mut frames = Vec::with_capacity(file.frame_count as usize);
-    for offset in 0..file.frame_count as u64 {
-        let frame_index =
-            file.first_frame_index
-                .checked_add(offset)
-                .ok_or(FormatError::InvalidArchive(
-                    "FileEntry frame range overflow",
-                ))?;
-        let frame = shard
-            .frames
-            .iter()
-            .find(|entry| entry.frame_index == frame_index)
-            .ok_or(FormatError::InvalidArchive(
+) -> Result<&'b [FrameEntry], FormatError> {
+    let start = shard
+        .frames
+        .binary_search_by_key(&file.first_frame_index, |entry| entry.frame_index)
+        .map_err(|_| FormatError::InvalidArchive("FileEntry references missing FrameEntry"))?;
+    let count = usize::try_from(file.frame_count)
+        .map_err(|_| FormatError::InvalidArchive("FileEntry frame count overflow"))?;
+    let end = start.checked_add(count).ok_or(FormatError::InvalidArchive(
+        "FileEntry frame range overflow",
+    ))?;
+    let frames = shard
+        .frames
+        .get(start..end)
+        .ok_or(FormatError::InvalidArchive(
+            "FileEntry references missing FrameEntry",
+        ))?;
+    for (offset, frame) in frames.iter().enumerate() {
+        let expected = file.first_frame_index.checked_add(offset as u64).ok_or(
+            FormatError::InvalidArchive("FileEntry frame range overflow"),
+        )?;
+        if frame.frame_index != expected {
+            return Err(FormatError::InvalidArchive(
                 "FileEntry references missing FrameEntry",
-            ))?;
-        frames.push(frame);
+            ));
+        }
     }
     Ok(frames)
 }
@@ -12505,6 +12509,112 @@ mod tests {
         assert_eq!(looked_up.file_data_size, b"broken payload\n".len() as u64);
         assert_eq!(looked_up.mtime, 0);
         assert_eq!(opened.list_files().unwrap_err(), FormatError::AeadFailure);
+    }
+
+    #[test]
+    fn index_entry_layout_stats_match_frame_and_envelope_tables() {
+        let payload = pseudo_random_bytes(12 * 1024);
+        let archive = write_archive(
+            &[RegularFile::new("chunked.bin", &payload)],
+            &master_key(),
+            WriterOptions {
+                block_size: 4096,
+                chunk_size: 1024,
+                envelope_target_size: 2048,
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                fec_data_shards: 16,
+                fec_parity_shards: 0,
+                ..WriterOptions::default()
+            },
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let entry = opened.list_index_entries().unwrap().remove(0);
+        let located = opened
+            .locate_index_file(b"chunked.bin")
+            .unwrap()
+            .expect("indexed file exists");
+        let file = &located.shard.files[located.file_index];
+        let frames = frame_range_for_file(&located.shard, file).unwrap();
+        assert!(frames.len() > 1);
+
+        let expected_compressed_size = frames
+            .iter()
+            .map(|frame| frame.compressed_size as u64)
+            .sum::<u64>();
+        let expected_decompressed_frame_size = frames
+            .iter()
+            .map(|frame| frame.decompressed_size as u64)
+            .sum::<u64>();
+        let envelope_indexes = frames
+            .iter()
+            .map(|frame| frame.envelope_index)
+            .collect::<BTreeSet<_>>();
+        assert!(envelope_indexes.len() > 1);
+
+        let envelopes = envelope_indexes
+            .iter()
+            .map(|index| envelope_by_index(&located.shard, *index).unwrap())
+            .collect::<Vec<_>>();
+        let expected_first_payload_block_index = envelopes
+            .iter()
+            .map(|envelope| envelope.first_block_index)
+            .min();
+        let expected_payload_data_block_count = envelopes
+            .iter()
+            .map(|envelope| envelope.data_block_count as u64)
+            .sum::<u64>();
+        let expected_payload_parity_block_count = envelopes
+            .iter()
+            .map(|envelope| envelope.parity_block_count as u64)
+            .sum::<u64>();
+        let expected_payload_encrypted_size = envelopes
+            .iter()
+            .map(|envelope| envelope.encrypted_size as u64)
+            .sum::<u64>();
+
+        assert_eq!(entry.path, "chunked.bin");
+        assert_eq!(entry.name, "chunked.bin");
+        assert_eq!(entry.file_data_size, payload.len() as u64);
+        assert_eq!(entry.tar_member_group_size, file.tar_member_group_size);
+        assert_eq!(entry.first_frame_index, file.first_frame_index);
+        assert_eq!(entry.frame_count, file.frame_count);
+        assert_eq!(
+            entry.offset_in_first_frame_plaintext,
+            file.offset_in_first_frame_plaintext
+        );
+        assert_eq!(entry.layout.compressed_size, expected_compressed_size);
+        assert_eq!(
+            entry.layout.decompressed_frame_size,
+            expected_decompressed_frame_size
+        );
+        assert_eq!(entry.layout.envelope_count as usize, envelope_indexes.len());
+        assert_eq!(
+            entry.layout.first_envelope_index,
+            envelope_indexes.iter().next().copied()
+        );
+        assert_eq!(
+            entry.layout.last_envelope_index,
+            envelope_indexes.iter().next_back().copied()
+        );
+        assert_eq!(
+            entry.layout.first_payload_block_index,
+            expected_first_payload_block_index
+        );
+        assert_eq!(
+            entry.layout.payload_data_block_count,
+            expected_payload_data_block_count
+        );
+        assert_eq!(
+            entry.layout.payload_parity_block_count,
+            expected_payload_parity_block_count
+        );
+        assert_eq!(
+            entry.layout.payload_encrypted_size,
+            expected_payload_encrypted_size
+        );
     }
 
     #[test]
