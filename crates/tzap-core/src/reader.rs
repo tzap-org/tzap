@@ -214,8 +214,28 @@ pub struct ArchiveEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveIndexEntry {
     pub path: String,
+    pub name: String,
     pub file_data_size: u64,
-    pub mtime: Option<u64>,
+    pub mtime: u64,
+    pub path_hash: [u8; 8],
+    pub tar_member_group_size: u64,
+    pub first_frame_index: u64,
+    pub frame_count: u32,
+    pub offset_in_first_frame_plaintext: u32,
+    pub layout: ArchiveIndexEntryLayout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveIndexEntryLayout {
+    pub compressed_size: u64,
+    pub decompressed_frame_size: u64,
+    pub envelope_count: u32,
+    pub first_envelope_index: Option<u64>,
+    pub last_envelope_index: Option<u64>,
+    pub first_payload_block_index: Option<u64>,
+    pub payload_data_block_count: u64,
+    pub payload_parity_block_count: u64,
+    pub payload_encrypted_size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,7 +418,7 @@ pub(crate) struct StreamedArchiveOpenParts {
 struct WinningIndexEntry {
     start: u64,
     file_data_size: u64,
-    mtime: Option<u64>,
+    mtime: u64,
     shard_index: usize,
     file_index: usize,
 }
@@ -2017,11 +2037,11 @@ impl OpenedArchive {
         final_index_entry_winners(&shards)?
             .into_iter()
             .map(|(path, winner)| {
-                Ok(ArchiveIndexEntry {
+                archive_index_entry_from_loaded_file_with_path(
                     path,
-                    file_data_size: winner.file_data_size,
-                    mtime: winner.mtime,
-                })
+                    &shards[winner.shard_index],
+                    winner.file_index,
+                )
             })
             .collect()
     }
@@ -3786,20 +3806,120 @@ fn archive_index_entry_from_loaded_file(
     shard: &IndexShard,
     file_index: usize,
 ) -> Result<ArchiveIndexEntry, FormatError> {
-    let file = shard
-        .files
-        .get(file_index)
-        .ok_or(FormatError::InvalidArchive("FileEntry index out of bounds"))?;
     let path = utf8_path(
         shard
             .file_path(file_index)
             .ok_or(FormatError::InvalidArchive("FileEntry path is missing"))?,
     )?;
+    archive_index_entry_from_loaded_file_with_path(path, shard, file_index)
+}
+
+fn archive_index_entry_from_loaded_file_with_path(
+    path: String,
+    shard: &IndexShard,
+    file_index: usize,
+) -> Result<ArchiveIndexEntry, FormatError> {
+    let file = shard
+        .files
+        .get(file_index)
+        .ok_or(FormatError::InvalidArchive("FileEntry index out of bounds"))?;
+    let layout = archive_index_entry_layout(shard, file)?;
     Ok(ArchiveIndexEntry {
+        name: archive_entry_name(&path),
         path,
         file_data_size: file.file_data_size,
         mtime: file.mtime,
+        path_hash: file.path_hash,
+        tar_member_group_size: file.tar_member_group_size,
+        first_frame_index: file.first_frame_index,
+        frame_count: file.frame_count,
+        offset_in_first_frame_plaintext: file.offset_in_first_frame_plaintext,
+        layout,
     })
+}
+
+fn archive_index_entry_layout(
+    shard: &IndexShard,
+    file: &FileEntry,
+) -> Result<ArchiveIndexEntryLayout, FormatError> {
+    let frames = frame_range_for_file(shard, file)?;
+    let mut compressed_size = 0u64;
+    let mut decompressed_frame_size = 0u64;
+    let mut envelope_indexes = BTreeSet::new();
+
+    for frame in frames {
+        compressed_size = checked_u64_add(
+            compressed_size,
+            frame.compressed_size as u64,
+            "ArchiveIndexEntry.compressed_size",
+        )?;
+        decompressed_frame_size = checked_u64_add(
+            decompressed_frame_size,
+            frame.decompressed_size as u64,
+            "ArchiveIndexEntry.decompressed_frame_size",
+        )?;
+        envelope_indexes.insert(frame.envelope_index);
+    }
+
+    let mut first_payload_block_index = None::<u64>;
+    let mut payload_data_block_count = 0u64;
+    let mut payload_parity_block_count = 0u64;
+    let mut payload_encrypted_size = 0u64;
+
+    for envelope_index in &envelope_indexes {
+        let envelope = envelope_for_index(shard, *envelope_index)?;
+        first_payload_block_index = Some(
+            first_payload_block_index
+                .map(|existing| existing.min(envelope.first_block_index))
+                .unwrap_or(envelope.first_block_index),
+        );
+        payload_data_block_count = checked_u64_add(
+            payload_data_block_count,
+            envelope.data_block_count as u64,
+            "ArchiveIndexEntry.payload_data_block_count",
+        )?;
+        payload_parity_block_count = checked_u64_add(
+            payload_parity_block_count,
+            envelope.parity_block_count as u64,
+            "ArchiveIndexEntry.payload_parity_block_count",
+        )?;
+        payload_encrypted_size = checked_u64_add(
+            payload_encrypted_size,
+            envelope.encrypted_size as u64,
+            "ArchiveIndexEntry.payload_encrypted_size",
+        )?;
+    }
+
+    Ok(ArchiveIndexEntryLayout {
+        compressed_size,
+        decompressed_frame_size,
+        envelope_count: u32::try_from(envelope_indexes.len()).map_err(|_| {
+            FormatError::InvalidArchive("ArchiveIndexEntry envelope count overflow")
+        })?,
+        first_envelope_index: envelope_indexes.iter().next().copied(),
+        last_envelope_index: envelope_indexes.iter().next_back().copied(),
+        first_payload_block_index,
+        payload_data_block_count,
+        payload_parity_block_count,
+        payload_encrypted_size,
+    })
+}
+
+fn envelope_for_index(
+    shard: &IndexShard,
+    envelope_index: u64,
+) -> Result<&EnvelopeEntry, FormatError> {
+    shard
+        .envelopes
+        .iter()
+        .find(|entry| entry.envelope_index == envelope_index)
+        .ok_or(FormatError::InvalidArchive(
+            "FrameEntry references missing EnvelopeEntry",
+        ))
+}
+
+fn archive_entry_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_owned()
 }
 
 #[derive(Debug)]
@@ -10145,7 +10265,7 @@ mod tests {
     };
     use crate::metadata::{
         DirectoryHintEntry, DirectoryHintTableHeader, IndexRootHeader, IndexShardHeader,
-        ENVELOPE_ENTRY_LEN, FILE_ENTRY_V2_LEN, FRAME_ENTRY_LEN, INDEX_SHARD_HEADER_LEN,
+        ENVELOPE_ENTRY_LEN, FILE_ENTRY_LEN, FRAME_ENTRY_LEN, INDEX_SHARD_HEADER_LEN,
     };
     use crate::non_seekable_reader::{
         extract_non_seekable_stream_to_dir, list_non_seekable_stream, verify_non_seekable_stream,
@@ -12336,22 +12456,18 @@ mod tests {
         .unwrap();
         let opened = open_archive(&archive.bytes, &master_key()).unwrap();
 
-        assert_eq!(
-            opened.list_index_entries().unwrap(),
-            vec![ArchiveIndexEntry {
-                path: "same.txt".to_string(),
-                file_data_size: 5,
-                mtime: Some(1_700_000_100),
-            }]
-        );
-        assert_eq!(
-            opened.lookup_index_entry("same.txt").unwrap(),
-            Some(ArchiveIndexEntry {
-                path: "same.txt".to_string(),
-                file_data_size: 5,
-                mtime: Some(1_700_000_100),
-            })
-        );
+        let listed = opened.list_index_entries().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, "same.txt");
+        assert_eq!(listed[0].name, "same.txt");
+        assert_eq!(listed[0].file_data_size, 5);
+        assert_eq!(listed[0].mtime, 1_700_000_100);
+        assert_eq!(listed[0].frame_count, 1);
+        assert!(listed[0].layout.compressed_size > 0);
+        let looked_up = opened.lookup_index_entry("same.txt").unwrap().unwrap();
+        assert_eq!(looked_up.path, "same.txt");
+        assert_eq!(looked_up.file_data_size, 5);
+        assert_eq!(looked_up.mtime, 1_700_000_100);
         assert_eq!(opened.lookup_index_entry("missing.txt").unwrap(), None);
         assert_eq!(
             opened.list_files().unwrap(),
@@ -12376,29 +12492,18 @@ mod tests {
         let (mut opened, broken_payload_block) = multi_envelope_reader_fixture();
         corrupt_payload_record(&mut opened.blocks, broken_payload_block);
 
-        assert_eq!(
-            opened.list_index_entries().unwrap(),
-            vec![
-                ArchiveIndexEntry {
-                    path: "broken.txt".to_string(),
-                    file_data_size: b"broken payload\n".len() as u64,
-                    mtime: Some(0),
-                },
-                ArchiveIndexEntry {
-                    path: "healthy.txt".to_string(),
-                    file_data_size: b"healthy payload\n".len() as u64,
-                    mtime: Some(0),
-                },
-            ]
-        );
-        assert_eq!(
-            opened.lookup_index_entry("broken.txt").unwrap(),
-            Some(ArchiveIndexEntry {
-                path: "broken.txt".to_string(),
-                file_data_size: b"broken payload\n".len() as u64,
-                mtime: Some(0),
-            })
-        );
+        let listed = opened.list_index_entries().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].path, "broken.txt");
+        assert_eq!(listed[0].file_data_size, b"broken payload\n".len() as u64);
+        assert_eq!(listed[0].mtime, 0);
+        assert_eq!(listed[1].path, "healthy.txt");
+        assert_eq!(listed[1].file_data_size, b"healthy payload\n".len() as u64);
+        assert_eq!(listed[1].mtime, 0);
+        let looked_up = opened.lookup_index_entry("broken.txt").unwrap().unwrap();
+        assert_eq!(looked_up.path, "broken.txt");
+        assert_eq!(looked_up.file_data_size, b"broken payload\n".len() as u64);
+        assert_eq!(looked_up.mtime, 0);
         assert_eq!(opened.list_files().unwrap_err(), FormatError::AeadFailure);
     }
 
@@ -17912,25 +18017,25 @@ mod tests {
                 offset_in_first_frame_plaintext: 0,
                 tar_member_group_size: file.member_group_size,
                 file_data_size: file.file_data_size,
-                mtime: Some(0),
+                mtime: 0,
                 flags: 0,
             });
         }
 
         let header = IndexShardHeader {
-            version: 2,
+            version: 1,
             shard_index: 0,
             file_count: file_entries.len() as u32,
             frame_count: frames.len() as u32,
             envelope_count: envelopes.len() as u32,
             file_table_offset: INDEX_SHARD_HEADER_LEN as u32,
-            frame_table_offset: (INDEX_SHARD_HEADER_LEN + file_entries.len() * FILE_ENTRY_V2_LEN)
+            frame_table_offset: (INDEX_SHARD_HEADER_LEN + file_entries.len() * FILE_ENTRY_LEN)
                 as u32,
             envelope_table_offset: (INDEX_SHARD_HEADER_LEN
-                + file_entries.len() * FILE_ENTRY_V2_LEN
+                + file_entries.len() * FILE_ENTRY_LEN
                 + frames.len() * FRAME_ENTRY_LEN) as u32,
             string_pool_offset: (INDEX_SHARD_HEADER_LEN
-                + file_entries.len() * FILE_ENTRY_V2_LEN
+                + file_entries.len() * FILE_ENTRY_LEN
                 + frames.len() * FRAME_ENTRY_LEN
                 + envelopes.len() * ENVELOPE_ENTRY_LEN) as u32,
             string_pool_size: string_pool.len() as u32,
@@ -17939,7 +18044,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&header.to_bytes());
         for entry in &file_entries {
-            bytes.extend_from_slice(&entry.to_bytes_for_index_shard_version(header.version));
+            bytes.extend_from_slice(&entry.to_bytes());
         }
         for entry in frames {
             bytes.extend_from_slice(&entry.to_bytes());

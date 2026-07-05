@@ -533,8 +533,16 @@ The supported reader profile is:
 - local PAX `path`, `linkpath`, and `size` records for the following main entry;
 - local GNU long name and long link records for the following main entry;
 - ustar mode and integer mtime parsed from the main tar header, exposed by
-  list/API metadata, and applied to restored regular files when the platform
-  filesystem API accepts them.
+  tar-decoding list/API metadata, and applied to restored regular files when
+  the platform filesystem API accepts them.
+
+Index-backed listing exposes authenticated index metadata without decoding
+payload envelopes. `list_index_entries`, `lookup_index_entry`, and
+`tzap list --json` include path, basename, payload size, integer mtime,
+tar-member group size, frame range, compressed frame size, and touched
+envelope/block layout metadata. These layout fields describe archive objects
+touched by the file; they are not a per-file ownership claim for shared
+envelopes.
 
 Filesystem extraction writes file payloads and supported links safely under the
 destination root. It does not currently claim ownership, xattr, ACL, sparse-file,
@@ -542,8 +550,8 @@ nanosecond timestamp, or global tar-state restoration. Mode or mtime application
 failures are reported as degraded metadata diagnostics.
 
 Unsupported local metadata is reported as degraded metadata instead of looking
-fully successful. `tzap list --long`, `tzap list --json`, `tzap verify`, and
-payload-reading `tzap extract` operations write diagnostics such as:
+fully successful. `tzap list --long`, `tzap verify`, and payload-reading
+`tzap extract` operations write diagnostics such as:
 
 ```text
 tzap: degraded-metadata: path/in/archive: gnu-sparse: unsupported sparse-file PAX metadata was ignored
@@ -556,10 +564,10 @@ through degraded metadata diagnostics. The global `--quiet` flag suppresses
 success summaries where applicable; it is not a best-effort metadata-warning
 mode.
 
-Library callers that only need index paths and payload sizes may use
+Library callers that only need authenticated index metadata may use
 `list_index_entries` or `lookup_index_entry`. Library callers that only need
 bytes may use `extract_file`, which is explicitly payload-only. Callers that
-surface metadata fidelity should use `list_files`, `extract_member`,
+surface tar metadata fidelity should use `list_files`, `extract_member`,
 `extract_file_with_diagnostics`, or `extract_file_to`.
 
 ## Cloud directory-prefix optimization

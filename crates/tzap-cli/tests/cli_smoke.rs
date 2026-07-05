@@ -6842,14 +6842,32 @@ fn cli_list_outputs_stable_json() {
         .clone();
     let value: Value = serde_json::from_slice(&output).unwrap();
 
+    assert_eq!(
+        value.get("metadata_source").unwrap().as_str().unwrap(),
+        "index"
+    );
     let files = value.get("files").unwrap().as_array().unwrap();
     assert_eq!(files.len(), 1);
     let file = &files[0];
     assert_eq!(file.get("path").unwrap().as_str().unwrap(), "json.txt");
-    assert_eq!(file.get("kind").unwrap().as_str().unwrap(), "file");
+    assert_eq!(file.get("name").unwrap().as_str().unwrap(), "json.txt");
     assert_eq!(file.get("size").unwrap().as_u64().unwrap(), 12);
-    assert_eq!(file.get("mode").unwrap().as_u64().unwrap(), 420);
     assert_eq!(file.get("mtime").unwrap().as_u64().unwrap(), 0);
+    assert!(file.get("path_hash").unwrap().as_str().unwrap().len() == 16);
+    assert!(file.get("tar_member_group_size").unwrap().as_u64().unwrap() >= 512);
+    assert_eq!(file.get("first_frame_index").unwrap().as_u64().unwrap(), 0);
+    assert_eq!(file.get("frame_count").unwrap().as_u64().unwrap(), 1);
+    assert!(file.get("compressed_size").unwrap().as_u64().unwrap() > 0);
+    let layout = file.get("layout").unwrap();
+    assert_eq!(layout.get("envelope_count").unwrap().as_u64().unwrap(), 1);
+    assert_eq!(
+        layout
+            .get("first_payload_block_index")
+            .unwrap()
+            .as_u64()
+            .unwrap(),
+        0
+    );
 }
 
 #[test]

@@ -24,7 +24,7 @@ tzap-core = "0.1.9"
 - zstd compression and dictionary support
 - multi-volume layout and FEC recovery
 - bootstrap sidecar parsing and verification
-- index-only path and size listing
+- rich index-only listing with path, size, mtime, compressed-frame, and layout metadata
 - file-backed `ArchiveReadAt` opening for lazy random-access extraction
 - safe extraction and tar metadata normalization
 - RootAuth writer request, footer, and verifier callback surfaces

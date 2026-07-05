@@ -20,9 +20,10 @@ use crate::reader::{
     manifest_bootstrap_fields_match, observed_archive_size, parse_non_seekable_bootstrap_material,
     parse_terminal_material_read_at, recipient_wrap_subkeys_from_table, required_object_parity,
     startup_key_wrap_table, total_extraction_size_cap, v41_terminal_tail_cap,
-    validate_crypto_class_parity_exactness, validate_reader_options, ArchiveEntry, ArchiveReadAt,
-    KeyHoldingTerminalContext, NonSeekableBootstrapMaterial, OpenedArchive, ReaderOptions,
-    RecipientWrapCandidateMasterKey, RecipientWrapRecordContext, StreamedArchiveOpenParts,
+    validate_crypto_class_parity_exactness, validate_reader_options, ArchiveEntry,
+    ArchiveIndexEntry, ArchiveReadAt, KeyHoldingTerminalContext, NonSeekableBootstrapMaterial,
+    OpenedArchive, ReaderOptions, RecipientWrapCandidateMasterKey, RecipientWrapRecordContext,
+    StreamedArchiveOpenParts,
 };
 use crate::tar_model::{
     NoopTarStreamObserver, SafeExtractionOptions, TarStreamFilesystemRestoreObserver,
@@ -74,6 +75,7 @@ pub struct SequentialExtractReport {
 pub struct SequentialListReport {
     pub verification: SequentialVerifyReport,
     pub entries: Vec<ArchiveEntry>,
+    pub index_entries: Vec<ArchiveIndexEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,11 +537,7 @@ pub fn list_non_seekable_stream<R: Read>(
         NoopTarStreamObserver,
         None,
     )?;
-    let entries = streamed_list_entries(&outcome.opened, &outcome.streamed_payload)?;
-    Ok(SequentialListReport {
-        verification: outcome.verification,
-        entries,
-    })
+    sequential_list_report(outcome)
 }
 
 pub fn list_non_seekable_stream_with_recipient_wrap_resolver<R, F>(
@@ -560,11 +558,7 @@ where
         NoopTarStreamObserver,
         None,
     )?;
-    let entries = streamed_list_entries(&outcome.opened, &outcome.streamed_payload)?;
-    Ok(SequentialListReport {
-        verification: outcome.verification,
-        entries,
-    })
+    sequential_list_report(outcome)
 }
 
 pub fn list_unencrypted_non_seekable_stream<R: Read>(
@@ -578,11 +572,7 @@ pub fn list_unencrypted_non_seekable_stream<R: Read>(
         NoopTarStreamObserver,
         None,
     )?;
-    let entries = streamed_list_entries(&outcome.opened, &outcome.streamed_payload)?;
-    Ok(SequentialListReport {
-        verification: outcome.verification,
-        entries,
-    })
+    sequential_list_report(outcome)
 }
 
 pub fn list_non_seekable_stream_with_bootstrap_sidecar<R: Read>(
@@ -598,11 +588,7 @@ pub fn list_non_seekable_stream_with_bootstrap_sidecar<R: Read>(
         NoopTarStreamObserver,
         Some(bootstrap_sidecar),
     )?;
-    let entries = streamed_list_entries(&outcome.opened, &outcome.streamed_payload)?;
-    Ok(SequentialListReport {
-        verification: outcome.verification,
-        entries,
-    })
+    sequential_list_report(outcome)
 }
 
 pub fn list_non_seekable_stream_with_recipient_wrap_resolver_and_bootstrap_sidecar<R, F>(
@@ -624,11 +610,7 @@ where
         NoopTarStreamObserver,
         Some(bootstrap_sidecar),
     )?;
-    let entries = streamed_list_entries(&outcome.opened, &outcome.streamed_payload)?;
-    Ok(SequentialListReport {
-        verification: outcome.verification,
-        entries,
-    })
+    sequential_list_report(outcome)
 }
 
 pub fn list_unencrypted_non_seekable_stream_with_bootstrap_sidecar<R: Read>(
@@ -643,17 +625,25 @@ pub fn list_unencrypted_non_seekable_stream_with_bootstrap_sidecar<R: Read>(
         NoopTarStreamObserver,
         Some(bootstrap_sidecar),
     )?;
-    let entries = streamed_list_entries(&outcome.opened, &outcome.streamed_payload)?;
-    Ok(SequentialListReport {
-        verification: outcome.verification,
-        entries,
-    })
+    sequential_list_report(outcome)
 }
 
 struct SequentialStreamOutcome {
     opened: OpenedArchive,
     streamed_payload: StreamedPayloadSummary,
     verification: SequentialVerifyReport,
+}
+
+fn sequential_list_report(
+    outcome: SequentialStreamOutcome,
+) -> Result<SequentialListReport, FormatError> {
+    let entries = streamed_list_entries(&outcome.opened, &outcome.streamed_payload)?;
+    let index_entries = outcome.opened.list_index_entries()?;
+    Ok(SequentialListReport {
+        verification: outcome.verification,
+        entries,
+        index_entries,
+    })
 }
 
 type RecipientWrapResolver<'a> = dyn FnMut(

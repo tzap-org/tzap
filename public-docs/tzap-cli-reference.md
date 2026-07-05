@@ -245,7 +245,11 @@ Notes:
   succeed.
 - For file-backed archives, default `list` output reads encrypted index entries
   and prints archive paths. It does not decode payload envelopes for tar kind,
-  mode, mtime, or metadata diagnostics.
+  mode, or metadata diagnostics.
+- `tzap list --json` is also index-backed. It exposes path, basename, payload
+  size, integer mtime, tar-member group size, frame range, compressed frame
+  size, and touched envelope/block layout metadata without reading payload
+  envelopes.
 - Key-holding list opens archive files through the core file-backed
   random-access reader. Default output reads terminal and index metadata rather
   than loading every payload block.
@@ -255,9 +259,10 @@ Notes:
   pass volume files and omit the sidecar; combining multiple archive inputs
   with `--bootstrap` rejects before reading archive files with
   `unsupported-feature`.
-- Long listing and JSON output expose the parsed tar kind, size, ustar mode, and
-  integer mtime. Unsupported local tar metadata profiles are reported to stderr
-  as `tzap: degraded-metadata: ...`; global PAX/GNU state is rejected.
+- Long listing decodes tar member groups and exposes parsed tar kind, size,
+  ustar mode, and integer mtime. Unsupported local tar metadata profiles are
+  reported to stderr as `tzap: degraded-metadata: ...`; global PAX/GNU state is
+  rejected.
 
 ## Command: verify
 

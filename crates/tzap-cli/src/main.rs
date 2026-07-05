@@ -1745,28 +1745,15 @@ fn run(cli: Cli) -> Result<()> {
                 emit_entry_metadata_diagnostics(quiet, &report.entries)?;
                 if json {
                     let files = report
-                        .entries
+                        .index_entries
                         .iter()
-                        .map(|entry| {
-                            let kind = match entry.kind {
-                                TarEntryKind::Regular => "file",
-                                TarEntryKind::Directory => "directory",
-                                TarEntryKind::Symlink => "symlink",
-                                TarEntryKind::Hardlink => "hardlink",
-                            };
-                            json!({
-                                "path": &entry.path,
-                                "kind": kind,
-                                "size": entry.file_data_size,
-                                "mode": entry.mode,
-                                "mtime": entry.mtime,
-                            })
-                        })
+                        .map(archive_index_entry_json)
                         .collect::<Vec<_>>();
                     println!(
                         "{}",
                         serde_json::to_string(&json!({
                             "streaming_mode": "non-seekable",
+                            "metadata_source": "index",
                             "verification": {
                                 "file_count": report.verification.file_count,
                                 "tar_total_size": report.verification.tar_total_size,
@@ -1822,49 +1809,37 @@ fn run(cli: Cli) -> Result<()> {
                 )
             }
             .with_context(|| format!("failed to open archive {archive}"))?;
-            if json || long {
+            if json {
+                let files = opened
+                    .list_index_entries()?
+                    .iter()
+                    .map(archive_index_entry_json)
+                    .collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "metadata_source": "index",
+                        "files": files,
+                    }))
+                    .context("failed to encode list output as JSON")?
+                );
+                Ok(())
+            } else if long {
                 let entries = opened.list_files()?;
                 emit_entry_metadata_diagnostics(quiet, &entries)?;
-                if json {
-                    let files = entries
-                        .iter()
-                        .map(|entry| {
-                            let kind = match entry.kind {
-                                TarEntryKind::Regular => "file",
-                                TarEntryKind::Directory => "directory",
-                                TarEntryKind::Symlink => "symlink",
-                                TarEntryKind::Hardlink => "hardlink",
-                            };
-                            json!({
-                                "path": &entry.path,
-                                "kind": kind,
-                                "size": entry.file_data_size,
-                                "mode": entry.mode,
-                                "mtime": entry.mtime,
-                            })
-                        })
-                        .collect::<Vec<_>>();
+                for entry in entries {
+                    let kind = match entry.kind {
+                        TarEntryKind::Regular => "file",
+                        TarEntryKind::Directory => "directory",
+                        TarEntryKind::Symlink => "symlink",
+                        TarEntryKind::Hardlink => "hardlink",
+                    };
                     println!(
-                        "{}",
-                        serde_json::to_string(&json!({ "files": files }))
-                            .context("failed to encode list output as JSON")?
+                        "{}\t{}\t{}\t{}\t{}",
+                        entry.file_data_size, kind, entry.mode, entry.mtime, entry.path
                     );
-                    Ok(())
-                } else {
-                    for entry in entries {
-                        let kind = match entry.kind {
-                            TarEntryKind::Regular => "file",
-                            TarEntryKind::Directory => "directory",
-                            TarEntryKind::Symlink => "symlink",
-                            TarEntryKind::Hardlink => "hardlink",
-                        };
-                        println!(
-                            "{}\t{}\t{}\t{}\t{}",
-                            entry.file_data_size, kind, entry.mode, entry.mtime, entry.path
-                        );
-                    }
-                    Ok(())
                 }
+                Ok(())
             } else {
                 for entry in opened.list_index_entries()? {
                     println!("{}", entry.path);
@@ -2692,6 +2667,31 @@ fn emit_entry_metadata_diagnostics(quiet: bool, entries: &[ArchiveEntry]) -> io:
         eprintln!("{line}");
     }
     Ok(())
+}
+
+fn archive_index_entry_json(entry: &ArchiveIndexEntry) -> serde_json::Value {
+    json!({
+        "path": &entry.path,
+        "name": &entry.name,
+        "size": entry.file_data_size,
+        "mtime": entry.mtime,
+        "path_hash": encode_hex(&entry.path_hash),
+        "tar_member_group_size": entry.tar_member_group_size,
+        "first_frame_index": entry.first_frame_index,
+        "frame_count": entry.frame_count,
+        "offset_in_first_frame_plaintext": entry.offset_in_first_frame_plaintext,
+        "compressed_size": entry.layout.compressed_size,
+        "layout": {
+            "decompressed_frame_size": entry.layout.decompressed_frame_size,
+            "envelope_count": entry.layout.envelope_count,
+            "first_envelope_index": entry.layout.first_envelope_index,
+            "last_envelope_index": entry.layout.last_envelope_index,
+            "first_payload_block_index": entry.layout.first_payload_block_index,
+            "payload_data_block_count": entry.layout.payload_data_block_count,
+            "payload_parity_block_count": entry.layout.payload_parity_block_count,
+            "payload_encrypted_size": entry.layout.payload_encrypted_size,
+        },
+    })
 }
 
 fn emit_verify_json_error(
