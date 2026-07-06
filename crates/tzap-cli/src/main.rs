@@ -1119,7 +1119,7 @@ fn run(cli: Cli) -> Result<()> {
                     emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
                 }
                 if timings {
-                    emit_create_timing_report(
+                    emit_sink_backed_create_timing_report(
                         Duration::default(),
                         Duration::default(),
                         core_writer,
@@ -1224,7 +1224,7 @@ fn run(cli: Cli) -> Result<()> {
                     emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
                 }
                 if timings {
-                    emit_create_timing_report(
+                    emit_sink_backed_create_timing_report(
                         scan_inputs,
                         Duration::default(),
                         core_writer,
@@ -1318,7 +1318,7 @@ fn run(cli: Cli) -> Result<()> {
                     emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
                 }
                 if timings {
-                    emit_create_timing_report(
+                    emit_sink_backed_create_timing_report(
                         scan_inputs,
                         Duration::default(),
                         core_writer,
@@ -2459,13 +2459,59 @@ fn emit_create_timing_report(
     total: Duration,
     writer: WriterTimings,
 ) -> io::Result<()> {
+    emit_create_timing_report_with_labels(
+        scan_inputs,
+        read_inputs,
+        core_writer,
+        write_outputs,
+        total,
+        writer,
+        "core writer",
+        "write outputs",
+    )
+}
+
+fn emit_sink_backed_create_timing_report(
+    scan_inputs: Duration,
+    read_inputs: Duration,
+    core_writer: Duration,
+    write_outputs: Duration,
+    total: Duration,
+    writer: WriterTimings,
+) -> io::Result<()> {
+    emit_create_timing_report_with_labels(
+        scan_inputs,
+        read_inputs,
+        core_writer,
+        write_outputs,
+        total,
+        writer,
+        "core writer + archive output",
+        "post-writer outputs",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_create_timing_report_with_labels(
+    scan_inputs: Duration,
+    read_inputs: Duration,
+    core_writer: Duration,
+    write_outputs: Duration,
+    total: Duration,
+    writer: WriterTimings,
+    core_writer_label: &str,
+    write_outputs_label: &str,
+) -> io::Result<()> {
     let accounted = scan_inputs + read_inputs + core_writer + write_outputs;
     let other_cli = total.saturating_sub(accounted);
     eprintln!("create timings:");
     eprintln!("  scan inputs: {}", format_duration(scan_inputs));
     eprintln!("  read inputs: {}", format_duration(read_inputs));
-    eprintln!("  core writer: {}", format_duration(core_writer));
-    eprintln!("  write outputs: {}", format_duration(write_outputs));
+    eprintln!("  {core_writer_label}: {}", format_duration(core_writer));
+    eprintln!(
+        "  {write_outputs_label}: {}",
+        format_duration(write_outputs)
+    );
     eprintln!("  other CLI: {}", format_duration(other_cli));
     eprintln!("  total: {}", format_duration(total));
     eprintln!("writer timings:");

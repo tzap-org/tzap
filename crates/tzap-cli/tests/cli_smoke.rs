@@ -762,6 +762,8 @@ fn cli_create_timings_prints_breakdown() {
         .stderr(
             predicate::str::contains("create timings:")
                 .and(predicate::str::contains("writer timings:"))
+                .and(predicate::str::contains("core writer + archive output:"))
+                .and(predicate::str::contains("post-writer outputs:"))
                 .and(predicate::str::contains("plan payload:"))
                 .and(predicate::str::contains("emit payload:")),
         );
