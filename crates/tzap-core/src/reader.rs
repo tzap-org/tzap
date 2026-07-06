@@ -17259,7 +17259,7 @@ mod tests {
         let file = &located.shard.files[located.file_index];
         frame_range_for_file(&located.shard, file)
             .unwrap()
-            .into_iter()
+            .iter()
             .map(|frame| {
                 located
                     .shard

@@ -12,6 +12,7 @@ use tzap_core::metadata::{
     INDEX_SHARD_HEADER_LEN,
 };
 use tzap_core::padding::suffix_pad_for_aead;
+use tzap_core::tar_model::TarEntryKind;
 use tzap_core::wire::{
     BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage, CriticalMetadataRecoveryHeader,
     CriticalMetadataRecoveryShard, CriticalRecoveryLocator, CryptoHeaderFixed, ManifestFooter,
@@ -519,7 +520,9 @@ fn valid_index_shard() -> Vec<u8> {
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: 512,
             file_data_size: 0,
-            mtime: None,
+            kind: TarEntryKind::Regular,
+            mode: 0o644,
+            mtime: 0,
             flags: 0,
         }
         .to_bytes(),

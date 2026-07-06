@@ -31,6 +31,18 @@ const KEY_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1
 const BAD_KEY_HEX: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 const SIDECAR_HMAC_COVERED_LEN: usize = 92;
 
+#[cfg(unix)]
+fn expected_input_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn expected_input_mode(_path: &Path) -> u32 {
+    0o644
+}
+
 #[derive(Clone)]
 struct PayloadRecordLocation {
     volume_index: usize,
@@ -6734,6 +6746,7 @@ fn cli_list_with_long_output_includes_kind_mode_mtime() {
 
     fs::write(&keyfile, KEY_HEX).unwrap();
     fs::write(&input, b"abcde\n").unwrap();
+    let expected_mode = expected_input_mode(&input);
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -6759,7 +6772,9 @@ fn cli_list_with_long_output_includes_kind_mode_mtime() {
         ])
         .assert()
         .success()
-        .stdout(predicate::eq("6\tfile\t420\t0\tpayload.bin\n"));
+        .stdout(predicate::eq(format!(
+            "6\tfile\t{expected_mode}\t0\tpayload.bin\n"
+        )));
 }
 
 #[cfg(unix)]

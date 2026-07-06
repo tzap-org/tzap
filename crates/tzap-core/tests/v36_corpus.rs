@@ -15,7 +15,7 @@ use tzap_core::metadata::{
     IndexShard, IndexShardHeader, MetadataLimits, ShardEntry,
 };
 use tzap_core::reader::{open_archive, open_archive_volumes};
-use tzap_core::tar_model::parse_tar_member_group;
+use tzap_core::tar_model::{parse_tar_member_group, TarEntryKind};
 use tzap_core::wire::{CriticalRecoveryLocator, CryptoHeader, VolumeHeader};
 use tzap_core::writer::{write_archive, write_archive_with_dictionary, RegularFile, WriterOptions};
 
@@ -1258,6 +1258,8 @@ fn file_entry(
         offset_in_first_frame_plaintext,
         tar_member_group_size,
         file_data_size,
+        kind: TarEntryKind::Regular,
+        mode: 0o644,
         mtime: 0,
         flags: 0,
     }
