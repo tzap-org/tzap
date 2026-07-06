@@ -49,7 +49,7 @@ use tzap_core::{
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
     write_tar_stream_archive_to_sink_with_kdf_and_root_auth, AeadAlgo, ArchiveContentVerification,
     ArchiveRepairPatch, ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfAlgo, KdfParams,
-    MasterKey, MemoryArchiveSink, MetadataDiagnostic, NonSeekableReaderOptions, OpenedArchive,
+    MasterKey, MetadataDiagnostic, NonSeekableReaderOptions, OpenedArchive,
     PublicNoKeyVerification, ReaderOptions, RegularFile, RegularFileSource, RootAuthSigningRequest,
     RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions, SequentialRootAuthStatus,
     StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind, WriterOptions,
@@ -1180,23 +1180,34 @@ fn run(cli: Cli) -> Result<()> {
                     &mut recipient_options,
                 )?;
                 let core_writer_started = Instant::now();
-                let (archive, sink) = write_file_inputs_ordered_parallel_recipient_wrap_to_memory(
-                    &input_specs,
-                    &master_key,
-                    recipient_options,
-                    recipient_record,
-                )
-                .context("failed to create recipient-wrap archive")?;
+                let (archive, bootstrap_sidecar) =
+                    write_file_inputs_ordered_parallel_recipient_wrap_to_output(
+                        &output,
+                        &input_specs,
+                        &master_key,
+                        recipient_options,
+                        recipient_record,
+                        force,
+                    )
+                    .context("failed to create recipient-wrap archive")?;
                 let core_writer = core_writer_started.elapsed();
 
                 let write_outputs_started = Instant::now();
-                write_archive_outputs_with_optional_bootstrap(
-                    &output,
-                    &sink.volumes,
-                    bootstrap_out.as_deref(),
-                    &sink.bootstrap_sidecar,
-                    force,
-                )?;
+                if let Some(path) = bootstrap_out.as_deref() {
+                    if bootstrap_sidecar.is_empty() {
+                        return Err(FormatError::WriterUnsupported(
+                            "bootstrap output is unavailable for this archive shape",
+                        )
+                        .into());
+                    }
+                    write_bootstrap_output_with_archive_rollback(
+                        path,
+                        &bootstrap_sidecar,
+                        &output,
+                        archive.volume_count,
+                        force,
+                    )?;
+                }
                 let write_outputs = write_outputs_started.elapsed();
                 let summary = format!(
                     "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
@@ -1258,24 +1269,34 @@ fn run(cli: Cli) -> Result<()> {
                 && options.volume_loss_tolerance == 0
             {
                 let core_writer_started = Instant::now();
-                let (archive, sink) = write_file_inputs_ordered_parallel_to_memory(
+                let (archive, bootstrap_sidecar) = write_file_inputs_ordered_parallel_to_output(
+                    &output,
                     &input_specs,
                     &key,
                     options,
                     root_auth,
                     root_auth_profile.as_ref(),
+                    force,
                 )
                 .context("failed to create archive")?;
                 let core_writer = core_writer_started.elapsed();
 
                 let write_outputs_started = Instant::now();
-                write_archive_outputs_with_optional_bootstrap(
-                    &output,
-                    &sink.volumes,
-                    bootstrap_out.as_deref(),
-                    &sink.bootstrap_sidecar,
-                    force,
-                )?;
+                if let Some(path) = bootstrap_out.as_deref() {
+                    if bootstrap_sidecar.is_empty() {
+                        return Err(FormatError::WriterUnsupported(
+                            "bootstrap output is unavailable for this archive shape",
+                        )
+                        .into());
+                    }
+                    write_bootstrap_output_with_archive_rollback(
+                        path,
+                        &bootstrap_sidecar,
+                        &output,
+                        archive.volume_count,
+                        force,
+                    )?;
+                }
                 let write_outputs = write_outputs_started.elapsed();
                 let summary = format!(
                     "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
@@ -3367,70 +3388,82 @@ fn write_raw_stdin_archive_output<R: Read>(
     )
 }
 
-fn write_file_inputs_ordered_parallel_to_memory(
+fn write_file_inputs_ordered_parallel_to_output(
+    output: &str,
     input_specs: &[InputSpec],
     key: &CreateKey,
     options: WriterOptions,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     root_auth_profile: Option<&CreateRootAuthProfile>,
-) -> Result<(WrittenArchiveSummary, MemoryArchiveSink)> {
+    force: bool,
+) -> Result<(WrittenArchiveSummary, Vec<u8>)> {
     if let (Some(profile), Some(root_auth)) = (root_auth_profile, root_auth) {
         let mut authenticator =
             |request: &RootAuthSigningRequest| root_auth_authenticator_value(profile, request);
-        return write_file_inputs_ordered_parallel_to_memory_with_authenticator(
+        return write_file_inputs_ordered_parallel_to_output_with_authenticator(
+            output,
             input_specs,
             key,
             options,
             Some(root_auth),
             Some(&mut authenticator),
+            force,
         );
     }
-    write_file_inputs_ordered_parallel_to_memory_with_authenticator(
+    write_file_inputs_ordered_parallel_to_output_with_authenticator(
+        output,
         input_specs,
         key,
         options,
         None,
         None,
+        force,
     )
 }
 
-fn write_file_inputs_ordered_parallel_to_memory_with_authenticator(
+fn write_file_inputs_ordered_parallel_to_output_with_authenticator(
+    output: &str,
     input_specs: &[InputSpec],
     key: &CreateKey,
     options: WriterOptions,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     authenticator: Option<&mut CliRootAuthAuthenticator<'_>>,
-) -> Result<(WrittenArchiveSummary, MemoryArchiveSink)> {
-    let mut sink = MemoryArchiveSink::default();
-    let summary = write_archive_sources_to_sink_ordered_parallel(
-        input_specs,
-        &key.master_key,
-        options,
-        &key.kdf_params,
-        root_auth,
-        authenticator,
-        &mut sink,
-    )?;
-    Ok((summary, sink))
+    force: bool,
+) -> Result<(WrittenArchiveSummary, Vec<u8>)> {
+    let volume_count = options.stripe_width as usize;
+    write_stdin_archive_output_with_sink(output, volume_count, force, |sink| {
+        write_archive_sources_to_sink_ordered_parallel(
+            input_specs,
+            &key.master_key,
+            options,
+            &key.kdf_params,
+            root_auth,
+            authenticator,
+            sink,
+        )
+    })
 }
 
-fn write_file_inputs_ordered_parallel_recipient_wrap_to_memory(
+fn write_file_inputs_ordered_parallel_recipient_wrap_to_output(
+    output: &str,
     input_specs: &[InputSpec],
     master_key: &MasterKey,
     options: WriterOptions,
     recipient_record: tzap_core::wire::RecipientRecordV1,
-) -> Result<(WrittenArchiveSummary, MemoryArchiveSink)> {
-    let mut sink = MemoryArchiveSink::default();
-    let summary = write_archive_sources_to_sink_ordered_parallel_with_recipient_wrap_records(
-        input_specs,
-        master_key,
-        options,
-        vec![recipient_record],
-        None,
-        None,
-        &mut sink,
-    )?;
-    Ok((summary, sink))
+    force: bool,
+) -> Result<(WrittenArchiveSummary, Vec<u8>)> {
+    let volume_count = options.stripe_width as usize;
+    write_stdin_archive_output_with_sink(output, volume_count, force, |sink| {
+        write_archive_sources_to_sink_ordered_parallel_with_recipient_wrap_records(
+            input_specs,
+            master_key,
+            options,
+            vec![recipient_record],
+            None,
+            None,
+            sink,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

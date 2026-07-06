@@ -39,6 +39,7 @@ use crate::root_auth::{
     index_digest_for_revision, root_auth_descriptor_digest_for_revision, signer_identity_digest,
     ArchiveRootInputs, CriticalMetadataDigestInputs, FecLayoutObjectRow,
 };
+use crate::tar_model::TarEntryKind;
 use crate::wire::{
     compute_key_wrap_table_digest, BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage,
     CriticalMetadataRecoveryHeader, CriticalMetadataRecoveryShard, CriticalRecoveryLocator,
@@ -563,6 +564,7 @@ struct TarMember {
     tar_member_group_start: u64,
     tar_member_group_size: u64,
     file_data_size: u64,
+    kind: TarEntryKind,
     mode: u32,
     mtime: u64,
 }
@@ -1777,6 +1779,7 @@ fn plan_payload_stream<S: RegularFileSource>(
             tar_member_group_start: member_start,
             tar_member_group_size: member_group_size,
             file_data_size: file.file_data_size(),
+            kind: TarEntryKind::Regular,
             mode: file.mode(),
             mtime: file.mtime(),
         });
@@ -2368,6 +2371,7 @@ impl<O: ArchiveWriteSink> OrderedParallelArchiveWriter<'_, O> {
             tar_member_group_start: member_start,
             tar_member_group_size: member_group_size,
             file_data_size: member.file_data_size,
+            kind: TarEntryKind::Regular,
             mode: member.mode,
             mtime: member.mtime,
         });
@@ -2954,6 +2958,7 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
             tar_member_group_start: member_start,
             tar_member_group_size: member_group_size,
             file_data_size: member.file_data_size,
+            kind: TarEntryKind::Regular,
             mode: member.mode,
             mtime: member.mtime,
         });
@@ -4389,6 +4394,7 @@ fn build_tar_stream(
             tar_member_group_start: start,
             tar_member_group_size: member_group.len() as u64,
             file_data_size: file.contents.len() as u64,
+            kind: TarEntryKind::Regular,
             mode: file.mode,
             mtime: file.mtime,
         });
@@ -6846,6 +6852,7 @@ mod tests {
                 tar_member_group_start: idx as u64 * 512,
                 tar_member_group_size: 512,
                 file_data_size: 0,
+                kind: TarEntryKind::Regular,
                 mode: 0o644,
                 mtime: 0,
             })
@@ -6901,6 +6908,7 @@ mod tests {
                     tar_member_group_start: 0,
                     tar_member_group_size: 512,
                     file_data_size: 0,
+                    kind: TarEntryKind::Regular,
                     mode: 0o644,
                     mtime: 0,
                 },
@@ -6914,6 +6922,7 @@ mod tests {
                     tar_member_group_start: 512,
                     tar_member_group_size: 512,
                     file_data_size: 0,
+                    kind: TarEntryKind::Regular,
                     mode: 0o644,
                     mtime: 0,
                 },
@@ -8220,6 +8229,7 @@ mod tests {
                 tar_member_group_start: idx as u64 * 512,
                 tar_member_group_size: 512,
                 file_data_size: 0,
+                kind: TarEntryKind::Regular,
                 mode: 0o644,
                 mtime: 0,
             },
