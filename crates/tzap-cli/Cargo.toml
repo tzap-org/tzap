@@ -1,6 +1,6 @@
 [package]
 name = "tzap"
-version = "0.1.9"
+version = "0.1.10"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -27,9 +27,9 @@ openssl.workspace = true
 rpassword = "7"
 tempfile.workspace = true
 time.workspace = true
-tzap-core = { path = "../tzap-core", version = "0.1.9" }
-tzap-plugin-keywrap = { path = "../tzap-plugin-keywrap", version = "0.1.9" }
-tzap-plugin-signing = { path = "../tzap-plugin-signing", version = "0.1.9" }
+tzap-core = { path = "../tzap-core", version = "0.1.10" }
+tzap-plugin-keywrap = { path = "../tzap-plugin-keywrap", version = "0.1.10" }
+tzap-plugin-signing = { path = "../tzap-plugin-signing", version = "0.1.10" }
 
 [dev-dependencies]
 assert_cmd.workspace = true
