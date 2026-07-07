@@ -286,7 +286,7 @@ jobs:
 
       - name: Point formula at built artifacts
         run: |
-          ruby - <<'RUBY'
+          ruby - <<'FORMULA_REWRITE_RUBY'
           require "digest"
 
           tag = ENV.fetch("GITHUB_REF_NAME")
@@ -345,7 +345,7 @@ jobs:
                 0
               )
 
-              assert_match "input.txt", shell_output("#{bin}/tzap list --password-stdin #{archive}", passphrase)
+              assert_match "input.txt", pipe_output("#{bin}/tzap list --password-stdin #{archive}", passphrase, 0)
 
               pipe_output("#{bin}/tzap verify --password-stdin #{archive}", passphrase, 0)
 
@@ -369,8 +369,9 @@ jobs:
             replaced = formula.sub!(pattern) { "#{$1}file://#{path}#{$2}#{sha}#{$3}" }
             raise "formula did not contain #{platform} URL and checksum" unless replaced
           end
+          Dir.mkdir("Formula") unless Dir.exist?("Formula")
           File.write("Formula/tzap.rb", formula)
-          RUBY
+          FORMULA_REWRITE_RUBY
 
       - name: Test formula
         env:
