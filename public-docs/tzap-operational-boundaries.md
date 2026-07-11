@@ -408,6 +408,30 @@ terminal metadata and optional RootAuth signing finish. The CLI does not expose
 archive stdout, multipart-upload sink, or pipe output modes for `tzap create`.
 `-o -` is rejected instead of being treated as an archive stdout sentinel.
 
+### Core writer progress phases
+
+The file-backed core writer progress API is phase-native. Implementations of
+`ArchiveWriteProgressSink` receive these ordered phases:
+
+1. `PlanningPayload`: read and compress source payloads to determine the
+   archive layout.
+2. `PlanningMetadata`: build the index and metadata plan after payload layout
+   is known.
+3. `EmittingPayload`: read, compress, protect, and write payload blocks.
+4. `EmittingMetadata`: protect and write indexes, recovery metadata, footers,
+   and trailers.
+
+Multi-pass writers report source bytes independently in `PlanningPayload` and
+`EmittingPayload`. A caller must not treat completion of either source-byte
+counter as completion of the archive. Single-pass and ordered-parallel writers
+start at `EmittingPayload`. Archive publication or application-owned atomic
+commit happens after the core writer returns and therefore remains the caller's
+finalization phase.
+
+`WriterTimings` provides the corresponding post-run timing breakdown for
+diagnostics and estimator calibration. It is returned only after the writer
+finishes and is not itself a live progress source.
+
 Example:
 
 ```sh

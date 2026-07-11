@@ -361,53 +361,69 @@ impl RegularFileSource for RegularFile<'_> {
     }
 }
 
-/// Receives source-byte progress while the archive writer consumes file data.
+/// One observable phase of archive creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ArchiveWritePhase {
+    /// Read and compress source payloads to produce a deterministic archive plan.
+    PlanningPayload,
+    /// Build index and other metadata plans after the payload layout is known.
+    PlanningMetadata,
+    /// Read, compress, protect, and write the planned payload blocks.
+    EmittingPayload,
+    /// Protect and write indexes, recovery metadata, footers, and trailers.
+    EmittingMetadata,
+}
+
+/// Receives phase-native progress while the archive writer consumes file data.
 ///
-/// The writer may open source files multiple times when planning or replanning
-/// an archive. Progress callbacks report each archive member's logical source
-/// bytes at most once, capped by [`RegularFileSource::file_data_size`].
+/// Multi-pass writers report source bytes separately for planning and emission.
+/// Within each phase, one archive member reports at most
+/// [`RegularFileSource::file_data_size`] bytes.
 pub trait ArchiveWriteProgressSink {
-    /// Reports newly consumed source bytes for one archive member.
-    fn source_bytes_read(&mut self, archive_path: &str, bytes: u64);
+    /// Reports that the writer entered a new creation phase.
+    fn phase_started(&mut self, phase: ArchiveWritePhase);
+
+    /// Reports source bytes consumed within one specific writer phase.
+    fn source_bytes_read(&mut self, phase: ArchiveWritePhase, archive_path: &str, bytes: u64);
 }
 
-impl<F> ArchiveWriteProgressSink for F
-where
-    F: FnMut(&str, u64),
-{
-    fn source_bytes_read(&mut self, archive_path: &str, bytes: u64) {
-        self(archive_path, bytes);
-    }
-}
-
-struct SourceProgressState<'a> {
+pub(crate) struct SourceProgressState<'a> {
     sink: &'a mut dyn ArchiveWriteProgressSink,
-    reported_by_path: BTreeMap<String, u64>,
+    active_phase: Option<ArchiveWritePhase>,
+    phase_reported_by_path: BTreeMap<String, u64>,
 }
 
 impl<'a> SourceProgressState<'a> {
     fn new(sink: &'a mut dyn ArchiveWriteProgressSink) -> Self {
         Self {
             sink,
-            reported_by_path: BTreeMap::new(),
+            active_phase: None,
+            phase_reported_by_path: BTreeMap::new(),
         }
+    }
+
+    fn start_phase(&mut self, phase: ArchiveWritePhase) {
+        self.active_phase = Some(phase);
+        self.phase_reported_by_path.clear();
+        self.sink.phase_started(phase);
     }
 
     fn record(&mut self, archive_path: &str, bytes: u64, file_data_size: u64) {
         if bytes == 0 || file_data_size == 0 {
             return;
         }
-        let reported = self
-            .reported_by_path
-            .entry(archive_path.to_owned())
-            .or_default();
-        let capped_next = reported.saturating_add(bytes).min(file_data_size);
-        let delta = capped_next.saturating_sub(*reported);
-        if delta == 0 {
-            return;
+        if let Some(phase) = self.active_phase {
+            let phase_reported = self
+                .phase_reported_by_path
+                .entry(archive_path.to_owned())
+                .or_default();
+            let capped_next = phase_reported.saturating_add(bytes).min(file_data_size);
+            let delta = capped_next.saturating_sub(*phase_reported);
+            if delta > 0 {
+                *phase_reported = capped_next;
+                self.sink.source_bytes_read(phase, archive_path, delta);
+            }
         }
-        *reported = capped_next;
-        self.sink.source_bytes_read(archive_path, delta);
     }
 }
 
@@ -460,18 +476,24 @@ impl Read for SourceProgressReader<'_> {
     }
 }
 
+pub(crate) type SourceProgressHandle<'a> = Rc<RefCell<SourceProgressState<'a>>>;
+
 fn progress_sources<'a, S: RegularFileSource>(
     files: &'a [S],
     sink: &'a mut dyn ArchiveWriteProgressSink,
-) -> Vec<ProgressRegularFileSource<'a, S>> {
+) -> (
+    Vec<ProgressRegularFileSource<'a, S>>,
+    SourceProgressHandle<'a>,
+) {
     let state = Rc::new(RefCell::new(SourceProgressState::new(sink)));
-    files
+    let sources = files
         .iter()
         .map(|inner| ProgressRegularFileSource {
             inner,
             state: Rc::clone(&state),
         })
-        .collect()
+        .collect();
+    (sources, state)
 }
 
 /// Streaming destination for archive volumes and optional bootstrap sidecar.
@@ -1109,6 +1131,7 @@ where
         authenticator,
         None,
         sink,
+        None,
     )
 }
 
@@ -1128,7 +1151,7 @@ where
     S: RegularFileSource,
     O: ArchiveWriteSink,
 {
-    let progress_files = progress_sources(files, progress);
+    let (progress_files, progress_state) = progress_sources(files, progress);
     write_archive_stream_inner(
         &progress_files,
         master_key,
@@ -1139,6 +1162,7 @@ where
         authenticator,
         None,
         sink,
+        Some(&progress_state),
     )
 }
 
@@ -1164,6 +1188,7 @@ where
         authenticator,
         None,
         sink,
+        None,
         |writer| {
             for file in files {
                 let archive_path =
@@ -1208,6 +1233,7 @@ where
         authenticator,
         Some(&key_wrap_records),
         sink,
+        None,
         |writer| {
             for file in files {
                 let archive_path =
@@ -1243,15 +1269,33 @@ where
     S: RegularFileSource,
     O: ArchiveWriteSink,
 {
-    let progress_files = progress_sources(files, progress);
-    write_archive_sources_to_sink_single_pass(
-        &progress_files,
+    let (progress_files, progress_state) = progress_sources(files, progress);
+    write_single_pass_archive_to_sink(
         master_key,
         options,
         kdf_params,
         root_auth,
         authenticator,
+        None,
         sink,
+        Some(&progress_state),
+        |writer| {
+            for file in &progress_files {
+                let archive_path =
+                    normalize_lookup_file_path(file.archive_path(), options.max_path_length)?;
+                let mut reader = file.open()?;
+                writer.write_regular_member_from_reader(
+                    StreamingRegularMember {
+                        archive_path,
+                        file_data_size: file.file_data_size(),
+                        mode: file.mode(),
+                        mtime: file.mtime(),
+                    },
+                    reader.as_mut(),
+                )?;
+            }
+            Ok(())
+        },
     )
 }
 
@@ -1278,6 +1322,7 @@ where
         authenticator,
         None,
         sink,
+        None,
     )
 }
 
@@ -1306,6 +1351,41 @@ where
         authenticator,
         Some(&key_wrap_records),
         sink,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_archive_sources_to_sink_ordered_parallel_with_recipient_wrap_records_and_progress<
+    S,
+    O,
+>(
+    files: &[S],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    records: Vec<RecipientRecordV1>,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    sink: &mut O,
+    progress: &mut dyn ArchiveWriteProgressSink,
+) -> Result<WrittenArchiveSummary, ArchiveWriteError>
+where
+    S: RegularFileSource,
+    O: ArchiveWriteSink,
+{
+    let kdf_params = recipient_wrap_kdf_params_for_record_count(records.len())?;
+    let key_wrap_records = KeyWrapRecordSource::fixed(records);
+    let (progress_files, progress_state) = progress_sources(files, progress);
+    write_ordered_parallel_archive_to_sink(
+        &progress_files,
+        master_key,
+        options,
+        &kdf_params,
+        root_auth,
+        authenticator,
+        Some(&key_wrap_records),
+        sink,
+        Some(&progress_state),
     )
 }
 
@@ -1324,7 +1404,7 @@ where
     S: RegularFileSource,
     O: ArchiveWriteSink,
 {
-    let progress_files = progress_sources(files, progress);
+    let (progress_files, progress_state) = progress_sources(files, progress);
     write_ordered_parallel_archive_to_sink(
         &progress_files,
         master_key,
@@ -1334,6 +1414,7 @@ where
         authenticator,
         None,
         sink,
+        Some(&progress_state),
     )
 }
 
@@ -1359,6 +1440,7 @@ fn write_archive_inner(
         authenticator,
         key_wrap_records,
         &mut sink,
+        None,
     )
     .map_err(format_error_from_archive_write_error)?;
     Ok(WrittenArchive {
@@ -1408,6 +1490,7 @@ fn write_archive_stream_inner<S, O>(
     mut authenticator: Option<&mut RootAuthAuthenticator<'_>>,
     key_wrap_records: Option<&KeyWrapRecordSource>,
     sink: &mut O,
+    progress: Option<&SourceProgressHandle<'_>>,
 ) -> Result<WrittenArchiveSummary, ArchiveWriteError>
 where
     S: RegularFileSource,
@@ -1434,6 +1517,7 @@ where
 
     loop {
         let planned_options = plan_writer_options(requested_options)?;
+        start_write_phase(progress, ArchiveWritePhase::PlanningPayload);
         let timed_plan = build_writer_plan(
             files,
             master_key,
@@ -1444,6 +1528,7 @@ where
             archive_uuid,
             session_id,
             root_auth,
+            progress,
         )?;
         accumulated_timings.add_assign(timed_plan.timings);
         let plan = timed_plan.plan;
@@ -1454,6 +1539,7 @@ where
                 continue;
             }
         }
+        start_write_phase(progress, ArchiveWritePhase::EmittingPayload);
         let mut summary = emit_writer_plan(
             files,
             master_key,
@@ -1462,6 +1548,7 @@ where
             authenticator.take(),
             plan,
             sink,
+            progress,
         )?;
         summary.timings.add_assign(accumulated_timings);
         summary.timings.total = total_started.elapsed();
@@ -1510,11 +1597,13 @@ fn build_writer_plan<S: RegularFileSource>(
     archive_uuid: [u8; 16],
     session_id: [u8; 16],
     root_auth: Option<RootAuthWriterConfig<'_>>,
+    progress: Option<&SourceProgressHandle<'_>>,
 ) -> Result<TimedWriterPlan, ArchiveWriteError> {
     let mut next_block_index = 0u64;
     let payload_started = Instant::now();
     let payload = plan_payload_stream(files, options, dictionary, &mut next_block_index)?;
     let plan_payload = payload_started.elapsed();
+    start_write_phase(progress, ArchiveWritePhase::PlanningMetadata);
     let metadata_started = Instant::now();
     let plan = build_writer_plan_from_payload(
         payload,
@@ -1876,6 +1965,7 @@ pub(crate) fn write_single_pass_archive_to_sink<O, F>(
     authenticator: Option<&mut RootAuthAuthenticator<'_>>,
     key_wrap_records: Option<&KeyWrapRecordSource>,
     sink: &mut O,
+    progress: Option<&SourceProgressHandle<'_>>,
     drive_members: F,
 ) -> Result<WrittenArchiveSummary, ArchiveWriteError>
 where
@@ -1941,6 +2031,7 @@ where
         },
         emission_state,
     };
+    start_write_phase(progress, ArchiveWritePhase::EmittingPayload);
     let emit_payload_started = Instant::now();
     drive_members(&mut writer)?;
     let emit_payload = emit_payload_started.elapsed();
@@ -1950,6 +2041,7 @@ where
         key_wrap_records,
         root_auth,
         authenticator,
+        progress,
     )?;
     summary.timings.emit_payload += emit_payload;
     summary.timings.total = total_started.elapsed();
@@ -2048,6 +2140,7 @@ fn write_ordered_parallel_archive_to_sink<S, O>(
     authenticator: Option<&mut RootAuthAuthenticator<'_>>,
     key_wrap_records: Option<&KeyWrapRecordSource>,
     sink: &mut O,
+    progress: Option<&SourceProgressHandle<'_>>,
 ) -> Result<WrittenArchiveSummary, ArchiveWriteError>
 where
     S: RegularFileSource,
@@ -2061,6 +2154,7 @@ where
         authenticator,
         key_wrap_records,
         sink,
+        progress,
         |writer| {
             writer.reserve_member_capacity(files.len());
             for file in files {
@@ -2091,6 +2185,7 @@ pub(crate) fn write_ordered_parallel_stream_archive_to_sink<O, F>(
     authenticator: Option<&mut RootAuthAuthenticator<'_>>,
     key_wrap_records: Option<&KeyWrapRecordSource>,
     sink: &mut O,
+    progress: Option<&SourceProgressHandle<'_>>,
     drive_members: F,
 ) -> Result<WrittenArchiveSummary, ArchiveWriteError>
 where
@@ -2136,6 +2231,7 @@ where
         root_auth.is_some(),
     )?;
 
+    start_write_phase(progress, ArchiveWritePhase::EmittingPayload);
     let emit_payload_started = Instant::now();
     let mut ordered = OrderedParallelState::new(0);
     let worker_count = options.jobs.max(1);
@@ -2294,6 +2390,7 @@ where
         tar_total_size: ordered.tar_total_size,
         content_sha256,
     };
+    start_write_phase(progress, ArchiveWritePhase::EmittingMetadata);
     let plan = build_writer_plan_from_payload(
         payload,
         emission_state.next_block_index,
@@ -3120,6 +3217,7 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
         key_wrap_records: Option<&KeyWrapRecordSource>,
         root_auth: Option<RootAuthWriterConfig<'_>>,
         authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+        progress: Option<&SourceProgressHandle<'_>>,
     ) -> Result<WrittenArchiveSummary, ArchiveWriteError> {
         self.flush_payload_envelope()?;
         let digest = self.hasher.finalize();
@@ -3133,6 +3231,7 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
             tar_total_size: self.tar_total_size,
             content_sha256,
         };
+        start_write_phase(progress, ArchiveWritePhase::EmittingMetadata);
         let plan = build_writer_plan_from_payload(
             payload,
             self.emission_state.next_block_index,
@@ -3420,6 +3519,7 @@ fn emit_writer_plan<S, O>(
     authenticator: Option<&mut RootAuthAuthenticator<'_>>,
     plan: WriterPlan,
     sink: &mut O,
+    progress: Option<&SourceProgressHandle<'_>>,
 ) -> Result<WrittenArchiveSummary, ArchiveWriteError>
 where
     S: RegularFileSource,
@@ -3456,10 +3556,17 @@ where
     )?;
     let emit_payload = emit_payload_started.elapsed();
 
+    start_write_phase(progress, ArchiveWritePhase::EmittingMetadata);
     let mut summary =
         emit_writer_plan_suffix(&subkeys, root_auth, authenticator, plan, sink, state)?;
     summary.timings.emit_payload += emit_payload;
     Ok(summary)
+}
+
+fn start_write_phase(progress: Option<&SourceProgressHandle<'_>>, phase: ArchiveWritePhase) {
+    if let Some(progress) = progress {
+        progress.borrow_mut().start_phase(phase);
+    }
 }
 
 fn emit_writer_plan_suffix<O: ArchiveWriteSink>(
@@ -7986,7 +8093,7 @@ mod tests {
     }
 
     #[test]
-    fn sink_writer_progress_reports_source_bytes_during_multi_pass_write() {
+    fn sink_writer_progress_reports_source_bytes_for_each_multi_pass_phase() {
         let file_size = 512 * 1024;
         let stats = Rc::new(RefCell::new(GeneratedSourceStats::default()));
         let file = GeneratedFileSource {
@@ -8008,10 +8115,7 @@ mod tests {
             ..WriterOptions::default()
         };
         let mut sink = MemoryArchiveSink::default();
-        let mut progress_events = Vec::new();
-        let mut progress = |archive_path: &str, bytes: u64| {
-            progress_events.push((archive_path.to_owned(), bytes));
-        };
+        let mut progress = RecordingWriteProgress::default();
 
         let summary = write_archive_sources_to_sink_with_progress(
             &[file],
@@ -8026,16 +8130,191 @@ mod tests {
         )
         .unwrap();
 
-        let reported_bytes = progress_events.iter().map(|(_, bytes)| *bytes).sum::<u64>();
         let stats = stats.borrow();
         assert!(stats.open_count > 1);
-        assert_eq!(reported_bytes, file_size as u64);
-        assert!(progress_events.len() > 1);
-        assert!(progress_events
-            .iter()
-            .all(|(path, _)| path == "large/generated.bin"));
+        assert_eq!(
+            progress.bytes_for(ArchiveWritePhase::PlanningPayload),
+            file_size as u64
+        );
+        assert_eq!(
+            progress.bytes_for(ArchiveWritePhase::EmittingPayload),
+            file_size as u64
+        );
         assert_eq!(summary.volume_count, 1);
         assert!(!sink.volumes.is_empty());
+    }
+
+    #[test]
+    fn sink_writer_progress_reports_multi_pass_phases_and_phase_bytes() {
+        let file_size = 512 * 1024;
+        let stats = Rc::new(RefCell::new(GeneratedSourceStats::default()));
+        let file = GeneratedFileSource {
+            path: "large/generated.bin",
+            len: file_size,
+            stats: Rc::clone(&stats),
+        };
+        let master_key = MasterKey::from_raw_key(&[4u8; 32]).unwrap();
+        let options = WriterOptions {
+            block_size: MIN_BLOCK_SIZE,
+            chunk_size: 16 * 1024,
+            envelope_target_size: 64 * 1024,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            fec_parity_shards: 0,
+            index_fec_parity_shards: 0,
+            index_root_fec_parity_shards: 0,
+            ..WriterOptions::default()
+        };
+        let mut sink = MemoryArchiveSink::default();
+        let mut progress = RecordingWriteProgress::default();
+
+        write_archive_sources_to_sink_with_progress(
+            &[file],
+            &master_key,
+            options,
+            None,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+            &mut progress,
+        )
+        .unwrap();
+
+        assert_eq!(
+            progress.phases,
+            vec![
+                ArchiveWritePhase::PlanningPayload,
+                ArchiveWritePhase::PlanningMetadata,
+                ArchiveWritePhase::EmittingPayload,
+                ArchiveWritePhase::EmittingMetadata,
+            ]
+        );
+        assert_eq!(
+            progress.bytes_for(ArchiveWritePhase::PlanningPayload),
+            file_size as u64
+        );
+        assert_eq!(
+            progress.bytes_for(ArchiveWritePhase::EmittingPayload),
+            file_size as u64
+        );
+    }
+
+    #[test]
+    fn single_pass_progress_reports_emission_phases() {
+        let file_size = 128 * 1024;
+        let stats = Rc::new(RefCell::new(GeneratedSourceStats::default()));
+        let file = GeneratedFileSource {
+            path: "single/generated.bin",
+            len: file_size,
+            stats,
+        };
+        let master_key = MasterKey::from_raw_key(&[5u8; 32]).unwrap();
+        let options = progress_test_writer_options();
+        let mut sink = MemoryArchiveSink::default();
+        let mut progress = RecordingWriteProgress::default();
+
+        write_archive_sources_to_sink_single_pass_with_progress(
+            &[file],
+            &master_key,
+            options,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+            &mut progress,
+        )
+        .unwrap();
+
+        assert_eq!(
+            progress.phases,
+            vec![
+                ArchiveWritePhase::EmittingPayload,
+                ArchiveWritePhase::EmittingMetadata,
+            ]
+        );
+        assert_eq!(
+            progress.bytes_for(ArchiveWritePhase::EmittingPayload),
+            file_size as u64
+        );
+    }
+
+    #[test]
+    fn ordered_parallel_progress_reports_emission_phases() {
+        let file_size = 128 * 1024;
+        let stats = Rc::new(RefCell::new(GeneratedSourceStats::default()));
+        let file = GeneratedFileSource {
+            path: "parallel/generated.bin",
+            len: file_size,
+            stats,
+        };
+        let master_key = MasterKey::from_raw_key(&[6u8; 32]).unwrap();
+        let options = progress_test_writer_options();
+        let mut sink = MemoryArchiveSink::default();
+        let mut progress = RecordingWriteProgress::default();
+
+        write_archive_sources_to_sink_ordered_parallel_with_progress(
+            &[file],
+            &master_key,
+            options,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+            &mut progress,
+        )
+        .unwrap();
+
+        assert_eq!(
+            progress.phases,
+            vec![
+                ArchiveWritePhase::EmittingPayload,
+                ArchiveWritePhase::EmittingMetadata,
+            ]
+        );
+        assert_eq!(
+            progress.bytes_for(ArchiveWritePhase::EmittingPayload),
+            file_size as u64
+        );
+    }
+
+    fn progress_test_writer_options() -> WriterOptions {
+        WriterOptions {
+            block_size: MIN_BLOCK_SIZE,
+            chunk_size: 16 * 1024,
+            envelope_target_size: 64 * 1024,
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            fec_parity_shards: 0,
+            index_fec_parity_shards: 0,
+            index_root_fec_parity_shards: 0,
+            ..WriterOptions::default()
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingWriteProgress {
+        phases: Vec<ArchiveWritePhase>,
+        phase_bytes: BTreeMap<ArchiveWritePhase, u64>,
+    }
+
+    impl RecordingWriteProgress {
+        fn bytes_for(&self, phase: ArchiveWritePhase) -> u64 {
+            self.phase_bytes.get(&phase).copied().unwrap_or_default()
+        }
+    }
+
+    impl ArchiveWriteProgressSink for RecordingWriteProgress {
+        fn phase_started(&mut self, phase: ArchiveWritePhase) {
+            self.phases.push(phase);
+        }
+
+        fn source_bytes_read(&mut self, phase: ArchiveWritePhase, _archive_path: &str, bytes: u64) {
+            let total = self.phase_bytes.entry(phase).or_default();
+            *total = total.saturating_add(bytes);
+        }
     }
 
     #[derive(Default)]

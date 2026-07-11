@@ -132,6 +132,7 @@ where
         authenticator,
         None,
         sink,
+        None,
         |writer| {
             let mut payload = SizedRawPayloadReader {
                 reader: &mut reader,
@@ -186,6 +187,7 @@ where
         authenticator,
         None,
         sink,
+        None,
         |writer| {
             let summary = stream_tar_stdin_regulars(
                 &mut reader,

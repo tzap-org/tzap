@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Replaces logical-source-only create progress with phase-native writer progress.
+- Reports planning and emission source bytes separately for multi-pass writers.
+- Exposes planning-payload, planning-metadata, emitting-payload, and
+  emitting-metadata phase transitions for live progress and ETA consumers.
+
 ## 0.1.10
 
 - Stores and exposes archive entry modified times in TZAP index metadata.
