@@ -377,7 +377,10 @@ pub enum ArchiveWritePhase {
 /// Receives phase-native progress while the archive writer consumes file data.
 ///
 /// Multi-pass writers report source bytes separately for planning and emission.
-/// Within each phase, one archive member reports at most
+/// Automatic volume-size replanning may start `PlanningPayload` and
+/// `PlanningMetadata` more than once. Each call to
+/// [`ArchiveWriteProgressSink::phase_started`] begins a new phase occurrence;
+/// within that occurrence, one archive member reports at most
 /// [`RegularFileSource::file_data_size`] bytes.
 pub trait ArchiveWriteProgressSink {
     /// Reports that the writer entered a new creation phase.
@@ -3511,6 +3514,7 @@ fn striped_block_count(total_block_count: u64, stripe_width: u32, volume_index: 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_writer_plan<S, O>(
     files: &[S],
     master_key: &MasterKey,
@@ -8198,6 +8202,79 @@ mod tests {
         assert_eq!(
             progress.bytes_for(ArchiveWritePhase::EmittingPayload),
             file_size as u64
+        );
+    }
+
+    #[test]
+    fn sink_writer_progress_reports_each_volume_size_replanning_attempt() {
+        let file_size = 64 * 1024;
+        let mut contents = Vec::with_capacity(file_size);
+        let mut random = 0x1234_5678u32;
+        for _ in 0..file_size {
+            random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            contents.push((random >> 24) as u8);
+        }
+        let file = RegularFile::new("sized.bin", &contents);
+        let master_key = MasterKey::from_raw_key(&[9u8; 32]).unwrap();
+        let options = WriterOptions {
+            block_size: 4 * 1024,
+            chunk_size: 4 * 1024,
+            envelope_target_size: 128 * 1024,
+            stripe_width: 1,
+            volume_loss_tolerance: 1,
+            target_volume_size: Some(8 * 1024),
+            ..WriterOptions::default()
+        };
+        let mut sink = MemoryArchiveSink::default();
+        let mut progress = RecordingWriteProgress::default();
+
+        write_archive_sources_to_sink_with_progress(
+            &[file],
+            &master_key,
+            options,
+            None,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+            &mut progress,
+        )
+        .unwrap();
+
+        let planning_attempts = progress
+            .phases
+            .iter()
+            .filter(|phase| **phase == ArchiveWritePhase::PlanningPayload)
+            .count();
+        assert!(planning_attempts > 1);
+        assert_eq!(
+            progress.phases.len(),
+            planning_attempts * 2 + 2,
+            "each planning attempt has payload and metadata phases before emission",
+        );
+        for phases in progress.phases[..planning_attempts * 2].chunks_exact(2) {
+            assert_eq!(
+                phases,
+                [
+                    ArchiveWritePhase::PlanningPayload,
+                    ArchiveWritePhase::PlanningMetadata,
+                ]
+            );
+        }
+        assert_eq!(
+            &progress.phases[planning_attempts * 2..],
+            [
+                ArchiveWritePhase::EmittingPayload,
+                ArchiveWritePhase::EmittingMetadata,
+            ]
+        );
+        assert_eq!(
+            progress.bytes_for(ArchiveWritePhase::PlanningPayload),
+            file_size as u64 * planning_attempts as u64,
+        );
+        assert_eq!(
+            progress.bytes_for(ArchiveWritePhase::EmittingPayload),
+            file_size as u64,
         );
     }
 

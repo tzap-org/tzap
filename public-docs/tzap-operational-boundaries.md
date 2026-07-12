@@ -411,7 +411,8 @@ archive stdout, multipart-upload sink, or pipe output modes for `tzap create`.
 ### Core writer progress phases
 
 The file-backed core writer progress API is phase-native. Implementations of
-`ArchiveWriteProgressSink` receive these ordered phases:
+`ArchiveWriteProgressSink` receive these phase transitions in the normal
+sequence:
 
 1. `PlanningPayload`: read and compress source payloads to determine the
    archive layout.
@@ -427,6 +428,14 @@ counter as completion of the archive. Single-pass and ordered-parallel writers
 start at `EmittingPayload`. Archive publication or application-owned atomic
 commit happens after the core writer returns and therefore remains the caller's
 finalization phase.
+
+When automatic volume sizing requires replanning, the writer reports one
+`PlanningPayload` -> `PlanningMetadata` pair for each planning attempt before
+moving to emission. Every `phase_started` callback begins a new phase
+occurrence, even when the same phase was reported by an earlier attempt.
+Consumers must reset phase-local counters for every occurrence; source-byte
+caps apply per archive member and occurrence. This exposes the repeated reads
+and compression work instead of hiding it from progress and ETA calculations.
 
 `WriterTimings` provides the corresponding post-run timing breakdown for
 diagnostics and estimator calibration. It is returned only after the writer
