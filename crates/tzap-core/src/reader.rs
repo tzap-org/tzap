@@ -10443,7 +10443,8 @@ mod tests {
         write_archive, write_archive_unencrypted, write_archive_with_dictionary,
         write_archive_with_kdf, write_archive_with_recipient_wrap_records,
         write_archive_with_root_auth, write_archive_with_root_auth_and_recipient_wrap_records,
-        RegularFile, RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions,
+        PortableFileMetadata, PortableModeOrigin, PortablePosixOwner, RegularFile,
+        RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions,
     };
 
     fn master_key() -> MasterKey {
@@ -11747,6 +11748,272 @@ mod tests {
             std::fs::read(tmp.path().join("dir").join("hello.txt")).unwrap(),
             b"safe m8"
         );
+    }
+
+    #[test]
+    fn compressed_archive_round_trips_header_and_pax_portable_metadata_stores() {
+        let files = [
+            RegularFile {
+                mode: 0o640,
+                mtime: ArchiveTimestamp::from_seconds(1_700_000_000),
+                portable_metadata: PortableFileMetadata {
+                    source_os: "other-unix".into(),
+                    source_filesystem: "ext4".into(),
+                    mode_origin: PortableModeOrigin::Native,
+                    posix_owner: Some(PortablePosixOwner {
+                        uid: 42,
+                        gid: 84,
+                        uname: Some("alice".into()),
+                        gname: Some("staff".into()),
+                    }),
+                    attributes: Some(1),
+                },
+                ..RegularFile::new("header-fields.txt", b"header metadata")
+            },
+            RegularFile {
+                mode: 0o604,
+                mtime: ArchiveTimestamp::new(-1, 500_000_000),
+                portable_metadata: PortableFileMetadata {
+                    source_os: "other-unix".into(),
+                    source_filesystem: "zfs".into(),
+                    mode_origin: PortableModeOrigin::Native,
+                    posix_owner: Some(PortablePosixOwner {
+                        uid: 9_000_000,
+                        gid: 8_000_000,
+                        uname: Some("u".repeat(40)),
+                        gname: Some("g".repeat(40)),
+                    }),
+                    attributes: Some(2),
+                },
+                ..RegularFile::new("pax-overrides.txt", b"PAX metadata")
+            },
+        ];
+        let archive = write_archive(&files, &master_key(), single_stream_options()).unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+
+        assert_eq!(
+            opened.crypto_header.compression_algo,
+            CompressionAlgo::ZstdFramed
+        );
+        for expected in &files {
+            let index = opened.lookup_index_entry(expected.path).unwrap().unwrap();
+            assert!(index.layout.compressed_size > 0);
+            assert_eq!(
+                index.flags,
+                crate::entry_metadata::EXTENDED_METADATA_V1
+                    | crate::entry_metadata::REQUIRES_SYSTEM_RESTORE
+            );
+
+            let located = opened
+                .locate_index_file(expected.path.as_bytes())
+                .unwrap()
+                .unwrap();
+            let member = opened
+                .decode_loaded_owned_tar_member(&located.shard, located.file_index, false)
+                .unwrap();
+            let metadata = member.v45_metadata.unwrap();
+            let owner = expected.portable_metadata.posix_owner.as_ref().unwrap();
+
+            assert_eq!(member.mode, expected.mode);
+            assert_eq!(member.mtime, expected.mtime);
+            assert_eq!(
+                metadata.file_entry_flags,
+                crate::entry_metadata::EXTENDED_METADATA_V1
+                    | crate::entry_metadata::REQUIRES_SYSTEM_RESTORE
+            );
+            assert_eq!(
+                metadata.declaration.source_os,
+                expected.portable_metadata.source_os
+            );
+            assert_eq!(
+                metadata.declaration.source_filesystem,
+                expected.portable_metadata.source_filesystem
+            );
+            assert!(metadata.declaration.mode_origin_native);
+            assert_eq!(metadata.portable_mirror.mode, expected.mode);
+            assert_eq!(
+                metadata.portable_mirror.mtime,
+                (expected.mtime.seconds, expected.mtime.nanoseconds)
+            );
+            assert_eq!(
+                metadata.portable_mirror.attributes,
+                expected.portable_metadata.attributes
+            );
+            assert_eq!(metadata.portable_mirror.uid, Some(owner.uid));
+            assert_eq!(metadata.portable_mirror.gid, Some(owner.gid));
+            assert_eq!(
+                metadata.portable_mirror.uname.as_deref(),
+                owner.uname.as_deref().map(str::as_bytes)
+            );
+            assert_eq!(
+                metadata.portable_mirror.gname.as_deref(),
+                owner.gname.as_deref().map(str::as_bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_archive_extraction_applies_metadata_only_for_portable_policy() {
+        let archived_mtime = ArchiveTimestamp::from_seconds(946_684_800);
+        let archive = write_archive(
+            &[RegularFile {
+                mtime: archived_mtime,
+                ..RegularFile::new("dated.txt", b"dated")
+            }],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let content_root = tempfile::tempdir().unwrap();
+
+        let content_diagnostics = opened
+            .extract_file_to(
+                "dated.txt",
+                content_root.path(),
+                SafeExtractionOptions {
+                    restore_policy: crate::entry_metadata::RestorePolicy::Content,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(content_diagnostics.iter().any(|diagnostic| {
+            diagnostic.metadata_class == "mtime"
+                && diagnostic.status == crate::tar_model::MetadataDiagnosticStatus::Skipped
+        }));
+        let content_mtime = fs::metadata(content_root.path().join("dated.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_ne!(
+            content_mtime,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(archived_mtime.seconds as u64)
+        );
+
+        let portable_root = tempfile::tempdir().unwrap();
+        opened
+            .extract_file_to(
+                "dated.txt",
+                portable_root.path(),
+                SafeExtractionOptions::default(),
+            )
+            .unwrap()
+            .unwrap();
+        let portable_mtime = fs::metadata(portable_root.path().join("dated.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            portable_mtime,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(archived_mtime.seconds as u64)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compressed_archive_extraction_restores_system_mode_flags_only_when_authorized() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let archive = write_archive(
+            &[RegularFile {
+                mode: 0o6751,
+                mtime: ArchiveTimestamp::from_seconds(1_700_000_000),
+                ..RegularFile::new("privileged.sh", b"#!/bin/sh\n")
+            }],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        assert_eq!(
+            opened
+                .lookup_index_entry("privileged.sh")
+                .unwrap()
+                .unwrap()
+                .flags,
+            crate::entry_metadata::EXTENDED_METADATA_V1
+                | crate::entry_metadata::REQUIRES_SYSTEM_RESTORE
+        );
+
+        let portable_root = tempfile::tempdir().unwrap();
+        opened
+            .extract_file_to(
+                "privileged.sh",
+                portable_root.path(),
+                SafeExtractionOptions::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::metadata(portable_root.path().join("privileged.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o751
+        );
+
+        let system_root = tempfile::tempdir().unwrap();
+        opened
+            .extract_file_to(
+                "privileged.sh",
+                system_root.path(),
+                SafeExtractionOptions {
+                    restore_policy: crate::entry_metadata::RestorePolicy::System,
+                    system_authorized: true,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::metadata(system_root.path().join("privileged.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o6751
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn compressed_archive_extraction_restores_portable_readonly_attribute() {
+        let archive = write_archive(
+            &[RegularFile {
+                portable_metadata: PortableFileMetadata {
+                    source_os: "windows".into(),
+                    source_filesystem: "ntfs".into(),
+                    mode_origin: PortableModeOrigin::Projected,
+                    posix_owner: None,
+                    attributes: Some(1),
+                },
+                ..RegularFile::new("readonly.txt", b"readonly")
+            }],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+
+        opened
+            .extract_file_to(
+                "readonly.txt",
+                root.path(),
+                SafeExtractionOptions::default(),
+            )
+            .unwrap()
+            .unwrap();
+        let path = root.path().join("readonly.txt");
+        assert!(fs::metadata(&path).unwrap().permissions().readonly());
+
+        // Let TempDir clean up the restored file on Windows.
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions).unwrap();
     }
 
     #[test]
