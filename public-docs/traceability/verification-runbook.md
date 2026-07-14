@@ -1,6 +1,6 @@
 # Verification runbook and record
 
-Review date: 2026-06-20
+Review date: 2026-07-14
 
 This runbook defines the reproducible gate for the traceability matrices in
 this folder.
@@ -54,22 +54,23 @@ cargo install cargo-audit --locked
 
 ## Current record
 
-This record is updated by the 2026-06-20 release-readiness pass.
+This record is updated by the 2026-07-14 revision-45 implementation review.
 
 | Gate | Command | Result |
 |---|---|---|
 | Format | `cargo fmt --check` | Passed |
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| Workspace tests | `cargo test --workspace` | Passed: 666 tests across workspace suites and doc tests |
+| Workspace tests | `cargo test --workspace --all-features` | Passed: 705 tests across workspace suites; doc tests also passed |
 | Deterministic fuzz smoke | `cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked` | Passed: 39 deterministic seeds |
-| Dependency audit | `cargo audit` | Passed: 1134 advisories loaded, 219 locked dependencies scanned, no vulnerabilities reported |
-| Bounded libFuzzer extension | `cargo +nightly fuzz run --features libfuzzer <target> -- -max_total_time=60` for all three parser targets | Passed: `parse_fixed_structures` 3569750 runs, `parse_metadata` 15079282 runs, `parse_compressed_and_padding` 16725498 runs |
+| Dependency audit | `cargo audit` | Passed: 1160 advisories loaded, 231 locked dependencies scanned, no vulnerabilities or warnings reported after updating `anyhow` and `memmap2` |
+| Bounded libFuzzer extension | `cargo +nightly fuzz run --features libfuzzer <target> -- -max_total_time=60` | Host-limited in this review: Windows ARM64 lacks AddressSanitizer support; the emulated Windows x64 target compiled through the fuzz crates but could not link because `clang_rt.asan_dynamic_runtime_thunk-x86_64.lib` is not installed. The earlier 2026-06-20 results predate the current v45 metadata changes and are not treated as current evidence. |
 
 Tools installed during this local pass:
 
-- `cargo-audit v0.22.1`
-- `cargo-fuzz v0.13.1`
-- `nightly-aarch64-apple-darwin` `rustc 1.98.0-nightly (57d06900f 2026-05-27)`
+- `cargo-audit v0.22.2` (Windows x64 binary under ARM64 emulation)
+- `cargo-fuzz v0.13.2`
+- `nightly-aarch64-pc-windows-msvc` `rustc 1.99.0-nightly (daf2e5e18 2026-07-13)`
+- `nightly` Windows x64 standard library target for the bounded-fuzz fallback attempt
 
 ## Claim decision
 

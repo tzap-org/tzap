@@ -561,9 +561,9 @@ PAX `mtime` whenever the value is pre-epoch, too large for ustar, or has a
 fraction, and rechecks size, mode, and mtime after the final source read.
 Filesystem inputs also preserve native-vs-projected mode origin, POSIX numeric
 UID/GID where applicable, and the Windows readonly/hidden/system/archive
-portable projection. Unix regular-file creation additionally captures readable
+portable projection. Linux regular-file creation additionally captures readable
 extended attributes, observed ctime, available creation time, and source-native
-profiles. Linux creation captures the exact inode-flag scalar and converts
+profiles. It captures the exact inode-flag scalar and converts
 Linux POSIX ACL xattrs to canonical `SCHILY.acl.*` records rather than
 duplicating filesystem-internal ACL xattrs. These values participate in the
 same final identity recheck. Library writers expose native primary-PAX records
@@ -632,14 +632,14 @@ surface tar metadata fidelity should use `list_files`, `extract_member`,
 - `tzap-core`: revision-45 Core reader and physical archive reader/writer for
   the documented archive workflows.
 - CLI/core writer: complete `portable-v1` regular-file emission plus declared
-  POSIX/Linux regular-file native records. It does not claim the full Portable,
+  Linux regular-file native records. It does not claim the full Portable,
   POSIX backup, or Linux backup reader/writer class because directory/link
   capture and auxiliary native streams are not exposed by the current writer.
 - `tzap-plugin-keywrap`: `x509-hpke-recipient-v1` for revision 45.
 - `tzap-plugin-signing`: `ed25519-archiveroot-v1` and the revision-45 X.509
   RootAuth profile.
 - POSIX, Linux, macOS, and Windows backup reader/writer classes are not
-  advertised. POSIX/Linux regular-file ownership, xattrs, ACLs, and flags are
+  advertised. Linux regular-file ownership, xattrs, ACLs, and flags are
   captured/applied as described above; macOS dedicated auxiliary records,
   Windows backup streams/security metadata, and remaining non-regular-file
   capture are still parser/validator-only.

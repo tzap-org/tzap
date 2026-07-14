@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use unicode_normalization::UnicodeNormalization;
 
+#[cfg(unix)]
+use crate::entry_metadata::canonical_base64_decode;
 #[cfg(target_os = "linux")]
 use crate::entry_metadata::schily_posix_acl_to_linux_xattr;
 #[cfg(unix)]
@@ -16,12 +18,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 
 use crate::entry_metadata::{
-    canonical_base64_decode, decode_percent_name, parse_auxiliary_record, parse_canonical_pax,
-    parse_primary_metadata, parse_sparse_payload, validate_group_metadata, ArchiveTimestamp,
-    AuxiliaryRecord, AuxiliaryStreamValidator, CaptureReportRow, CaptureStatus, MemberMetadata,
-    PaxRecords, PortableMetadataMirror, PrimaryMetadata, RestoreClass, RestorePolicy,
-    SparseStreamValidator, CAPTURE_REPORT_KIND, HAS_NATIVE_METADATA, HAS_SPARSE_EXTENTS,
-    MAX_AGGREGATE_PAX_PAYLOAD, MAX_LOCAL_PAX_PAYLOAD, REQUIRES_SYSTEM_RESTORE,
+    decode_percent_name, parse_auxiliary_record, parse_canonical_pax, parse_primary_metadata,
+    parse_sparse_payload, validate_group_metadata, ArchiveTimestamp, AuxiliaryRecord,
+    AuxiliaryStreamValidator, CaptureReportRow, CaptureStatus, MemberMetadata, PaxRecords,
+    PortableMetadataMirror, PrimaryMetadata, RestoreClass, RestorePolicy, SparseStreamValidator,
+    CAPTURE_REPORT_KIND, HAS_NATIVE_METADATA, HAS_SPARSE_EXTENTS, MAX_AGGREGATE_PAX_PAYLOAD,
+    MAX_LOCAL_PAX_PAYLOAD, REQUIRES_SYSTEM_RESTORE,
 };
 use crate::format::{ExtractError, FormatError};
 use crate::metadata::validate_file_path_bytes;
@@ -3047,11 +3049,19 @@ fn plan_restore(
             .required_profiles
             .iter()
             .any(|profile| profile != "portable-v1");
+    let required_native_profile = metadata
+        .declaration
+        .required_profiles
+        .iter()
+        .any(|profile| profile != "portable-v1");
+    let native_source_matches_host =
+        source_os_matches_current_host(&metadata.declaration.source_os);
     let unsupported_primary_same_os = native_primary_restore_unsupported(metadata, false);
     let unsupported_primary_system = native_primary_restore_unsupported(metadata, true);
     let unsupported_same_os = metadata.auxiliary.iter().any(|record| {
         record.restore_class == RestoreClass::SameOs && profile_is_required(&record.profile)
-    }) || (required_native_scalar && unsupported_primary_same_os);
+    }) || (required_native_scalar && unsupported_primary_same_os)
+        || (required_native_profile && !native_source_matches_host);
     let unsupported_system = metadata.auxiliary.iter().any(|record| {
         record.restore_class == RestoreClass::System && profile_is_required(&record.profile)
     }) || (metadata.declaration.owner_kind_posix
@@ -3062,7 +3072,8 @@ fn plan_restore(
         || matches!(
             kind,
             TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
-        );
+        )
+        || (required_native_profile && !native_source_matches_host);
 
     if (requests_same_os && unsupported_same_os) || (requests_system && unsupported_system) {
         if !options.allow_degraded {
@@ -3105,7 +3116,8 @@ fn plan_restore(
     if requests_same_os
         && metadata.primary_has_native_scalar
         && !required_native_scalar
-        && native_primary_restore_unsupported(metadata, requests_system)
+        && (native_primary_restore_unsupported(metadata, requests_system)
+            || !native_source_matches_host)
     {
         diagnostics.push(
             MetadataDiagnostic::new(
@@ -3196,6 +3208,65 @@ fn native_primary_restore_unsupported(metadata: &MemberMetadata, include_system:
         }
         true
     })
+}
+
+fn source_os_matches_current_host(source_os: &str) -> bool {
+    source_os == current_host_os()
+}
+
+#[cfg(target_os = "linux")]
+fn current_host_os() -> &'static str {
+    "linux"
+}
+
+#[cfg(target_os = "macos")]
+fn current_host_os() -> &'static str {
+    "macos"
+}
+
+#[cfg(target_os = "windows")]
+fn current_host_os() -> &'static str {
+    "windows"
+}
+
+#[cfg(target_os = "freebsd")]
+fn current_host_os() -> &'static str {
+    "freebsd"
+}
+
+#[cfg(target_os = "netbsd")]
+fn current_host_os() -> &'static str {
+    "netbsd"
+}
+
+#[cfg(target_os = "openbsd")]
+fn current_host_os() -> &'static str {
+    "openbsd"
+}
+
+#[cfg(target_os = "solaris")]
+fn current_host_os() -> &'static str {
+    "solaris"
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris"
+    ))
+))]
+fn current_host_os() -> &'static str {
+    "other-unix"
+}
+
+#[cfg(not(any(unix, windows)))]
+fn current_host_os() -> &'static str {
+    "other"
 }
 
 #[cfg(unix)]
@@ -4044,6 +4115,9 @@ fn apply_linux_inode_flags(
     options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Result<(), FormatError> {
+    if !source_os_matches_current_host(&metadata.declaration.source_os) {
+        return Ok(());
+    }
     let Some(encoded) = metadata.primary_records.get("TZAP.linux.fsflags") else {
         return Ok(());
     };
@@ -4127,10 +4201,12 @@ fn apply_regular_file_posix_acl(
 ) -> Result<(), FormatError> {
     use xattr::FileExt as _;
 
-    if !matches!(
-        options.restore_policy,
-        RestorePolicy::SameOs | RestorePolicy::System
-    ) {
+    if !source_os_matches_current_host(&metadata.declaration.source_os)
+        || !matches!(
+            options.restore_policy,
+            RestorePolicy::SameOs | RestorePolicy::System
+        )
+    {
         return Ok(());
     }
     for (key, name) in [
@@ -4185,10 +4261,12 @@ fn apply_regular_file_xattrs(
     use std::os::unix::ffi::OsStrExt;
     use xattr::FileExt as _;
 
-    if !matches!(
-        options.restore_policy,
-        RestorePolicy::SameOs | RestorePolicy::System
-    ) {
+    if !source_os_matches_current_host(&metadata.declaration.source_os)
+        || !matches!(
+            options.restore_policy,
+            RestorePolicy::SameOs | RestorePolicy::System
+        )
+    {
         return Ok(());
     }
     for (key, encoded) in metadata

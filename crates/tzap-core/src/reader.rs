@@ -10489,12 +10489,13 @@ mod tests {
         serialize_raw_stream_content_model_extension, RAW_STREAM_UNSUPPORTED_MESSAGE,
     };
     use crate::wire::RecipientRecordV1;
+    use crate::writer::NativeFileMetadata;
     use crate::writer::{
         write_archive, write_archive_unencrypted, write_archive_with_dictionary,
         write_archive_with_kdf, write_archive_with_recipient_wrap_records,
         write_archive_with_root_auth, write_archive_with_root_auth_and_recipient_wrap_records,
-        NativeFileMetadata, PortableFileMetadata, PortableModeOrigin, PortablePosixOwner,
-        RegularFile, RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions,
+        PortableFileMetadata, PortableModeOrigin, PortablePosixOwner, RegularFile,
+        RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions,
     };
 
     fn master_key() -> MasterKey {
@@ -12066,6 +12067,50 @@ mod tests {
                 0o604
             );
         }
+    }
+
+    #[test]
+    fn same_os_restore_rejects_required_native_profile_from_another_os() {
+        let (source_os, required_profiles) = if cfg!(target_os = "macos") {
+            (
+                "linux",
+                vec!["posix-backup-v1".into(), "linux-backup-v1".into()],
+            )
+        } else {
+            (
+                "macos",
+                vec!["posix-backup-v1".into(), "macos-backup-v1".into()],
+            )
+        };
+        let archive = write_archive(
+            &[RegularFile {
+                portable_metadata: PortableFileMetadata {
+                    source_os: source_os.into(),
+                    native: NativeFileMetadata {
+                        required_profiles,
+                        ..NativeFileMetadata::default()
+                    },
+                    ..PortableFileMetadata::default()
+                },
+                ..RegularFile::new("foreign-native.txt", b"payload")
+            }],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+
+        assert_eq!(
+            opened
+                .plan_metadata_restore(SafeExtractionOptions {
+                    restore_policy: RestorePolicy::SameOs,
+                    ..SafeExtractionOptions::default()
+                })
+                .unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "requested native metadata is not supported by this conformance class"
+            )
+        );
     }
 
     #[cfg(unix)]

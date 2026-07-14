@@ -1190,6 +1190,7 @@ mod tests {
 
         assert_eq!(report.signed_at_unix_seconds, signed_at);
         assert_eq!(report.signature_scheme, "rsa-pkcs1-sha256");
+        assert_eq!(report.trust_store_policy, "caller_roots");
         assert_eq!(report.x509_time_policy, "verifier_current_time");
         assert_eq!(report.chain_time_basis, "verifier_current_time");
         assert!(!report.trusted_timestamp);
@@ -1200,6 +1201,18 @@ mod tests {
         assert_eq!(
             report.trust_anchor_subject.as_deref(),
             Some("CN=Acme Test Root CA")
+        );
+
+        let combined_report = verify_root_auth_footer(
+            &footer,
+            &request.archive_root,
+            &[root_cert.to_der().unwrap()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            combined_report.trust_store_policy,
+            "caller_roots_plus_openssl_default_roots"
         );
     }
 
@@ -1452,55 +1465,65 @@ mod tests {
     }
 
     #[test]
-    fn ecdsa_authenticator_uses_scheme_2_and_round_trips() {
-        let (root_cert, root_key) = test_ca_cert("Acme Test Root CA");
-        let (leaf_cert, leaf_key) = test_ec_leaf_cert(
-            "Acme EC Release Signing",
-            root_cert.as_ref(),
-            root_key.as_ref(),
-            Nid::X9_62_PRIME256V1,
-        );
-        let signed_at = now_unix_seconds();
-        let signer =
-            X509RootAuthSigner::new(leaf_cert.to_der().unwrap(), leaf_key, Vec::new(), signed_at)
-                .unwrap();
-        let request = RootAuthSigningRequest {
-            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V45,
-            archive_uuid: [1; 16],
-            session_id: [2; 16],
-            archive_root: [3; 32],
-        };
-        let value = signer.authenticator_value_for_request(&request).unwrap();
-        assert_eq!(
-            u16::from_le_bytes([value[6], value[7]]),
-            SIG_SCHEME_ECDSA_SHA256_DER
-        );
-        let footer = RootAuthFooterV1 {
-            archive_uuid: request.archive_uuid,
-            session_id: request.session_id,
-            format_version: FORMAT_VERSION,
-            volume_format_rev: VOLUME_FORMAT_REV_45,
-            authenticator_id: X509_AUTHENTICATOR_ID,
-            signer_identity_type: X509_SIGNER_IDENTITY_TYPE_DER_CERT,
-            signer_identity_bytes: leaf_cert.to_der().unwrap(),
-            authenticator_value: value,
-            total_data_block_count: 0,
-            critical_metadata_digest: [0; 32],
-            index_digest: [0; 32],
-            fec_layout_digest: [0; 32],
-            data_block_merkle_root: [0; 32],
-            signer_identity_digest: [0; 32],
-            archive_root: request.archive_root,
-            footer_crc32c: 0,
-        };
+    fn ecdsa_authenticator_round_trips_on_all_registered_curves() {
+        for (curve, label) in [
+            (Nid::X9_62_PRIME256V1, "P-256"),
+            (Nid::SECP384R1, "P-384"),
+            (Nid::SECP521R1, "P-521"),
+        ] {
+            let (root_cert, root_key) = test_ca_cert(&format!("{label} Test Root CA"));
+            let (leaf_cert, leaf_key) = test_ec_leaf_cert(
+                &format!("{label} EC Release Signing"),
+                root_cert.as_ref(),
+                root_key.as_ref(),
+                curve,
+            );
+            let signed_at = now_unix_seconds();
+            let signer = X509RootAuthSigner::new(
+                leaf_cert.to_der().unwrap(),
+                leaf_key,
+                Vec::new(),
+                signed_at,
+            )
+            .unwrap();
+            let request = RootAuthSigningRequest {
+                root_auth_spec_id: ROOT_AUTH_SPEC_ID_V45,
+                archive_uuid: [1; 16],
+                session_id: [2; 16],
+                archive_root: [3; 32],
+            };
+            let value = signer.authenticator_value_for_request(&request).unwrap();
+            assert_eq!(
+                u16::from_le_bytes([value[6], value[7]]),
+                SIG_SCHEME_ECDSA_SHA256_DER
+            );
+            let footer = RootAuthFooterV1 {
+                archive_uuid: request.archive_uuid,
+                session_id: request.session_id,
+                format_version: FORMAT_VERSION,
+                volume_format_rev: VOLUME_FORMAT_REV_45,
+                authenticator_id: X509_AUTHENTICATOR_ID,
+                signer_identity_type: X509_SIGNER_IDENTITY_TYPE_DER_CERT,
+                signer_identity_bytes: leaf_cert.to_der().unwrap(),
+                authenticator_value: value,
+                total_data_block_count: 0,
+                critical_metadata_digest: [0; 32],
+                index_digest: [0; 32],
+                fec_layout_digest: [0; 32],
+                data_block_merkle_root: [0; 32],
+                signer_identity_digest: [0; 32],
+                archive_root: request.archive_root,
+                footer_crc32c: 0,
+            };
 
-        verify_root_auth_footer(
-            &footer,
-            &request.archive_root,
-            &[root_cert.to_der().unwrap()],
-            false,
-        )
-        .unwrap();
+            verify_root_auth_footer(
+                &footer,
+                &request.archive_root,
+                &[root_cert.to_der().unwrap()],
+                false,
+            )
+            .unwrap();
+        }
     }
 
     #[test]

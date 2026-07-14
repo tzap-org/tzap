@@ -920,6 +920,9 @@ pub fn validate_group_metadata(
         } else if !primary.declaration.profile_selected(&record.profile) {
             return invalid("MemberGroup", "auxiliary owner profile is not selected");
         }
+        if record.kind == "generic.xattr" {
+            validate_generic_xattr_declaration(record, &primary.declaration.source_os)?;
+        }
         let identity = if record.kind.starts_with("x.") {
             format!("{}\0{}\0", record.profile, record.kind).into_bytes()
         } else {
@@ -1688,16 +1691,7 @@ fn validate_profile_owned_primary_fields(
             POSIX_PROFILE
         } else if key.starts_with("LIBARCHIVE.xattr.") {
             let name = decode_percent_name(&key.as_bytes()["LIBARCHIVE.xattr.".len()..])?;
-            if name.starts_with(b"security.")
-                || name.starts_with(b"trusted.")
-                || name.starts_with(b"system.")
-            {
-                LINUX_PROFILE
-            } else if name.starts_with(b"com.apple.") {
-                MACOS_PROFILE
-            } else {
-                POSIX_PROFILE
-            }
+            xattr_owner_profile(&name, source_os)
         } else if key.starts_with("SCHILY.acl.") || key.starts_with("TZAP.acl.") {
             POSIX_PROFILE
         } else if key.starts_with("SCHILY.")
@@ -1723,6 +1717,16 @@ fn system_xattr_namespace(name: &[u8], source_os: &str) -> bool {
         || name.starts_with(b"trusted.")
         || name.starts_with(b"system.")
         || (source_os == "linux" && !name.starts_with(b"user.") && !name.starts_with(b"com.apple."))
+}
+
+fn xattr_owner_profile(name: &[u8], source_os: &str) -> &'static str {
+    if name.starts_with(b"com.apple.") {
+        MACOS_PROFILE
+    } else if source_os == "linux" && system_xattr_namespace(name, source_os) {
+        LINUX_PROFILE
+    } else {
+        POSIX_PROFILE
+    }
 }
 
 fn validate_builtin_auxiliary(record: &AuxiliaryRecord) -> Result<(), FormatError> {
@@ -1852,7 +1856,7 @@ fn validate_builtin_auxiliary(record: &AuxiliaryRecord) -> Result<(), FormatErro
         validate_windows_stream_name(&record.decoded_name)?;
     }
     if record.kind == "generic.xattr" {
-        validate_generic_xattr_declaration(record)?;
+        validate_generic_xattr_name(record)?;
     }
     if record.flags & 1 != 0
         && matches!(
@@ -1883,7 +1887,7 @@ fn retained_auxiliary_cap(kind: &str) -> usize {
     }
 }
 
-fn validate_generic_xattr_declaration(record: &AuxiliaryRecord) -> Result<(), FormatError> {
+fn validate_generic_xattr_name(record: &AuxiliaryRecord) -> Result<(), FormatError> {
     let name = record.decoded_name.as_slice();
     if matches!(name, b"com.apple.ResourceFork" | b"com.apple.FinderInfo") {
         return invalid(
@@ -1891,15 +1895,20 @@ fn validate_generic_xattr_declaration(record: &AuxiliaryRecord) -> Result<(), Fo
             "macOS resource fork or FinderInfo is encoded as a generic xattr",
         );
     }
-    let (profile, class) = if name.starts_with(b"security.")
-        || name.starts_with(b"trusted.")
-        || name.starts_with(b"system.")
-    {
-        (LINUX_PROFILE, RestoreClass::System)
-    } else if name.starts_with(b"com.apple.") {
-        (MACOS_PROFILE, RestoreClass::SameOs)
+    Ok(())
+}
+
+fn validate_generic_xattr_declaration(
+    record: &AuxiliaryRecord,
+    source_os: &str,
+) -> Result<(), FormatError> {
+    validate_generic_xattr_name(record)?;
+    let name = record.decoded_name.as_slice();
+    let profile = xattr_owner_profile(name, source_os);
+    let class = if system_xattr_namespace(name, source_os) {
+        RestoreClass::System
     } else {
-        (POSIX_PROFILE, RestoreClass::SameOs)
+        RestoreClass::SameOs
     };
     if record.profile != profile || record.restore_class != class {
         return invalid(
@@ -2900,6 +2909,88 @@ mod tests {
             b"linux-backup-v1,portable-v1,posix-backup-v1".to_vec(),
         );
         assert!(parse_primary_metadata(&records).is_ok());
+    }
+
+    #[test]
+    fn canonical_base64_and_percent_name_codecs_round_trip_binary_values() {
+        for len in 0..=512usize {
+            let value = (0..len)
+                .map(|index| (index.wrapping_mul(73).wrapping_add(19) & 0xff) as u8)
+                .collect::<Vec<_>>();
+            let encoded = canonical_base64_encode(&value);
+            assert_eq!(canonical_base64_decode(&encoded).unwrap(), value);
+            assert!(!encoded.contains(&b'='));
+        }
+        assert!(canonical_base64_decode(b"AB").is_err());
+        assert!(canonical_base64_decode(b"ABC").is_err());
+
+        let name = (1u8..=u8::MAX).collect::<Vec<_>>();
+        let encoded = encode_percent_name(&name).unwrap();
+        assert_eq!(decode_percent_name(encoded.as_bytes()).unwrap(), name);
+        assert!(encode_percent_name(b"").is_err());
+        assert!(encode_percent_name(b"nul\0name").is_err());
+    }
+
+    #[test]
+    fn xattr_profile_ownership_depends_on_declared_source_os() {
+        let mut macos = portable_primary_pax(b"file.txt", 0o644, "macos", false).unwrap();
+        macos.insert(
+            "TZAP.metadata.required-profiles".into(),
+            b"macos-backup-v1,portable-v1,posix-backup-v1".to_vec(),
+        );
+        macos.insert(
+            "LIBARCHIVE.xattr.security.example".into(),
+            canonical_base64_encode(b"value"),
+        );
+        let parsed = parse_primary_metadata(&macos).unwrap();
+        assert!(parsed.requires_system_restore);
+
+        let mut linux = portable_primary_pax(b"file.txt", 0o644, "linux", false).unwrap();
+        linux.insert(
+            "TZAP.metadata.required-profiles".into(),
+            b"portable-v1,posix-backup-v1".to_vec(),
+        );
+        linux.insert(
+            "LIBARCHIVE.xattr.unknown.example".into(),
+            canonical_base64_encode(b"value"),
+        );
+        assert!(parse_primary_metadata(&linux).is_err());
+        linux.insert(
+            "TZAP.metadata.required-profiles".into(),
+            b"linux-backup-v1,portable-v1,posix-backup-v1".to_vec(),
+        );
+        let parsed = parse_primary_metadata(&linux).unwrap();
+        assert!(parsed.requires_system_restore);
+    }
+
+    #[test]
+    fn generic_xattr_auxiliary_uses_the_declared_source_os_namespace_rules() {
+        let mut records = portable_primary_pax(b"file.txt", 0o644, "macos", false).unwrap();
+        records.insert(
+            "TZAP.metadata.required-profiles".into(),
+            b"macos-backup-v1,portable-v1,posix-backup-v1".to_vec(),
+        );
+        let primary = parse_primary_metadata(&records).unwrap();
+        let mut auxiliary = AuxiliaryRecord {
+            ordinal: 0,
+            kind: "generic.xattr".into(),
+            profile: "posix-backup-v1".into(),
+            restore_class: RestoreClass::System,
+            native: true,
+            name_encoding: "bytes-base64".into(),
+            decoded_name: b"security.example".to_vec(),
+            flags: 0,
+            logical_size: 0,
+            stored_size: 0,
+            sha256: [0; 32],
+            meta: BTreeMap::new(),
+            sparse_layout: None,
+            capture_report_payload: None,
+        };
+        assert!(validate_group_metadata(&primary, &[auxiliary.clone()]).is_ok());
+
+        auxiliary.profile = "linux-backup-v1".into();
+        assert!(validate_group_metadata(&primary, &[auxiliary]).is_err());
     }
 
     #[test]

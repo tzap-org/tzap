@@ -26,9 +26,10 @@ use tzap_core::reader::{ArchiveEntry, ArchiveIndexEntry, RecipientWrapRecordCont
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
 #[cfg(unix)]
 use tzap_core::PortablePosixOwner;
+#[cfg(target_os = "linux")]
+use tzap_core::{canonical_base64_encode, encode_percent_name};
 use tzap_core::{
-    canonical_base64_encode, encode_percent_name, extract_non_seekable_stream_to_dir,
-    extract_non_seekable_stream_to_dir_with_bootstrap_sidecar,
+    extract_non_seekable_stream_to_dir, extract_non_seekable_stream_to_dir_with_bootstrap_sidecar,
     extract_non_seekable_stream_to_dir_with_recipient_wrap_resolver,
     extract_non_seekable_stream_to_dir_with_recipient_wrap_resolver_and_bootstrap_sidecar,
     extract_unencrypted_non_seekable_stream_to_dir,
@@ -3528,7 +3529,7 @@ fn portable_input_metadata(identity: InputIdentity, input: &Path) -> Result<Port
     })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn capture_native_file_metadata(
     input: &Path,
     identity: InputIdentity,
@@ -3620,17 +3621,13 @@ fn capture_native_file_metadata(
         );
     }
     native.required_profiles.push("posix-backup-v1".into());
-    if cfg!(target_os = "linux") {
-        native.required_profiles.push("linux-backup-v1".into());
-    } else if cfg!(target_os = "macos") {
-        native.required_profiles.push("macos-backup-v1".into());
-    }
+    native.required_profiles.push("linux-backup-v1".into());
     native.required_profiles.sort();
     native.required_profiles.dedup();
     Ok(native)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn capture_native_file_metadata(
     _input: &Path,
     _identity: InputIdentity,
