@@ -11750,6 +11750,46 @@ mod tests {
         );
     }
 
+    fn decoded_primary_metadata_storage(
+        opened: &OpenedArchive,
+        path: &str,
+    ) -> (crate::entry_metadata::PaxRecords, [u8; 512]) {
+        let located = opened.locate_index_file(path.as_bytes()).unwrap().unwrap();
+        let file = &located.shard.files[located.file_index];
+        let mut reader = DecodedTarMemberGroupReader::new(opened, &located.shard, file).unwrap();
+        let mut group = vec![0u8; usize::try_from(file.tar_member_group_size).unwrap()];
+        let mut offset = 0usize;
+        while offset < group.len() {
+            let read = reader.read_some_member_bytes(&mut group[offset..]).unwrap();
+            assert_ne!(read, 0, "decoded member group ended early");
+            offset += read;
+        }
+
+        assert_eq!(group[156], b'x');
+        let pax_size = usize::try_from(parse_test_tar_octal(&group[124..136])).unwrap();
+        let pax_end = 512 + pax_size;
+        let records = crate::entry_metadata::parse_canonical_pax(&group[512..pax_end]).unwrap();
+        let primary_offset = pax_end + padding_to_512(pax_size);
+        let primary = group[primary_offset..primary_offset + 512]
+            .try_into()
+            .unwrap();
+        (records, primary)
+    }
+
+    fn parse_test_tar_octal(field: &[u8]) -> u64 {
+        let field = nul_trimmed_test_field(field);
+        let text = std::str::from_utf8(field).unwrap().trim();
+        u64::from_str_radix(text, 8).unwrap()
+    }
+
+    fn nul_trimmed_test_field(field: &[u8]) -> &[u8] {
+        let end = field
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(field.len());
+        &field[..end]
+    }
+
     #[test]
     fn compressed_archive_round_trips_header_and_pax_portable_metadata_stores() {
         let files = [
@@ -11795,6 +11835,40 @@ mod tests {
             opened.crypto_header.compression_algo,
             CompressionAlgo::ZstdFramed
         );
+
+        let (header_records, header_primary) =
+            decoded_primary_metadata_storage(&opened, "header-fields.txt");
+        for key in ["uid", "gid", "uname", "gname", "mtime"] {
+            assert!(!header_records.contains_key(key), "{key} should use ustar");
+        }
+        assert_eq!(parse_test_tar_octal(&header_primary[108..116]), 42);
+        assert_eq!(parse_test_tar_octal(&header_primary[116..124]), 84);
+        assert_eq!(nul_trimmed_test_field(&header_primary[265..297]), b"alice");
+        assert_eq!(nul_trimmed_test_field(&header_primary[297..329]), b"staff");
+        assert_eq!(
+            parse_test_tar_octal(&header_primary[136..148]),
+            1_700_000_000
+        );
+
+        let (pax_records, pax_primary) =
+            decoded_primary_metadata_storage(&opened, "pax-overrides.txt");
+        let long_uname = "u".repeat(40);
+        let long_gname = "g".repeat(40);
+        for (key, expected) in [
+            ("uid", b"9000000".as_slice()),
+            ("gid", b"8000000".as_slice()),
+            ("uname", long_uname.as_bytes()),
+            ("gname", long_gname.as_bytes()),
+            ("mtime", b"-1.5".as_slice()),
+        ] {
+            assert_eq!(pax_records.get(key).map(Vec::as_slice), Some(expected));
+        }
+        assert_eq!(parse_test_tar_octal(&pax_primary[108..116]), 0);
+        assert_eq!(parse_test_tar_octal(&pax_primary[116..124]), 0);
+        assert!(nul_trimmed_test_field(&pax_primary[265..297]).is_empty());
+        assert!(nul_trimmed_test_field(&pax_primary[297..329]).is_empty());
+        assert_eq!(parse_test_tar_octal(&pax_primary[136..148]), 0);
+
         for expected in &files {
             let index = opened.lookup_index_entry(expected.path).unwrap().unwrap();
             assert!(index.layout.compressed_size > 0);
@@ -11853,10 +11927,11 @@ mod tests {
     }
 
     #[test]
-    fn compressed_archive_extraction_applies_metadata_only_for_portable_policy() {
-        let archived_mtime = ArchiveTimestamp::from_seconds(946_684_800);
+    fn compressed_archive_extraction_applies_portable_mode_and_pax_mtime() {
+        let archived_mtime = ArchiveTimestamp::new(946_684_800, 123_456_700);
         let archive = write_archive(
             &[RegularFile {
+                mode: 0o604,
                 mtime: archived_mtime,
                 ..RegularFile::new("dated.txt", b"dated")
             }],
@@ -11865,6 +11940,14 @@ mod tests {
         )
         .unwrap();
         let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        assert_eq!(
+            opened
+                .lookup_index_entry("dated.txt")
+                .unwrap()
+                .unwrap()
+                .flags,
+            crate::entry_metadata::EXTENDED_METADATA_V1
+        );
         let content_root = tempfile::tempdir().unwrap();
 
         let content_diagnostics = opened
@@ -11878,17 +11961,23 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert!(content_diagnostics.iter().any(|diagnostic| {
-            diagnostic.metadata_class == "mtime"
-                && diagnostic.status == crate::tar_model::MetadataDiagnosticStatus::Skipped
-        }));
+        for metadata_class in ["mode", "mtime"] {
+            assert!(content_diagnostics.iter().any(|diagnostic| {
+                diagnostic.metadata_class == metadata_class
+                    && diagnostic.status == crate::tar_model::MetadataDiagnosticStatus::Skipped
+            }));
+        }
         let content_mtime = fs::metadata(content_root.path().join("dated.txt"))
             .unwrap()
             .modified()
             .unwrap();
         assert_ne!(
             content_mtime,
-            std::time::UNIX_EPOCH + std::time::Duration::from_secs(archived_mtime.seconds as u64)
+            std::time::UNIX_EPOCH
+                + std::time::Duration::new(
+                    archived_mtime.seconds as u64,
+                    archived_mtime.nanoseconds,
+                )
         );
 
         let portable_root = tempfile::tempdir().unwrap();
@@ -11906,18 +11995,35 @@ mod tests {
             .unwrap();
         assert_eq!(
             portable_mtime,
-            std::time::UNIX_EPOCH + std::time::Duration::from_secs(archived_mtime.seconds as u64)
+            std::time::UNIX_EPOCH
+                + std::time::Duration::new(
+                    archived_mtime.seconds as u64,
+                    archived_mtime.nanoseconds,
+                )
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(portable_root.path().join("dated.txt"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o604
+            );
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn compressed_archive_extraction_restores_system_mode_flags_only_when_authorized() {
+    fn compressed_archive_extraction_restores_setid_bits_only_for_authorized_system_policy() {
         use std::os::unix::fs::PermissionsExt;
 
         let archive = write_archive(
             &[RegularFile {
-                mode: 0o6751,
+                mode: 0o7751,
                 mtime: ArchiveTimestamp::from_seconds(1_700_000_000),
                 ..RegularFile::new("privileged.sh", b"#!/bin/sh\n")
             }],
@@ -11937,7 +12043,7 @@ mod tests {
         );
 
         let portable_root = tempfile::tempdir().unwrap();
-        opened
+        let portable_diagnostics = opened
             .extract_file_to(
                 "privileged.sh",
                 portable_root.path(),
@@ -11945,14 +12051,57 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        assert!(portable_diagnostics.iter().any(|diagnostic| {
+            diagnostic.metadata_class == "setid-mode"
+                && diagnostic.status == crate::tar_model::MetadataDiagnosticStatus::Skipped
+        }));
         assert_eq!(
             fs::metadata(portable_root.path().join("privileged.sh"))
                 .unwrap()
                 .permissions()
                 .mode()
                 & 0o7777,
-            0o751
+            0o1751
         );
+
+        let same_os_root = tempfile::tempdir().unwrap();
+        opened
+            .extract_file_to(
+                "privileged.sh",
+                same_os_root.path(),
+                SafeExtractionOptions {
+                    restore_policy: crate::entry_metadata::RestorePolicy::SameOs,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::metadata(same_os_root.path().join("privileged.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o1751
+        );
+
+        let unauthorized_root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            opened
+                .extract_file_to(
+                    "privileged.sh",
+                    unauthorized_root.path(),
+                    SafeExtractionOptions {
+                        restore_policy: crate::entry_metadata::RestorePolicy::System,
+                        ..SafeExtractionOptions::default()
+                    },
+                )
+                .unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "system restore policy requires explicit caller authorization"
+            )
+        );
+        assert!(!unauthorized_root.path().join("privileged.sh").exists());
 
         let system_root = tempfile::tempdir().unwrap();
         opened
@@ -11973,7 +12122,7 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o7777,
-            0o6751
+            0o7751
         );
     }
 
