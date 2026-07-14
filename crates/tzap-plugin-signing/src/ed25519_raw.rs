@@ -212,8 +212,8 @@ mod tests {
     use super::*;
     use rand::rngs::OsRng;
     use tzap_core::format::{
-        FORMAT_VERSION, ROOT_AUTH_SPEC_ID, ROOT_AUTH_SPEC_ID_V44, VOLUME_FORMAT_REV,
-        VOLUME_FORMAT_REV_44,
+        FORMAT_VERSION, ROOT_AUTH_SPEC_ID, ROOT_AUTH_SPEC_ID_V45, VOLUME_FORMAT_REV,
+        VOLUME_FORMAT_REV_45,
     };
 
     #[test]
@@ -294,11 +294,11 @@ mod tests {
     }
 
     #[test]
-    fn v44_footer_uses_core_archive_root_and_rejects_wrong_spec_id() {
+    fn v45_footer_uses_core_archive_root_and_rejects_wrong_spec_id() {
         let signing_key = SigningKey::generate(&mut OsRng);
         let public_key = signing_key.verifying_key().to_bytes();
         let request = RootAuthSigningRequest {
-            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V44,
+            root_auth_spec_id: ROOT_AUTH_SPEC_ID_V45,
             archive_uuid: [1; 16],
             session_id: [2; 16],
             archive_root: [3; 32],
@@ -308,7 +308,7 @@ mod tests {
             archive_uuid: request.archive_uuid,
             session_id: request.session_id,
             format_version: FORMAT_VERSION,
-            volume_format_rev: VOLUME_FORMAT_REV_44,
+            volume_format_rev: VOLUME_FORMAT_REV_45,
             authenticator_id: ED25519_AUTHENTICATOR_ID,
             signer_identity_type: 1,
             signer_identity_bytes: public_key.to_vec(),
@@ -333,8 +333,10 @@ mod tests {
             Ed25519RootAuthOutcome::RootAuthContentVerified { key_id: public_key }
         );
 
+        let mut revision_44_spec_id = [0u8; 24];
+        revision_44_spec_id[..20].copy_from_slice(b"tzap-root-auth-v0.44");
         let wrong_spec_request = RootAuthSigningRequest {
-            root_auth_spec_id: [0xA5; 24],
+            root_auth_spec_id: revision_44_spec_id,
             ..request
         };
         let mut wrong_spec_footer = footer;

@@ -9,7 +9,7 @@ use hpke::{
 use openssl::{bn::BigNumContext, ec::PointConversionForm, nid::Nid, pkey::PKey, x509::X509};
 use rand_core::{OsRng, UnwrapErr};
 use sha2::{Digest, Sha256};
-use tzap_core::format::{FORMAT_VERSION, VOLUME_FORMAT_REV_44};
+use tzap_core::format::{FORMAT_VERSION, VOLUME_FORMAT_REV_45};
 use tzap_core::wire::RecipientRecordV1;
 use x509_parser::parse_x509_certificate;
 
@@ -23,7 +23,7 @@ const KEYWRAP_PROFILE_PAYLOAD_HEADER_LEN: usize = 64;
 pub const KEYWRAP_PAYLOAD_VERSION: u16 = 1;
 const KEY_WRAP_CONTEXT_DOMAIN: &[u8] = b"tzap-keywrap-x509-hpke-v1-context\0";
 const HPKE_INFO_DOMAIN: &[u8] = b"tzap-x509-hpke-recipient-v1\0";
-const HPKE_AAD_DOMAIN: &[u8] = b"tzap-keywrap-master-key-v44\0";
+const HPKE_AAD_DOMAIN: &[u8] = b"tzap-keywrap-master-key-v45\0";
 
 const X25519_KEM_ID: u16 = 0x0020;
 const P256_KEM_ID: u16 = 0x0010;
@@ -108,7 +108,7 @@ impl Default for ArchiveIdentity {
             archive_uuid: [0u8; 16],
             session_id: [0u8; 16],
             format_version: FORMAT_VERSION,
-            volume_format_rev: VOLUME_FORMAT_REV_44,
+            volume_format_rev: VOLUME_FORMAT_REV_45,
         }
     }
 }
@@ -194,7 +194,7 @@ where
     L: PrivateKeyLookup + ?Sized,
 {
     if input.archive_identity.format_version != FORMAT_VERSION
-        || input.archive_identity.volume_format_rev != VOLUME_FORMAT_REV_44
+        || input.archive_identity.volume_format_rev != VOLUME_FORMAT_REV_45
     {
         return KeyWrapOutcome::UnsupportedArchiveIdentity;
     }
@@ -271,7 +271,7 @@ pub fn wrap_master_key_for_recipient(
     suite: KeyWrapSuite,
 ) -> Result<RecipientRecordV1, KeyWrapOutcome> {
     if archive_identity.format_version != FORMAT_VERSION
-        || archive_identity.volume_format_rev != VOLUME_FORMAT_REV_44
+        || archive_identity.volume_format_rev != VOLUME_FORMAT_REV_45
     {
         return Err(KeyWrapOutcome::UnsupportedArchiveIdentity);
     }
@@ -312,10 +312,30 @@ fn hpke_seal_master_key(
     master_key: &[u8; 32],
     suite: HpkeSuite,
 ) -> Result<Vec<u8>, KeyWrapOutcome> {
+    hpke_seal_master_key_with_aad_domain(
+        recipient_certificate_der,
+        archive_identity,
+        metadata,
+        identity,
+        master_key,
+        suite,
+        HPKE_AAD_DOMAIN,
+    )
+}
+
+fn hpke_seal_master_key_with_aad_domain(
+    recipient_certificate_der: &[u8],
+    archive_identity: &ArchiveIdentity,
+    metadata: &RecipientRecordMetadata,
+    identity: &ParsedRecipientIdentity,
+    master_key: &[u8; 32],
+    suite: HpkeSuite,
+    aad_domain: &[u8],
+) -> Result<Vec<u8>, KeyWrapOutcome> {
     let key_wrap_context_digest =
         compute_key_wrap_context_digest(archive_identity, metadata, identity, suite);
     let info = hpke_info(&key_wrap_context_digest);
-    let aad = hpke_aad(&key_wrap_context_digest);
+    let aad = hpke_aad_with_domain(aad_domain, &key_wrap_context_digest);
     let (enc, ciphertext) = match (suite.kem_id, suite.aead_id) {
         (X25519_KEM_ID, CHACHA20POLY1305_AEAD_ID) => {
             let public_key = x25519_public_key_from_certificate(recipient_certificate_der)
@@ -579,8 +599,12 @@ fn hpke_info(key_wrap_context_digest: &[u8; 32]) -> Vec<u8> {
 }
 
 fn hpke_aad(key_wrap_context_digest: &[u8; 32]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(HPKE_AAD_DOMAIN.len() + key_wrap_context_digest.len());
-    aad.extend_from_slice(HPKE_AAD_DOMAIN);
+    hpke_aad_with_domain(HPKE_AAD_DOMAIN, key_wrap_context_digest)
+}
+
+fn hpke_aad_with_domain(domain: &[u8], key_wrap_context_digest: &[u8; 32]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(domain.len() + key_wrap_context_digest.len());
+    aad.extend_from_slice(domain);
     aad.extend_from_slice(key_wrap_context_digest);
     aad
 }
@@ -806,7 +830,7 @@ mod tests {
             archive_uuid,
             session_id,
             format_version: FORMAT_VERSION,
-            volume_format_rev: VOLUME_FORMAT_REV_44,
+            volume_format_rev: VOLUME_FORMAT_REV_45,
         }
     }
 
@@ -1162,6 +1186,58 @@ mod tests {
         let result = dispatch_key_wrap_record(input, &StaticLookup { private_key });
 
         assert!(matches!(result, KeyWrapOutcome::InvalidRecord));
+    }
+
+    #[test]
+    fn revision_45_never_retries_revision_44_hpke_aad() {
+        let (cert_der, private_key) = x25519_recipient_material();
+        let identity = parse_x509_recipient_identity(&cert_der).unwrap();
+        let archive_identity = archive_identity();
+        let metadata = RecipientRecordMetadata {
+            profile_id: KEYWRAP_PROFILE_ID,
+            recipient_identity_type: KEYWRAP_RECIPIENT_IDENTITY_TYPE_BYTES,
+            recipient_identity_digest: identity.recipient_identity_digest,
+        };
+        let suite =
+            HpkeSuite::for_profile(X25519_KEM_ID, HKDF_SHA256_KDF_ID, CHACHA20POLY1305_AEAD_ID)
+                .unwrap();
+        let payload = hpke_seal_master_key_with_aad_domain(
+            &cert_der,
+            &archive_identity,
+            &metadata,
+            &identity,
+            &[0x42; 32],
+            suite,
+            b"tzap-keywrap-master-key-v44\0",
+        )
+        .unwrap();
+        let input = RecipientRecordInput {
+            archive_identity,
+            metadata,
+            recipient_identity_bytes: cert_der,
+            profile_payload_bytes: payload,
+        };
+
+        assert!(matches!(
+            dispatch_key_wrap_record(input, &StaticLookup { private_key }),
+            KeyWrapOutcome::InvalidRecord
+        ));
+    }
+
+    #[test]
+    fn revision_44_archive_identity_is_rejected_without_compatibility_dispatch() {
+        let (cert_der, _) = x25519_recipient_material();
+        let mut identity = archive_identity();
+        identity.volume_format_rev = 44;
+        assert!(matches!(
+            wrap_master_key_for_recipient(
+                identity,
+                &cert_der,
+                &[0x42; 32],
+                KeyWrapSuite::X25519HkdfSha256ChaCha20Poly1305,
+            ),
+            Err(KeyWrapOutcome::UnsupportedArchiveIdentity)
+        ));
     }
 
     #[test]

@@ -41,7 +41,7 @@ The audit pass has two layers:
 - Dependency vulnerability scan: `cargo audit`.
 - Traceability audit: confirm every row in the signing matrix has a status,
   implementation pointer, and evidence pointer; confirm
-  supported v44 workflow evidence in the public docs and verification record;
+  supported v45 workflow evidence in the public docs and verification record;
   and confirm all unsupported rows point to public operational docs or stable
   tests.
 
@@ -74,7 +74,7 @@ Tools installed during this local pass:
 ## Claim decision
 
 When all required local gates pass and the matrices still have no
-`Evidence gap` or `Implementation gap` rows, the supported-workflow v44
+`Evidence gap` or `Implementation gap` rows, the supported-workflow v45
 compliance claim in [the root README](../../README.md) and
 [traceability README](README.md) may be used.
 

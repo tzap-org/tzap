@@ -1,8 +1,8 @@
 # tzap-plugin-signing
 
-`tzap-plugin-signing` adds v44-compliant RootAuth signing profiles for
+`tzap-plugin-signing` adds v45-compliant RootAuth signing profiles for
 documented supported tzap workflows. It is the companion crate for applications
-that want signed v44 RootAuth archives on top of the standalone `tzap-core`
+that want signed v45 RootAuth archives on top of the standalone `tzap-core`
 archive foundation.
 
 The `ed25519_raw` profile implements the Ed25519 RootAuth
@@ -88,6 +88,6 @@ The `x509_chain` module provides:
 - Repository: <https://github.com/tzap-org/tzap>
 - Core crate: <https://crates.io/crates/tzap-core>
 - CLI crate: <https://crates.io/crates/tzap>
-- Implemented format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv44.md>
-- v44 Ed25519 RootAuth spec: <https://github.com/tzap-org/tzap/blob/main/specs/plugin/tzap-plugin-signing-v6-proposed-v44.md>
-- v44 X.509 RootAuth spec: <https://github.com/tzap-org/tzap/blob/main/specs/plugin/tzap-plugin-x509-chain-v2-proposed-v44.md>
+- Implemented format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv45.md>
+- v45 Ed25519 RootAuth spec: <https://github.com/tzap-org/tzap/blob/main/specs/plugin/tzap-plugin-signing-v6-proposed-v45.md>
+- v45 X.509 RootAuth spec: <https://github.com/tzap-org/tzap/blob/main/specs/plugin/tzap-plugin-x509-chain-v2-proposed-v45.md>

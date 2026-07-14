@@ -25,11 +25,11 @@ tar member groups -> zstd frames -> pack -> pad -> optional AEAD -> FEC -> strip
 
 The format stores payload objects, indexes, integrity-protected headers and
 trailers, and enough metadata to support random access after the archive is
-opened. The v0.44 spec defines the wire structures, optional-encryption
+opened. The v0.45 spec defines the wire structures, optional-encryption
 registry, integrity model, FEC layout, bootstrap behavior, and reader/writer
 requirements.
 
-The current reference implementation is v44-compliant for documented supported
+The current reference implementation is v45-compliant for documented supported
 writer, reader, recovery, RootAuth, and RecipientWrap workflows. Legacy
 revisions are rejected as unsupported revisions.
 

@@ -15,7 +15,7 @@ use serde_json::Value;
 use tempfile::tempdir;
 use tzap_core::format::{
     BlockKind, BLOCK_RECORD_FRAMING_LEN, BOOTSTRAP_SIDECAR_HEADER_LEN, FORMAT_VERSION,
-    VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    VOLUME_FORMAT_REV_45, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use tzap_core::wire::{
     BlockRecord, BootstrapSidecarHeader, CriticalRecoveryLocator, CryptoHeader, VolumeHeader,
@@ -342,7 +342,7 @@ fn cli_top_level_help_contains_product_description_and_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Create, list, verify, and extract v44 archives",
+            "Create, list, verify, and extract v45 archives",
         ))
         .stdout(predicate::str::contains("create"))
         .stdout(predicate::str::contains("extract"))
@@ -2419,7 +2419,7 @@ fn cli_extract_reads_unencrypted_archive_without_key_source() {
     let input = temp.path().join("sample.txt");
     let archive = temp.path().join("sample.tzap");
     let output = temp.path().join("out");
-    fs::write(&input, b"plaintext v44\n").unwrap();
+    fs::write(&input, b"plaintext v45\n").unwrap();
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -2446,7 +2446,7 @@ fn cli_extract_reads_unencrypted_archive_without_key_source() {
 
     assert_eq!(
         fs::read(output.join("sample.txt")).unwrap(),
-        b"plaintext v44\n"
+        b"plaintext v45\n"
     );
 }
 
@@ -2455,7 +2455,7 @@ fn cli_list_reads_unencrypted_archive_without_key_source() {
     let temp = tempdir().unwrap();
     let input = temp.path().join("sample.txt");
     let archive = temp.path().join("sample.tzap");
-    fs::write(&input, b"plaintext v44\n").unwrap();
+    fs::write(&input, b"plaintext v45\n").unwrap();
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -2482,7 +2482,7 @@ fn cli_verify_reads_unencrypted_archive_without_key_source() {
     let temp = tempdir().unwrap();
     let input = temp.path().join("sample.txt");
     let archive = temp.path().join("sample.tzap");
-    fs::write(&input, b"plaintext v44\n").unwrap();
+    fs::write(&input, b"plaintext v45\n").unwrap();
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -2547,7 +2547,7 @@ fn cli_plaintext_header_digest_corruption_is_corrupt_archive_not_wrong_key() {
     let input = temp.path().join("sample.txt");
     let archive = temp.path().join("sample.tzap");
 
-    fs::write(&input, b"plaintext v44\n").unwrap();
+    fs::write(&input, b"plaintext v45\n").unwrap();
     Command::cargo_bin("tzap")
         .unwrap()
         .args([
@@ -4004,7 +4004,7 @@ fn cli_verify_accepts_multivolume_recipient_wrap() {
             archive_uuid,
             session_id,
             format_version: FORMAT_VERSION,
-            volume_format_rev: VOLUME_FORMAT_REV_44,
+            volume_format_rev: VOLUME_FORMAT_REV_45,
         },
         &recipient_cert.to_der().unwrap(),
         &master.0,
@@ -6869,9 +6869,9 @@ fn cli_list_outputs_stable_json() {
     assert_eq!(file.get("path").unwrap().as_str().unwrap(), "json.txt");
     assert_eq!(file.get("name").unwrap().as_str().unwrap(), "json.txt");
     assert_eq!(file.get("size").unwrap().as_u64().unwrap(), 12);
-    assert_eq!(file.get("mtime").unwrap().as_u64().unwrap(), 0);
+    assert_eq!(file.get("flags").unwrap().as_u64().unwrap(), 1);
     assert!(file.get("path_hash").unwrap().as_str().unwrap().len() == 16);
-    assert!(file.get("tar_member_group_size").unwrap().as_u64().unwrap() >= 512);
+    assert!(file.get("tar_member_group_size").unwrap().as_u64().unwrap() >= 1536);
     assert_eq!(file.get("first_frame_index").unwrap().as_u64().unwrap(), 0);
     assert_eq!(file.get("frame_count").unwrap().as_u64().unwrap(), 1);
     assert!(file.get("compressed_size").unwrap().as_u64().unwrap() > 0);

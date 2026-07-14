@@ -2,18 +2,18 @@ use sha2::{Digest, Sha256};
 
 use crate::format::{
     root_auth_spec_id_for_revision, AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, FormatError,
-    KdfAlgo, FORMAT_VERSION, VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44,
+    KdfAlgo, FORMAT_VERSION, VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_45,
 };
 
 const ROOT_AUTH_DESCRIPTOR_DOMAIN: &[u8] = b"tzap-root-auth-descriptor-v1\0";
-const ARCHIVE_ROOT_DOMAIN_V44: &[u8] = b"tzap-archive-root-v44\0";
-const CRYPTO_HEADER_PRE_HMAC_DOMAIN_V44: &[u8] = b"tzap-crypto-header-pre-hmac-v44\0";
-const MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN_V44: &[u8] =
-    b"tzap-manifest-footer-global-pre-hmac-v44\0";
-const CRITICAL_METADATA_DOMAIN_V44: &[u8] = b"tzap-critical-metadata-v44\0";
-const INDEX_ROOT_DOMAIN_V44: &[u8] = b"tzap-index-root-v44\0";
-const FEC_LAYOUT_DOMAIN_V44: &[u8] = b"tzap-fec-layout-v44\0";
-const DATA_BLOCK_MERKLE_DOMAIN_V44: &[u8] = b"tzap-data-block-merkle-v44\0";
+const ARCHIVE_ROOT_DOMAIN_V45: &[u8] = b"tzap-archive-root-v45\0";
+const CRYPTO_HEADER_PRE_HMAC_DOMAIN_V45: &[u8] = b"tzap-crypto-header-pre-hmac-v45\0";
+const MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN_V45: &[u8] =
+    b"tzap-manifest-footer-global-pre-hmac-v45\0";
+const CRITICAL_METADATA_DOMAIN_V45: &[u8] = b"tzap-critical-metadata-v45\0";
+const INDEX_ROOT_DOMAIN_V45: &[u8] = b"tzap-index-root-v45\0";
+const FEC_LAYOUT_DOMAIN_V45: &[u8] = b"tzap-fec-layout-v45\0";
+const DATA_BLOCK_MERKLE_DOMAIN_V45: &[u8] = b"tzap-data-block-merkle-v45\0";
 const EMPTY_MERKLE_DOMAIN: &[u8] = b"tzap-empty-merkle-tree-v1\0";
 const SIGNER_IDENTITY_DOMAIN: &[u8] = b"tzap-signer-identity-v1\0";
 
@@ -107,22 +107,22 @@ fn root_auth_revision_params(
     volume_format_rev: u16,
 ) -> Result<RootAuthRevisionParams, FormatError> {
     let root_auth_spec_id = root_auth_spec_id_for_revision(format_version, volume_format_rev)?;
-    if volume_format_rev != VOLUME_FORMAT_REV_44 {
+    if volume_format_rev != VOLUME_FORMAT_REV_45 {
         return Err(FormatError::UnsupportedVolumeFormatRevision {
             format_version,
             volume_format_rev,
-            reader_max_supported_revision: VOLUME_FORMAT_REV_44,
+            reader_max_supported_revision: VOLUME_FORMAT_REV_45,
         });
     }
     Ok(RootAuthRevisionParams {
         root_auth_spec_id,
-        archive_root_domain: ARCHIVE_ROOT_DOMAIN_V44,
-        crypto_header_pre_hmac_domain: CRYPTO_HEADER_PRE_HMAC_DOMAIN_V44,
-        manifest_footer_global_pre_hmac_domain: MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN_V44,
-        critical_metadata_domain: CRITICAL_METADATA_DOMAIN_V44,
-        index_root_domain: INDEX_ROOT_DOMAIN_V44,
-        fec_layout_domain: FEC_LAYOUT_DOMAIN_V44,
-        data_block_merkle_domain: DATA_BLOCK_MERKLE_DOMAIN_V44,
+        archive_root_domain: ARCHIVE_ROOT_DOMAIN_V45,
+        crypto_header_pre_hmac_domain: CRYPTO_HEADER_PRE_HMAC_DOMAIN_V45,
+        manifest_footer_global_pre_hmac_domain: MANIFEST_FOOTER_GLOBAL_PRE_HMAC_DOMAIN_V45,
+        critical_metadata_domain: CRITICAL_METADATA_DOMAIN_V45,
+        index_root_domain: INDEX_ROOT_DOMAIN_V45,
+        fec_layout_domain: FEC_LAYOUT_DOMAIN_V45,
+        data_block_merkle_domain: DATA_BLOCK_MERKLE_DOMAIN_V45,
     })
 }
 
@@ -594,11 +594,11 @@ mod tests {
             FormatError::UnsupportedVolumeFormatRevision {
                 format_version: FORMAT_VERSION,
                 volume_format_rev: 43,
-                reader_max_supported_revision: VOLUME_FORMAT_REV_44,
+                reader_max_supported_revision: VOLUME_FORMAT_REV_45,
             }
         );
         archive_root_for_revision(sample_archive_inputs(
-            VOLUME_FORMAT_REV_44,
+            VOLUME_FORMAT_REV_45,
             KdfAlgo::None,
             [8; 32],
         ))
@@ -606,10 +606,10 @@ mod tests {
     }
 
     #[test]
-    fn v44_recipient_wrap_archive_root_commits_keywrap_table_digest() {
+    fn v45_recipient_wrap_archive_root_commits_keywrap_table_digest() {
         let descriptor = root_auth_descriptor_digest_for_revision(
             FORMAT_VERSION,
-            VOLUME_FORMAT_REV_44,
+            VOLUME_FORMAT_REV_45,
             1,
             1,
             b"identity",
@@ -618,14 +618,14 @@ mod tests {
         )
         .unwrap();
         let critical_a = critical_metadata_digest(sample_critical_inputs(
-            VOLUME_FORMAT_REV_44,
+            VOLUME_FORMAT_REV_45,
             KdfAlgo::RecipientWrap,
             b"crypto-header-pre-hmac keywrap-table-digest A",
             descriptor,
         ))
         .unwrap();
         let critical_b = critical_metadata_digest(sample_critical_inputs(
-            VOLUME_FORMAT_REV_44,
+            VOLUME_FORMAT_REV_45,
             KdfAlgo::RecipientWrap,
             b"crypto-header-pre-hmac keywrap-table-digest B",
             descriptor,
@@ -635,13 +635,13 @@ mod tests {
         assert_ne!(critical_a, critical_b);
         assert_ne!(
             archive_root_for_revision(sample_archive_inputs(
-                VOLUME_FORMAT_REV_44,
+                VOLUME_FORMAT_REV_45,
                 KdfAlgo::RecipientWrap,
                 critical_a,
             ))
             .unwrap(),
             archive_root_for_revision(sample_archive_inputs(
-                VOLUME_FORMAT_REV_44,
+                VOLUME_FORMAT_REV_45,
                 KdfAlgo::RecipientWrap,
                 critical_b,
             ))

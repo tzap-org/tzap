@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::entry_metadata::{EXTENDED_METADATA_V1, FILE_ENTRY_KNOWN_FLAGS};
 use crate::format::FormatError;
 
 const TZIR_MAGIC: [u8; 4] = *b"TZIR";
@@ -15,7 +16,7 @@ pub const DIRECTORY_HINT_SHARD_ENTRY_LEN: usize = 56;
 pub const ENVELOPE_ENTRY_LEN: usize = 48;
 pub const FRAME_ENTRY_LEN: usize = 44;
 pub const INDEX_SHARD_HEADER_LEN: usize = 64;
-pub const FILE_ENTRY_LEN: usize = 72;
+pub const FILE_ENTRY_LEN: usize = 56;
 pub const DIRECTORY_HINT_TABLE_LEN: usize = 72;
 pub const DIRECTORY_HINT_ENTRY_LEN: usize = 40;
 
@@ -667,9 +668,6 @@ impl FileEntry {
         write_u64(&mut bytes, 32, self.tar_member_group_size);
         write_u64(&mut bytes, 40, self.file_data_size);
         write_u32(&mut bytes, 48, self.flags);
-        bytes[52] = tar_entry_kind_to_file_entry_byte(self.kind);
-        write_u64(&mut bytes, 56, self.mtime);
-        write_u32(&mut bytes, 64, self.mode);
         bytes
     }
 }
@@ -1098,8 +1096,7 @@ fn parse_directory_hint_shard_entries(
 }
 
 fn parse_file_entry(bytes: &[u8]) -> Result<FileEntry, FormatError> {
-    expect_zero("FileEntry", slice(bytes, 53, 3, "FileEntry")?)?;
-    expect_zero("FileEntry", slice(bytes, 68, 4, "FileEntry")?)?;
+    expect_zero("FileEntry", slice(bytes, 52, 4, "FileEntry")?)?;
     Ok(FileEntry {
         path_hash: read_array::<8>(bytes, 0, "FileEntry")?,
         path_offset: read_u32(bytes, 8, "FileEntry")?,
@@ -1109,30 +1106,11 @@ fn parse_file_entry(bytes: &[u8]) -> Result<FileEntry, FormatError> {
         offset_in_first_frame_plaintext: read_u32(bytes, 28, "FileEntry")?,
         tar_member_group_size: read_u64(bytes, 32, "FileEntry")?,
         file_data_size: read_u64(bytes, 40, "FileEntry")?,
-        kind: parse_file_entry_tar_kind(bytes[52])?,
-        mode: read_u32(bytes, 64, "FileEntry")?,
+        kind: crate::tar_model::TarEntryKind::Regular,
+        mode: 0,
         flags: read_u32(bytes, 48, "FileEntry")?,
-        mtime: read_u64(bytes, 56, "FileEntry")?,
+        mtime: 0,
     })
-}
-
-fn tar_entry_kind_to_file_entry_byte(kind: crate::tar_model::TarEntryKind) -> u8 {
-    match kind {
-        crate::tar_model::TarEntryKind::Regular => 0,
-        crate::tar_model::TarEntryKind::Directory => 1,
-        crate::tar_model::TarEntryKind::Symlink => 2,
-        crate::tar_model::TarEntryKind::Hardlink => 3,
-    }
-}
-
-fn parse_file_entry_tar_kind(value: u8) -> Result<crate::tar_model::TarEntryKind, FormatError> {
-    match value {
-        0 => Ok(crate::tar_model::TarEntryKind::Regular),
-        1 => Ok(crate::tar_model::TarEntryKind::Directory),
-        2 => Ok(crate::tar_model::TarEntryKind::Symlink),
-        3 => Ok(crate::tar_model::TarEntryKind::Hardlink),
-        _ => Err(FormatError::InvalidArchive("unknown FileEntry tar kind")),
-    }
 }
 
 fn parse_frame_entry(bytes: &[u8]) -> Result<FrameEntry, FormatError> {
@@ -1307,8 +1285,11 @@ fn validate_index_shard_tables(
     let mut required_frames = BTreeSet::new();
 
     for file in files {
-        if file.flags != 0 {
-            return invalid("FileEntry", "reserved flags are non-zero");
+        if file.flags & !FILE_ENTRY_KNOWN_FLAGS != 0 {
+            return invalid("FileEntry", "unknown revision-45 flags are non-zero");
+        }
+        if file.flags & EXTENDED_METADATA_V1 == 0 {
+            return invalid("FileEntry", "EXTENDED_METADATA_V1 flag is not set");
         }
         if file.path_length == 0 {
             return invalid("FileEntry", "path length is zero");
@@ -1319,10 +1300,10 @@ fn validate_index_shard_tables(
         if file.frame_count == 0 {
             return invalid("FileEntry", "frame count is zero");
         }
-        if file.tar_member_group_size < 512 {
+        if file.tar_member_group_size < 1536 {
             return invalid(
                 "FileEntry",
-                "tar member group is smaller than one tar record",
+                "tar member group is smaller than the revision-45 minimum",
             );
         }
         if file.path_hash < locating_shard.first_path_hash
@@ -2669,19 +2650,19 @@ mod tests {
             first_frame_index: 0,
             frame_count: 1,
             offset_in_first_frame_plaintext: 0,
-            tar_member_group_size: 512,
+            tar_member_group_size: 1536,
             file_data_size: 0,
             kind: crate::tar_model::TarEntryKind::Regular,
             mode: 0o644,
             mtime: 0,
-            flags: 0,
+            flags: EXTENDED_METADATA_V1,
         };
         let frame = FrameEntry {
             frame_index: 0,
             envelope_index: 0,
             offset_in_envelope: 0,
             compressed_size: 128,
-            decompressed_size: 512,
+            decompressed_size: 1536,
             flags: 0,
             tar_stream_offset: 0,
         };
@@ -2839,19 +2820,19 @@ mod tests {
             first_frame_index: 0,
             frame_count: 1,
             offset_in_first_frame_plaintext: 0,
-            tar_member_group_size: 512,
+            tar_member_group_size: 1536,
             file_data_size: 0,
             kind: crate::tar_model::TarEntryKind::Regular,
             mode: 0o644,
             mtime: 0,
-            flags: 0,
+            flags: EXTENDED_METADATA_V1,
         };
         let frame = FrameEntry {
             frame_index: 0,
             envelope_index: 0,
             offset_in_envelope: 0,
             compressed_size: 128,
-            decompressed_size: 512,
+            decompressed_size: 1536,
             flags: 0,
             tar_stream_offset: 0,
         };
@@ -2922,7 +2903,7 @@ mod tests {
 
         let mut unreferenced_frame = frame.clone();
         unreferenced_frame.frame_index = 9;
-        unreferenced_frame.tar_stream_offset = 1024;
+        unreferenced_frame.tar_stream_offset = 3072;
         assert_eq!(
             parse_with(
                 vec![frame.clone(), unreferenced_frame],
@@ -3076,19 +3057,19 @@ mod tests {
             first_frame_index: 0,
             frame_count: 1,
             offset_in_first_frame_plaintext: 0,
-            tar_member_group_size: 512,
+            tar_member_group_size: 1536,
             file_data_size: 0,
             kind: crate::tar_model::TarEntryKind::Regular,
             mode: 0o644,
             mtime: 0,
-            flags: 0,
+            flags: EXTENDED_METADATA_V1,
         };
         let frame = FrameEntry {
             frame_index: 0,
             envelope_index: 0,
             offset_in_envelope: 0,
             compressed_size: 128,
-            decompressed_size: 512,
+            decompressed_size: 1536,
             flags: 0x0000_0003,
             tar_stream_offset: 0,
         };
@@ -3332,19 +3313,19 @@ mod tests {
             first_frame_index: 0,
             frame_count: 1,
             offset_in_first_frame_plaintext: 0,
-            tar_member_group_size: 512,
+            tar_member_group_size: 1536,
             file_data_size: 0,
             kind: crate::tar_model::TarEntryKind::Regular,
             mode: 0o644,
             mtime: 0,
-            flags: 0,
+            flags: EXTENDED_METADATA_V1,
         };
         let frame = FrameEntry {
             frame_index: 0,
             envelope_index: 0,
             offset_in_envelope: 0,
             compressed_size: 128,
-            decompressed_size: 512,
+            decompressed_size: 1536,
             flags: 0,
             tar_stream_offset: 0,
         };

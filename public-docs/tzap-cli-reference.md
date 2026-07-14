@@ -3,7 +3,7 @@
 This document is a compact command reference for `tzap` operators and automation.
 
 - **Version**: from binary metadata (`tzap --version`)
-- **Revision**: v0.44-compliant writers and readers for documented supported
+- **Revision**: v0.45-compliant writers and readers for documented supported
   workflows, with legacy reader compatibility
 
 ## Global options
@@ -75,9 +75,9 @@ Useful flags:
   modes default to 0.
 - `--bit-rot-buffer-pct`: recovery budget as percentage
 - `--argon2-*`: passphrase derivation tuning
-- `--recipient-cert`: encrypt a v44 RecipientWrap archive to one X.509
+- `--recipient-cert`: encrypt a v45 RecipientWrap archive to one X.509
   recipient certificate
-- `--no-encryption`: write an explicit plaintext archive with unkeyed v44
+- `--no-encryption`: write an explicit plaintext archive with unkeyed v45
   integrity digests
 - `--dictionary`: optional zstd dictionary
 - `--signing-key`: Ed25519 signing seed for RootAuth
@@ -107,12 +107,12 @@ Notes:
 - `--bootstrap-out` rejects `--volumes > 1` and `--volume-size` with
   `unsupported-feature`.
 - `--no-encryption` stores payload and metadata without confidentiality. It
-  uses `aead_algo = None`, `kdf_algo = None`, and unkeyed v44 integrity
+  uses `aead_algo = None`, `kdf_algo = None`, and unkeyed v45 integrity
   digests for fixed metadata. RootAuth signing can still authenticate the
   archive and signer provenance.
 - `--insecure-zero-key` was removed in a legacy revision. Use `--no-encryption` when the
   archive is intentionally public plaintext.
-- `--recipient-cert` creates a v44 RecipientWrap archive for one certificate.
+- `--recipient-cert` creates a v45 RecipientWrap archive for one certificate.
   The current CLI supports this path for file-backed, single-volume archives
   without `--dictionary` or RootAuth signing flags. Use `--recipient-key` on
   read commands to open the archive with the matching local private key.
@@ -126,11 +126,11 @@ Notes:
   `--volume-size`, and `--volume-loss-tolerance > 0` before reading payload
   stdin.
 - `--raw-stdin --stdin-size SIZE` streams exactly `SIZE` bytes into one
-  regular-file member in the standard tar-member v44 profile. Add `--volumes N`
+  regular-file member in the standard tar-member v45 profile. Add `--volumes N`
   for fixed-count multi-volume output. Short or overlong stdin is rejected and
   the temporary archive path or volume set is not published.
 - `--raw-stdin --spool-stdin` writes stdin to an explicit plaintext temporary
-  spool first, then archives it as the same tar-member v44 profile. Add
+  spool first, then archives it as the same tar-member v45 profile. Add
   `--volumes N` for fixed-count multi-volume output. After EOF the spool gives
   tzap a file-backed raw source with a known size, while `-o` still writes a
   normal file-backed archive path or volume set. That output shape is faster
@@ -172,8 +172,12 @@ Useful flags:
 - `--stdout`: emit a single file payload to stdout
 - `--overwrite`: replace existing files
 - `--dry-run`: show what would be extracted
+- `--restore {content,portable,same-os,system}`: choose the authenticated
+  metadata restore policy; defaults to `portable`
+- `--allow-degraded`: explicitly permit requested but unsupported native
+  metadata to be skipped with diagnostics
 - `--bootstrap`: bootstrap sidecar path
-- `--recipient-key`: open a v44 RecipientWrap archive with a local recipient
+- `--recipient-key`: open a v45 RecipientWrap archive with a local recipient
   private key
 - `--volume`: additional multi-volume input paths
 - `--jobs`: worker count for reader CPU work; defaults to the logical CPU count
@@ -206,9 +210,13 @@ Notes:
   pass volume files and omit the sidecar; combining multiple archive inputs
   with `--bootstrap` rejects before reading archive files with
   `unsupported-feature`.
-- Unsupported local tar metadata profiles and mode/mtime restoration failures
-  are reported to stderr as `tzap: degraded-metadata: ...`. Global PAX/GNU state
-  is rejected.
+- `system` is explicit authorization for system-class restoration. The current
+  CLI does not implement native backup-class application, so unsupported
+  same-OS/system records fail unless `--allow-degraded` is present.
+- Authenticated metadata outside the policy, partial capture, skipped native
+  records, and mode/mtime application failures are reported to stderr as
+  `tzap: degraded-metadata: ...`. Global PAX/GNU state and unregistered local
+  keys are rejected.
 
 ## Command: list
 
@@ -230,7 +238,7 @@ Useful flags:
 - `--long`: human-readable long listing
 - `--json`: machine-readable JSON output
 - `--bootstrap`: bootstrap sidecar path
-- `--recipient-key`: open a v44 RecipientWrap archive with a local recipient
+- `--recipient-key`: open a v45 RecipientWrap archive with a local recipient
   private key
 - `--volume`: additional multi-volume input paths
 - `--jobs`: worker count for reader CPU work; defaults to the logical CPU count
@@ -246,10 +254,11 @@ Notes:
 - For file-backed archives, default `list` output reads encrypted index entries
   and prints archive paths. It does not decode payload envelopes for metadata
   diagnostics.
-- `tzap list --json` is also index-backed. It exposes path, basename, payload
-  size, tar kind, ustar mode, integer mtime, tar-member group size, frame range,
+- `tzap list --json` is also index-backed. It exposes path, basename, logical
+  payload size, revision-45 FileEntry flags, member-group size, frame range,
   compressed frame size, and touched envelope/block layout metadata without
-  reading payload envelopes.
+  reading payload envelopes. Kind, mode, and mtime require `--long` because
+  they are authenticated in the primary member group rather than FileEntry.
 - Key-holding list opens archive files through the core file-backed
   random-access reader. Default output reads terminal and index metadata rather
   than loading every payload block.
@@ -302,7 +311,7 @@ Useful flags:
 - `--public-no-key`: verify public RootAuth metadata commitments without the
   archive key. This is a metadata-only/public commitment check and does not
   claim full payload integrity.
-- `--recipient-key`: verify a v44 RecipientWrap archive with a local recipient
+- `--recipient-key`: verify a v45 RecipientWrap archive with a local recipient
   private key
 - `--fast`: use the seekable archive fast-verification path. For plaintext,
   unsigned, dictionary-free archives with no recovery parity, this verifies
@@ -331,7 +340,7 @@ Notes:
   recipient key, but it does not imply RootAuth signing or signer trust.
 - RootAuth success reports a trusted signer over the recomputed archive root,
   but it does not imply the signer can decrypt the archive.
-- `revision_mode` is explicit: supported v44 archives report `v44`; legacy
+- `revision_mode` is explicit: supported v45 archives report `v45`; legacy
   revisions are rejected as `unsupported-revision`.
 - Fast verification is available only for seekable archive paths, not archive
   stdin. For plaintext, unsigned, dictionary-free archives with no recovery
@@ -352,8 +361,9 @@ Notes:
   public diagnostics `public_data_block_commitment_verified`,
   `public_physical_completeness_unverified`, and
   `public_recovery_margin_unchecked` on success.
-- Verification reports unsupported local tar metadata profiles to stderr as
-  `tzap: degraded-metadata: ...` after the archive structure and content verify.
+- Verification reports authenticated partial-capture, unsupported required
+  extension-profile, and restore-degradation diagnostics to stderr as
+  `tzap: degraded-metadata: ...` after archive structure and content verify.
 - `-` is archive stdin for single-volume verification with a raw `--keyfile`
   or no key for an unencrypted archive. Dictionary-compressed streams require
   `--bootstrap`. Archive stdin does not support `--password-stdin`,

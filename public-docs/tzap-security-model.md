@@ -1,9 +1,9 @@
 # tzap Security Model
 
 This document explains what `tzap` is trying to protect in everyday language.
-The full wire-level rules live in the v0.44 format specification.
+The full wire-level rules live in the v0.45 format specification.
 
-The current implementation is v44-compliant for documented supported security
+The current implementation is v45-compliant for documented supported security
 workflows, including encrypted archives, explicit plaintext archives, safe
 extraction, RootAuth verification, and RecipientWrap opening.
 
@@ -42,7 +42,7 @@ contents from a normal encrypted archive.
 
 ## What plaintext mode means
 
-In v44, `tzap create --no-encryption` writes an explicit plaintext archive.
+In v45, `tzap create --no-encryption` writes an explicit plaintext archive.
 Payloads, member names, and index metadata are not confidential, and list,
 verify, and extract can run without a password or keyfile.
 
@@ -137,7 +137,7 @@ channel is arranged.
 
 ## Deeper references
 
-- Format specification: `specs/tzap-format-revisedv44.md`
+- Format specification: `specs/tzap-format-revisedv45.md`
 - CLI reference: `public-docs/tzap-cli-reference.md`
 - Recovery matrix: `public-docs/tzap-recovery-matrix.md`
 - Operational boundaries: `public-docs/tzap-operational-boundaries.md`

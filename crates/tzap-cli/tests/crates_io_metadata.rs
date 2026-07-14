@@ -256,14 +256,14 @@ fn public_package_docs_do_not_link_private_docs() {
     let root_manifest = read_workspace_file("Cargo.toml");
 
     assert!(root_manifest.contains(
-        "documentation = \"https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv44.md\""
+        "documentation = \"https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv45.md\""
     ));
-    assert!(root_readme.contains("specs/tzap-format-revisedv44.md"));
+    assert!(root_readme.contains("specs/tzap-format-revisedv45.md"));
     assert!(root_readme.contains("public-docs/tzap-cli-reference.md"));
-    assert!(cli_readme.contains("specs/tzap-format-revisedv44.md"));
+    assert!(cli_readme.contains("specs/tzap-format-revisedv45.md"));
     assert!(cli_readme.contains("public-docs/tzap-cli-reference.md"));
-    assert!(signing_readme.contains("specs/tzap-format-revisedv44.md"));
-    assert!(keywrap_readme.contains("specs/tzap-format-revisedv44.md"));
+    assert!(signing_readme.contains("specs/tzap-format-revisedv45.md"));
+    assert!(keywrap_readme.contains("specs/tzap-format-revisedv45.md"));
     assert!(!root_readme.contains("](docs/"));
     assert!(!root_readme.contains("blob/main/docs/"));
     assert!(!cli_readme.contains("](docs/"));

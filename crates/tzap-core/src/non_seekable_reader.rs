@@ -40,7 +40,7 @@ const DEFAULT_MAX_STREAMED_MEMBER_COUNT: u64 = 1_000_000;
 fn parse_volume_format_dispatch(volume_header: &VolumeHeader) -> Result<(), FormatError> {
     let revision = volume_header.parse_volume_format_revision()?;
     match revision {
-        crate::format::VolumeFormatRevision::V44 => Ok(()),
+        crate::format::VolumeFormatRevision::V45 => Ok(()),
     }
 }
 
@@ -314,6 +314,7 @@ pub fn extract_non_seekable_stream_to_dir<R: Read>(
         staging.root(),
         SafeExtractionOptions {
             overwrite_existing: true,
+            ..extraction
         },
     );
     let outcome = run_non_seekable_stream(
@@ -355,6 +356,7 @@ where
         staging.root(),
         SafeExtractionOptions {
             overwrite_existing: true,
+            ..extraction
         },
     );
     let outcome = run_non_seekable_stream(
@@ -389,6 +391,7 @@ pub fn extract_unencrypted_non_seekable_stream_to_dir<R: Read>(
         staging.root(),
         SafeExtractionOptions {
             overwrite_existing: true,
+            ..extraction
         },
     );
     let outcome = run_non_seekable_stream(
@@ -425,6 +428,7 @@ pub fn extract_non_seekable_stream_to_dir_with_bootstrap_sidecar<R: Read>(
         staging.root(),
         SafeExtractionOptions {
             overwrite_existing: true,
+            ..extraction
         },
     );
     let outcome = run_non_seekable_stream(
@@ -467,6 +471,7 @@ where
         staging.root(),
         SafeExtractionOptions {
             overwrite_existing: true,
+            ..extraction
         },
     );
     let outcome = run_non_seekable_stream(
@@ -502,6 +507,7 @@ pub fn extract_unencrypted_non_seekable_stream_to_dir_with_bootstrap_sidecar<R: 
         staging.root(),
         SafeExtractionOptions {
             overwrite_existing: true,
+            ..extraction
         },
     );
     let outcome = run_non_seekable_stream(
@@ -972,9 +978,9 @@ fn streamed_list_entries(
             Ok(ArchiveEntry {
                 path: entry.path.clone(),
                 file_data_size: entry.file_data_size,
-                kind: entry.kind,
-                mode: entry.mode,
-                mtime: entry.mtime,
+                kind: member.kind,
+                mode: member.mode,
+                mtime: member.mtime,
                 diagnostics: member.diagnostics.clone(),
             })
         })

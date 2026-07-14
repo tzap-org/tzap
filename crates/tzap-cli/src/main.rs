@@ -18,7 +18,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tzap_core::format::{
     FormatError, CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION, READER_MAX_ARGON2ID_M_COST_KIB,
     READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST,
-    READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN,
+    READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_45, VOLUME_HEADER_LEN,
 };
 use tzap_core::reader::{ArchiveEntry, ArchiveIndexEntry, RecipientWrapRecordContext};
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
@@ -50,10 +50,10 @@ use tzap_core::{
     write_tar_stream_archive_to_sink_with_kdf_and_root_auth, AeadAlgo, ArchiveContentVerification,
     ArchiveRepairPatch, ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfAlgo, KdfParams,
     MasterKey, MetadataDiagnostic, NonSeekableReaderOptions, OpenedArchive,
-    PublicNoKeyVerification, ReaderOptions, RegularFile, RegularFileSource, RootAuthSigningRequest,
-    RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions, SequentialRootAuthStatus,
-    StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind, WriterOptions,
-    WriterTimings, WrittenArchiveSummary,
+    PublicNoKeyVerification, ReaderOptions, RegularFile, RegularFileSource, RestorePolicy,
+    RootAuthSigningRequest, RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions,
+    SequentialRootAuthStatus, StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind,
+    WriterOptions, WriterTimings, WrittenArchiveSummary,
 };
 use tzap_plugin_keywrap::{
     dispatch_key_wrap_record, wrap_master_key_for_recipient,
@@ -97,9 +97,9 @@ type CliRootAuthAuthenticator<'a> =
 #[derive(Debug, Parser)]
 #[command(name = "tzap")]
 #[command(version)]
-#[command(about = "Create, list, verify, and extract v44 archives")]
+#[command(about = "Create, list, verify, and extract v45 archives")]
 #[command(
-    long_about = "Create, list, verify, and extract v44 archives.\n\nCreate selects one protection mode: `--keyfile` for encrypted raw-key archives, `--password` or `--password-stdin` for encrypted passphrase archives, `--recipient-cert` for encrypted v44 RecipientWrap archives, or `--no-encryption` for explicit plaintext archives. Plaintext archives can be listed, verified, and extracted without a password or keyfile. RecipientWrap archives are opened with `--recipient-key`. The `verify --public-no-key` mode verifies signed public RootAuth commitments without the archive key.\n\nSize suffixes accepted by size flags:\n  0-9 (bytes), K/KB/KiB, M/MB/MiB, G/GB/GiB.\n\nMulti-volume output naming for this CLI:\n  - one volume: --output writes exactly that path\n  - multiple volumes: --output backup.tzap writes backup.vol000.tzap, backup.vol001.tzap, ...\n\nExit codes:\n  2  usage / argument error\n  3  I/O failure (missing file, permission denied, etc.)\n  10 wrong key\n  11 archive corruption or integrity mismatch\n  12 unsupported archive revision / format version\n  13 unsafe extraction attempt\n  14 missing required bootstrap metadata\n  16 unsupported feature in this CLI/core version\n  1  generic failure\n\nSubcommands:\n  create   Build a new archive\n  extract  Extract files from an archive\n  list     List archive contents\n  verify   Validate archive integrity\n  keygen   Generate a random raw keyfile\n  signing-keygen Generate an Ed25519 RootAuth signing keypair"
+    long_about = "Create, list, verify, and extract v45 archives.\n\nCreate selects one protection mode: `--keyfile` for encrypted raw-key archives, `--password` or `--password-stdin` for encrypted passphrase archives, `--recipient-cert` for encrypted v45 RecipientWrap archives, or `--no-encryption` for explicit plaintext archives. Plaintext archives can be listed, verified, and extracted without a password or keyfile. RecipientWrap archives are opened with `--recipient-key`. The `verify --public-no-key` mode verifies signed public RootAuth commitments without the archive key.\n\nSize suffixes accepted by size flags:\n  0-9 (bytes), K/KB/KiB, M/MB/MiB, G/GB/GiB.\n\nMulti-volume output naming for this CLI:\n  - one volume: --output writes exactly that path\n  - multiple volumes: --output backup.tzap writes backup.vol000.tzap, backup.vol001.tzap, ...\n\nExit codes:\n  2  usage / argument error\n  3  I/O failure (missing file, permission denied, etc.)\n  10 wrong key\n  11 archive corruption or integrity mismatch\n  12 unsupported archive revision / format version\n  13 unsafe extraction attempt\n  14 missing required bootstrap metadata\n  16 unsupported feature in this CLI/core version\n  1  generic failure\n\nSubcommands:\n  create   Build a new archive\n  extract  Extract files from an archive\n  list     List archive contents\n  verify   Validate archive integrity\n  keygen   Generate a random raw keyfile\n  signing-keygen Generate an Ed25519 RootAuth signing keypair"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -202,14 +202,14 @@ enum Command {
             conflicts_with = "password",
             conflicts_with = "password_stdin",
             conflicts_with = "no_encryption",
-            help = "Encrypt a v44 RecipientWrap archive to one X.509 recipient certificate."
+            help = "Encrypt a v45 RecipientWrap archive to one X.509 recipient certificate."
         )]
         recipient_cert: Option<String>,
 
         #[arg(
             long = "no-encryption",
             conflicts_with = "recipient_cert",
-            help = "Create an explicit plaintext v44 archive with no password or keyfile."
+            help = "Create an explicit plaintext v45 archive with no password or keyfile."
         )]
         no_encryption: bool,
 
@@ -442,6 +442,20 @@ enum Command {
         overwrite: bool,
 
         #[arg(
+            long = "restore",
+            value_enum,
+            default_value = "portable",
+            help = "Restore policy: content, portable, same-os, or system."
+        )]
+        restore: CliRestorePolicy,
+
+        #[arg(
+            long = "allow-degraded",
+            help = "Explicitly permit requested unsupported metadata to be skipped with diagnostics."
+        )]
+        allow_degraded: bool,
+
+        #[arg(
             long = "password-stdin",
             conflicts_with = "keyfile",
             conflicts_with = "password",
@@ -476,7 +490,7 @@ enum Command {
             conflicts_with = "password",
             conflicts_with = "password_stdin",
             conflicts_with = "insecure_zero_key",
-            help = "Use a local recipient private key to open a v44 RecipientWrap archive."
+            help = "Use a local recipient private key to open a v45 RecipientWrap archive."
         )]
         recipient_key: Option<String>,
 
@@ -559,7 +573,7 @@ enum Command {
             conflicts_with = "password",
             conflicts_with = "password_stdin",
             conflicts_with = "insecure_zero_key",
-            help = "Use a local recipient private key to open a v44 RecipientWrap archive."
+            help = "Use a local recipient private key to open a v45 RecipientWrap archive."
         )]
         recipient_key: Option<String>,
 
@@ -607,7 +621,7 @@ enum Command {
     },
     #[command(
         about = "Verify archive integrity",
-        long_about = "Verify archive signatures and checksum integrity. No payload changes are made unless --write-repaired is set; original archive files are never modified.\n\nEncrypted archives need --keyfile, --password, --password-stdin, or --recipient-key for v44 RecipientWrap archives. Unencrypted archives need no key source. Official TZAP X.509 RootAuth uses the embedded TZAP root by default. With --public-no-key, verify uses the public RootAuth profile and does not require the archive key.",
+        long_about = "Verify archive signatures and checksum integrity. No payload changes are made unless --write-repaired is set; original archive files are never modified.\n\nEncrypted archives need --keyfile, --password, --password-stdin, or --recipient-key for v45 RecipientWrap archives. Unencrypted archives need no key source. Official TZAP X.509 RootAuth uses the embedded TZAP root by default. With --public-no-key, verify uses the public RootAuth profile and does not require the archive key.",
         after_help = "Examples:\n  tzap verify --keyfile key.hex backup.tzap\n  tzap verify --recipient-key recipient.key backup.tzap\n  tzap verify --keyfile key.hex --write-repaired backup.tzap\n  tzap verify --keyfile key.hex --trusted-public-key root.public.hex backup.tzap\n  tzap verify --keyfile key.hex --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --public-no-key backup.tzap\n  tzap verify --public-no-key --trusted-public-key root.public.hex backup.tzap\n  tzap verify --public-no-key --trusted-ca-cert root-ca.pem backup.tzap\n  tzap verify --keyfile key.hex backup.vol000.tzap backup.vol001.tzap\n  tzap verify --password-stdin backup.tzap\n  tzap verify --json --keyfile key.hex backup.tzap\n  tzap verify --quiet --keyfile key.hex backup.tzap\n\nFor multi-volume archives named `.volNNN.tzap`, passing any one volume discovers matching siblings in the same directory. Additional positionals are explicit extra volumes."
     )]
     Verify {
@@ -653,7 +667,7 @@ enum Command {
             conflicts_with = "password",
             conflicts_with = "password_stdin",
             conflicts_with = "insecure_zero_key",
-            help = "Use a local recipient private key to verify a v44 RecipientWrap archive."
+            help = "Use a local recipient private key to verify a v45 RecipientWrap archive."
         )]
         recipient_key: Option<String>,
 
@@ -1467,6 +1481,8 @@ fn run(cli: Cli) -> Result<()> {
             stdout,
             dry_run,
             overwrite,
+            restore,
+            allow_degraded,
             password_stdin,
             password,
             keyfile,
@@ -1499,6 +1515,9 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 let options = SafeExtractionOptions {
                     overwrite_existing: overwrite,
+                    restore_policy: restore.into(),
+                    allow_degraded,
+                    system_authorized: restore == CliRestorePolicy::System,
                 };
                 let bootstrap_bytes = read_optional_bootstrap_sidecar(bootstrap.as_deref())?;
                 let stdin = io::stdin();
@@ -1650,6 +1669,9 @@ fn run(cli: Cli) -> Result<()> {
             let mut degraded_metadata_count = 0u64;
             let options = SafeExtractionOptions {
                 overwrite_existing: overwrite,
+                restore_policy: restore.into(),
+                allow_degraded,
+                system_authorized: restore == CliRestorePolicy::System,
             };
             let diagnostics = if paths.is_empty() {
                 opened.extract_indexed_files_to(&root, options, reader_options.jobs)?
@@ -2730,10 +2752,8 @@ fn archive_index_entry_json(entry: &ArchiveIndexEntry) -> serde_json::Value {
     json!({
         "path": &entry.path,
         "name": &entry.name,
-        "kind": archive_entry_kind_label(entry.kind),
         "size": entry.file_data_size,
-        "mode": entry.mode,
-        "mtime": entry.mtime,
+        "flags": entry.flags,
         "path_hash": encode_hex(&entry.path_hash),
         "tar_member_group_size": entry.tar_member_group_size,
         "first_frame_index": entry.first_frame_index,
@@ -2759,6 +2779,9 @@ fn archive_entry_kind_label(kind: TarEntryKind) -> &'static str {
         TarEntryKind::Directory => "directory",
         TarEntryKind::Symlink => "symlink",
         TarEntryKind::Hardlink => "hardlink",
+        TarEntryKind::CharacterDevice => "character-device",
+        TarEntryKind::BlockDevice => "block-device",
+        TarEntryKind::Fifo => "fifo",
     }
 }
 
@@ -2928,6 +2951,26 @@ enum CliX509SignatureScheme {
     EcdsaSha256Der,
     #[value(name = "rsa-pss-sha256")]
     RsaPssSha256,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliRestorePolicy {
+    Content,
+    Portable,
+    #[value(name = "same-os")]
+    SameOs,
+    System,
+}
+
+impl From<CliRestorePolicy> for RestorePolicy {
+    fn from(value: CliRestorePolicy) -> Self {
+        match value {
+            CliRestorePolicy::Content => Self::Content,
+            CliRestorePolicy::Portable => Self::Portable,
+            CliRestorePolicy::SameOs => Self::SameOs,
+            CliRestorePolicy::System => Self::System,
+        }
+    }
 }
 
 impl CliX509SignatureScheme {
@@ -5190,7 +5233,7 @@ fn verify_opened_root_auth_x509(
 
 fn revision_mode_label(volume_format_rev: u16) -> &'static str {
     match volume_format_rev {
-        VOLUME_FORMAT_REV_44 => "v44",
+        VOLUME_FORMAT_REV_45 => "v45",
         _ => "unsupported",
     }
 }
@@ -5924,7 +5967,7 @@ fn recipient_wrap_archive_identity_for_writer(
         archive_uuid,
         session_id,
         format_version: FORMAT_VERSION,
-        volume_format_rev: VOLUME_FORMAT_REV_44,
+        volume_format_rev: VOLUME_FORMAT_REV_45,
     }
 }
 
@@ -6891,8 +6934,8 @@ mod tests {
     fn reporting_unsupported_revision_json_has_observed_supported_action_only() {
         let err = anyhow!(FormatError::UnsupportedVolumeFormatRevision {
             format_version: 1,
-            volume_format_rev: VOLUME_FORMAT_REV_44 + 1,
-            reader_max_supported_revision: VOLUME_FORMAT_REV_44,
+            volume_format_rev: VOLUME_FORMAT_REV_45 + 1,
+            reader_max_supported_revision: VOLUME_FORMAT_REV_45,
         });
 
         let payload = unsupported_revision_error_json(
@@ -6907,11 +6950,11 @@ mod tests {
         );
         assert_eq!(
             payload["observed"]["volume_format_rev"],
-            serde_json::json!(VOLUME_FORMAT_REV_44 + 1)
+            serde_json::json!(VOLUME_FORMAT_REV_45 + 1)
         );
         assert_eq!(
             payload["supported"]["max_volume_format_rev"],
-            serde_json::json!(VOLUME_FORMAT_REV_44)
+            serde_json::json!(VOLUME_FORMAT_REV_45)
         );
         assert!(payload.get("root_auth").is_none());
         assert!(payload.get("decryption_keywrap").is_none());
@@ -6921,7 +6964,7 @@ mod tests {
     fn reporting_public_no_key_status_is_metadata_only() {
         let root_auth = VerifiedPublicNoKeyRootAuth::Ed25519(PublicNoKeyVerification {
             format_version: FORMAT_VERSION,
-            volume_format_rev: VOLUME_FORMAT_REV_44,
+            volume_format_rev: VOLUME_FORMAT_REV_45,
             archive_root: [1; 32],
             authenticator_id: ED25519_AUTHENTICATOR_ID,
             signer_identity_type: 1,
@@ -6935,7 +6978,7 @@ mod tests {
 
         let status = public_no_key_status_json(&root_auth);
 
-        assert_eq!(status["revision_mode"], serde_json::json!("v44"));
+        assert_eq!(status["revision_mode"], serde_json::json!("v45"));
         assert_eq!(status["decryption_keywrap"], serde_json::json!("not_used"));
         assert_eq!(
             status["trust_policy"],

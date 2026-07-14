@@ -1,6 +1,6 @@
 # tzap traceability pack
 
-This folder is the working evidence set for the v44-compliant reference
+This folder is the working evidence set for the v45-compliant reference
 implementation, RootAuth signing-plugin compliance, and RecipientWrap support.
 The root README stays product-facing; this folder carries the review map,
 verification gates, and audit notes.
@@ -12,7 +12,7 @@ The folder name is `public-docs/traceability`.
 Allowed after all required gates pass:
 
 ```text
-tzap is a v44-compliant reference implementation for documented supported
+tzap is a v45-compliant reference implementation for documented supported
 writer, reader, recovery, RootAuth, and RecipientWrap workflows. Legacy
 archives fail closed as unsupported revisions.
 ```

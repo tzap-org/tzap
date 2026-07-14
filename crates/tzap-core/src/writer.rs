@@ -15,6 +15,9 @@ use crate::crypto::{
     aead_encrypt, build_aad, compute_integrity_tag, derive_nonce, HmacDomain, KdfParams, MasterKey,
     Subkeys,
 };
+use crate::entry_metadata::{
+    encode_canonical_pax, portable_primary_pax, EXTENDED_METADATA_V1, REQUIRES_SYSTEM_RESTORE,
+};
 use crate::fec::encode_parity_gf16;
 use crate::format::{
     root_auth_spec_id_for_revision, AeadAlgo, ArchiveWriteError, BlockKind, CompressionAlgo,
@@ -23,7 +26,7 @@ use crate::format::{
     CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, MANIFEST_FOOTER_LEN, READER_MAX_CMRA_PARITY_PCT,
     READER_MAX_INDEX_ROOT_FEC_CLASS_SHARDS, READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN,
     READER_MAX_ROOT_AUTH_FOOTER_LEN, READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN,
-    VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    VOLUME_FORMAT_REV_45, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, validate_file_path_bytes, DirectoryHintEntry,
@@ -106,8 +109,8 @@ fn default_jobs() -> usize {
 }
 
 fn volume_format_revision_for_options(_options: &WriterOptions, _kdf_params: &KdfParams) -> u16 {
-    // Writer is intentionally canonicalized to v44-only output.
-    VOLUME_FORMAT_REV_44
+    // Writer is intentionally canonicalized to v45-only output.
+    VOLUME_FORMAT_REV_45
 }
 
 fn resolve_key_wrap_artifacts(
@@ -164,7 +167,7 @@ fn resolve_key_wrap_artifacts(
 
             let key_wrap_table = KeyWrapTableV1 {
                 version: *key_wrap_table_version,
-                volume_format_rev: VOLUME_FORMAT_REV_44,
+                volume_format_rev: VOLUME_FORMAT_REV_45,
                 table_length: 0,
                 flags: 0,
                 archive_uuid: *archive_uuid,
@@ -4784,7 +4787,7 @@ fn build_index_shard_plaintext(
             kind: row.member.kind,
             mode: row.member.mode,
             mtime: row.member.mtime,
-            flags: 0,
+            flags: v45_portable_file_entry_flags(row.member.mode),
         });
     }
 
@@ -5964,9 +5967,9 @@ fn build_v41_cmra(input: CmraBuildInput<'_>) -> Result<BuiltCmra, FormatError> {
             Ok((table, key_wrap_table_length))
         })
         .transpose()?;
-    if input.volume_format_rev != VOLUME_FORMAT_REV_44 && key_wrap_table.is_some() {
+    if input.volume_format_rev != VOLUME_FORMAT_REV_45 && key_wrap_table.is_some() {
         return Err(FormatError::WriterInvariant(
-            "KeyWrapTableV1 requires volume_format_rev 44",
+            "KeyWrapTableV1 requires volume_format_rev 45",
         ));
     }
     let key_wrap_table_length = key_wrap_table.map(|(_, length)| u64::from(length));
@@ -6468,19 +6471,16 @@ fn build_regular_file_member_prefix(
     mtime: u64,
 ) -> Result<Vec<u8>, FormatError> {
     let mut out = Vec::new();
-    let header_path = if path_requires_pax(path) {
-        let pax_payload = build_pax_record("path", path)?;
-        let pax_header = build_ustar_header(
-            b"PaxHeaders/path",
-            pax_payload.len() as u64,
-            0o644,
-            mtime,
-            b'x',
-        )?;
-        out.extend_from_slice(&pax_header);
-        out.extend_from_slice(&pax_payload);
-        out.resize(out.len() + padding_to_512(pax_payload.len()), 0);
-        pax_ustar_fallback_path(path)
+    let use_path_override = path_requires_pax(path);
+    let pax_records = portable_primary_pax(path, mode, writer_source_os(), use_path_override)?;
+    let pax_payload = encode_canonical_pax(&pax_records)?;
+    let pax_header = build_ustar_header(b"TZAP-PAX/PRIMARY", pax_payload.len() as u64, 0, 0, b'x')?;
+    out.extend_from_slice(&pax_header);
+    out.extend_from_slice(&pax_payload);
+    out.resize(out.len() + padding_to_512(pax_payload.len()), 0);
+
+    let header_path = if use_path_override {
+        b"TZAP-PRIMARY".to_vec()
     } else {
         path.to_vec()
     };
@@ -6504,38 +6504,36 @@ fn build_regular_file_member_group(
 }
 
 fn path_requires_pax(path: &[u8]) -> bool {
-    path.len() > 100 || !path.is_ascii()
+    path.len() > 100
 }
 
-fn pax_ustar_fallback_path(path: &[u8]) -> Vec<u8> {
-    path.rsplit(|byte| *byte == b'/')
-        .next()
-        .filter(|component| !component.is_empty() && component.len() <= 100 && component.is_ascii())
-        .map(|component| component.to_vec())
-        .unwrap_or_else(|| b"pax-file".to_vec())
-}
-
-fn build_pax_record(key: &str, value: &[u8]) -> Result<Vec<u8>, FormatError> {
-    let body_len = checked_usize_add(key.len(), 1, "PAX record")?;
-    let body_len = checked_usize_add(body_len, value.len(), "PAX record")?;
-    let body_len = checked_usize_add(body_len, 1, "PAX record")?;
-    let mut digits = 1usize;
-    loop {
-        let len = checked_usize_add(digits, 1, "PAX record")?;
-        let len = checked_usize_add(len, body_len, "PAX record")?;
-        let next_digits = len.to_string().len();
-        if next_digits == digits {
-            let mut out = Vec::with_capacity(len);
-            out.extend_from_slice(len.to_string().as_bytes());
-            out.push(b' ');
-            out.extend_from_slice(key.as_bytes());
-            out.push(b'=');
-            out.extend_from_slice(value);
-            out.push(b'\n');
-            return Ok(out);
-        }
-        digits = next_digits;
+fn writer_source_os() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else if cfg!(target_os = "netbsd") {
+        "netbsd"
+    } else if cfg!(target_os = "openbsd") {
+        "openbsd"
+    } else if cfg!(target_family = "unix") {
+        "other-unix"
+    } else {
+        "other"
     }
+}
+
+fn v45_portable_file_entry_flags(mode: u32) -> u32 {
+    EXTENDED_METADATA_V1
+        | if mode & 0o6000 != 0 {
+            REQUIRES_SYSTEM_RESTORE
+        } else {
+            0
+        }
 }
 
 fn build_ustar_header(
@@ -7215,7 +7213,7 @@ mod tests {
 
         let payload = plan_payload_stream(&files, options, None, &mut next_block_index).unwrap();
         let expected_tar_total_size =
-            TAR_BLOCK_LEN as u64 + data.len() as u64 + padding_to_512(data.len()) as u64;
+            3 * TAR_BLOCK_LEN as u64 + data.len() as u64 + padding_to_512(data.len()) as u64;
         let (tar_stream, _) = build_tar_stream(&files, options.max_path_length).unwrap();
 
         assert_eq!(payload.tar_members.len(), 1);
@@ -7226,28 +7224,27 @@ mod tests {
         );
         assert_eq!(payload.tar_total_size, expected_tar_total_size);
         assert_eq!(payload.content_sha256, sha256_bytes(&tar_stream));
-        assert_eq!(payload.frames.len(), 14);
+        assert_eq!(payload.frames.len(), 15);
         assert_eq!(payload.payload_objects.len(), 7);
         assert_eq!(payload.payload_block_count, 7);
         assert_eq!(next_block_index, 7);
 
         for (idx, frame) in payload.frames.iter().enumerate() {
-            let expected_envelope_index = (idx / 2) as u64;
-            let expected_decompressed_size = if idx == 13 { 512 } else { 1024 };
+            let expected_decompressed_size = if idx == 14 { 512 } else { 1024 };
             let expected_flags = match idx {
                 0 => 0x0000_0001,
-                13 => 0x0000_0002,
+                14 => 0x0000_0002,
                 _ => 0,
             };
-            let expected_offset = if idx % 2 == 0 {
-                0
-            } else {
-                payload.frames[idx - 1].compressed_size
-            };
+            let expected_offset = payload.frames[..idx]
+                .iter()
+                .filter(|prior| prior.envelope_index == frame.envelope_index)
+                .map(|prior| prior.compressed_size)
+                .sum::<u32>();
 
             assert_eq!(frame.frame_index, idx as u64);
             assert_eq!(frame.member_index, 0);
-            assert_eq!(frame.envelope_index, expected_envelope_index);
+            assert!((frame.envelope_index as usize) < payload.payload_objects.len());
             assert_eq!(frame.offset_in_envelope, expected_offset);
             assert_eq!(frame.decompressed_size, expected_decompressed_size);
             assert_eq!(frame.flags, expected_flags);
@@ -7255,9 +7252,10 @@ mod tests {
         }
 
         for (idx, object) in payload.payload_objects.iter().enumerate() {
-            let frame_start = idx * 2;
-            let expected_plaintext_size = payload.frames[frame_start..frame_start + 2]
+            let expected_plaintext_size = payload
+                .frames
                 .iter()
+                .filter(|frame| frame.envelope_index == idx as u64)
                 .map(|frame| frame.compressed_size)
                 .sum::<u32>();
 
@@ -7296,10 +7294,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(shard.header.file_count, 1);
-        assert_eq!(shard.header.frame_count, 14);
+        assert_eq!(shard.header.frame_count, 15);
         assert_eq!(shard.header.envelope_count, 7);
         assert_eq!(shard.files[0].first_frame_index, 0);
-        assert_eq!(shard.files[0].frame_count, 14);
+        assert_eq!(shard.files[0].frame_count, 15);
         assert_eq!(
             shard.files[0].tar_member_group_size,
             expected_tar_total_size
@@ -7308,7 +7306,7 @@ mod tests {
 
         for (idx, frame) in shard.frames.iter().enumerate() {
             assert_eq!(frame.frame_index, idx as u64);
-            assert_eq!(frame.envelope_index, (idx / 2) as u64);
+            assert_eq!(frame.envelope_index, payload.frames[idx].envelope_index);
             assert_eq!(
                 frame.offset_in_envelope,
                 payload.frames[idx].offset_in_envelope
@@ -7335,8 +7333,16 @@ mod tests {
                 envelope.plaintext_size,
                 payload.payload_objects[idx].plaintext_size
             );
-            assert_eq!(envelope.first_frame_index, (idx * 2) as u64);
-            assert_eq!(envelope.frame_count, 2);
+            let envelope_frames: Vec<_> = payload
+                .frames
+                .iter()
+                .filter(|frame| frame.envelope_index == idx as u64)
+                .collect();
+            assert_eq!(
+                envelope.first_frame_index,
+                envelope_frames.first().unwrap().frame_index
+            );
+            assert_eq!(envelope.frame_count, envelope_frames.len() as u32);
         }
 
         let master_key = MasterKey::from_raw_key(&[6u8; 32]).unwrap();
@@ -7356,7 +7362,7 @@ mod tests {
         let index_root =
             IndexRoot::parse(&plan.index_root_plaintext, false, MetadataLimits::default()).unwrap();
 
-        assert_eq!(index_root.header.frame_count, 14);
+        assert_eq!(index_root.header.frame_count, 15);
         assert_eq!(index_root.header.envelope_count, 7);
         assert_eq!(index_root.header.file_count, 1);
         assert_eq!(index_root.header.payload_block_count, 7);
@@ -7980,7 +7986,7 @@ mod tests {
                     && footer.authenticator_value.as_slice() == archive_root)
             })
             .unwrap();
-        assert_eq!(verification.volume_format_rev, VOLUME_FORMAT_REV_44);
+        assert_eq!(verification.volume_format_rev, VOLUME_FORMAT_REV_45);
     }
 
     #[test]

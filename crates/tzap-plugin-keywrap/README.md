@@ -1,6 +1,6 @@
 # tzap-plugin-keywrap
 
-`tzap-plugin-keywrap` is the companion crate for v44-compliant RecipientWrap
+`tzap-plugin-keywrap` is the companion crate for v45-compliant RecipientWrap
 workflows in documented supported tzap archives.
 
 The crate provides HPKE recipient record generation, profile dispatch, X.509
@@ -18,7 +18,7 @@ tzap-plugin-keywrap = "0.1.10"
 ## Architecture
 
 `tzap-core` owns the archive wire model and reader/writer surfaces. Projects
-add this companion crate when they need v44 RecipientWrap records for
+add this companion crate when they need v45 RecipientWrap records for
 certificate-based archive access.
 
 ```text
@@ -58,7 +58,7 @@ dispatch returns `KeyWrapOutcome::UnwrappedCandidateMasterKey`.
 
 ## Supported Suites
 
-The v44 key-wrap profile supports:
+The v45 key-wrap profile supports:
 
 - `KeyWrapSuite::X25519HkdfSha256ChaCha20Poly1305`
 - `KeyWrapSuite::P256HkdfSha256Aes256Gcm`
@@ -72,5 +72,5 @@ caller-owned through `PrivateKeyLookup::is_recipient_certificate_accepted`.
 - Repository: <https://github.com/tzap-org/tzap>
 - Core crate: <https://crates.io/crates/tzap-core>
 - CLI crate: <https://crates.io/crates/tzap>
-- Implemented format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv44.md>
-- v44 RecipientWrap spec: <https://github.com/tzap-org/tzap/blob/main/specs/plugin/tzap-plugin-keywrap-v1-proposed-v44.md>
+- Implemented format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv45.md>
+- v45 RecipientWrap spec: <https://github.com/tzap-org/tzap/blob/main/specs/plugin/tzap-plugin-keywrap-v1-proposed-v45.md>

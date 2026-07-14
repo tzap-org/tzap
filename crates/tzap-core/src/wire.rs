@@ -16,7 +16,7 @@ use crate::format::{
     READER_MAX_PATH_LENGTH, READER_MAX_ROOT_AUTH_AUTHENTICATOR_VALUE_LEN,
     READER_MAX_ROOT_AUTH_FOOTER_LEN, READER_MAX_ROOT_AUTH_SIGNER_IDENTITY_LEN,
     READER_MAX_STRIPE_WIDTH, READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, ROOT_AUTH_FOOTER_FIXED_LEN,
-    SERIALIZED_REGION_HEADER_LEN, VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    SERIALIZED_REGION_HEADER_LEN, VOLUME_FORMAT_REV_45, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::raw_stream_profile::{
     validate_raw_stream_content_model_extension, RAW_STREAM_CONTENT_MODEL_EXTENSION_TAG,
@@ -44,7 +44,7 @@ const SIDECAR_DICTIONARY_PRESENT: u32 = 0x04;
 const SIDECAR_KNOWN_FLAGS: u32 =
     SIDECAR_MANIFEST_PRESENT | SIDECAR_INDEX_ROOT_PRESENT | SIDECAR_DICTIONARY_PRESENT;
 
-const KEY_WRAP_TABLE_DIGEST_DOMAIN_V44: &[u8] = b"tzap-key-wrap-table-v44\0";
+const KEY_WRAP_TABLE_DIGEST_DOMAIN_V45: &[u8] = b"tzap-key-wrap-table-v45\0";
 const KEY_WRAP_TABLE_VERSION: u16 = 1;
 const KEY_WRAP_TABLE_HEADER_LEN: usize = 96;
 const KEY_WRAP_RECORD_HEADER_LEN: usize = 68;
@@ -499,7 +499,7 @@ pub fn compute_key_wrap_table_digest(
     key_wrap_table_bytes: &[u8],
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(KEY_WRAP_TABLE_DIGEST_DOMAIN_V44);
+    hasher.update(KEY_WRAP_TABLE_DIGEST_DOMAIN_V45);
     hasher.update(key_wrap_table_length.to_le_bytes());
     hasher.update(key_wrap_table_bytes);
     let digest = hasher.finalize();
@@ -529,9 +529,9 @@ impl KeyWrapTableV1 {
                 "KeyWrapTableV1 version must be 1",
             ));
         }
-        if self.volume_format_rev != VOLUME_FORMAT_REV_44 {
+        if self.volume_format_rev != VOLUME_FORMAT_REV_45 {
             return Err(FormatError::InvalidArchive(
-                "KeyWrapTableV1 volume_format_rev must be 44",
+                "KeyWrapTableV1 volume_format_rev must be 45",
             ));
         }
         if self.flags != 0 {
@@ -637,9 +637,9 @@ impl KeyWrapTableV1 {
             ));
         }
         let volume_format_rev = read_u16(bytes, 6)?;
-        if volume_format_rev != VOLUME_FORMAT_REV_44 {
+        if volume_format_rev != VOLUME_FORMAT_REV_45 {
             return Err(FormatError::InvalidArchive(
-                "KeyWrapTableV1 volume_format_rev must be 44",
+                "KeyWrapTableV1 volume_format_rev must be 45",
             ));
         }
 
@@ -1448,7 +1448,7 @@ pub struct CriticalMetadataImage {
 }
 
 fn critical_metadata_image_fixed_len(volume_format_rev: u16) -> Result<usize, FormatError> {
-    if volume_format_rev == VOLUME_FORMAT_REV_44 {
+    if volume_format_rev == VOLUME_FORMAT_REV_45 {
         Ok(CRITICAL_METADATA_IMAGE_FIXED_LEN)
     } else {
         Err(FormatError::UnsupportedVolumeFormatRevision {
@@ -1823,7 +1823,7 @@ impl CriticalRecoveryLocator {
             return Err(FormatError::UnsupportedFormatVersion(version));
         }
         let volume_format_rev = read_u16(bytes, 6)?;
-        if volume_format_rev != VOLUME_FORMAT_REV_44 {
+        if volume_format_rev != VOLUME_FORMAT_REV_45 {
             return Err(FormatError::UnsupportedVolumeFormatRevision {
                 format_version: FORMAT_VERSION,
                 volume_format_rev,
@@ -2326,7 +2326,7 @@ mod tests {
         let mut bytes = vec![0u8; KEY_WRAP_TABLE_HEADER_LEN];
         bytes[0..4].copy_from_slice(&TZKW_MAGIC);
         write_u16(&mut bytes, 4, KEY_WRAP_TABLE_VERSION);
-        write_u16(&mut bytes, 6, VOLUME_FORMAT_REV_44);
+        write_u16(&mut bytes, 6, VOLUME_FORMAT_REV_45);
         write_u32(&mut bytes, 8, table_length);
         write_u32(&mut bytes, 12, KEY_WRAP_TABLE_HEADER_LEN as u32);
         bytes[20..36].copy_from_slice(&uuid());
@@ -2423,7 +2423,7 @@ mod tests {
         let parsed = VolumeHeader::parse(&bytes).unwrap();
         assert_eq!(
             parsed.parse_volume_format_revision().unwrap(),
-            VolumeFormatRevision::V44
+            VolumeFormatRevision::V45
         );
 
         let mut legacy = volume_header().to_bytes();
@@ -2442,7 +2442,7 @@ mod tests {
         );
 
         let mut v45 = volume_header().to_bytes();
-        write_u16(&mut v45, 6, VOLUME_FORMAT_REV_44 + 1);
+        write_u16(&mut v45, 6, VOLUME_FORMAT_REV_45 + 1);
         let v45_crc = crc32c(&v45[..124]);
         write_u32(&mut v45, 124, v45_crc);
         assert_eq!(
@@ -2451,7 +2451,7 @@ mod tests {
                 .parse_volume_format_revision(),
             Err(FormatError::UnsupportedVolumeFormatRevision {
                 format_version: FORMAT_VERSION,
-                volume_format_rev: VOLUME_FORMAT_REV_44 + 1,
+                volume_format_rev: VOLUME_FORMAT_REV_45 + 1,
                 reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
             })
         );
@@ -2618,7 +2618,7 @@ mod tests {
 
         let digest = compute_key_wrap_table_digest(table_length, &table_bytes);
         let mut expected = Sha256::new();
-        expected.update(KEY_WRAP_TABLE_DIGEST_DOMAIN_V44);
+        expected.update(KEY_WRAP_TABLE_DIGEST_DOMAIN_V45);
         expected.update(table_length.to_le_bytes());
         expected.update(&table_bytes);
         let expected = expected.finalize();
@@ -2686,7 +2686,7 @@ mod tests {
         assert_eq!(
             KeyWrapTableV1::parse(&bad_revision, &uuid(), &session(), table_length, 1),
             Err(FormatError::InvalidArchive(
-                "KeyWrapTableV1 volume_format_rev must be 44"
+                "KeyWrapTableV1 volume_format_rev must be 45"
             ))
         );
 
@@ -2741,7 +2741,7 @@ mod tests {
     }
 
     #[test]
-    fn crypto_header_fixed_validates_v44_protection_mode_pairs() {
+    fn crypto_header_fixed_validates_v45_protection_mode_pairs() {
         let mut header = crypto_fixed();
         header.aead_algo = AeadAlgo::None;
         header.kdf_algo = KdfAlgo::None;
@@ -3467,7 +3467,7 @@ mod tests {
         );
 
         let mut mismatched = footer.to_bytes().unwrap();
-        write_u16(&mut mismatched, 72, VOLUME_FORMAT_REV_44 + 1);
+        write_u16(&mut mismatched, 72, VOLUME_FORMAT_REV_45 + 1);
         let mismatch_crc_offset = mismatched.len() - 4;
         let mismatch_crc = crc32c(&mismatched[..mismatch_crc_offset]);
         write_u32(&mut mismatched, mismatch_crc_offset, mismatch_crc);
@@ -3475,7 +3475,7 @@ mod tests {
             RootAuthFooterV1::parse(&mismatched).unwrap_err(),
             FormatError::UnsupportedVolumeFormatRevision {
                 format_version: FORMAT_VERSION,
-                volume_format_rev: VOLUME_FORMAT_REV_44 + 1,
+                volume_format_rev: VOLUME_FORMAT_REV_45 + 1,
                 reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
             }
         );
@@ -3526,7 +3526,7 @@ mod tests {
     #[test]
     fn critical_metadata_image_rejects_unsupported_volume_format_revision() {
         let image = CriticalMetadataImage {
-            volume_format_rev: VOLUME_FORMAT_REV_44,
+            volume_format_rev: VOLUME_FORMAT_REV_45,
             archive_uuid: uuid(),
             session_id: session(),
             volume_index: 0,
@@ -3556,7 +3556,7 @@ mod tests {
             volume_trailer_sha256: [0u8; 32],
             regions: vec![],
         };
-        for revision in [43, VOLUME_FORMAT_REV_44 + 1] {
+        for revision in [43, VOLUME_FORMAT_REV_45 + 1] {
             let mut bytes = image.to_bytes().unwrap();
             write_u16(&mut bytes, 6, revision);
             let crc_offset = bytes.len() - 4;

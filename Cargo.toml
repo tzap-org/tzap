@@ -16,7 +16,7 @@ rust-version = "1.85"
 repository = "https://github.com/tzap-org/tzap"
 keywords = ["archive", "compression", "encryption", "recovery", "zstd"]
 categories = ["compression", "cryptography", "filesystem"]
-documentation = "https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv44.md"
+documentation = "https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv45.md"
 readme = "README.md"
 
 [workspace.dependencies]

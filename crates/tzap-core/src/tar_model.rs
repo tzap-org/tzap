@@ -1,14 +1,23 @@
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+use unicode_normalization::UnicodeNormalization;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use crate::entry_metadata::{
+    parse_auxiliary_record, parse_canonical_pax, parse_primary_metadata, parse_sparse_payload,
+    validate_group_metadata, AuxiliaryRecord, AuxiliaryStreamValidator, CaptureReportRow,
+    CaptureStatus, MemberMetadata, PaxRecords, PortableMetadataMirror, PrimaryMetadata,
+    RestoreClass, RestorePolicy, SparseStreamValidator, CAPTURE_REPORT_KIND, HAS_NATIVE_METADATA,
+    MAX_AGGREGATE_PAX_PAYLOAD, MAX_LOCAL_PAX_PAYLOAD, REQUIRES_SYSTEM_RESTORE,
+};
 use crate::format::{ExtractError, FormatError};
 use crate::metadata::validate_file_path_bytes;
 
@@ -20,6 +29,9 @@ pub enum TarEntryKind {
     Directory,
     Symlink,
     Hardlink,
+    CharacterDevice,
+    BlockDevice,
+    Fifo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +49,8 @@ pub struct OwnedTarMember {
     pub mode: u32,
     pub mtime: u64,
     pub logical_size: u64,
+    pub reparse_placeholder: bool,
+    pub v45_metadata: Option<MemberMetadata>,
     pub diagnostics: Vec<MetadataDiagnostic>,
 }
 
@@ -49,19 +63,71 @@ pub struct ParsedTarMember<'a> {
     pub mode: u32,
     pub mtime: u64,
     pub logical_size: u64,
+    pub reparse_placeholder: bool,
     pub diagnostics: Vec<MetadataDiagnostic>,
+    pub v45_metadata: MemberMetadata,
 }
 
 impl ParsedTarMember<'_> {
-    pub fn to_owned_member(&self) -> OwnedTarMember {
-        OwnedTarMember {
+    pub fn to_owned_member(&self) -> Result<OwnedTarMember, FormatError> {
+        let data = if let Some(layout) = &self.v45_metadata.sparse_layout {
+            let logical_len = usize::try_from(layout.logical_size).map_err(|_| {
+                FormatError::ReaderUnsupported("sparse logical size exceeds platform limits")
+            })?;
+            let mut logical = vec![0u8; logical_len];
+            let mut stored_cursor = layout.map_and_padding_size;
+            for extent in &layout.extents {
+                let extent_len = usize::try_from(extent.length).map_err(|_| {
+                    FormatError::ReaderUnsupported("sparse extent exceeds platform limits")
+                })?;
+                let stored_end = stored_cursor
+                    .checked_add(extent_len)
+                    .ok_or(FormatError::InvalidArchive("sparse stored range overflow"))?;
+                let logical_start = usize::try_from(extent.offset).map_err(|_| {
+                    FormatError::ReaderUnsupported("sparse offset exceeds platform limits")
+                })?;
+                let logical_end = logical_start
+                    .checked_add(extent_len)
+                    .ok_or(FormatError::InvalidArchive("sparse logical range overflow"))?;
+                logical
+                    .get_mut(logical_start..logical_end)
+                    .ok_or(FormatError::InvalidArchive(
+                        "sparse logical range is invalid",
+                    ))?
+                    .copy_from_slice(self.data.get(stored_cursor..stored_end).ok_or(
+                        FormatError::InvalidArchive("sparse stored range is invalid"),
+                    )?);
+                stored_cursor = stored_end;
+            }
+            logical
+        } else {
+            self.data.to_vec()
+        };
+        Ok(OwnedTarMember {
             path: self.path.clone(),
             kind: self.kind,
-            data: self.data.to_vec(),
+            data,
             link_target: self.link_target.clone(),
             mode: self.mode,
             mtime: self.mtime,
             logical_size: self.logical_size,
+            reparse_placeholder: self.reparse_placeholder,
+            v45_metadata: Some(self.v45_metadata.clone()),
+            diagnostics: self.diagnostics.clone(),
+        })
+    }
+
+    pub(crate) fn to_owned_metadata(&self) -> OwnedTarMember {
+        OwnedTarMember {
+            path: self.path.clone(),
+            kind: self.kind,
+            data: Vec::new(),
+            link_target: self.link_target.clone(),
+            mode: self.mode,
+            mtime: self.mtime,
+            logical_size: self.logical_size,
+            reparse_placeholder: self.reparse_placeholder,
+            v45_metadata: Some(self.v45_metadata.clone()),
             diagnostics: self.diagnostics.clone(),
         }
     }
@@ -70,6 +136,13 @@ impl ParsedTarMember<'_> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SafeExtractionOptions {
     pub overwrite_existing: bool,
+    pub restore_policy: RestorePolicy,
+    /// Permit a requested same-OS/system operation to skip unsupported
+    /// authenticated metadata with durable diagnostics.
+    pub allow_degraded: bool,
+    /// Explicit caller authorization for system-class restoration. The core
+    /// implementation still applies only system items it understands.
+    pub system_authorized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +153,9 @@ pub(crate) struct StreamedTarMemberMetadata {
     pub mode: u32,
     pub mtime: u64,
     pub logical_size: u64,
+    pub file_entry_flags: u32,
+    pub reparse_placeholder: bool,
+    pub v45_metadata: MemberMetadata,
     pub diagnostics: Vec<MetadataDiagnostic>,
 }
 
@@ -91,6 +167,9 @@ pub(crate) struct TarStreamMemberSummary {
     pub mode: u32,
     pub mtime: u64,
     pub logical_size: u64,
+    pub file_entry_flags: u32,
+    pub reparse_placeholder: bool,
+    pub portable_mirror: PortableMetadataMirror,
     pub diagnostics: Vec<MetadataDiagnostic>,
     pub group_start: u64,
     pub group_size: u64,
@@ -141,6 +220,10 @@ pub(crate) trait TarStreamObserver {
     ) -> Result<Vec<MetadataDiagnostic>, FormatError> {
         Ok(member.diagnostics.clone())
     }
+
+    fn on_archive_complete(&mut self) -> Result<(), FormatError> {
+        Ok(())
+    }
 }
 
 pub(crate) struct NoopTarStreamObserver;
@@ -154,7 +237,7 @@ pub(crate) struct TarStreamFilesystemRestoreObserver<'a> {
 impl<'a> TarStreamFilesystemRestoreObserver<'a> {
     pub(crate) fn new(root: &'a Path, options: SafeExtractionOptions) -> Self {
         Self {
-            handler: FilesystemRestoreHandler::new(root, options),
+            handler: FilesystemRestoreHandler::new_deferred(root, options),
         }
     }
 }
@@ -180,30 +263,129 @@ impl TarStreamObserver for TarStreamFilesystemRestoreObserver<'_> {
             .finish(member)
             .map_err(format_error_from_extract_error)
     }
+
+    fn on_archive_complete(&mut self) -> Result<(), FormatError> {
+        self.handler.finish_archive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V45PaxKind {
+    Primary,
+    Auxiliary(u32),
 }
 
 #[derive(Default)]
-struct LocalMetadata {
-    pax_path: Option<Vec<u8>>,
-    pax_linkpath: Option<Vec<u8>>,
-    pax_size: Option<u64>,
-    gnu_long_name: Option<Vec<u8>>,
-    gnu_long_link: Option<Vec<u8>>,
-    diagnostics: Vec<MetadataDiagnostic>,
+struct V45StreamingGroup {
+    pending: Option<(V45PaxKind, PaxRecords)>,
+    auxiliary: Vec<AuxiliaryRecord>,
+    aggregate_pax_bytes: usize,
+}
+
+struct StreamingSparsePrimary {
+    validator: SparseStreamValidator,
+    layout: Option<crate::entry_metadata::SparseLayout>,
+    extent_index: usize,
+    extent_consumed: u64,
+    logical_cursor: u64,
+}
+
+impl StreamingSparsePrimary {
+    fn new(logical_size: u64) -> Self {
+        Self {
+            validator: SparseStreamValidator::new(logical_size),
+            layout: None,
+            extent_index: 0,
+            extent_consumed: 0,
+            logical_cursor: 0,
+        }
+    }
+
+    fn observe<O: TarStreamObserver>(
+        &mut self,
+        bytes: &[u8],
+        observer: &mut O,
+    ) -> Result<(), FormatError> {
+        let before = self.validator.position();
+        self.validator.observe(bytes)?;
+        if self.layout.is_none() {
+            self.layout = self.validator.layout_if_map_complete();
+        }
+        let Some(layout) = &self.layout else {
+            return Ok(());
+        };
+        let padded = layout.map_and_padding_size as u64;
+        let data_offset = if before >= padded {
+            0
+        } else {
+            usize::try_from((padded - before).min(bytes.len() as u64))
+                .map_err(|_| FormatError::InvalidArchive("sparse offset exceeds usize"))?
+        };
+        let mut data = &bytes[data_offset..];
+        while !data.is_empty() {
+            let extent =
+                layout
+                    .extents
+                    .get(self.extent_index)
+                    .ok_or(FormatError::InvalidArchive(
+                        "sparse primary has trailing extent bytes",
+                    ))?;
+            if self.extent_consumed == 0 {
+                observer_write_zeros(observer, extent.offset - self.logical_cursor)?;
+            }
+            let available = extent.length - self.extent_consumed;
+            let take = usize::try_from(available.min(data.len() as u64))
+                .map_err(|_| FormatError::InvalidArchive("sparse extent exceeds usize"))?;
+            observer.on_regular_payload(&data[..take])?;
+            self.extent_consumed += take as u64;
+            data = &data[take..];
+            if self.extent_consumed == extent.length {
+                self.logical_cursor = extent.offset + extent.length;
+                self.extent_index += 1;
+                self.extent_consumed = 0;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish<O: TarStreamObserver>(self, observer: &mut O) -> Result<(), FormatError> {
+        let layout = self.validator.finish()?;
+        if self.extent_index != layout.extents.len() || self.extent_consumed != 0 {
+            return Err(FormatError::InvalidArchive(
+                "sparse primary extent data is incomplete",
+            ));
+        }
+        observer_write_zeros(observer, layout.logical_size - self.logical_cursor)
+    }
+}
+
+fn observer_write_zeros<O: TarStreamObserver>(
+    observer: &mut O,
+    mut len: u64,
+) -> Result<(), FormatError> {
+    let zeros = [0u8; 64 * 1024];
+    while len > 0 {
+        let take = len.min(zeros.len() as u64) as usize;
+        observer.on_regular_payload(&zeros[..take])?;
+        len -= take as u64;
+    }
+    Ok(())
 }
 
 pub fn parse_tar_member_group<'a>(
     group: &'a [u8],
     max_path_length: u32,
 ) -> Result<ParsedTarMember<'a>, FormatError> {
-    if group.len() < TAR_BLOCK_LEN || group.len() % TAR_BLOCK_LEN != 0 {
+    if group.len() < TAR_BLOCK_LEN * 3 || group.len() % TAR_BLOCK_LEN != 0 {
         return Err(FormatError::InvalidArchive(
             "tar member group is not block aligned",
         ));
     }
 
     let mut cursor = 0usize;
-    let mut metadata = LocalMetadata::default();
+    let mut pending: Option<(V45PaxKind, PaxRecords)> = None;
+    let mut auxiliary = Vec::<AuxiliaryRecord>::new();
+    let mut aggregate_pax_bytes = 0usize;
 
     loop {
         let header = slice(group, cursor, TAR_BLOCK_LEN)?;
@@ -213,12 +395,12 @@ pub fn parse_tar_member_group<'a>(
         verify_tar_checksum(header)?;
         let typeflag = header[156];
         let header_size = parse_tar_octal(&header[124..136])?;
-        let is_main = matches!(typeflag, 0 | b'0' | b'5' | b'2' | b'1');
-        let effective_size = if is_main {
-            metadata.pax_size.unwrap_or(header_size)
-        } else {
-            header_size
-        };
+        let effective_size = pending
+            .as_ref()
+            .and_then(|(_, records)| records.get("size"))
+            .map(|value| parse_minimal_decimal_u64(value, "PAX size"))
+            .transpose()?
+            .unwrap_or(header_size);
         let payload_start = checked_add(cursor, TAR_BLOCK_LEN)?;
         let payload_len = to_usize(effective_size)?;
         let payload_end = checked_add(payload_start, payload_len)?;
@@ -237,33 +419,67 @@ pub fn parse_tar_member_group<'a>(
 
         match typeflag {
             b'x' => {
-                parse_pax_records(payload, &mut metadata)?;
+                if pending.is_some() {
+                    return Err(FormatError::InvalidArchive(
+                        "PAX header is not immediately consumed",
+                    ));
+                }
+                validate_v45_metadata_header(header)?;
+                aggregate_pax_bytes = aggregate_pax_bytes
+                    .checked_add(payload.len())
+                    .ok_or(FormatError::InvalidArchive("aggregate PAX size overflow"))?;
+                if aggregate_pax_bytes > MAX_AGGREGATE_PAX_PAYLOAD {
+                    return Err(FormatError::ReaderResourceLimitExceeded {
+                        field: "aggregate local PAX payload bytes per member group",
+                        cap: MAX_AGGREGATE_PAX_PAYLOAD as u64,
+                        actual: aggregate_pax_bytes as u64,
+                    });
+                }
+                let records = parse_canonical_pax(payload)?;
+                let label = ustar_path(header);
+                let kind = if label == b"TZAP-PAX/PRIMARY" {
+                    V45PaxKind::Primary
+                } else if let Some(ordinal) = parse_auxiliary_pax_label(&label) {
+                    if ordinal != auxiliary.len() as u32 {
+                        return Err(FormatError::InvalidArchive(
+                            "auxiliary PAX ordinal is not contiguous",
+                        ));
+                    }
+                    V45PaxKind::Auxiliary(ordinal)
+                } else {
+                    return Err(FormatError::InvalidArchive(
+                        "revision-45 PAX header has a non-canonical internal name",
+                    ));
+                };
+                pending = Some((kind, records));
                 cursor = padded_end;
             }
-            b'g' => {
+            b'Z' => {
+                let Some((V45PaxKind::Auxiliary(ordinal), records)) = pending.take() else {
+                    return Err(FormatError::InvalidArchive(
+                        "auxiliary entry is missing its local PAX header",
+                    ));
+                };
+                validate_v45_auxiliary_header(header, ordinal, header_size, effective_size)?;
+                auxiliary.push(parse_auxiliary_record(
+                    &records,
+                    ordinal,
+                    effective_size,
+                    payload,
+                )?);
+                cursor = padded_end;
+            }
+            b'g' | b'L' | b'K' | b'V' | b'M' | b'N' | b'S' => {
                 return Err(FormatError::InvalidArchive(
-                    "global PAX headers are not allowed",
+                    "global or GNU tar metadata is forbidden in revision 45",
                 ));
             }
-            b'V' | b'M' | b'N' => {
-                return Err(FormatError::InvalidArchive(
-                    "global GNU headers are not allowed",
-                ));
-            }
-            b'L' => {
-                metadata.gnu_long_name = Some(trimmed_metadata_payload(payload));
-                cursor = padded_end;
-            }
-            b'K' => {
-                metadata.gnu_long_link = Some(trimmed_metadata_payload(payload));
-                cursor = padded_end;
-            }
-            b'S' => {
-                return Err(FormatError::ReaderUnsupported(
-                    "unsupported GNU sparse tar entry",
-                ));
-            }
-            0 | b'0' | b'5' | b'2' | b'1' => {
+            0 | b'0' | b'5' | b'2' | b'1' | b'3' | b'4' | b'6' => {
+                let Some((V45PaxKind::Primary, records)) = pending.take() else {
+                    return Err(FormatError::InvalidArchive(
+                        "primary entry is missing its canonical local PAX header",
+                    ));
+                };
                 if padded_end != group.len() {
                     return Err(FormatError::InvalidArchive(
                         "tar member group has bytes after main entry",
@@ -273,22 +489,87 @@ pub fn parse_tar_member_group<'a>(
                     b'5' => TarEntryKind::Directory,
                     b'2' => TarEntryKind::Symlink,
                     b'1' => TarEntryKind::Hardlink,
+                    b'3' => TarEntryKind::CharacterDevice,
+                    b'4' => TarEntryKind::BlockDevice,
+                    b'6' => TarEntryKind::Fifo,
                     _ => TarEntryKind::Regular,
                 };
-                let mode = parse_tar_octal(&header[100..108])? as u32;
-                let mtime = parse_tar_octal(&header[136..148])?;
-                let path = canonical_main_path(header, kind, &metadata, max_path_length)?;
+                let primary = parse_primary_metadata(&records)?;
+                validate_v45_primary_header(
+                    header,
+                    kind,
+                    header_size,
+                    effective_size,
+                    &primary,
+                    &records,
+                )?;
+                let path = v45_primary_path(header, kind, &records, &primary, max_path_length)?;
                 let link_target =
-                    canonical_link_target(header, kind, &path, &metadata, max_path_length)?;
+                    v45_primary_link_target(header, kind, &path, &primary, max_path_length)?;
+                let is_sparse = primary.sparse_logical_size.is_some();
+                let reparse_placeholder = records.contains_key("TZAP.windows.reparse-placeholder");
                 if kind != TarEntryKind::Regular && effective_size != 0 {
                     return Err(FormatError::InvalidArchive(
                         "non-regular tar entry has non-zero payload size",
                     ));
                 }
-                let logical_size = if kind == TarEntryKind::Regular {
-                    effective_size
+                if reparse_placeholder && effective_size != 0 {
+                    return Err(FormatError::InvalidArchive(
+                        "reparse placeholder has non-zero primary payload",
+                    ));
+                }
+                let sparse_layout = if let Some(logical_size) = primary.sparse_logical_size {
+                    if kind != TarEntryKind::Regular || reparse_placeholder {
+                        return Err(FormatError::InvalidArchive(
+                            "sparse metadata is not valid for this primary type",
+                        ));
+                    }
+                    Some(parse_sparse_payload(payload, logical_size)?)
+                } else {
+                    None
+                };
+                let logical_size = if kind == TarEntryKind::Regular && !reparse_placeholder {
+                    primary.sparse_logical_size.unwrap_or(effective_size)
                 } else {
                     0
+                };
+                let (file_entry_flags, capture_report) =
+                    v45_group_flags(&primary, &auxiliary, kind)?;
+                validate_v45_primary_cross_fields(
+                    kind,
+                    &records,
+                    &primary,
+                    &auxiliary,
+                    V45PrimaryLink {
+                        path: &path,
+                        target: link_target.as_deref(),
+                    },
+                    is_sparse,
+                    capture_report.as_deref(),
+                )?;
+                let mut diagnostics = Vec::new();
+                let (mtime_seconds, _mtime_nanos) = primary.mtime.unwrap_or((
+                    i64::try_from(parse_tar_octal(&header[136..148])?).unwrap_or(i64::MAX),
+                    0,
+                ));
+                let mtime = if mtime_seconds < 0 {
+                    diagnostics.push(MetadataDiagnostic {
+                        profile: "portable-v1",
+                        message: "pre-epoch mtime requires a signed-time restore API",
+                    });
+                    0
+                } else {
+                    mtime_seconds as u64
+                };
+                let v45_metadata = MemberMetadata {
+                    declaration: primary.declaration.clone(),
+                    auxiliary,
+                    file_entry_flags,
+                    sparse_layout,
+                    capture_report,
+                    primary_has_native_scalar: primary.has_native_scalar,
+                    primary_requires_system_restore: primary.requires_system_restore,
+                    portable_mirror: portable_metadata_mirror(header, &records, &primary)?,
                 };
                 return Ok(ParsedTarMember {
                     path,
@@ -298,15 +579,19 @@ pub fn parse_tar_member_group<'a>(
                     } else {
                         &[]
                     },
-                    mode,
+                    mode: primary.declaration.portable_mode,
                     mtime,
                     link_target,
                     logical_size,
-                    diagnostics: metadata.diagnostics,
+                    reparse_placeholder,
+                    diagnostics,
+                    v45_metadata,
                 });
             }
             _ => {
-                return Err(FormatError::ReaderUnsupported("unsupported tar entry type"));
+                return Err(FormatError::InvalidArchive(
+                    "unsupported revision-45 tar entry type",
+                ));
             }
         }
 
@@ -316,6 +601,693 @@ pub fn parse_tar_member_group<'a>(
             ));
         }
     }
+}
+
+fn validate_v45_metadata_header(header: &[u8]) -> Result<(), FormatError> {
+    validate_ustar_header(header)?;
+    if parse_tar_octal(&header[100..108])? != 0
+        || parse_tar_octal(&header[108..116])? != 0
+        || parse_tar_octal(&header[116..124])? != 0
+        || parse_tar_octal(&header[136..148])? != 0
+        || !nul_trimmed(&header[157..257]).is_empty()
+        || !nul_trimmed(&header[265..297]).is_empty()
+        || !nul_trimmed(&header[297..329]).is_empty()
+        || parse_tar_octal(&header[329..337])? != 0
+        || parse_tar_octal(&header[337..345])? != 0
+        || !nul_trimmed(&header[345..500]).is_empty()
+    {
+        return Err(FormatError::InvalidArchive(
+            "revision-45 local PAX header has non-zero metadata fields",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ustar_header(header: &[u8]) -> Result<(), FormatError> {
+    if &header[257..263] != b"ustar\0" || &header[263..265] != b"00" {
+        return Err(FormatError::InvalidArchive(
+            "tar header is not canonical ustar",
+        ));
+    }
+    for field in [
+        &header[0..100],
+        &header[157..257],
+        &header[265..297],
+        &header[297..329],
+        &header[345..500],
+    ] {
+        validate_nul_terminated_field(field)?;
+    }
+    if header[500..512].iter().any(|byte| *byte != 0) {
+        return Err(FormatError::InvalidArchive(
+            "tar header has non-zero reserved bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_nul_terminated_field(field: &[u8]) -> Result<(), FormatError> {
+    if let Some(nul) = field.iter().position(|byte| *byte == 0) {
+        if field[nul..].iter().any(|byte| *byte != 0) {
+            return Err(FormatError::InvalidArchive(
+                "ustar string field has bytes after NUL",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_auxiliary_pax_label(label: &[u8]) -> Option<u32> {
+    let suffix = label.strip_prefix(b"TZAP-PAX/AUX/")?;
+    if suffix.len() != 8
+        || !suffix
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return None;
+    }
+    u32::from_str_radix(std::str::from_utf8(suffix).ok()?, 16).ok()
+}
+
+fn validate_v45_auxiliary_header(
+    header: &[u8],
+    ordinal: u32,
+    header_size: u64,
+    effective_size: u64,
+) -> Result<(), FormatError> {
+    validate_ustar_header(header)?;
+    let expected = format!("TZAP-AUX/{ordinal:08x}");
+    if ustar_path(header) != expected.as_bytes()
+        || parse_tar_octal(&header[100..108])? != 0
+        || parse_tar_octal(&header[108..116])? != 0
+        || parse_tar_octal(&header[116..124])? != 0
+        || parse_tar_octal(&header[136..148])? != 0
+        || !nul_trimmed(&header[157..257]).is_empty()
+        || !nul_trimmed(&header[265..297]).is_empty()
+        || !nul_trimmed(&header[297..329]).is_empty()
+        || parse_tar_octal(&header[329..337])? != 0
+        || parse_tar_octal(&header[337..345])? != 0
+        || !nul_trimmed(&header[345..500]).is_empty()
+        || (header_size != effective_size && header_size != 0)
+    {
+        return Err(FormatError::InvalidArchive(
+            "revision-45 auxiliary tar header is not canonical",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v45_primary_header(
+    header: &[u8],
+    kind: TarEntryKind,
+    header_size: u64,
+    effective_size: u64,
+    primary: &PrimaryMetadata,
+    records: &PaxRecords,
+) -> Result<(), FormatError> {
+    validate_ustar_header(header)?;
+    if parse_tar_octal(&header[100..108])? != primary.declaration.portable_mode as u64 {
+        return Err(FormatError::InvalidArchive(
+            "ustar mode does not match TZAP.portable.mode",
+        ));
+    }
+    if primary.stored_size.is_some() {
+        if header_size != 0 && header_size != effective_size {
+            return Err(FormatError::InvalidArchive(
+                "ustar size conflicts with PAX size",
+            ));
+        }
+    } else if header_size != effective_size {
+        return Err(FormatError::InvalidArchive("ustar size is inconsistent"));
+    }
+    if !primary.declaration.owner_kind_posix
+        && (parse_tar_octal(&header[108..116])? != 0
+            || parse_tar_octal(&header[116..124])? != 0
+            || !nul_trimmed(&header[265..297]).is_empty()
+            || !nul_trimmed(&header[297..329]).is_empty())
+    {
+        return Err(FormatError::InvalidArchive(
+            "owner-kind none has non-zero ustar ownership fields",
+        ));
+    }
+    if primary.declaration.owner_kind_posix {
+        validate_numeric_pax_header_match(records, "uid", &header[108..116], "UID")?;
+        validate_numeric_pax_header_match(records, "gid", &header[116..124], "GID")?;
+        validate_string_pax_header_match(records, "uname", &header[265..297], "user name")?;
+        validate_string_pax_header_match(records, "gname", &header[297..329], "group name")?;
+    }
+    if let Some((seconds, _)) = primary.mtime {
+        let header_mtime = parse_tar_octal(&header[136..148])?;
+        if header_mtime != 0 && (seconds < 0 || u64::try_from(seconds).ok() != Some(header_mtime)) {
+            return Err(FormatError::InvalidArchive(
+                "ustar mtime conflicts with PAX mtime",
+            ));
+        }
+    }
+    let is_device = matches!(
+        kind,
+        TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice
+    );
+    if !is_device
+        && (parse_tar_octal(&header[329..337])? != 0 || parse_tar_octal(&header[337..345])? != 0)
+    {
+        return Err(FormatError::InvalidArchive(
+            "non-device primary has device numbers",
+        ));
+    }
+    if is_device {
+        validate_numeric_pax_header_match(
+            records,
+            "TZAP.posix.device-major",
+            &header[329..337],
+            "device major",
+        )?;
+        validate_numeric_pax_header_match(
+            records,
+            "TZAP.posix.device-minor",
+            &header[337..345],
+            "device minor",
+        )?;
+    }
+    Ok(())
+}
+
+fn portable_metadata_mirror(
+    header: &[u8],
+    records: &PaxRecords,
+    primary: &PrimaryMetadata,
+) -> Result<PortableMetadataMirror, FormatError> {
+    let numeric = |key: &'static str, field: &[u8]| -> Result<Option<u64>, FormatError> {
+        if !primary.declaration.owner_kind_posix {
+            return Ok(None);
+        }
+        if let Some(value) = records.get(key) {
+            Ok(Some(parse_minimal_decimal_u64(value, key)?))
+        } else {
+            Ok(Some(parse_tar_octal(field)?))
+        }
+    };
+    let string = |key: &str, field: &[u8]| -> Option<Vec<u8>> {
+        if !primary.declaration.owner_kind_posix {
+            return None;
+        }
+        let value = records
+            .get(key)
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| nul_trimmed(field));
+        (!value.is_empty()).then(|| value.to_vec())
+    };
+    let mtime = if let Some(value) = primary.mtime {
+        value
+    } else {
+        (
+            i64::try_from(parse_tar_octal(&header[136..148])?)
+                .map_err(|_| FormatError::InvalidArchive("ustar mtime exceeds i64"))?,
+            0,
+        )
+    };
+    Ok(PortableMetadataMirror {
+        owner_kind_posix: primary.declaration.owner_kind_posix,
+        mode_origin_native: primary.declaration.mode_origin_native,
+        mode: primary.declaration.portable_mode,
+        attributes: primary.declaration.portable_attributes,
+        uid: numeric("uid", &header[108..116])?,
+        gid: numeric("gid", &header[116..124])?,
+        uname: string("uname", &header[265..297]),
+        gname: string("gname", &header[297..329]),
+        mtime,
+    })
+}
+
+fn validate_numeric_pax_header_match(
+    records: &PaxRecords,
+    key: &'static str,
+    header_field: &[u8],
+    label: &'static str,
+) -> Result<(), FormatError> {
+    let Some(value) = records.get(key) else {
+        return Ok(());
+    };
+    let pax = parse_minimal_decimal_u64(value, key)?;
+    let header = parse_tar_octal(header_field)?;
+    if header != 0 && header != pax {
+        return Err(FormatError::InvalidMetadata {
+            structure: label,
+            reason: "ustar field conflicts with PAX value",
+        });
+    }
+    Ok(())
+}
+
+fn validate_string_pax_header_match(
+    records: &PaxRecords,
+    key: &'static str,
+    header_field: &[u8],
+    label: &'static str,
+) -> Result<(), FormatError> {
+    if let Some(value) = records.get(key) {
+        let header = nul_trimmed(header_field);
+        if !header.is_empty() && header != value {
+            return Err(FormatError::InvalidMetadata {
+                structure: label,
+                reason: "ustar field conflicts with PAX value",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn v45_primary_path(
+    header: &[u8],
+    kind: TarEntryKind,
+    records: &PaxRecords,
+    primary: &PrimaryMetadata,
+    max_path_length: u32,
+) -> Result<Vec<u8>, FormatError> {
+    let sparse_name = records.get("GNU.sparse.name");
+    let mut path = if let Some(name) = sparse_name {
+        if primary.path.is_some() || ustar_path(header) != b"GNUSparseFile.0/TZAP" {
+            return Err(FormatError::InvalidArchive(
+                "GNU sparse primary path framing is not canonical",
+            ));
+        }
+        name.clone()
+    } else if let Some(path) = &primary.path {
+        if ustar_path(header) != b"TZAP-PRIMARY" {
+            return Err(FormatError::InvalidArchive(
+                "PAX path override lacks canonical ustar placeholder",
+            ));
+        }
+        path.clone()
+    } else {
+        ustar_path(header)
+    };
+    if kind == TarEntryKind::Directory && path.ends_with(b"/") {
+        path.pop();
+    }
+    validate_file_path_bytes(&path, max_path_length)?;
+    Ok(path)
+}
+
+fn v45_primary_link_target(
+    header: &[u8],
+    kind: TarEntryKind,
+    path: &[u8],
+    primary: &PrimaryMetadata,
+    max_path_length: u32,
+) -> Result<Option<Vec<u8>>, FormatError> {
+    let header_target = nul_trimmed(&header[157..257]);
+    match kind {
+        TarEntryKind::Symlink | TarEntryKind::Hardlink => {
+            let target = if let Some(target) = &primary.linkpath {
+                if !header_target.is_empty() {
+                    return Err(FormatError::InvalidArchive(
+                        "PAX linkpath override has non-empty ustar linkname",
+                    ));
+                }
+                target.clone()
+            } else {
+                header_target.to_vec()
+            };
+            if target.is_empty() || target.contains(&0) {
+                return Err(FormatError::InvalidArchive("tar link target is empty"));
+            }
+            if kind == TarEntryKind::Hardlink {
+                validate_file_path_bytes(&target, max_path_length)?;
+            } else {
+                validate_symlink_target(path, &target)?;
+            }
+            Ok(Some(target))
+        }
+        _ => {
+            if primary.linkpath.is_some() || !header_target.is_empty() {
+                return Err(FormatError::InvalidArchive(
+                    "non-link primary has a link target",
+                ));
+            }
+            Ok(None)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct V45PrimaryLink<'a> {
+    path: &'a [u8],
+    target: Option<&'a [u8]>,
+}
+
+fn validate_v45_primary_cross_fields(
+    kind: TarEntryKind,
+    records: &PaxRecords,
+    primary: &PrimaryMetadata,
+    auxiliary: &[AuxiliaryRecord],
+    link: V45PrimaryLink<'_>,
+    sparse: bool,
+    capture_report: Option<&[CaptureReportRow]>,
+) -> Result<(), FormatError> {
+    let is_device = matches!(
+        kind,
+        TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice
+    );
+    let has_device_major = records.contains_key("TZAP.posix.device-major");
+    let has_device_minor = records.contains_key("TZAP.posix.device-minor");
+    if is_device != (has_device_major && has_device_minor) {
+        return Err(FormatError::InvalidArchive(
+            "device primary and device-number metadata disagree",
+        ));
+    }
+    if (kind == TarEntryKind::Fifo || is_device)
+        && !primary.declaration.profile_selected("posix-backup-v1")
+    {
+        return Err(FormatError::InvalidArchive(
+            "special POSIX primary lacks posix-backup-v1",
+        ));
+    }
+    if records.contains_key("TZAP.linux.whiteout") {
+        let major = records
+            .get("TZAP.posix.device-major")
+            .map(|value| parse_minimal_decimal_u64(value, "device major"))
+            .transpose()?;
+        let minor = records
+            .get("TZAP.posix.device-minor")
+            .map(|value| parse_minimal_decimal_u64(value, "device minor"))
+            .transpose()?;
+        if kind != TarEntryKind::CharacterDevice || major != Some(0) || minor != Some(0) {
+            return Err(FormatError::InvalidArchive(
+                "Linux whiteout is not a character device with major/minor zero",
+            ));
+        }
+    }
+    if sparse && kind != TarEntryKind::Regular {
+        return Err(FormatError::InvalidArchive(
+            "non-regular primary carries sparse metadata",
+        ));
+    }
+    if kind == TarEntryKind::Hardlink {
+        if primary.declaration.required_profiles != ["portable-v1"]
+            || !primary.declaration.optional_profiles.is_empty()
+            || sparse
+            || auxiliary
+                .iter()
+                .any(|record| record.kind != CAPTURE_REPORT_KIND)
+        {
+            return Err(FormatError::InvalidArchive(
+                "hardlink alias carries forbidden native or inode metadata",
+            ));
+        }
+        if link.target == Some(link.path) {
+            return Err(FormatError::InvalidArchive("hardlink aliases itself"));
+        }
+    }
+    if records.contains_key("TZAP.windows.directory-case-sensitive")
+        && kind != TarEntryKind::Directory
+    {
+        return Err(FormatError::InvalidArchive(
+            "Windows directory case-sensitive state is attached to a non-directory",
+        ));
+    }
+    if records.contains_key("SCHILY.acl.default") && kind != TarEntryKind::Directory {
+        return Err(FormatError::InvalidArchive(
+            "default POSIX ACL is attached to a non-directory",
+        ));
+    }
+    if records.contains_key("TZAP.macos.clone-group") && kind != TarEntryKind::Regular {
+        return Err(FormatError::InvalidArchive(
+            "macOS clone group is attached to a non-regular primary",
+        ));
+    }
+    validate_windows_cross_fields(kind, records, primary, auxiliary, sparse, capture_report)?;
+    let has_textual_acl = records.contains_key("SCHILY.acl.access")
+        || records.contains_key("SCHILY.acl.default")
+        || records.contains_key("SCHILY.acl.ace");
+    let has_native_macos_acl = auxiliary
+        .iter()
+        .any(|record| record.kind == "macos.acl-native");
+    let acl_projection_none = records
+        .get("TZAP.acl.projection")
+        .is_some_and(|value| value == b"none");
+    if (!has_textual_acl && has_native_macos_acl) != acl_projection_none {
+        return Err(FormatError::InvalidArchive(
+            "native-only ACL declaration and projection=none disagree",
+        ));
+    }
+    if auxiliary.iter().any(|record| {
+        record.kind == "generic.xattr"
+            && primary
+                .xattr_names
+                .iter()
+                .any(|name| name == &record.decoded_name)
+    }) {
+        return Err(FormatError::InvalidArchive(
+            "xattr is duplicated in primary and auxiliary metadata",
+        ));
+    }
+    if has_textual_acl
+        && (primary.xattr_names.iter().any(|name| {
+            matches!(
+                name.as_slice(),
+                b"system.posix_acl_access"
+                    | b"system.posix_acl_default"
+                    | b"com.apple.system.Security"
+            )
+        }) || auxiliary.iter().any(|record| {
+            record.kind == "generic.xattr"
+                && matches!(
+                    record.decoded_name.as_slice(),
+                    b"system.posix_acl_access"
+                        | b"system.posix_acl_default"
+                        | b"com.apple.system.Security"
+                )
+        }))
+    {
+        return Err(FormatError::InvalidArchive(
+            "filesystem ACL backing xattr duplicates declared ACL metadata",
+        ));
+    }
+    Ok(())
+}
+
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x0000_4000;
+const STREAM_CONTAINS_SECURITY: u32 = 0x0000_0002;
+const STREAM_SPARSE_ATTRIBUTE: u32 = 0x0000_0008;
+
+fn validate_windows_cross_fields(
+    kind: TarEntryKind,
+    records: &PaxRecords,
+    primary: &PrimaryMetadata,
+    auxiliary: &[AuxiliaryRecord],
+    sparse: bool,
+    capture_report: Option<&[CaptureReportRow]>,
+) -> Result<(), FormatError> {
+    let selected = primary.declaration.profile_selected("windows-backup-v1");
+    let file_attributes = records
+        .get("TZAP.windows.file-attributes")
+        .map(|value| parse_lower_hex_u32(value, "Windows file attributes"))
+        .transpose()?;
+    let stream_attributes = records
+        .get("TZAP.windows.data-stream-attributes")
+        .map(|value| parse_lower_hex_u32(value, "Windows data-stream attributes"))
+        .transpose()?;
+    let placeholder = records.contains_key("TZAP.windows.reparse-placeholder");
+    let reparse_count = auxiliary
+        .iter()
+        .filter(|record| record.kind == "windows.reparse-data")
+        .count();
+    let security_descriptor_count = auxiliary
+        .iter()
+        .filter(|record| record.kind == "windows.security-descriptor")
+        .count();
+    let efs_count = auxiliary
+        .iter()
+        .filter(|record| record.kind == "windows.efs-raw")
+        .count();
+
+    if !selected {
+        if file_attributes.is_some()
+            || stream_attributes.is_some()
+            || placeholder
+            || reparse_count != 0
+            || security_descriptor_count != 0
+            || efs_count != 0
+        {
+            return Err(FormatError::InvalidArchive(
+                "Windows metadata is present without windows-backup-v1",
+            ));
+        }
+        return Ok(());
+    }
+
+    let complete = primary.declaration.capture_status == CaptureStatus::Complete;
+    if file_attributes.is_none()
+        && (complete
+            || !has_capture_omission(capture_report, "windows-backup-v1", "file-attributes"))
+    {
+        return Err(FormatError::InvalidArchive(
+            "windows-backup-v1 lacks exact file attributes or a matching omission",
+        ));
+    }
+    if security_descriptor_count == 0
+        && (complete
+            || !has_capture_omission(capture_report, "windows-backup-v1", "security-descriptor"))
+    {
+        return Err(FormatError::InvalidArchive(
+            "windows-backup-v1 lacks a security descriptor or a matching omission",
+        ));
+    }
+    if let Some(attributes) = file_attributes {
+        let is_directory = kind == TarEntryKind::Directory;
+        if (attributes & FILE_ATTRIBUTE_DIRECTORY != 0) != is_directory {
+            return Err(FormatError::InvalidArchive(
+                "Windows directory attribute disagrees with primary type",
+            ));
+        }
+        let is_reparse = attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        if reparse_count != 0 && !is_reparse {
+            return Err(FormatError::InvalidArchive(
+                "Windows reparse data lacks FILE_ATTRIBUTE_REPARSE_POINT",
+            ));
+        }
+        if is_reparse
+            && reparse_count == 0
+            && (complete
+                || !has_capture_omission(capture_report, "windows-backup-v1", "reparse-data")
+                || (kind != TarEntryKind::Symlink && !placeholder))
+        {
+            return Err(FormatError::InvalidArchive(
+                "Windows reparse attribute lacks exact data or a safe partial placeholder",
+            ));
+        }
+        if placeholder
+            && (!is_reparse || !matches!(kind, TarEntryKind::Regular | TarEntryKind::Directory))
+        {
+            return Err(FormatError::InvalidArchive(
+                "Windows reparse placeholder has invalid attributes or primary type",
+            ));
+        }
+        if attributes & FILE_ATTRIBUTE_ENCRYPTED != 0
+            && efs_count == 0
+            && (complete || !has_capture_omission(capture_report, "windows-backup-v1", "efs-raw"))
+        {
+            return Err(FormatError::InvalidArchive(
+                "encrypted Windows entry lacks raw EFS data or a matching omission",
+            ));
+        }
+    } else if placeholder || reparse_count != 0 || efs_count != 0 {
+        return Err(FormatError::InvalidArchive(
+            "Windows native records cannot be checked without file attributes",
+        ));
+    }
+
+    let ordinary_regular = kind == TarEntryKind::Regular && !placeholder;
+    if !ordinary_regular && stream_attributes.is_some() {
+        return Err(FormatError::InvalidArchive(
+            "Windows default-data-stream attributes disagree with primary type",
+        ));
+    }
+    if ordinary_regular
+        && stream_attributes.is_none()
+        && (complete
+            || !has_capture_omission(
+                capture_report,
+                "windows-backup-v1",
+                "data-stream-attributes",
+            ))
+    {
+        return Err(FormatError::InvalidArchive(
+            "Windows regular primary lacks default-data-stream attributes or an omission",
+        ));
+    }
+    if let Some(attributes) = stream_attributes {
+        if (attributes & STREAM_SPARSE_ATTRIBUTE != 0) != sparse {
+            let fallback = !sparse
+                && primary.declaration.capture_status == CaptureStatus::Partial
+                && has_capture_omission(capture_report, "windows-backup-v1", "sparse-layout");
+            if !fallback {
+                return Err(FormatError::InvalidArchive(
+                    "Windows primary sparse attribute disagrees with sparse framing",
+                ));
+            }
+        }
+        let _requires_system = attributes & STREAM_CONTAINS_SECURITY != 0;
+    } else if sparse
+        && !has_capture_omission(
+            capture_report,
+            "windows-backup-v1",
+            "data-stream-attributes",
+        )
+    {
+        return Err(FormatError::InvalidArchive(
+            "sparse Windows primary lacks default-stream attributes",
+        ));
+    }
+    Ok(())
+}
+
+fn has_capture_omission(
+    report: Option<&[CaptureReportRow]>,
+    profile: &str,
+    metadata_class: &str,
+) -> bool {
+    report.is_some_and(|rows| {
+        rows.iter()
+            .any(|row| row.profile == profile && row.metadata_class == metadata_class)
+    })
+}
+
+fn parse_lower_hex_u32(value: &[u8], structure: &'static str) -> Result<u32, FormatError> {
+    if value.len() != 8
+        || !value
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(FormatError::InvalidMetadata {
+            structure,
+            reason: "value is not eight lowercase hexadecimal digits",
+        });
+    }
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|text| u32::from_str_radix(text, 16).ok())
+        .ok_or(FormatError::InvalidMetadata {
+            structure,
+            reason: "hexadecimal value exceeds u32",
+        })
+}
+
+fn v45_group_flags(
+    primary: &PrimaryMetadata,
+    auxiliary: &[AuxiliaryRecord],
+    kind: TarEntryKind,
+) -> Result<(u32, Option<Vec<crate::entry_metadata::CaptureReportRow>>), FormatError> {
+    let (mut flags, capture_report) = validate_group_metadata(primary, auxiliary)?;
+    if matches!(
+        kind,
+        TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
+    ) {
+        flags |= REQUIRES_SYSTEM_RESTORE;
+    }
+    Ok((flags, capture_report))
+}
+
+fn parse_minimal_decimal_u64(value: &[u8], structure: &'static str) -> Result<u64, FormatError> {
+    if value.is_empty()
+        || !value.iter().all(u8::is_ascii_digit)
+        || (value.len() > 1 && value[0] == b'0')
+    {
+        return Err(FormatError::InvalidMetadata {
+            structure,
+            reason: "value is not minimal unsigned decimal",
+        });
+    }
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .ok_or(FormatError::InvalidMetadata {
+            structure,
+            reason: "value exceeds u64",
+        })
 }
 
 pub fn validate_tar_stream_total_extraction_size(
@@ -472,16 +1444,30 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
                 padding_remaining,
             } => {
                 let take = remaining.min(input.len() as u64) as usize;
-                if let Some(payload) = entry.metadata_payload_mut() {
-                    let next_len = checked_add(payload.len(), take)?;
-                    if next_len > self.max_metadata_payload_bytes {
-                        return Err(FormatError::ReaderUnsupported(
-                            "tar metadata payload exceeds configured streaming cap",
-                        ));
+                match &mut entry {
+                    PendingTarEntry::LocalPax { payload, .. } => {
+                        let next_len = checked_add(payload.len(), take)?;
+                        let cap = self.max_metadata_payload_bytes.min(MAX_LOCAL_PAX_PAYLOAD);
+                        if next_len > cap {
+                            return Err(FormatError::ReaderUnsupported(
+                                "tar metadata payload exceeds configured streaming cap",
+                            ));
+                        }
+                        payload.extend_from_slice(&input[..take]);
                     }
-                    payload.extend_from_slice(&input[..take]);
-                } else if take > 0 && entry.is_regular_main() {
-                    self.observer.on_regular_payload(&input[..take])?;
+                    PendingTarEntry::Auxiliary { validator } => {
+                        validator.observe(&input[..take])?;
+                    }
+                    PendingTarEntry::Main { member, sparse, .. }
+                        if take > 0 && member.kind == TarEntryKind::Regular =>
+                    {
+                        if let Some(sparse) = sparse {
+                            sparse.observe(&input[..take], &mut self.observer)?;
+                        } else {
+                            self.observer.on_regular_payload(&input[..take])?;
+                        }
+                    }
+                    PendingTarEntry::Main { .. } => {}
                 }
                 remaining -= take as u64;
                 group_size = checked_u64_add(group_size, take as u64)?;
@@ -590,16 +1576,20 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
         }
     }
 
-    pub(crate) fn finish(self) -> Result<TarStreamSummary, FormatError> {
+    pub(crate) fn finish(mut self) -> Result<TarStreamSummary, FormatError> {
         let tar_total_size = self.tar_total_size();
         match self.state {
             StreamingTarState::Header {
                 header, group_size, ..
-            } if header.is_empty() && group_size == 0 => Ok(TarStreamSummary {
-                members: self.members,
-                tar_total_size,
-                total_extraction_size: self.total_extraction_size,
-            }),
+            } if header.is_empty() && group_size == 0 => {
+                validate_v45_member_graph(&self.members)?;
+                self.observer.on_archive_complete()?;
+                Ok(TarStreamSummary {
+                    members: self.members,
+                    tar_total_size,
+                    total_extraction_size: self.total_extraction_size,
+                })
+            }
             _ => Err(FormatError::InvalidArchive(
                 "tar stream ended inside member group",
             )),
@@ -608,7 +1598,7 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
 
     fn state_after_header(
         &mut self,
-        mut metadata: LocalMetadata,
+        mut metadata: V45StreamingGroup,
         group_start: u64,
         group_size: u64,
         header: [u8; TAR_BLOCK_LEN],
@@ -619,61 +1609,126 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
         verify_tar_checksum(&header)?;
         let typeflag = header[156];
         let header_size = parse_tar_octal(&header[124..136])?;
-        let is_main = matches!(typeflag, 0 | b'0' | b'5' | b'2' | b'1');
-        let effective_size = if is_main {
-            metadata.pax_size.unwrap_or(header_size)
-        } else {
-            header_size
-        };
+        let effective_size = metadata
+            .pending
+            .as_ref()
+            .and_then(|(_, records)| records.get("size"))
+            .map(|value| parse_minimal_decimal_u64(value, "PAX size"))
+            .transpose()?
+            .unwrap_or(header_size);
         let padding_remaining = padding_to_512_u64(effective_size);
 
         let entry = match typeflag {
-            b'x' => PendingTarEntry::LocalPax {
-                payload: Vec::new(),
-            },
-            b'L' => PendingTarEntry::GnuLongName {
-                payload: Vec::new(),
-            },
-            b'K' => PendingTarEntry::GnuLongLink {
-                payload: Vec::new(),
-            },
-            b'g' => {
+            b'x' => {
+                if metadata.pending.is_some() {
+                    return Err(FormatError::InvalidArchive(
+                        "PAX header is not immediately consumed",
+                    ));
+                }
+                validate_v45_metadata_header(&header)?;
+                if effective_size > MAX_LOCAL_PAX_PAYLOAD as u64
+                    || effective_size > self.max_metadata_payload_bytes as u64
+                {
+                    return Err(FormatError::ReaderUnsupported(
+                        "tar metadata payload exceeds configured streaming cap",
+                    ));
+                }
+                let label = ustar_path(&header);
+                let kind = if label == b"TZAP-PAX/PRIMARY" {
+                    V45PaxKind::Primary
+                } else if let Some(ordinal) = parse_auxiliary_pax_label(&label) {
+                    if ordinal != metadata.auxiliary.len() as u32 {
+                        return Err(FormatError::InvalidArchive(
+                            "auxiliary PAX ordinal is not contiguous",
+                        ));
+                    }
+                    V45PaxKind::Auxiliary(ordinal)
+                } else {
+                    return Err(FormatError::InvalidArchive(
+                        "revision-45 PAX header has a non-canonical internal name",
+                    ));
+                };
+                PendingTarEntry::LocalPax {
+                    kind,
+                    payload: Vec::new(),
+                }
+            }
+            b'Z' => {
+                let Some((V45PaxKind::Auxiliary(ordinal), records)) = metadata.pending.take()
+                else {
+                    return Err(FormatError::InvalidArchive(
+                        "auxiliary entry is missing its local PAX header",
+                    ));
+                };
+                validate_v45_auxiliary_header(&header, ordinal, header_size, effective_size)?;
+                PendingTarEntry::Auxiliary {
+                    validator: AuxiliaryStreamValidator::new(&records, ordinal, effective_size)?,
+                }
+            }
+            b'g' | b'L' | b'K' | b'V' | b'M' | b'N' | b'S' => {
                 return Err(FormatError::InvalidArchive(
-                    "global PAX headers are not allowed",
-                ))
+                    "global or GNU tar metadata is forbidden in revision 45",
+                ));
             }
-            b'V' | b'M' | b'N' => {
-                return Err(FormatError::InvalidArchive(
-                    "global GNU headers are not allowed",
-                ))
-            }
-            b'S' => {
-                return Err(FormatError::ReaderUnsupported(
-                    "unsupported GNU sparse tar entry",
-                ))
-            }
-            0 | b'0' | b'5' | b'2' | b'1' => {
+            0 | b'0' | b'5' | b'2' | b'1' | b'3' | b'4' | b'6' => {
+                let Some((V45PaxKind::Primary, records)) = metadata.pending.take() else {
+                    return Err(FormatError::InvalidArchive(
+                        "primary entry is missing its canonical local PAX header",
+                    ));
+                };
                 let kind = match typeflag {
                     b'5' => TarEntryKind::Directory,
                     b'2' => TarEntryKind::Symlink,
                     b'1' => TarEntryKind::Hardlink,
+                    b'3' => TarEntryKind::CharacterDevice,
+                    b'4' => TarEntryKind::BlockDevice,
+                    b'6' => TarEntryKind::Fifo,
                     _ => TarEntryKind::Regular,
                 };
-                let mode = parse_tar_octal(&header[100..108])? as u32;
-                let mtime = parse_tar_octal(&header[136..148])?;
-                let path = canonical_main_path(&header, kind, &metadata, self.max_path_length)?;
+                let primary = parse_primary_metadata(&records)?;
+                validate_v45_primary_header(
+                    &header,
+                    kind,
+                    header_size,
+                    effective_size,
+                    &primary,
+                    &records,
+                )?;
+                let path =
+                    v45_primary_path(&header, kind, &records, &primary, self.max_path_length)?;
                 let link_target =
-                    canonical_link_target(&header, kind, &path, &metadata, self.max_path_length)?;
+                    v45_primary_link_target(&header, kind, &path, &primary, self.max_path_length)?;
+                let is_sparse = primary.sparse_logical_size.is_some();
+                let reparse_placeholder = records.contains_key("TZAP.windows.reparse-placeholder");
                 if kind != TarEntryKind::Regular && effective_size != 0 {
                     return Err(FormatError::InvalidArchive(
                         "non-regular tar entry has non-zero payload size",
                     ));
                 }
-                let logical_size = if kind == TarEntryKind::Regular {
-                    effective_size
+                if reparse_placeholder && effective_size != 0 {
+                    return Err(FormatError::InvalidArchive(
+                        "reparse placeholder has non-zero primary payload",
+                    ));
+                }
+                let logical_size = if kind == TarEntryKind::Regular && !reparse_placeholder {
+                    primary.sparse_logical_size.unwrap_or(effective_size)
                 } else {
                     0
                 };
+                let (file_entry_flags, capture_report) =
+                    v45_group_flags(&primary, &metadata.auxiliary, kind)?;
+                validate_v45_primary_cross_fields(
+                    kind,
+                    &records,
+                    &primary,
+                    &metadata.auxiliary,
+                    V45PrimaryLink {
+                        path: &path,
+                        target: link_target.as_deref(),
+                    },
+                    is_sparse,
+                    capture_report.as_deref(),
+                )?;
                 if kind == TarEntryKind::Regular {
                     self.total_extraction_size =
                         self.total_extraction_size.checked_add(logical_size).ok_or(
@@ -685,22 +1740,59 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
                         ));
                     }
                 }
+                let mut diagnostics = Vec::new();
+                let (mtime_seconds, _) = primary.mtime.unwrap_or((
+                    i64::try_from(parse_tar_octal(&header[136..148])?).unwrap_or(i64::MAX),
+                    0,
+                ));
+                let mtime = if mtime_seconds < 0 {
+                    diagnostics.push(MetadataDiagnostic {
+                        profile: "portable-v1",
+                        message: "pre-epoch mtime requires a signed-time restore API",
+                    });
+                    0
+                } else {
+                    mtime_seconds as u64
+                };
+                if is_sparse {
+                    diagnostics.push(MetadataDiagnostic {
+                        profile: "portable-v1",
+                        message: "sparse layout was materialized as logical zero bytes",
+                    });
+                }
                 let member = StreamedTarMemberMetadata {
                     path,
                     kind,
                     link_target,
-                    mode,
+                    mode: primary.declaration.portable_mode,
                     mtime,
                     logical_size,
-                    diagnostics: std::mem::take(&mut metadata.diagnostics),
+                    file_entry_flags,
+                    reparse_placeholder,
+                    v45_metadata: MemberMetadata {
+                        declaration: primary.declaration.clone(),
+                        auxiliary: metadata.auxiliary.clone(),
+                        file_entry_flags,
+                        sparse_layout: None,
+                        capture_report,
+                        primary_has_native_scalar: primary.has_native_scalar,
+                        primary_requires_system_restore: primary.requires_system_restore,
+                        portable_mirror: portable_metadata_mirror(&header, &records, &primary)?,
+                    },
+                    diagnostics,
                 };
                 self.observer.on_member_start(&member)?;
                 PendingTarEntry::Main {
                     member,
                     group_start,
+                    sparse: primary.sparse_logical_size.map(StreamingSparsePrimary::new),
                 }
             }
-            _ => return Err(FormatError::ReaderUnsupported("unsupported tar entry type")),
+            _ => {
+                return Err(FormatError::InvalidArchive(
+                    "unsupported revision-45 tar entry type",
+                ));
+            }
         };
 
         self.resolve_ready_state(StreamingTarState::Payload {
@@ -715,14 +1807,25 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
 
     fn finish_entry_parts(
         &mut self,
-        mut metadata: LocalMetadata,
+        mut metadata: V45StreamingGroup,
         group_start: u64,
         group_size: u64,
         entry: PendingTarEntry,
     ) -> Result<StreamingTarState, FormatError> {
         match entry {
-            PendingTarEntry::LocalPax { payload } => {
-                parse_pax_records(&payload, &mut metadata)?;
+            PendingTarEntry::LocalPax { kind, payload } => {
+                metadata.aggregate_pax_bytes = metadata
+                    .aggregate_pax_bytes
+                    .checked_add(payload.len())
+                    .ok_or(FormatError::InvalidArchive("aggregate PAX size overflow"))?;
+                if metadata.aggregate_pax_bytes > MAX_AGGREGATE_PAX_PAYLOAD {
+                    return Err(FormatError::ReaderResourceLimitExceeded {
+                        field: "aggregate local PAX payload bytes per member group",
+                        cap: MAX_AGGREGATE_PAX_PAYLOAD as u64,
+                        actual: metadata.aggregate_pax_bytes as u64,
+                    });
+                }
+                metadata.pending = Some((kind, parse_canonical_pax(&payload)?));
                 Ok(StreamingTarState::Header {
                     metadata,
                     group_start,
@@ -730,17 +1833,8 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
                     header: Vec::new(),
                 })
             }
-            PendingTarEntry::GnuLongName { payload } => {
-                metadata.gnu_long_name = Some(trimmed_metadata_payload(&payload));
-                Ok(StreamingTarState::Header {
-                    metadata,
-                    group_start,
-                    group_size,
-                    header: Vec::new(),
-                })
-            }
-            PendingTarEntry::GnuLongLink { payload } => {
-                metadata.gnu_long_link = Some(trimmed_metadata_payload(&payload));
+            PendingTarEntry::Auxiliary { validator } => {
+                metadata.auxiliary.push(validator.finish()?);
                 Ok(StreamingTarState::Header {
                     metadata,
                     group_start,
@@ -751,11 +1845,15 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
             PendingTarEntry::Main {
                 member,
                 group_start,
+                sparse,
             } => {
                 if self.members.len() as u64 >= self.max_member_count {
                     return Err(FormatError::ReaderUnsupported(
                         "tar member count exceeds configured streaming cap",
                     ));
+                }
+                if let Some(sparse) = sparse {
+                    sparse.finish(&mut self.observer)?;
                 }
                 let diagnostics = self.observer.on_member_complete(&member)?;
                 self.members.push(TarStreamMemberSummary {
@@ -765,6 +1863,9 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
                     mode: member.mode,
                     mtime: member.mtime,
                     logical_size: member.logical_size,
+                    file_entry_flags: member.file_entry_flags,
+                    reparse_placeholder: member.reparse_placeholder,
+                    portable_mirror: member.v45_metadata.portable_mirror,
                     diagnostics,
                     group_start,
                     group_size,
@@ -778,15 +1879,157 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
     }
 }
 
+pub(crate) fn validate_v45_member_graph(
+    members: &[TarStreamMemberSummary],
+) -> Result<(), FormatError> {
+    let mut selected = BTreeMap::<&[u8], &TarStreamMemberSummary>::new();
+    for member in members {
+        let replace = selected
+            .get(member.path.as_slice())
+            .is_none_or(|existing| existing.group_start < member.group_start);
+        if replace {
+            selected.insert(member.path.as_slice(), member);
+        }
+    }
+    for member in selected.values() {
+        if member.kind == TarEntryKind::Hardlink {
+            let target_path = member
+                .link_target
+                .as_deref()
+                .ok_or(FormatError::InvalidArchive("hardlink target is missing"))?;
+            let target = selected
+                .get(target_path)
+                .ok_or(FormatError::InvalidArchive(
+                    "hardlink target is not present in the selected archive graph",
+                ))?;
+            if target.kind != TarEntryKind::Regular || target.reparse_placeholder {
+                return Err(FormatError::InvalidArchive(
+                    "hardlink target is not a canonical regular primary",
+                ));
+            }
+            if member.portable_mirror != target.portable_mirror {
+                return Err(FormatError::InvalidArchive(
+                    "hardlink portable metadata mirror differs from canonical target",
+                ));
+            }
+        }
+
+        let mut ancestor = Vec::new();
+        let components: Vec<_> = member.path.split(|byte| *byte == b'/').collect();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            if !ancestor.is_empty() {
+                ancestor.push(b'/');
+            }
+            ancestor.extend_from_slice(component);
+            if let Some(parent) = selected.get(ancestor.as_slice()) {
+                if parent.reparse_placeholder || parent.kind == TarEntryKind::Symlink {
+                    return Err(FormatError::InvalidArchive(
+                        "selected path graph traverses a symlink or reparse ancestor",
+                    ));
+                }
+                if parent.kind != TarEntryKind::Directory {
+                    return Err(FormatError::InvalidArchive(
+                        "selected path graph traverses a non-directory ancestor",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_owned_restore_plan(
+    members: &[&OwnedTarMember],
+    options: SafeExtractionOptions,
+) -> Result<(), FormatError> {
+    let mut selected = BTreeMap::<&[u8], &OwnedTarMember>::new();
+    for &member in members {
+        if selected.insert(member.path.as_slice(), member).is_some() {
+            return Err(FormatError::InvalidArchive(
+                "restore plan contains duplicate selected paths",
+            ));
+        }
+        let metadata = member
+            .v45_metadata
+            .as_ref()
+            .ok_or(FormatError::InvalidArchive(
+                "revision-45 member metadata is missing",
+            ))?;
+        plan_restore(metadata, member.kind, member.reparse_placeholder, options)?;
+    }
+    for member in selected.values() {
+        if member.kind == TarEntryKind::Hardlink {
+            let target_path = member
+                .link_target
+                .as_deref()
+                .ok_or(FormatError::InvalidArchive("hardlink target is missing"))?;
+            let target = selected
+                .get(target_path)
+                .ok_or(FormatError::InvalidArchive(
+                    "hardlink target is not present in the selected restore graph",
+                ))?;
+            if target.kind != TarEntryKind::Regular || target.reparse_placeholder {
+                return Err(FormatError::InvalidArchive(
+                    "hardlink target is not a canonical regular primary",
+                ));
+            }
+            let alias_metadata = member.v45_metadata.as_ref().expect("checked above");
+            let target_metadata = target.v45_metadata.as_ref().expect("checked above");
+            if alias_metadata.portable_mirror != target_metadata.portable_mirror {
+                return Err(FormatError::InvalidArchive(
+                    "hardlink portable metadata mirror differs from canonical target",
+                ));
+            }
+        }
+
+        let mut ancestor = Vec::new();
+        let components: Vec<_> = member.path.split(|byte| *byte == b'/').collect();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            if !ancestor.is_empty() {
+                ancestor.push(b'/');
+            }
+            ancestor.extend_from_slice(component);
+            if let Some(parent) = selected.get(ancestor.as_slice()) {
+                if parent.reparse_placeholder || parent.kind == TarEntryKind::Symlink {
+                    return Err(FormatError::InvalidArchive(
+                        "restore path traverses a selected symlink or reparse ancestor",
+                    ));
+                }
+                if parent.kind != TarEntryKind::Directory {
+                    return Err(FormatError::InvalidArchive(
+                        "restore path traverses a selected non-directory ancestor",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn restore_phase(member: &OwnedTarMember) -> u8 {
+    if member.reparse_placeholder {
+        return 3;
+    }
+    match member.kind {
+        TarEntryKind::Directory => 0,
+        TarEntryKind::Regular => 1,
+        TarEntryKind::Symlink
+        | TarEntryKind::CharacterDevice
+        | TarEntryKind::BlockDevice
+        | TarEntryKind::Fifo => 2,
+        TarEntryKind::Hardlink => 3,
+    }
+}
+
 enum StreamingTarState {
     Header {
-        metadata: LocalMetadata,
+        metadata: V45StreamingGroup,
         group_start: u64,
         group_size: u64,
         header: Vec<u8>,
     },
     Payload {
-        metadata: LocalMetadata,
+        metadata: V45StreamingGroup,
         group_start: u64,
         group_size: u64,
         entry: PendingTarEntry,
@@ -794,7 +2037,7 @@ enum StreamingTarState {
         padding_remaining: u64,
     },
     Padding {
-        metadata: LocalMetadata,
+        metadata: V45StreamingGroup,
         group_start: u64,
         group_size: u64,
         entry: PendingTarEntry,
@@ -805,7 +2048,7 @@ enum StreamingTarState {
 impl StreamingTarState {
     fn new_member(group_start: u64) -> Self {
         Self::Header {
-            metadata: LocalMetadata::default(),
+            metadata: V45StreamingGroup::default(),
             group_start,
             group_size: 0,
             header: Vec::new(),
@@ -815,42 +2058,17 @@ impl StreamingTarState {
 
 enum PendingTarEntry {
     LocalPax {
+        kind: V45PaxKind,
         payload: Vec<u8>,
     },
-    GnuLongName {
-        payload: Vec<u8>,
-    },
-    GnuLongLink {
-        payload: Vec<u8>,
+    Auxiliary {
+        validator: AuxiliaryStreamValidator,
     },
     Main {
         member: StreamedTarMemberMetadata,
         group_start: u64,
+        sparse: Option<StreamingSparsePrimary>,
     },
-}
-
-impl PendingTarEntry {
-    fn metadata_payload_mut(&mut self) -> Option<&mut Vec<u8>> {
-        match self {
-            Self::LocalPax { payload }
-            | Self::GnuLongName { payload }
-            | Self::GnuLongLink { payload } => Some(payload),
-            Self::Main { .. } => None,
-        }
-    }
-
-    fn is_regular_main(&self) -> bool {
-        matches!(
-            self,
-            Self::Main {
-                member: StreamedTarMemberMetadata {
-                    kind: TarEntryKind::Regular,
-                    ..
-                },
-                ..
-            }
-        )
-    }
 }
 
 fn checked_u64_add(lhs: u64, rhs: u64) -> Result<u64, FormatError> {
@@ -864,7 +2082,9 @@ pub(crate) fn try_tar_member_group_end(
     start: usize,
 ) -> Result<Option<usize>, FormatError> {
     let mut cursor = start;
-    let mut metadata = LocalMetadata::default();
+    let mut pending: Option<(V45PaxKind, PaxRecords)> = None;
+    let mut auxiliary_count = 0u32;
+    let mut aggregate_pax_bytes = 0usize;
 
     loop {
         let Some(header) = try_slice(stream, cursor, TAR_BLOCK_LEN)? else {
@@ -876,12 +2096,12 @@ pub(crate) fn try_tar_member_group_end(
         verify_tar_checksum(header)?;
         let typeflag = header[156];
         let header_size = parse_tar_octal(&header[124..136])?;
-        let is_main = matches!(typeflag, 0 | b'0' | b'5' | b'2' | b'1');
-        let effective_size = if is_main {
-            metadata.pax_size.unwrap_or(header_size)
-        } else {
-            header_size
-        };
+        let effective_size = pending
+            .as_ref()
+            .and_then(|(_, records)| records.get("size"))
+            .map(|value| parse_minimal_decimal_u64(value, "PAX size"))
+            .transpose()?
+            .unwrap_or(header_size);
         let payload_start = checked_add(cursor, TAR_BLOCK_LEN)?;
         let payload_len = to_usize(effective_size)?;
         let payload_end = checked_add(payload_start, payload_len)?;
@@ -903,29 +2123,71 @@ pub(crate) fn try_tar_member_group_end(
 
         match typeflag {
             b'x' => {
-                parse_pax_records(payload, &mut metadata)?;
+                if pending.is_some() {
+                    return Err(FormatError::InvalidArchive(
+                        "PAX header is not immediately consumed",
+                    ));
+                }
+                validate_v45_metadata_header(header)?;
+                aggregate_pax_bytes = aggregate_pax_bytes
+                    .checked_add(payload.len())
+                    .ok_or(FormatError::InvalidArchive("aggregate PAX size overflow"))?;
+                if aggregate_pax_bytes > MAX_AGGREGATE_PAX_PAYLOAD {
+                    return Err(FormatError::ReaderResourceLimitExceeded {
+                        field: "aggregate local PAX payload bytes per member group",
+                        cap: MAX_AGGREGATE_PAX_PAYLOAD as u64,
+                        actual: aggregate_pax_bytes as u64,
+                    });
+                }
+                let records = parse_canonical_pax(payload)?;
+                let label = ustar_path(header);
+                let kind = if label == b"TZAP-PAX/PRIMARY" {
+                    V45PaxKind::Primary
+                } else if let Some(ordinal) = parse_auxiliary_pax_label(&label) {
+                    if ordinal != auxiliary_count {
+                        return Err(FormatError::InvalidArchive(
+                            "auxiliary PAX ordinal is not contiguous",
+                        ));
+                    }
+                    V45PaxKind::Auxiliary(ordinal)
+                } else {
+                    return Err(FormatError::InvalidArchive(
+                        "revision-45 PAX header has a non-canonical internal name",
+                    ));
+                };
+                pending = Some((kind, records));
                 cursor = padded_end;
             }
-            b'L' | b'K' => {
+            b'Z' => {
+                let Some((V45PaxKind::Auxiliary(ordinal), _)) = pending.take() else {
+                    return Err(FormatError::InvalidArchive(
+                        "auxiliary entry is missing its local PAX header",
+                    ));
+                };
+                validate_v45_auxiliary_header(header, ordinal, header_size, effective_size)?;
+                auxiliary_count = auxiliary_count
+                    .checked_add(1)
+                    .ok_or(FormatError::InvalidArchive("auxiliary count overflow"))?;
                 cursor = padded_end;
             }
-            b'g' => {
+            b'g' | b'L' | b'K' | b'V' | b'M' | b'N' | b'S' => {
                 return Err(FormatError::InvalidArchive(
-                    "global PAX headers are not allowed",
+                    "global or GNU tar metadata is forbidden in revision 45",
                 ));
             }
-            b'V' | b'M' | b'N' => {
+            0 | b'0' | b'5' | b'2' | b'1' | b'3' | b'4' | b'6' => {
+                if !matches!(pending, Some((V45PaxKind::Primary, _))) {
+                    return Err(FormatError::InvalidArchive(
+                        "primary entry is missing its canonical local PAX header",
+                    ));
+                }
+                return Ok(Some(padded_end));
+            }
+            _ => {
                 return Err(FormatError::InvalidArchive(
-                    "global GNU headers are not allowed",
+                    "unsupported revision-45 tar entry type",
                 ));
             }
-            b'S' => {
-                return Err(FormatError::ReaderUnsupported(
-                    "unsupported GNU sparse tar entry",
-                ));
-            }
-            0 | b'0' | b'5' | b'2' | b'1' => return Ok(Some(padded_end)),
-            _ => return Err(FormatError::ReaderUnsupported("unsupported tar entry type")),
         }
 
         if cursor >= stream.len() {
@@ -946,6 +2208,7 @@ pub(crate) fn stream_regular_tar_member_group_to_writer<R, W>(
     reader: &mut R,
     expected_path: &[u8],
     expected_file_data_size: u64,
+    expected_file_flags: u32,
     group_len: u64,
     max_path_length: u32,
     writer: &mut W,
@@ -959,6 +2222,7 @@ where
         reader,
         expected_path,
         expected_file_data_size,
+        expected_file_flags,
         group_len,
         max_path_length,
         &mut handler,
@@ -966,12 +2230,18 @@ where
     Ok(member.diagnostics)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StreamingMemberExpectation<'a> {
+    pub path: &'a [u8],
+    pub file_data_size: u64,
+    pub file_flags: u32,
+    pub group_len: u64,
+    pub max_path_length: u32,
+}
+
 pub(crate) fn restore_streaming_tar_member_group<R>(
     root: &Path,
-    expected_path: &[u8],
-    expected_file_data_size: u64,
-    group_len: u64,
-    max_path_length: u32,
+    expected: StreamingMemberExpectation<'_>,
     options: SafeExtractionOptions,
     reader: &mut R,
 ) -> Result<Vec<MetadataDiagnostic>, ExtractError>
@@ -981,10 +2251,11 @@ where
     let mut handler = FilesystemRestoreHandler::new(root, options);
     let member = stream_tar_member_group(
         reader,
-        expected_path,
-        expected_file_data_size,
-        group_len,
-        max_path_length,
+        expected.path,
+        expected.file_data_size,
+        expected.file_flags,
+        expected.group_len,
+        expected.max_path_length,
         &mut handler,
     )?;
     handler.finish(&member)
@@ -994,6 +2265,7 @@ fn stream_tar_member_group<R, H>(
     reader: &mut R,
     expected_path: &[u8],
     expected_file_data_size: u64,
+    expected_file_flags: u32,
     group_len: u64,
     max_path_length: u32,
     handler: &mut H,
@@ -1002,12 +2274,14 @@ where
     R: TarMemberGroupReader,
     H: TarMemberStreamHandler,
 {
-    if group_len < TAR_BLOCK_LEN as u64 || group_len % TAR_BLOCK_LEN as u64 != 0 {
+    if group_len < (TAR_BLOCK_LEN * 3) as u64 || group_len % TAR_BLOCK_LEN as u64 != 0 {
         return Err(FormatError::InvalidArchive("tar member group is not block aligned").into());
     }
 
     let mut remaining = group_len;
-    let mut metadata = LocalMetadata::default();
+    let mut pending: Option<(V45PaxKind, PaxRecords)> = None;
+    let mut auxiliary = Vec::<AuxiliaryRecord>::new();
+    let mut aggregate_pax_bytes = 0usize;
 
     loop {
         let mut header = [0u8; TAR_BLOCK_LEN];
@@ -1019,12 +2293,12 @@ where
 
         let typeflag = header[156];
         let header_size = parse_tar_octal(&header[124..136])?;
-        let is_main = matches!(typeflag, 0 | b'0' | b'5' | b'2' | b'1');
-        let effective_size = if is_main {
-            metadata.pax_size.unwrap_or(header_size)
-        } else {
-            header_size
-        };
+        let effective_size = pending
+            .as_ref()
+            .and_then(|(_, records)| records.get("size"))
+            .map(|value| parse_minimal_decimal_u64(value, "PAX size"))
+            .transpose()?
+            .unwrap_or(header_size);
         let padding_len = padding_to_512_u64(effective_size);
         let entry_payload_len =
             effective_size
@@ -1038,66 +2312,181 @@ where
 
         match typeflag {
             b'x' => {
+                if pending.is_some() {
+                    return Err(FormatError::InvalidArchive(
+                        "PAX header is not immediately consumed",
+                    )
+                    .into());
+                }
+                validate_v45_metadata_header(&header)?;
+                if effective_size > MAX_LOCAL_PAX_PAYLOAD as u64 {
+                    return Err(FormatError::ReaderResourceLimitExceeded {
+                        field: "local PAX payload bytes",
+                        cap: MAX_LOCAL_PAX_PAYLOAD as u64,
+                        actual: effective_size,
+                    }
+                    .into());
+                }
                 let payload = read_member_vec(reader, effective_size, &mut remaining)?;
-                parse_pax_records(&payload, &mut metadata)?;
                 read_zero_padding(reader, padding_len, &mut remaining)?;
+                aggregate_pax_bytes = aggregate_pax_bytes
+                    .checked_add(payload.len())
+                    .ok_or(FormatError::InvalidArchive("aggregate PAX size overflow"))?;
+                if aggregate_pax_bytes > MAX_AGGREGATE_PAX_PAYLOAD {
+                    return Err(FormatError::ReaderResourceLimitExceeded {
+                        field: "aggregate local PAX payload bytes per member group",
+                        cap: MAX_AGGREGATE_PAX_PAYLOAD as u64,
+                        actual: aggregate_pax_bytes as u64,
+                    }
+                    .into());
+                }
+                let records = parse_canonical_pax(&payload)?;
+                let label = ustar_path(&header);
+                let kind = if label == b"TZAP-PAX/PRIMARY" {
+                    V45PaxKind::Primary
+                } else if let Some(ordinal) = parse_auxiliary_pax_label(&label) {
+                    if ordinal != auxiliary.len() as u32 {
+                        return Err(FormatError::InvalidArchive(
+                            "auxiliary PAX ordinal is not contiguous",
+                        )
+                        .into());
+                    }
+                    V45PaxKind::Auxiliary(ordinal)
+                } else {
+                    return Err(FormatError::InvalidArchive(
+                        "revision-45 PAX header has a non-canonical internal name",
+                    )
+                    .into());
+                };
+                pending = Some((kind, records));
             }
-            b'g' => {
-                return Err(
-                    FormatError::InvalidArchive("global PAX headers are not allowed").into(),
-                );
-            }
-            b'V' | b'M' | b'N' => {
-                return Err(
-                    FormatError::InvalidArchive("global GNU headers are not allowed").into(),
-                );
-            }
-            b'L' => {
-                let payload = read_member_vec(reader, effective_size, &mut remaining)?;
-                metadata.gnu_long_name = Some(trimmed_metadata_payload(&payload));
+            b'Z' => {
+                let Some((V45PaxKind::Auxiliary(ordinal), records)) = pending.take() else {
+                    return Err(FormatError::InvalidArchive(
+                        "auxiliary entry is missing its local PAX header",
+                    )
+                    .into());
+                };
+                validate_v45_auxiliary_header(&header, ordinal, header_size, effective_size)?;
+                let mut validator =
+                    AuxiliaryStreamValidator::new(&records, ordinal, effective_size)?;
+                stream_auxiliary_payload(reader, effective_size, &mut remaining, &mut validator)?;
                 read_zero_padding(reader, padding_len, &mut remaining)?;
+                auxiliary.push(validator.finish()?);
             }
-            b'K' => {
-                let payload = read_member_vec(reader, effective_size, &mut remaining)?;
-                metadata.gnu_long_link = Some(trimmed_metadata_payload(&payload));
-                read_zero_padding(reader, padding_len, &mut remaining)?;
+            b'g' | b'L' | b'K' | b'V' | b'M' | b'N' | b'S' => {
+                return Err(FormatError::InvalidArchive(
+                    "global or GNU tar metadata is forbidden in revision 45",
+                )
+                .into());
             }
-            b'S' => {
-                return Err(
-                    FormatError::ReaderUnsupported("unsupported GNU sparse tar entry").into(),
-                );
-            }
-            0 | b'0' | b'5' | b'2' | b'1' => {
+            0 | b'0' | b'5' | b'2' | b'1' | b'3' | b'4' | b'6' => {
+                let Some((V45PaxKind::Primary, records)) = pending.take() else {
+                    return Err(FormatError::InvalidArchive(
+                        "primary entry is missing its canonical local PAX header",
+                    )
+                    .into());
+                };
                 let kind = match typeflag {
                     b'5' => TarEntryKind::Directory,
                     b'2' => TarEntryKind::Symlink,
                     b'1' => TarEntryKind::Hardlink,
+                    b'3' => TarEntryKind::CharacterDevice,
+                    b'4' => TarEntryKind::BlockDevice,
+                    b'6' => TarEntryKind::Fifo,
                     _ => TarEntryKind::Regular,
                 };
-                let mode = parse_tar_octal(&header[100..108])? as u32;
-                let mtime = parse_tar_octal(&header[136..148])?;
-                let path = canonical_main_path(&header, kind, &metadata, max_path_length)?;
+                let primary = parse_primary_metadata(&records)?;
+                validate_v45_primary_header(
+                    &header,
+                    kind,
+                    header_size,
+                    effective_size,
+                    &primary,
+                    &records,
+                )?;
+                let path = v45_primary_path(&header, kind, &records, &primary, max_path_length)?;
                 let link_target =
-                    canonical_link_target(&header, kind, &path, &metadata, max_path_length)?;
+                    v45_primary_link_target(&header, kind, &path, &primary, max_path_length)?;
+                let sparse = primary.sparse_logical_size.is_some();
+                let reparse_placeholder = records.contains_key("TZAP.windows.reparse-placeholder");
                 if kind != TarEntryKind::Regular && effective_size != 0 {
                     return Err(FormatError::InvalidArchive(
                         "non-regular tar entry has non-zero payload size",
                     )
                     .into());
                 }
-                let logical_size = if kind == TarEntryKind::Regular {
-                    effective_size
+                if reparse_placeholder && effective_size != 0 {
+                    return Err(FormatError::InvalidArchive(
+                        "reparse placeholder has non-zero primary payload",
+                    )
+                    .into());
+                }
+                let logical_size = if kind == TarEntryKind::Regular && !reparse_placeholder {
+                    primary.sparse_logical_size.unwrap_or(effective_size)
                 } else {
                     0
                 };
+                let (file_entry_flags, capture_report) =
+                    v45_group_flags(&primary, &auxiliary, kind)?;
+                if file_entry_flags != expected_file_flags {
+                    return Err(FormatError::InvalidArchive(
+                        "tar member metadata flags do not match FileEntry flags",
+                    )
+                    .into());
+                }
+                validate_v45_primary_cross_fields(
+                    kind,
+                    &records,
+                    &primary,
+                    &auxiliary,
+                    V45PrimaryLink {
+                        path: &path,
+                        target: link_target.as_deref(),
+                    },
+                    sparse,
+                    capture_report.as_deref(),
+                )?;
+                let mut diagnostics = Vec::new();
+                let (mtime_seconds, _) = primary.mtime.unwrap_or((
+                    i64::try_from(parse_tar_octal(&header[136..148])?).unwrap_or(i64::MAX),
+                    0,
+                ));
+                let mtime = if mtime_seconds < 0 {
+                    diagnostics.push(MetadataDiagnostic {
+                        profile: "portable-v1",
+                        message: "pre-epoch mtime requires a signed-time restore API",
+                    });
+                    0
+                } else {
+                    mtime_seconds as u64
+                };
+                if sparse {
+                    diagnostics.push(MetadataDiagnostic {
+                        profile: "portable-v1",
+                        message: "sparse layout was materialized as logical zero bytes",
+                    });
+                }
                 let member = StreamedTarMemberMetadata {
                     path,
                     kind,
                     link_target,
-                    mode,
+                    mode: primary.declaration.portable_mode,
                     mtime,
                     logical_size,
-                    diagnostics: std::mem::take(&mut metadata.diagnostics),
+                    file_entry_flags,
+                    reparse_placeholder,
+                    v45_metadata: MemberMetadata {
+                        declaration: primary.declaration.clone(),
+                        auxiliary: auxiliary.clone(),
+                        file_entry_flags,
+                        sparse_layout: None,
+                        capture_report,
+                        primary_has_native_scalar: primary.has_native_scalar,
+                        primary_requires_system_restore: primary.requires_system_restore,
+                        portable_mirror: portable_metadata_mirror(&header, &records, &primary)?,
+                    },
+                    diagnostics,
                 };
                 if member.path != expected_path {
                     return Err(FormatError::InvalidArchive(
@@ -1113,7 +2502,17 @@ where
                 }
                 handler.on_member(&member)?;
                 if member.kind == TarEntryKind::Regular {
-                    stream_regular_payload(reader, effective_size, &mut remaining, handler)?;
+                    if let Some(logical_size) = primary.sparse_logical_size {
+                        stream_sparse_primary_payload(
+                            reader,
+                            effective_size,
+                            logical_size,
+                            &mut remaining,
+                            handler,
+                        )?;
+                    } else {
+                        stream_regular_payload(reader, effective_size, &mut remaining, handler)?;
+                    }
                 }
                 read_zero_padding(reader, padding_len, &mut remaining)?;
                 if remaining != 0 {
@@ -1125,7 +2524,9 @@ where
                 return Ok(member);
             }
             _ => {
-                return Err(FormatError::ReaderUnsupported("unsupported tar entry type").into());
+                return Err(
+                    FormatError::InvalidArchive("unsupported revision-45 tar entry type").into(),
+                );
             }
         }
 
@@ -1138,13 +2539,117 @@ where
     }
 }
 
+fn plan_restore(
+    metadata: &MemberMetadata,
+    kind: TarEntryKind,
+    reparse_placeholder: bool,
+    options: SafeExtractionOptions,
+) -> Result<Vec<MetadataDiagnostic>, FormatError> {
+    if options.restore_policy == RestorePolicy::System && !options.system_authorized {
+        return Err(FormatError::ReaderUnsupported(
+            "system restore policy requires explicit caller authorization",
+        ));
+    }
+
+    let mut diagnostics = Vec::new();
+    if metadata.declaration.capture_status == CaptureStatus::Partial {
+        diagnostics.push(MetadataDiagnostic {
+            profile: "tzap-core-v1",
+            message: "entry capture is partial; full-fidelity restoration is impossible",
+        });
+        let required_omission = metadata.capture_report.as_ref().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                metadata
+                    .declaration
+                    .required_profiles
+                    .binary_search(&row.profile)
+                    .is_ok()
+            })
+        });
+        if required_omission && !options.allow_degraded {
+            return Err(FormatError::ReaderUnsupported(
+                "required-profile capture omission needs explicit degraded restore",
+            ));
+        }
+    }
+    if metadata.declaration.has_unknown_required_profile() {
+        if !options.allow_degraded {
+            return Err(FormatError::ReaderUnsupported(
+                "requested restore policy requires an unsupported required profile",
+            ));
+        }
+        diagnostics.push(MetadataDiagnostic {
+            profile: "extension-profile",
+            message: "unsupported required profile was preserved but not restored",
+        });
+    }
+
+    let requests_same_os = matches!(
+        options.restore_policy,
+        RestorePolicy::SameOs | RestorePolicy::System
+    );
+    let requests_system = options.restore_policy == RestorePolicy::System;
+    let unsupported_same_os = metadata
+        .auxiliary
+        .iter()
+        .any(|record| record.restore_class == RestoreClass::SameOs)
+        || metadata.primary_has_native_scalar;
+    let unsupported_system = metadata
+        .auxiliary
+        .iter()
+        .any(|record| record.restore_class == RestoreClass::System)
+        || (metadata.primary_requires_system_restore
+            && (metadata.declaration.owner_kind_posix
+                || metadata.primary_has_native_scalar
+                || !cfg!(unix)))
+        || reparse_placeholder
+        || matches!(
+            kind,
+            TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
+        );
+
+    if (requests_same_os && unsupported_same_os) || (requests_system && unsupported_system) {
+        if !options.allow_degraded {
+            return Err(FormatError::ReaderUnsupported(
+                "requested native metadata is not supported by this conformance class",
+            ));
+        }
+        diagnostics.push(MetadataDiagnostic {
+            profile: "native-metadata",
+            message: "requested native metadata was skipped under explicit degraded restore",
+        });
+    }
+
+    if metadata.file_entry_flags & HAS_NATIVE_METADATA != 0 && !requests_same_os {
+        diagnostics.push(MetadataDiagnostic {
+            profile: "native-metadata",
+            message: "authenticated native metadata is outside the selected restore policy",
+        });
+    }
+    for record in &metadata.auxiliary {
+        let requested = match options.restore_policy {
+            RestorePolicy::Content => record.restore_class == RestoreClass::None,
+            RestorePolicy::Portable => record.restore_class <= RestoreClass::Portable,
+            RestorePolicy::SameOs => record.restore_class <= RestoreClass::SameOs,
+            RestorePolicy::System => true,
+        };
+        if !requested && record.restore_class != RestoreClass::None {
+            diagnostics.push(MetadataDiagnostic {
+                profile: "auxiliary-metadata",
+                message: "authenticated auxiliary record is outside the selected restore policy",
+            });
+        }
+    }
+    Ok(diagnostics)
+}
+
 struct RegularWriterHandler<'a, W> {
     writer: &'a mut W,
 }
 
 impl<W: Write> TarMemberStreamHandler for RegularWriterHandler<'_, W> {
     fn on_member(&mut self, member: &StreamedTarMemberMetadata) -> Result<(), ExtractError> {
-        if member.kind != TarEntryKind::Regular {
+        if member.kind != TarEntryKind::Regular || member.reparse_placeholder {
             return Err(FormatError::ReaderUnsupported(
                 "extract_file_to_writer returns only regular file payloads",
             )
@@ -1164,6 +2669,12 @@ struct FilesystemRestoreHandler<'a> {
     destination: Option<PreparedDestination>,
     temp_leaf: Option<PathBuf>,
     file: Option<fs::File>,
+    skipped_reparse_placeholder: bool,
+    skipped_by_policy: bool,
+    materialized_hardlink: bool,
+    planned_diagnostics: Vec<MetadataDiagnostic>,
+    defer_hardlinks: bool,
+    deferred_hardlinks: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl<'a> FilesystemRestoreHandler<'a> {
@@ -1174,7 +2685,46 @@ impl<'a> FilesystemRestoreHandler<'a> {
             destination: None,
             temp_leaf: None,
             file: None,
+            skipped_reparse_placeholder: false,
+            skipped_by_policy: false,
+            materialized_hardlink: false,
+            planned_diagnostics: Vec::new(),
+            defer_hardlinks: false,
+            deferred_hardlinks: Vec::new(),
         }
+    }
+
+    fn new_deferred(root: &'a Path, options: SafeExtractionOptions) -> Self {
+        let mut handler = Self::new(root, options);
+        handler.defer_hardlinks = true;
+        handler
+    }
+
+    fn finish_archive(&mut self) -> Result<(), FormatError> {
+        for (path, target) in std::mem::take(&mut self.deferred_hardlinks) {
+            let destination =
+                prepare_destination(self.root, &path, TarEntryKind::Hardlink, self.options)?;
+            let target_path = existing_safe_regular_path(self.root, &target)?;
+            if self.options.restore_policy == RestorePolicy::Content {
+                let (temp_leaf, mut output) = create_temp_regular_file(&destination)?;
+                let mut input = open_existing_regular_file(&target_path)?;
+                if std::io::copy(&mut input, &mut output).is_err() {
+                    let _ = destination.parent.remove_file_or_symlink(&temp_leaf);
+                    return Err(FormatError::FilesystemExtractionFailed(
+                        "failed to materialize hardlink target",
+                    ));
+                }
+                output.flush().map_err(|_| {
+                    FormatError::FilesystemExtractionFailed(
+                        "failed to write materialized hardlink target",
+                    )
+                })?;
+                publish_regular_file(&destination, &temp_leaf, output, self.options)?;
+            } else {
+                create_hardlink(&destination, &target_path, self.options)?;
+            }
+        }
+        Ok(())
     }
 
     fn finish(
@@ -1182,7 +2732,18 @@ impl<'a> FilesystemRestoreHandler<'a> {
         member: &StreamedTarMemberMetadata,
     ) -> Result<Vec<MetadataDiagnostic>, ExtractError> {
         let mut diagnostics = member.diagnostics.clone();
-        if member.kind != TarEntryKind::Regular {
+        diagnostics.append(&mut self.planned_diagnostics);
+        if self.skipped_reparse_placeholder {
+            diagnostics.push(MetadataDiagnostic {
+                profile: "windows-backup-v1",
+                message: "reparse placeholder skipped by portable restore policy",
+            });
+            return Ok(diagnostics);
+        }
+        if self.skipped_by_policy {
+            return Ok(diagnostics);
+        }
+        if member.kind != TarEntryKind::Regular && !self.materialized_hardlink {
             return Ok(diagnostics);
         }
 
@@ -1199,12 +2760,15 @@ impl<'a> FilesystemRestoreHandler<'a> {
             "regular file temp path is missing",
         ))?;
         let file = publish_regular_file(&destination, &temp_leaf, file, self.options)?;
-        apply_restored_regular_file_metadata_parts(
-            &file,
-            member.mode,
-            member.mtime,
-            &mut diagnostics,
-        );
+        if self.options.restore_policy != RestorePolicy::Content {
+            apply_restored_regular_file_metadata_parts(
+                &file,
+                member.mode,
+                member.mtime,
+                self.options,
+                &mut diagnostics,
+            );
+        }
         Ok(diagnostics)
     }
 }
@@ -1221,6 +2785,26 @@ impl Drop for FilesystemRestoreHandler<'_> {
 
 impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
     fn on_member(&mut self, member: &StreamedTarMemberMetadata) -> Result<(), ExtractError> {
+        if self.destination.is_some() || self.temp_leaf.is_some() || self.file.is_some() {
+            return Err(FormatError::InvalidArchive(
+                "previous streamed restore member was not finalized",
+            )
+            .into());
+        }
+        self.skipped_reparse_placeholder = false;
+        self.skipped_by_policy = false;
+        self.materialized_hardlink = false;
+        self.planned_diagnostics.clear();
+        self.planned_diagnostics = plan_restore(
+            &member.v45_metadata,
+            member.kind,
+            member.reparse_placeholder,
+            self.options,
+        )?;
+        if member.reparse_placeholder {
+            self.skipped_reparse_placeholder = true;
+            return Ok(());
+        }
         let destination = prepare_destination(self.root, &member.path, member.kind, self.options)?;
         match member.kind {
             TarEntryKind::Regular => {
@@ -1231,6 +2815,14 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
             }
             TarEntryKind::Directory => create_directory(&destination)?,
             TarEntryKind::Symlink => {
+                if self.options.restore_policy == RestorePolicy::Content {
+                    self.skipped_by_policy = true;
+                    self.planned_diagnostics.push(MetadataDiagnostic {
+                        profile: "portable-v1",
+                        message: "symlink skipped by content restore policy",
+                    });
+                    return Ok(());
+                }
                 let target = member
                     .link_target
                     .as_deref()
@@ -1243,8 +2835,46 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                     .link_target
                     .as_deref()
                     .ok_or(FormatError::InvalidArchive("hardlink target is missing"))?;
+                if self.defer_hardlinks {
+                    self.deferred_hardlinks
+                        .push((member.path.clone(), target.to_vec()));
+                    self.skipped_by_policy = true;
+                    if self.options.restore_policy == RestorePolicy::Content {
+                        self.planned_diagnostics.push(MetadataDiagnostic {
+                            profile: "portable-v1",
+                            message: "hardlink topology was materialized by content restore policy",
+                        });
+                    }
+                    return Ok(());
+                }
                 let target_path = existing_safe_regular_path(self.root, target)?;
-                create_hardlink(&destination, &target_path, self.options)?;
+                if self.options.restore_policy == RestorePolicy::Content {
+                    let (temp_leaf, mut output) = create_temp_regular_file(&destination)?;
+                    let mut input = open_existing_regular_file(&target_path)?;
+                    std::io::copy(&mut input, &mut output).map_err(|_| {
+                        FormatError::FilesystemExtractionFailed(
+                            "failed to materialize hardlink target",
+                        )
+                    })?;
+                    self.destination = Some(destination);
+                    self.temp_leaf = Some(temp_leaf);
+                    self.file = Some(output);
+                    self.materialized_hardlink = true;
+                    self.planned_diagnostics.push(MetadataDiagnostic {
+                        profile: "portable-v1",
+                        message: "hardlink topology was materialized by content restore policy",
+                    });
+                } else {
+                    create_hardlink(&destination, &target_path, self.options)?;
+                }
+            }
+            TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo => {
+                // Default portable extraction never creates privileged special objects.
+                self.skipped_by_policy = true;
+                self.planned_diagnostics.push(MetadataDiagnostic {
+                    profile: "posix-backup-v1",
+                    message: "special object skipped by selected restore policy",
+                });
             }
         }
         Ok(())
@@ -1335,76 +2965,113 @@ where
     Ok(())
 }
 
-fn tar_member_group_end(stream: &[u8], start: usize) -> Result<usize, FormatError> {
-    let mut cursor = start;
-    let mut metadata = LocalMetadata::default();
-
-    loop {
-        let header = slice(stream, cursor, TAR_BLOCK_LEN)?;
-        if header.iter().all(|byte| *byte == 0) {
-            return Err(FormatError::InvalidArchive("tar member header is empty"));
+fn stream_auxiliary_payload<R: TarMemberGroupReader>(
+    reader: &mut R,
+    len: u64,
+    remaining: &mut u64,
+    validator: &mut AuxiliaryStreamValidator,
+) -> Result<(), ExtractError> {
+    let mut pending = len;
+    let mut buf = [0u8; 64 * 1024];
+    while pending > 0 {
+        let chunk_len = pending.min(buf.len() as u64).min(*remaining) as usize;
+        let read = reader.read_some_member_bytes(&mut buf[..chunk_len])?;
+        if read == 0 {
+            return Err(FormatError::InvalidArchive("tar member group exceeds frame range").into());
         }
-        verify_tar_checksum(header)?;
-        let typeflag = header[156];
-        let header_size = parse_tar_octal(&header[124..136])?;
-        let is_main = matches!(typeflag, 0 | b'0' | b'5' | b'2' | b'1');
-        let effective_size = if is_main {
-            metadata.pax_size.unwrap_or(header_size)
-        } else {
-            header_size
-        };
-        let payload_start = checked_add(cursor, TAR_BLOCK_LEN)?;
-        let payload_len = to_usize(effective_size)?;
-        let payload_end = checked_add(payload_start, payload_len)?;
-        let padded_end = checked_add(payload_end, padding_to_512(payload_len))?;
-        let payload = slice(stream, payload_start, payload_len)?;
-        if padded_end > stream.len() {
-            return Err(FormatError::InvalidArchive(
-                "tar member payload exceeds stream",
-            ));
-        }
-        if stream[payload_end..padded_end]
-            .iter()
-            .any(|byte| *byte != 0)
-        {
-            return Err(FormatError::InvalidArchive(
-                "tar member padding is non-zero",
-            ));
-        }
-
-        match typeflag {
-            b'x' => {
-                parse_pax_records(payload, &mut metadata)?;
-                cursor = padded_end;
-            }
-            b'L' | b'K' => {
-                cursor = padded_end;
-            }
-            b'g' => {
-                return Err(FormatError::InvalidArchive(
-                    "global PAX headers are not allowed",
-                ));
-            }
-            b'V' | b'M' | b'N' => {
-                return Err(FormatError::InvalidArchive(
-                    "global GNU headers are not allowed",
-                ));
-            }
-            b'S' => {
-                return Err(FormatError::ReaderUnsupported(
-                    "unsupported GNU sparse tar entry",
-                ));
-            }
-            0 | b'0' | b'5' | b'2' | b'1' => return Ok(padded_end),
-            _ => return Err(FormatError::ReaderUnsupported("unsupported tar entry type")),
-        }
-
-        if cursor >= stream.len() {
-            return Err(FormatError::InvalidArchive(
-                "tar member group has metadata records but no main entry",
-            ));
-        }
+        *remaining -= read as u64;
+        pending -= read as u64;
+        validator.observe(&buf[..read])?;
     }
+    Ok(())
+}
+
+fn stream_sparse_primary_payload<R, H>(
+    reader: &mut R,
+    stored_size: u64,
+    logical_size: u64,
+    remaining: &mut u64,
+    handler: &mut H,
+) -> Result<(), ExtractError>
+where
+    R: TarMemberGroupReader,
+    H: TarMemberStreamHandler,
+{
+    if stored_size < TAR_BLOCK_LEN as u64 {
+        return Err(FormatError::InvalidArchive("sparse primary map is truncated").into());
+    }
+    let mut validator = SparseStreamValidator::new(logical_size);
+    let mut consumed = 0u64;
+    let layout = loop {
+        if consumed
+            .checked_add(TAR_BLOCK_LEN as u64)
+            .is_none_or(|value| value > stored_size)
+        {
+            return Err(FormatError::InvalidArchive("sparse primary map is truncated").into());
+        }
+        let mut block = [0u8; TAR_BLOCK_LEN];
+        read_member_bytes(reader, &mut block, remaining)?;
+        consumed += TAR_BLOCK_LEN as u64;
+        validator.observe(&block)?;
+        if let Some(layout) = validator.layout_if_map_complete() {
+            if layout.map_and_padding_size as u64 == consumed {
+                break layout;
+            }
+        }
+    };
+    let extent_bytes = layout.extents.iter().try_fold(0u64, |sum, extent| {
+        sum.checked_add(extent.length)
+            .ok_or(FormatError::InvalidArchive(
+                "sparse extent byte count overflow",
+            ))
+    })?;
+    if consumed
+        .checked_add(extent_bytes)
+        .is_none_or(|value| value != stored_size)
+    {
+        return Err(FormatError::InvalidArchive(
+            "sparse primary stored size does not match its map",
+        )
+        .into());
+    }
+
+    let zeros = [0u8; 64 * 1024];
+    let mut logical_cursor = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    for extent in &layout.extents {
+        write_zero_run(handler, &zeros, extent.offset - logical_cursor)?;
+        let mut extent_remaining = extent.length;
+        while extent_remaining > 0 {
+            let chunk_len = extent_remaining.min(buf.len() as u64) as usize;
+            read_member_bytes(reader, &mut buf[..chunk_len], remaining)?;
+            validator.observe(&buf[..chunk_len])?;
+            handler.write_regular_payload(&buf[..chunk_len])?;
+            extent_remaining -= chunk_len as u64;
+        }
+        logical_cursor = extent.offset + extent.length;
+    }
+    write_zero_run(handler, &zeros, logical_size - logical_cursor)?;
+    validator.finish()?;
+    Ok(())
+}
+
+fn write_zero_run<H: TarMemberStreamHandler>(
+    handler: &mut H,
+    zeros: &[u8],
+    mut len: u64,
+) -> Result<(), ExtractError> {
+    while len > 0 {
+        let chunk_len = len.min(zeros.len() as u64) as usize;
+        handler.write_regular_payload(&zeros[..chunk_len])?;
+        len -= chunk_len as u64;
+    }
+    Ok(())
+}
+
+fn tar_member_group_end(stream: &[u8], start: usize) -> Result<usize, FormatError> {
+    try_tar_member_group_end(stream, start)?.ok_or(FormatError::InvalidArchive(
+        "tar member payload exceeds stream",
+    ))
 }
 
 pub fn restore_tar_member(
@@ -1414,8 +3081,23 @@ pub fn restore_tar_member(
 ) -> Result<Vec<MetadataDiagnostic>, FormatError> {
     let destination = prepare_destination(root, &member.path, member.kind, options)?;
     let mut diagnostics = member.diagnostics.clone();
+    if let Some(metadata) = &member.v45_metadata {
+        diagnostics.extend(plan_restore(
+            metadata,
+            member.kind,
+            member.reparse_placeholder,
+            options,
+        )?);
+    }
     match member.kind {
         TarEntryKind::Regular => {
+            if member.reparse_placeholder {
+                diagnostics.push(MetadataDiagnostic {
+                    profile: "windows-backup-v1",
+                    message: "reparse placeholder skipped by portable restore policy",
+                });
+                return Ok(diagnostics);
+            }
             let (temp_leaf, mut file) = create_temp_regular_file(&destination)?;
             file.write_all(&member.data).map_err(|_| {
                 FormatError::FilesystemExtractionFailed("failed to write regular file")
@@ -1424,10 +3106,19 @@ pub fn restore_tar_member(
                 FormatError::FilesystemExtractionFailed("failed to write regular file")
             })?;
             let file = publish_regular_file(&destination, &temp_leaf, file, options)?;
-            apply_restored_regular_file_metadata(&file, member, &mut diagnostics);
+            if options.restore_policy != RestorePolicy::Content {
+                apply_restored_regular_file_metadata(&file, member, options, &mut diagnostics);
+            }
         }
         TarEntryKind::Directory => create_directory(&destination)?,
         TarEntryKind::Symlink => {
+            if options.restore_policy == RestorePolicy::Content {
+                diagnostics.push(MetadataDiagnostic {
+                    profile: "portable-v1",
+                    message: "symlink skipped by content restore policy",
+                });
+                return Ok(diagnostics);
+            }
             let target = member
                 .link_target
                 .as_deref()
@@ -1441,7 +3132,29 @@ pub fn restore_tar_member(
                 .as_deref()
                 .ok_or(FormatError::InvalidArchive("hardlink target is missing"))?;
             let target_path = existing_safe_regular_path(root, target)?;
-            create_hardlink(&destination, &target_path, options)?;
+            if options.restore_policy == RestorePolicy::Content {
+                let (temp_leaf, mut output) = create_temp_regular_file(&destination)?;
+                let mut input = open_existing_regular_file(&target_path)?;
+                std::io::copy(&mut input, &mut output).map_err(|_| {
+                    FormatError::FilesystemExtractionFailed("failed to materialize hardlink target")
+                })?;
+                output.flush().map_err(|_| {
+                    FormatError::FilesystemExtractionFailed("failed to materialize hardlink target")
+                })?;
+                publish_regular_file(&destination, &temp_leaf, output, options)?;
+                diagnostics.push(MetadataDiagnostic {
+                    profile: "portable-v1",
+                    message: "hardlink topology was materialized by content restore policy",
+                });
+            } else {
+                create_hardlink(&destination, &target_path, options)?;
+            }
+        }
+        TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo => {
+            diagnostics.push(MetadataDiagnostic {
+                profile: "posix-backup-v1",
+                message: "special object skipped by portable restore policy",
+            });
         }
     }
     Ok(diagnostics)
@@ -1450,18 +3163,31 @@ pub fn restore_tar_member(
 fn apply_restored_regular_file_metadata(
     file: &fs::File,
     member: &OwnedTarMember,
+    options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
 ) {
-    apply_restored_regular_file_metadata_parts(file, member.mode, member.mtime, diagnostics);
+    apply_restored_regular_file_metadata_parts(
+        file,
+        member.mode,
+        member.mtime,
+        options,
+        diagnostics,
+    );
 }
 
 fn apply_restored_regular_file_metadata_parts(
     file: &fs::File,
     mode: u32,
     mtime: u64,
+    options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
 ) {
     apply_regular_file_mtime(file, mtime, diagnostics);
+    let mode = if options.restore_policy == RestorePolicy::System && options.system_authorized {
+        mode
+    } else {
+        mode & !0o6000
+    };
     apply_regular_file_mode(file, mode, diagnostics);
 }
 
@@ -1533,113 +3259,6 @@ fn apply_regular_file_mtime(
     }
 }
 
-fn canonical_main_path(
-    header: &[u8],
-    kind: TarEntryKind,
-    metadata: &LocalMetadata,
-    max_path_length: u32,
-) -> Result<Vec<u8>, FormatError> {
-    let mut path = metadata
-        .pax_path
-        .clone()
-        .or_else(|| metadata.gnu_long_name.clone())
-        .unwrap_or_else(|| ustar_path(header));
-    if kind == TarEntryKind::Directory && path.ends_with(b"/") && !path.ends_with(b"//") {
-        path.pop();
-    }
-    validate_file_path_bytes(&path, max_path_length)?;
-    Ok(path)
-}
-
-fn canonical_link_target(
-    header: &[u8],
-    kind: TarEntryKind,
-    link_path: &[u8],
-    metadata: &LocalMetadata,
-    max_path_length: u32,
-) -> Result<Option<Vec<u8>>, FormatError> {
-    if !matches!(kind, TarEntryKind::Symlink | TarEntryKind::Hardlink) {
-        return Ok(None);
-    }
-    let target = metadata
-        .pax_linkpath
-        .clone()
-        .or_else(|| metadata.gnu_long_link.clone())
-        .unwrap_or_else(|| nul_trimmed(&header[157..257]).to_vec());
-    if target.is_empty() {
-        return Err(FormatError::UnsafeArchivePath);
-    }
-    match kind {
-        TarEntryKind::Hardlink => validate_file_path_bytes(&target, max_path_length)?,
-        TarEntryKind::Symlink => validate_symlink_target(link_path, &target)?,
-        _ => {}
-    }
-    Ok(Some(target))
-}
-
-fn parse_pax_records(payload: &[u8], metadata: &mut LocalMetadata) -> Result<(), FormatError> {
-    let mut cursor = 0usize;
-    while cursor < payload.len() {
-        let len_digits_start = cursor;
-        while cursor < payload.len() && payload[cursor].is_ascii_digit() {
-            cursor += 1;
-        }
-        if cursor == len_digits_start || cursor >= payload.len() || payload[cursor] != b' ' {
-            return Err(FormatError::InvalidArchive("malformed PAX record"));
-        }
-        let len = parse_decimal(&payload[len_digits_start..cursor])?;
-        let record_start = len_digits_start;
-        let record_end = checked_add(record_start, len)?;
-        if record_end > payload.len() || len < 4 {
-            return Err(FormatError::InvalidArchive("malformed PAX record"));
-        }
-        let body_start = cursor + 1;
-        let record = &payload[body_start..record_end];
-        if record.last().copied() != Some(b'\n') {
-            return Err(FormatError::InvalidArchive("malformed PAX record"));
-        }
-        let body = &record[..record.len() - 1];
-        let eq = body
-            .iter()
-            .position(|byte| *byte == b'=')
-            .ok_or(FormatError::InvalidArchive("malformed PAX record"))?;
-        let key = std::str::from_utf8(&body[..eq])
-            .map_err(|_| FormatError::InvalidArchive("malformed PAX key"))?;
-        let value = &body[eq + 1..];
-        match key {
-            "path" => metadata.pax_path = Some(value.to_vec()),
-            "linkpath" => metadata.pax_linkpath = Some(value.to_vec()),
-            "size" => metadata.pax_size = Some(parse_decimal(value)? as u64),
-            "atime" | "ctime" | "mtime" => metadata.diagnostics.push(MetadataDiagnostic {
-                profile: "pax-posix-2001",
-                message: "unsupported PAX timestamp metadata was ignored",
-            }),
-            key if key.starts_with("SCHILY.xattr.")
-                || key.starts_with("LIBARCHIVE.xattr.")
-                || key.starts_with("SCHILY.acl.")
-                || key.starts_with("LIBARCHIVE.acl.") =>
-            {
-                metadata.diagnostics.push(MetadataDiagnostic {
-                    profile: "pax-xattrs-acls",
-                    message: "unsupported xattr/ACL PAX metadata was ignored",
-                });
-            }
-            key if key.starts_with("GNU.sparse.") => {
-                metadata.diagnostics.push(MetadataDiagnostic {
-                    profile: "gnu-sparse",
-                    message: "unsupported sparse-file PAX metadata was ignored",
-                });
-            }
-            _ => metadata.diagnostics.push(MetadataDiagnostic {
-                profile: "pax-posix-2001",
-                message: "unsupported PAX key was ignored",
-            }),
-        }
-        cursor = record_end;
-    }
-    Ok(())
-}
-
 fn validate_symlink_target(link_path: &[u8], target: &[u8]) -> Result<(), FormatError> {
     if target.is_empty()
         || target.contains(&0)
@@ -1651,6 +3270,9 @@ fn validate_symlink_target(link_path: &[u8], target: &[u8]) -> Result<(), Format
     }
     let target = std::str::from_utf8(target).map_err(|_| FormatError::UnsafeArchivePath)?;
     let link_path = std::str::from_utf8(link_path).map_err(|_| FormatError::UnsafeArchivePath)?;
+    if target.nfc().collect::<String>() != target {
+        return Err(FormatError::UnsafeArchivePath);
+    }
     let mut stack = link_path
         .split('/')
         .take(link_path.split('/').count().saturating_sub(1))
@@ -1782,6 +3404,20 @@ fn create_new_file_options() -> CapOpenOptions {
         .create_new(true)
         .follow(FollowSymlinks::No);
     options
+}
+
+fn open_existing_regular_file(target: &PreparedDestination) -> Result<fs::File, FormatError> {
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    target
+        .parent
+        .open_with(&target.leaf, &options)
+        .map(cap_std::fs::File::into_std)
+        .map_err(|_| {
+            FormatError::FilesystemExtractionFailed(
+                "failed to open hardlink target for materialization",
+            )
+        })
 }
 
 fn create_temp_regular_file(
@@ -1968,14 +3604,6 @@ fn ustar_path(header: &[u8]) -> Vec<u8> {
     }
 }
 
-fn trimmed_metadata_payload(payload: &[u8]) -> Vec<u8> {
-    let mut end = payload.len();
-    while end > 0 && payload[end - 1] == 0 {
-        end -= 1;
-    }
-    payload[..end].to_vec()
-}
-
 fn verify_tar_checksum(header: &[u8]) -> Result<(), FormatError> {
     let stored = parse_tar_octal(&header[148..156])?;
     let mut sum = 0u64;
@@ -2008,23 +3636,6 @@ fn parse_tar_octal(field: &[u8]) -> Result<u64, FormatError> {
             }
             _ => return Err(FormatError::InvalidArchive("malformed tar octal field")),
         }
-    }
-    Ok(value)
-}
-
-fn parse_decimal(field: &[u8]) -> Result<usize, FormatError> {
-    let mut value = 0usize;
-    if field.is_empty() {
-        return Err(FormatError::InvalidArchive("malformed decimal field"));
-    }
-    for byte in field {
-        if !byte.is_ascii_digit() {
-            return Err(FormatError::InvalidArchive("malformed decimal field"));
-        }
-        value = value
-            .checked_mul(10)
-            .and_then(|acc| acc.checked_add((byte - b'0') as usize))
-            .ok_or(FormatError::InvalidArchive("decimal field overflow"))?;
     }
     Ok(value)
 }
@@ -2108,7 +3719,18 @@ mod tests {
         data: &[u8],
         link: &[u8],
     ) -> Vec<u8> {
+        let records =
+            crate::entry_metadata::portable_primary_pax(path, 0o644, "other", false).unwrap();
+        let pax = crate::entry_metadata::encode_canonical_pax(&records).unwrap();
+        let mut pax_header = header(b"TZAP-PAX/PRIMARY", b'x', pax.len(), b"");
+        write_octal(&mut pax_header[100..108], 0);
+        pax_header[148..156].fill(b' ');
+        let checksum = pax_header.iter().map(|byte| *byte as u64).sum::<u64>();
+        write_checksum(&mut pax_header[148..156], checksum);
         let mut out = Vec::new();
+        out.extend_from_slice(&pax_header);
+        out.extend_from_slice(&pax);
+        out.resize(out.len() + padding_to_512(pax.len()), 0);
         out.extend_from_slice(&header(path, kind, declared_size, link));
         out.extend_from_slice(data);
         out.resize(out.len() + padding_to_512(data.len()), 0);
@@ -2116,6 +3738,17 @@ mod tests {
     }
 
     fn member_with_prefix(prefix: &[u8], path: &[u8], kind: u8, data: &[u8]) -> Vec<u8> {
+        let mut full_path = prefix.to_vec();
+        full_path.push(b'/');
+        full_path.extend_from_slice(path);
+        let records =
+            crate::entry_metadata::portable_primary_pax(&full_path, 0o644, "other", false).unwrap();
+        let pax = crate::entry_metadata::encode_canonical_pax(&records).unwrap();
+        let mut pax_header = header(b"TZAP-PAX/PRIMARY", b'x', pax.len(), b"");
+        write_octal(&mut pax_header[100..108], 0);
+        pax_header[148..156].fill(b' ');
+        let checksum = pax_header.iter().map(|byte| *byte as u64).sum::<u64>();
+        write_checksum(&mut pax_header[148..156], checksum);
         let mut header = header(path, kind, data.len(), b"");
         header[345..345 + prefix.len()].copy_from_slice(prefix);
         header[148..156].fill(b' ');
@@ -2123,6 +3756,9 @@ mod tests {
         write_checksum(&mut header[148..156], checksum);
 
         let mut out = Vec::new();
+        out.extend_from_slice(&pax_header);
+        out.extend_from_slice(&pax);
+        out.resize(out.len() + padding_to_512(pax.len()), 0);
         out.extend_from_slice(&header);
         out.extend_from_slice(data);
         out.resize(out.len() + padding_to_512(data.len()), 0);
@@ -2191,7 +3827,7 @@ mod tests {
         let bytes = member(b"pax", b'g', b"11 path=x\n", b"");
         assert_eq!(
             parse_tar_member_group(&bytes, 4096).unwrap_err(),
-            FormatError::InvalidArchive("global PAX headers are not allowed")
+            FormatError::InvalidArchive("global or GNU tar metadata is forbidden in revision 45")
         );
     }
 
@@ -2203,7 +3839,7 @@ mod tests {
 
         assert_eq!(
             parse_tar_member_group(&bytes, 4096).unwrap_err(),
-            FormatError::InvalidArchive("global PAX headers are not allowed")
+            FormatError::InvalidArchive("global or GNU tar metadata is forbidden in revision 45")
         );
     }
 
@@ -2214,7 +3850,9 @@ mod tests {
 
             assert_eq!(
                 parse_tar_member_group(&bytes, 4096).unwrap_err(),
-                FormatError::InvalidArchive("global GNU headers are not allowed"),
+                FormatError::InvalidArchive(
+                    "global or GNU tar metadata is forbidden in revision 45"
+                ),
                 "typeflag {typeflag:?}"
             );
         }
@@ -2226,37 +3864,28 @@ mod tests {
 
         assert_eq!(
             parse_tar_member_group(&bytes, 4096).unwrap_err(),
-            FormatError::ReaderUnsupported("unsupported GNU sparse tar entry")
+            FormatError::InvalidArchive("global or GNU tar metadata is forbidden in revision 45")
         );
     }
 
     #[test]
-    fn applies_local_pax_path_and_size() {
+    fn rejects_noncanonical_extra_local_pax_path_and_size() {
         let pax = pax_record("path", b"long/name.txt");
         let mut bytes = member(b"PaxHeaders/name", b'x', &pax, b"");
         bytes.extend_from_slice(&member(b"short", b'0', b"abc", b""));
 
-        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
-        assert_eq!(parsed.path, b"long/name.txt");
-        assert_eq!(parsed.data, b"abc");
+        assert!(parse_tar_member_group(&bytes, 4096).is_err());
     }
 
     #[test]
-    fn applies_local_gnu_long_name_and_link_to_following_entry() {
+    fn rejects_gnu_long_name_and_link_records() {
         let mut named = member(b"././@LongLink", b'L', b"long/path.txt\0", b"");
         named.extend_from_slice(&member(b"short", b'0', b"abc", b""));
-        let parsed = parse_tar_member_group(&named, 4096).unwrap();
-        assert_eq!(parsed.path, b"long/path.txt");
-        assert_eq!(parsed.data, b"abc");
+        assert!(parse_tar_member_group(&named, 4096).is_err());
 
         let mut linked = member(b"././@LongLink", b'K', b"target/file.txt\0", b"");
         linked.extend_from_slice(&member(b"short-link", b'2', b"", b"fallback"));
-        let parsed = parse_tar_member_group(&linked, 4096).unwrap();
-        assert_eq!(parsed.path, b"short-link");
-        assert_eq!(
-            parsed.link_target.as_deref(),
-            Some(b"target/file.txt".as_slice())
-        );
+        assert!(parse_tar_member_group(&linked, 4096).is_err());
     }
 
     #[test]
@@ -2270,38 +3899,6 @@ mod tests {
             expected_link_target: Option<&'static [u8]>,
             expected_logical_size: u64,
         }
-
-        let mut pax_path_and_size = member(
-            b"PaxHeaders/pax-file",
-            b'x',
-            &[
-                pax_record("path", b"deep/pax-name.txt"),
-                pax_record("size", b"5"),
-            ]
-            .concat(),
-            b"",
-        );
-        pax_path_and_size.extend_from_slice(&member_with_declared_size(
-            b"fallback",
-            b'0',
-            0,
-            b"hello",
-            b"",
-        ));
-
-        let mut pax_linkpath = member(
-            b"PaxHeaders/pax-link",
-            b'x',
-            &pax_record("linkpath", b"target/file.txt"),
-            b"",
-        );
-        pax_linkpath.extend_from_slice(&member(b"links/link", b'2', b"", b"fallback-target"));
-
-        let mut gnu_long_name = member(b"././@LongLink", b'L', b"long/path/name.txt\0", b"");
-        gnu_long_name.extend_from_slice(&member(b"short", b'0', b"abc", b""));
-
-        let mut gnu_long_link = member(b"././@LongLink", b'K', b"target/hard.txt\0", b"");
-        gnu_long_link.extend_from_slice(&member(b"links/hard", b'1', b"", b"fallback"));
 
         let cases = vec![
             Case {
@@ -2332,39 +3929,12 @@ mod tests {
                 expected_logical_size: 0,
             },
             Case {
-                name: "local pax path and size",
-                bytes: pax_path_and_size,
-                expected_path: b"deep/pax-name.txt",
-                expected_kind: TarEntryKind::Regular,
-                expected_data: b"hello",
-                expected_link_target: None,
-                expected_logical_size: 5,
-            },
-            Case {
-                name: "local pax linkpath",
-                bytes: pax_linkpath,
+                name: "canonical symlink",
+                bytes: member(b"links/link", b'2', b"", b"target/file.txt"),
                 expected_path: b"links/link",
                 expected_kind: TarEntryKind::Symlink,
                 expected_data: b"",
                 expected_link_target: Some(b"target/file.txt"),
-                expected_logical_size: 0,
-            },
-            Case {
-                name: "gnu long name",
-                bytes: gnu_long_name,
-                expected_path: b"long/path/name.txt",
-                expected_kind: TarEntryKind::Regular,
-                expected_data: b"abc",
-                expected_link_target: None,
-                expected_logical_size: 3,
-            },
-            Case {
-                name: "gnu long link",
-                bytes: gnu_long_link,
-                expected_path: b"links/hard",
-                expected_kind: TarEntryKind::Hardlink,
-                expected_data: b"",
-                expected_link_target: Some(b"target/hard.txt"),
                 expected_logical_size: 0,
             },
         ];
@@ -2462,43 +4032,15 @@ mod tests {
         pax_size_on_directory
             .extend_from_slice(&member_with_declared_size(b"dir", b'5', 0, b"x", b""));
 
-        for (name, bytes, expected) in [
-            (
-                "pax absolute path",
-                pax_absolute_path,
-                FormatError::UnsafeArchivePath,
-            ),
-            (
-                "pax parent path",
-                pax_parent_path,
-                FormatError::UnsafeArchivePath,
-            ),
-            (
-                "pax absolute symlink target",
-                pax_absolute_link,
-                FormatError::UnsafeArchivePath,
-            ),
-            (
-                "gnu unsafe long name",
-                gnu_unsafe_name,
-                FormatError::UnsafeArchivePath,
-            ),
-            (
-                "gnu hardlink parent target",
-                gnu_parent_hardlink,
-                FormatError::UnsafeArchivePath,
-            ),
-            (
-                "pax size on directory",
-                pax_size_on_directory,
-                FormatError::InvalidArchive("non-regular tar entry has non-zero payload size"),
-            ),
+        for (name, bytes) in [
+            ("pax absolute path", pax_absolute_path),
+            ("pax parent path", pax_parent_path),
+            ("pax absolute symlink target", pax_absolute_link),
+            ("gnu unsafe long name", gnu_unsafe_name),
+            ("gnu hardlink parent target", gnu_parent_hardlink),
+            ("pax size on directory", pax_size_on_directory),
         ] {
-            assert_eq!(
-                parse_tar_member_group(&bytes, 4096).unwrap_err(),
-                expected,
-                "{name}"
-            );
+            assert!(parse_tar_member_group(&bytes, 4096).is_err(), "{name}");
 
             let mut streaming = TarStreamSummaryValidator::with_observer(
                 4096,
@@ -2507,7 +4049,7 @@ mod tests {
                 16,
                 NoopTarStreamObserver,
             );
-            assert_eq!(streaming.observe(&bytes).unwrap_err(), expected, "{name}");
+            assert!(streaming.observe(&bytes).is_err(), "{name}");
         }
     }
 
@@ -2516,14 +4058,7 @@ mod tests {
         let mut bytes = member(b"PaxHeaders/file", b'x', &pax_record("size", b"4096"), b"");
         bytes.extend_from_slice(&member_with_declared_size(b"file", b'0', 0, b"short", b""));
 
-        assert_eq!(
-            parse_tar_member_group(&bytes, 4096).unwrap_err(),
-            FormatError::InvalidLength {
-                structure: "tar member",
-                expected: 5632,
-                actual: 2048,
-            }
-        );
+        assert!(parse_tar_member_group(&bytes, 4096).is_err());
 
         let mut streaming = TarStreamSummaryValidator::with_observer(
             4096,
@@ -2532,11 +4067,7 @@ mod tests {
             16,
             NoopTarStreamObserver,
         );
-        streaming.observe(&bytes).unwrap();
-        assert_eq!(
-            streaming.finish().unwrap_err(),
-            FormatError::InvalidArchive("tar stream ended inside member group")
-        );
+        assert!(streaming.observe(&bytes).is_err());
     }
 
     #[test]
@@ -2581,7 +4112,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_degraded_diagnostics_for_xattr_and_acl_pax_profiles() {
+    fn rejects_unregistered_legacy_xattr_and_acl_pax_keys() {
         let mut pax = Vec::new();
         pax.extend_from_slice(&pax_record("SCHILY.xattr.user.comment", b"hello"));
         pax.extend_from_slice(&pax_record("LIBARCHIVE.xattr.user.comment", b"hello"));
@@ -2590,26 +4121,11 @@ mod tests {
         let mut bytes = member(b"PaxHeaders/file", b'x', &pax, b"");
         bytes.extend_from_slice(&member(b"file.txt", b'0', b"abc", b""));
 
-        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
-
-        assert_eq!(parsed.path, b"file.txt");
-        assert_eq!(parsed.data, b"abc");
-        assert_eq!(
-            parsed
-                .diagnostics
-                .iter()
-                .filter(|diagnostic| **diagnostic
-                    == MetadataDiagnostic {
-                        profile: "pax-xattrs-acls",
-                        message: "unsupported xattr/ACL PAX metadata was ignored",
-                    })
-                .count(),
-            4
-        );
+        assert!(parse_tar_member_group(&bytes, 4096).is_err());
     }
 
     #[test]
-    fn reports_degraded_diagnostics_for_pax_timestamp_precision() {
+    fn rejects_unregistered_legacy_timestamp_pax_keys() {
         let mut pax = Vec::new();
         pax.extend_from_slice(&pax_record("atime", b"1.123456789"));
         pax.extend_from_slice(&pax_record("ctime", b"2.123456789"));
@@ -2617,24 +4133,11 @@ mod tests {
         let mut bytes = member(b"PaxHeaders/file", b'x', &pax, b"");
         bytes.extend_from_slice(&member(b"file.txt", b'0', b"abc", b""));
 
-        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
-
-        assert_eq!(
-            parsed
-                .diagnostics
-                .iter()
-                .filter(|diagnostic| **diagnostic
-                    == MetadataDiagnostic {
-                        profile: "pax-posix-2001",
-                        message: "unsupported PAX timestamp metadata was ignored",
-                    })
-                .count(),
-            3
-        );
+        assert!(parse_tar_member_group(&bytes, 4096).is_err());
     }
 
     #[test]
-    fn reports_degraded_diagnostics_for_sparse_and_unknown_pax_profiles() {
+    fn rejects_noncanonical_sparse_and_unknown_pax_keys() {
         let mut pax = Vec::new();
         pax.extend_from_slice(&pax_record("GNU.sparse.realsize", b"1024"));
         pax.extend_from_slice(&pax_record("GNU.sparse.map", b"0,1"));
@@ -2642,36 +4145,11 @@ mod tests {
         let mut bytes = member(b"PaxHeaders/file", b'x', &pax, b"");
         bytes.extend_from_slice(&member(b"file.txt", b'0', b"abc", b""));
 
-        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
-
-        assert_eq!(
-            parsed
-                .diagnostics
-                .iter()
-                .filter(|diagnostic| **diagnostic
-                    == MetadataDiagnostic {
-                        profile: "gnu-sparse",
-                        message: "unsupported sparse-file PAX metadata was ignored",
-                    })
-                .count(),
-            2
-        );
-        assert_eq!(
-            parsed
-                .diagnostics
-                .iter()
-                .filter(|diagnostic| **diagnostic
-                    == MetadataDiagnostic {
-                        profile: "pax-posix-2001",
-                        message: "unsupported PAX key was ignored",
-                    })
-                .count(),
-            1
-        );
+        assert!(parse_tar_member_group(&bytes, 4096).is_err());
     }
 
     #[test]
-    fn reports_degraded_diagnostics_for_unsupported_local_pax_profiles() {
+    fn rejects_mixed_unregistered_local_pax_keys() {
         let mut pax = Vec::new();
         pax.extend_from_slice(&pax_record("SCHILY.xattr.user.comment", b"hello"));
         pax.extend_from_slice(&pax_record("GNU.sparse.realsize", b"1024"));
@@ -2680,26 +4158,7 @@ mod tests {
         let mut bytes = member(b"PaxHeaders/file", b'x', &pax, b"");
         bytes.extend_from_slice(&member(b"file.txt", b'0', b"abc", b""));
 
-        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
-
-        assert_eq!(parsed.path, b"file.txt");
-        assert_eq!(parsed.data, b"abc");
-        assert!(parsed.diagnostics.contains(&MetadataDiagnostic {
-            profile: "pax-xattrs-acls",
-            message: "unsupported xattr/ACL PAX metadata was ignored",
-        }));
-        assert!(parsed.diagnostics.contains(&MetadataDiagnostic {
-            profile: "gnu-sparse",
-            message: "unsupported sparse-file PAX metadata was ignored",
-        }));
-        assert!(parsed.diagnostics.contains(&MetadataDiagnostic {
-            profile: "pax-posix-2001",
-            message: "unsupported PAX timestamp metadata was ignored",
-        }));
-        assert!(parsed.diagnostics.contains(&MetadataDiagnostic {
-            profile: "pax-posix-2001",
-            message: "unsupported PAX key was ignored",
-        }));
+        assert!(parse_tar_member_group(&bytes, 4096).is_err());
     }
 
     #[test]
@@ -2812,6 +4271,8 @@ mod tests {
             mode: 0o644,
             mtime: 0,
             logical_size: 0,
+            reparse_placeholder: false,
+            v45_metadata: None,
             diagnostics: Vec::new(),
         };
 
@@ -2831,6 +4292,8 @@ mod tests {
             mode: 0o755,
             mtime: 0,
             logical_size: 10,
+            reparse_placeholder: false,
+            v45_metadata: None,
             diagnostics: Vec::new(),
         };
 
@@ -2857,6 +4320,8 @@ mod tests {
             mode: 0o666,
             mtime: 1_700_000_000,
             logical_size: 5,
+            reparse_placeholder: false,
+            v45_metadata: None,
             diagnostics: Vec::new(),
         };
 
@@ -2885,6 +4350,8 @@ mod tests {
             mode: 0o644,
             mtime: 0,
             logical_size: 0,
+            reparse_placeholder: false,
+            v45_metadata: None,
             diagnostics: Vec::new(),
         };
 
@@ -2908,6 +4375,8 @@ mod tests {
             mode: 0o644,
             mtime: 0,
             logical_size: 0,
+            reparse_placeholder: false,
+            v45_metadata: None,
             diagnostics: Vec::new(),
         };
 
@@ -2916,7 +4385,8 @@ mod tests {
                 tmp.path(),
                 &member,
                 SafeExtractionOptions {
-                    overwrite_existing: true
+                    overwrite_existing: true,
+                    ..SafeExtractionOptions::default()
                 }
             )
             .unwrap_err(),
@@ -2938,6 +4408,8 @@ mod tests {
             mode: 0o644,
             mtime: 0,
             logical_size: 0,
+            reparse_placeholder: false,
+            v45_metadata: None,
             diagnostics: Vec::new(),
         };
 
@@ -2953,5 +4425,90 @@ mod tests {
             parse_tar_member_group(&bytes, 4).unwrap_err(),
             FormatError::UnsafeArchivePath
         );
+    }
+
+    fn member_summary(bytes: &[u8], group_start: u64) -> TarStreamMemberSummary {
+        let parsed = parse_tar_member_group(bytes, 4096).unwrap();
+        TarStreamMemberSummary {
+            path: parsed.path,
+            kind: parsed.kind,
+            link_target: parsed.link_target,
+            mode: parsed.mode,
+            mtime: parsed.mtime,
+            logical_size: parsed.logical_size,
+            file_entry_flags: parsed.v45_metadata.file_entry_flags,
+            reparse_placeholder: parsed.reparse_placeholder,
+            portable_mirror: parsed.v45_metadata.portable_mirror,
+            diagnostics: parsed.diagnostics,
+            group_start,
+            group_size: bytes.len() as u64,
+        }
+    }
+
+    #[test]
+    fn member_graph_accepts_hardlink_target_after_alias_and_rejects_mirror_mismatch() {
+        let alias_bytes = member(b"alias.txt", b'1', b"", b"target.txt");
+        let target_bytes = member(b"target.txt", b'0', b"payload", b"");
+        let alias = member_summary(&alias_bytes, 0);
+        let target = member_summary(&target_bytes, alias_bytes.len() as u64);
+        assert!(validate_v45_member_graph(&[alias.clone(), target.clone()]).is_ok());
+
+        let mut mismatched_alias = alias;
+        mismatched_alias.portable_mirror.mode = 0o600;
+        assert_eq!(
+            validate_v45_member_graph(&[mismatched_alias, target]).unwrap_err(),
+            FormatError::InvalidArchive(
+                "hardlink portable metadata mirror differs from canonical target"
+            )
+        );
+    }
+
+    #[test]
+    fn member_graph_rejects_writes_below_selected_symlink() {
+        let link_bytes = member(b"dir", b'2', b"", b"target");
+        let child_bytes = member(b"dir/file.txt", b'0', b"payload", b"");
+        let link = member_summary(&link_bytes, 0);
+        let child = member_summary(&child_bytes, link_bytes.len() as u64);
+
+        assert_eq!(
+            validate_v45_member_graph(&[link, child]).unwrap_err(),
+            FormatError::InvalidArchive(
+                "selected path graph traverses a symlink or reparse ancestor"
+            )
+        );
+    }
+
+    #[test]
+    fn unsupported_required_profile_needs_explicit_degraded_restore() {
+        let bytes = member(b"file.txt", b'0', b"payload", b"");
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+        let mut metadata = parsed.v45_metadata;
+        metadata
+            .declaration
+            .required_profiles
+            .push("x.com.example.test-v1".into());
+
+        assert_eq!(
+            plan_restore(
+                &metadata,
+                TarEntryKind::Regular,
+                false,
+                SafeExtractionOptions::default(),
+            )
+            .unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "requested restore policy requires an unsupported required profile"
+            )
+        );
+        assert!(plan_restore(
+            &metadata,
+            TarEntryKind::Regular,
+            false,
+            SafeExtractionOptions {
+                allow_degraded: true,
+                ..SafeExtractionOptions::default()
+            },
+        )
+        .is_ok());
     }
 }

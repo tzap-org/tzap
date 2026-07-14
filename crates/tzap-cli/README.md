@@ -7,8 +7,8 @@ fast, recoverable, and easy to restore. It packs zstd compression, optional
 authenticated encryption, safe extraction defaults, multi-volume recovery, and
 instant selected-file restores into one practical command.
 
-This release is the v44-compliant reference CLI for documented supported
-workflows. Legacy v43 inputs fail closed with an unsupported revision error.
+This release is the v45-compliant reference CLI for documented supported
+workflows. Pre-v45 inputs fail closed with an unsupported revision error.
 
 Use it for project folders, private datasets, media collections, cold storage,
 cloud object storage, and long-lived backup sets where "just zip it" is not
@@ -140,8 +140,11 @@ X.509 RootAuth signing is available with `--signing-cert`,
 ## Safety defaults
 
 `tzap extract` validates archive paths and does not overwrite existing files
-unless `--overwrite` is supplied. Keep passphrases and key files separate from
-archive data; raw-key archives require the original 32-byte key.
+unless `--overwrite` is supplied. The default `--restore portable` policy
+restores safe portable metadata; `--restore content` is byte-focused, and
+same-OS/system requests reject unsupported native application unless the caller
+explicitly permits `--allow-degraded`. Keep passphrases and key files separate
+from archive data; raw-key archives require the original 32-byte key.
 
 ## Trust material
 
@@ -150,11 +153,11 @@ archive data; raw-key archives require the original 32-byte key.
 - Benchmark results: <https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-benchmark-results.md>
 - CLI reference: <https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-cli-reference.md>
 - Operational boundaries: <https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-operational-boundaries.md>
-- v44 compliance traceability: <https://github.com/tzap-org/tzap/blob/main/public-docs/traceability/README.md>
+- v45 compliance traceability: <https://github.com/tzap-org/tzap/blob/main/public-docs/traceability/README.md>
 
 ## More information
 
 - Repository: <https://github.com/tzap-org/tzap>
-- Format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv44.md>
+- Format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv45.md>
 - Library crate: <https://crates.io/crates/tzap-core>
 - Signing plugin crate: <https://crates.io/crates/tzap-plugin-signing>

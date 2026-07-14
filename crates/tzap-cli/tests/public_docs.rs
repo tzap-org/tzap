@@ -188,14 +188,14 @@ fn public_reference_file_exists_and_covers_commands() {
 
 #[test]
 fn public_spec_file_remains_linked() {
-    let spec = read_workspace_file("specs/tzap-format-revisedv44.md");
+    let spec = read_workspace_file("specs/tzap-format-revisedv45.md");
     let root_readme = read_workspace_file("README.md");
     let cli_readme = read_workspace_file("crates/tzap-cli/README.md");
 
     assert!(spec.contains("## 29. Conformance"));
     assert!(spec.contains("## 30. Critical Metadata Recovery and Root Authentication"));
-    assert!(root_readme.contains("specs/tzap-format-revisedv44.md"));
-    assert!(cli_readme.contains("specs/tzap-format-revisedv44.md"));
+    assert!(root_readme.contains("specs/tzap-format-revisedv45.md"));
+    assert!(cli_readme.contains("specs/tzap-format-revisedv45.md"));
 }
 
 #[test]
@@ -482,14 +482,14 @@ fn public_docs_pin_tar_metadata_profile() {
     let boundaries = read_workspace_file("public-docs/tzap-operational-boundaries.md");
 
     assert!(boundaries.contains("## Tar metadata profile"));
-    assert!(boundaries.contains("regular-file tar member groups"));
-    assert!(boundaries.contains("local PAX `path`, `linkpath`, and `size` records"));
-    assert!(boundaries.contains("local GNU long name and long link records"));
-    assert!(boundaries.contains("Mode or mtime application"));
-    assert!(boundaries.contains("Global PAX headers and global GNU state are rejected"));
-    assert!(reference
-        .contains("Unsupported local tar metadata profiles and mode/mtime restoration failures"));
-    assert!(reference.contains("Verification reports unsupported local tar metadata profiles"));
+    assert!(boundaries.contains("complete `portable-v1` regular-file member"));
+    assert!(boundaries.contains("mandatory canonical"));
+    assert!(boundaries.contains("streamed"));
+    assert!(boundaries.contains("auxiliary hashes"));
+    assert!(boundaries.contains("Global PAX/GNU state"));
+    assert!(boundaries.contains("Published revision-45 conformance classes"));
+    assert!(reference.contains("--restore {content,portable,same-os,system}"));
+    assert!(reference.contains("Verification reports authenticated partial-capture"));
 }
 
 #[test]
@@ -501,7 +501,7 @@ fn traceability_materials_live_under_requested_folder_and_cover_claim_gates() {
     let signing = read_workspace_file("public-docs/traceability/signing-plugin-traceability.md");
     let runbook = read_workspace_file("public-docs/traceability/verification-runbook.md");
 
-    assert!(index.contains("v44-compliant reference implementation"));
+    assert!(index.contains("v45-compliant reference implementation"));
     assert!(index.contains("documented supported"));
     assert!(index.contains("Legacy"));
     assert!(index.contains("archives fail closed as unsupported revisions"));

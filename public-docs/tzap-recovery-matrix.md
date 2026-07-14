@@ -1,10 +1,10 @@
 # tzap Recovery Matrix
 
 This document explains what `tzap` recovery means for normal archive users.
-The detailed implementation rules live in the v0.44 format specification and
+The detailed implementation rules live in the v0.45 format specification and
 the operational boundaries document.
 
-The current implementation is v44-compliant for documented supported recovery
+The current implementation is v45-compliant for documented supported recovery
 workflows, including payload repair, critical-metadata-first recovery, and
 multi-volume loss tolerance within the chosen recovery budget.
 
@@ -42,7 +42,7 @@ strong, but it is still a budget.
 
 `--bit-rot-buffer-pct 5` tells `tzap` to spend about five percent of the
 protected object layout on repair data. That repair data applies across payload
-and metadata objects in v0.44.
+and metadata objects in v0.45.
 
 For users, the practical message is:
 
@@ -50,13 +50,13 @@ For users, the practical message is:
 - damage must stay within the affected object's repair budget
 - many damaged bytes clustered in the same protected object can exceed the
   budget even if the whole archive looks less than five percent damaged
-- recovery-enabled file-backed v44 archives can recover malformed physical
+- recovery-enabled file-backed v45 archives can recover malformed physical
   `VolumeHeader` and `CryptoHeader` copies from the terminal CMRA image before
   trusting startup metadata in ordinary key-holding opens
 - CMRA header damage such as a bad `TZCR` byte is recoverable when a valid
   locator copy supplies the decoder tuple, and malformed CMRA shard rows are
   treated as erasures once the tuple establishes exact row boundaries
-- for file-backed v44 archives, once `tzap` has recovered the archive layout,
+- for file-backed v45 archives, once `tzap` has recovered the archive layout,
   a malformed block slot such as a damaged `TZBK` marker or reserved
   BlockRecord bytes is treated as a repair erasure, then validated after repair
 - after repair, authentication still has to pass before data is trusted
@@ -85,7 +85,7 @@ behavior.
 
 ## Payload and metadata coverage
 
-v0.44 protects the main archive pieces users expect:
+v0.45 protects the main archive pieces users expect:
 
 - file payload envelopes
 - IndexRoot
@@ -104,7 +104,7 @@ find, list, verify, and restore data after ordinary storage damage.
 
 `tzap` recovery data is part of the archive package. It is not a separate
 sidecar that must be kept healthy independently of the archive. Within the
-chosen recovery budget, v0.44 readers repair critical metadata first, then
+chosen recovery budget, v0.45 readers repair critical metadata first, then
 payload objects, then authenticate the repaired result before releasing data.
 
 External repair schemes such as PAR2 can be useful comparison baselines, but
@@ -167,4 +167,4 @@ tzap create \
 - Security model: `public-docs/tzap-security-model.md`
 - CLI reference: `public-docs/tzap-cli-reference.md`
 - Operational boundaries: `public-docs/tzap-operational-boundaries.md`
-- Format specification: `specs/tzap-format-revisedv44.md`
+- Format specification: `specs/tzap-format-revisedv45.md`

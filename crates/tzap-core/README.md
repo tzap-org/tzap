@@ -1,7 +1,7 @@
 # tzap-core
 
-`tzap-core` is the v44-compliant Rust reference library for documented
-supported tzap archive workflows. Legacy v43 inputs fail closed with an
+`tzap-core` is the v45-compliant Rust reference library for documented
+supported tzap archive workflows. Pre-v45 inputs fail closed with an
 unsupported revision error. It owns wire
 parsing, metadata validation, compression, optional encryption, FEC recovery
 structures, archive writing, archive opening, and safe extraction primitives.
@@ -19,12 +19,12 @@ tzap-core = "0.1.10"
 
 ## What It Provides
 
-- v44 encrypted and explicit plaintext archive writing and opening
+- v45 encrypted and explicit plaintext archive writing and opening
 - AEAD encryption, HMAC authentication, unencrypted digest mode, and KDF handling
 - zstd compression and dictionary support
 - multi-volume layout and FEC recovery
 - bootstrap sidecar parsing and verification
-- rich index-only listing with path, size, mtime, compressed-frame, and layout metadata
+- rich index-only listing with path, size, v45 summary flags, compressed-frame, and layout metadata
 - file-backed `ArchiveReadAt` opening for lazy random-access extraction
 - safe extraction and tar metadata normalization
 - RootAuth writer request, footer, and verifier callback surfaces
@@ -76,5 +76,5 @@ RootAuth or public no-key verification.
 ## More Information
 
 - Repository: <https://github.com/tzap-org/tzap>
-- Implemented format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv44.md>
+- Implemented format specification: <https://github.com/tzap-org/tzap/blob/main/specs/tzap-format-revisedv45.md>
 - CLI crate: <https://crates.io/crates/tzap>

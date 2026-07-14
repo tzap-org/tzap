@@ -2,6 +2,7 @@ use tzap_core::compression::{compress_zstd_frame, decompress_exact_zstd_frame};
 use tzap_core::crypto::{
     aead_decrypt, aead_encrypt, build_aad, derive_nonce, KdfParams, MasterKey, Subkeys,
 };
+use tzap_core::entry_metadata::EXTENDED_METADATA_V1;
 use tzap_core::fec::encode_parity_gf16;
 use tzap_core::format::{
     AeadAlgo, FormatError, CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION,
@@ -155,8 +156,8 @@ fn minimal_file_entry_frame_range_corpus_cases() {
 
     let single_frame = index_shard_bytes(
         0,
-        vec![file_entry(path, 0, 0, 1, 0, 512, 7)],
-        vec![frame_entry(0, 0, 0, 16, 1024, 0)],
+        vec![file_entry(path, 0, 0, 1, 0, 1536, 7)],
+        vec![frame_entry(0, 0, 0, 16, 2048, 0)],
         vec![envelope_entry(0, 0, 16, 0, 1)],
         path.to_vec(),
     );
@@ -169,10 +170,10 @@ fn minimal_file_entry_frame_range_corpus_cases() {
 
     let spanning_partial_final = index_shard_bytes(
         0,
-        vec![file_entry(path, 0, 0, 2, 0, 768, 7)],
+        vec![file_entry(path, 0, 0, 2, 0, 1536, 7)],
         vec![
-            frame_entry(0, 0, 0, 16, 512, 0),
-            frame_entry(1, 0, 16, 16, 512, 512),
+            frame_entry(0, 0, 0, 16, 1024, 0),
+            frame_entry(1, 0, 16, 16, 1024, 1024),
         ],
         vec![envelope_entry(0, 0, 32, 0, 2)],
         path.to_vec(),
@@ -186,10 +187,10 @@ fn minimal_file_entry_frame_range_corpus_cases() {
 
     let non_minimal = index_shard_bytes(
         0,
-        vec![file_entry(path, 0, 0, 2, 0, 512, 7)],
+        vec![file_entry(path, 0, 0, 2, 0, 1536, 7)],
         vec![
-            frame_entry(0, 0, 0, 16, 512, 0),
-            frame_entry(1, 0, 16, 16, 512, 512),
+            frame_entry(0, 0, 0, 16, 2048, 0),
+            frame_entry(1, 0, 16, 16, 512, 2048),
         ],
         vec![envelope_entry(0, 0, 32, 0, 2)],
         path.to_vec(),
@@ -251,8 +252,8 @@ fn exact_directory_entry_and_descendant_hints_have_distinct_authority() {
     let dir_hash = hash_prefix(dir);
     let exact_directory_shard = index_shard_bytes(
         0,
-        vec![file_entry(dir, 0, 0, 1, 0, 512, 0)],
-        vec![frame_entry(0, 0, 0, 16, 512, 0)],
+        vec![file_entry(dir, 0, 0, 1, 0, 1536, 0)],
+        vec![frame_entry(0, 0, 0, 16, 1536, 0)],
         vec![envelope_entry(0, 0, 16, 0, 1)],
         dir.to_vec(),
     );
@@ -362,12 +363,12 @@ fn directory_hint_equal_start_ordering_uses_last_hash_before_index() {
 fn metadata_path_hash_bindings_reject_silent_misroutes() {
     let file_path = b"hash-bound.txt";
     let wrong_file_hash = hash_prefix(b"other-file.txt");
-    let mut wrong_file = file_entry(file_path, 0, 0, 1, 0, 512, 1);
+    let mut wrong_file = file_entry(file_path, 0, 0, 1, 0, 1536, 1);
     wrong_file.path_hash = wrong_file_hash;
     let file_shard = index_shard_bytes(
         0,
         vec![wrong_file],
-        vec![frame_entry(0, 0, 0, 16, 512, 0)],
+        vec![frame_entry(0, 0, 0, 16, 1536, 0)],
         vec![envelope_entry(0, 0, 16, 0, 1)],
         file_path.to_vec(),
     );
@@ -427,12 +428,12 @@ fn metadata_path_hash_bindings_reject_silent_misroutes() {
 fn reserved_file_entry_flags_are_rejected_before_lookup() {
     let path = b"reserved-flag.txt";
     let path_hash = hash_prefix(path);
-    let mut flagged = file_entry(path, 0, 0, 1, 0, 512, 1);
-    flagged.flags = 1;
+    let mut flagged = file_entry(path, 0, 0, 1, 0, 1536, 1);
+    flagged.flags = EXTENDED_METADATA_V1 | (1 << 6);
     let shard = index_shard_bytes(
         0,
         vec![flagged],
-        vec![frame_entry(0, 0, 0, 16, 512, 0)],
+        vec![frame_entry(0, 0, 0, 16, 1536, 0)],
         vec![envelope_entry(0, 0, 16, 0, 1)],
         path.to_vec(),
     );
@@ -446,7 +447,7 @@ fn reserved_file_entry_flags_are_rejected_before_lookup() {
         .unwrap_err(),
         FormatError::InvalidMetadata {
             structure: "FileEntry",
-            reason: "reserved flags are non-zero",
+            reason: "unknown revision-45 flags are non-zero",
         }
     );
 }
@@ -749,8 +750,8 @@ fn shard_boundary_metadata_bindings_are_checked() {
     let path_hash = hash_prefix(path);
     let shard = index_shard_bytes(
         7,
-        vec![file_entry(path, 0, 0, 1, 0, 512, 5)],
-        vec![frame_entry(0, 0, 0, 16, 512, 0)],
+        vec![file_entry(path, 0, 0, 1, 0, 1536, 5)],
+        vec![frame_entry(0, 0, 0, 16, 1536, 0)],
         vec![envelope_entry(0, 10, 16, 0, 1)],
         path.to_vec(),
     );
@@ -840,8 +841,8 @@ fn sparse_local_frame_offsets_allow_unrelated_frame_index_gaps() {
     let a = b"a.txt";
     let z = b"z.txt";
     let mut file_rows = vec![
-        (a.as_slice(), file_entry(a, 0, 0, 1, 0, 512, 1), 0u64),
-        (z.as_slice(), file_entry(z, 5, 2, 1, 0, 512, 1), 1024u64),
+        (a.as_slice(), file_entry(a, 0, 0, 1, 0, 1536, 1), 0u64),
+        (z.as_slice(), file_entry(z, 5, 2, 1, 0, 1536, 1), 1537u64),
     ];
     file_rows.sort_by_key(|(path, _, start)| (hash_prefix(path), path.to_vec(), *start));
     let first_hash = hash_prefix(file_rows[0].0);
@@ -854,8 +855,8 @@ fn sparse_local_frame_offsets_allow_unrelated_frame_index_gaps() {
         0,
         file_rows.into_iter().map(|(_, file, _)| file).collect(),
         vec![
-            frame_entry(0, 0, 0, 16, 512, 0),
-            frame_entry(2, 1, 0, 16, 512, 1024),
+            frame_entry(0, 0, 0, 16, 1536, 0),
+            frame_entry(2, 1, 0, 16, 1536, 1537),
         ],
         vec![
             envelope_entry(0, 0, 16, 0, 1),
@@ -1079,7 +1080,7 @@ fn reconstructed_tar_stream_fixture_matches_member_bindings() {
     assert_eq!(member.path, b"tar/member.txt");
     assert_eq!(member.data, b"tar corpus");
     assert_eq!(member.logical_size, 10);
-    assert_eq!(tar_stream.len(), 1024);
+    assert_eq!(tar_stream.len(), 2048);
 }
 
 fn index_root_with_shard_hashes(hashes: Vec<(u64, [u8; 8], [u8; 8])>) -> IndexRoot {
@@ -1261,7 +1262,7 @@ fn file_entry(
         kind: TarEntryKind::Regular,
         mode: 0o644,
         mtime: 0,
-        flags: 0,
+        flags: EXTENDED_METADATA_V1,
     }
 }
 

@@ -35,7 +35,7 @@ What to do:
 ## Writer shape validation
 
 The writer validates archive layout choices before writing bytes. If a request
-cannot produce a valid v0.44 archive with this implementation, `tzap` exits with
+cannot produce a valid v0.45 archive with this implementation, `tzap` exits with
 `16 unsupported-feature`.
 
 Examples:
@@ -77,7 +77,7 @@ What to do:
 - Keep `--chunk-size <= --envelope-size`.
 - Increase very small `--volume-size` values.
 - Large regular-file input sets are supported. The writer emits multiple
-  IndexShard objects and directory-hint shards when the v0.44 layout requires
+  IndexShard objects and directory-hint shards when the v0.45 layout requires
   them.
 - If `tzap create` still returns `unsupported-feature`, check the exact resource
   choice in the diagnostic and the additional boundaries below.
@@ -134,9 +134,9 @@ What to do:
 - For multi-volume workflows, pass the available volume files and omit
   `--bootstrap-out` and `--bootstrap`.
 
-## Root-authenticated v44 archives
+## Root-authenticated v45 archives
 
-The core library and CLI can create and verify root-authenticated v44 archives
+The core library and CLI can create and verify root-authenticated v45 archives
 with the Ed25519 helper profile or an X.509 certificate profile. CLI Ed25519
 signing uses a 32-byte signing seed and writes the derived 32-byte public key
 through `signing-keygen`. CLI X.509 signing uses a leaf certificate plus its
@@ -215,9 +215,9 @@ Operational shape:
 
 ## Explicit plaintext archives
 
-`--no-encryption` is the v44 mode for workflows that intentionally publish
+`--no-encryption` is the v45 mode for workflows that intentionally publish
 archive payloads and metadata without archive key material. It sets
-`aead_algo = None`, `kdf_algo = None`, and uses unkeyed v44 integrity digests
+`aead_algo = None`, `kdf_algo = None`, and uses unkeyed v45 integrity digests
 for fixed metadata instead of HMAC.
 
 Example:
@@ -316,7 +316,7 @@ file-backed `ArchiveReadAt` APIs benefit from the same repair behavior.
 ## Verify repaired copies
 
 Key-holding `tzap verify` can write repaired sibling copies for volumes that
-contain recoverable BlockRecord damage. For file-backed v44 inputs, this
+contain recoverable BlockRecord damage. For file-backed v45 inputs, this
 includes CRC failures and malformed fixed slots such as a damaged `TZBK` marker
 or reserved BlockRecord bytes after `tzap` has recovered the archive layout:
 
@@ -469,14 +469,14 @@ file-backed path is also much faster for later selected-file workflows because
 seekable readers can use random access.
 
 Known-size raw stdin (`--stdin-size`) is consumed once and archived as one
-regular-file member in the standard tar-member v44 profile. With `--volumes N`,
+regular-file member in the standard tar-member v45 profile. With `--volumes N`,
 the same member is striped across the fixed output volume set. Short stdin or
 extra bytes after the declared size reject the create and remove the temporary
 archive output or volume set.
 
 Unknown-size raw stdin is supported only with explicit `--spool-stdin`. That
 mode writes plaintext stdin to a restrictive temporary file, then archives that
-file as a regular tar-member v44 member. With `--volumes N`, tzap waits for EOF,
+file as a regular tar-member v45 member. With `--volumes N`, tzap waits for EOF,
 uses the file-backed spool size as the known raw member size, and stripes the
 member across the fixed output volume set. The spool is removed after normal
 success or normal failure, but the plaintext exists on local disk while the
@@ -552,56 +552,64 @@ What to do:
 
 ## Tar metadata profile
 
-The current v0.44 CLI create path emits regular-file tar member groups. Archive
-paths are normalized safe relative UTF-8 paths using `/` separators. Long paths
-and non-ASCII paths are represented with a path-specific local PAX `path` record
-inside the same member group as the file it modifies. The writer does not emit
-global PAX headers, global GNU state, or the POSIX two-zero-block tar
-end-of-archive marker into the encrypted tzap tar stream.
+The v0.45 CLI create path emits complete `portable-v1` regular-file member
+groups. Every group starts with the mandatory canonical
+`TZAP-PAX/PRIMARY` record, followed by the primary ustar entry. Archive paths
+are normalized safe relative NFC UTF-8 paths using `/` separators. The writer
+does not emit global PAX state, GNU long-name records, legacy sparse formats, or
+the tar two-zero-block end marker.
 
-The supported reader profile is:
+The core reader implements the revision-45 member-group grammar for regular
+files, directories, symlinks, hardlinks, character devices, block devices, and
+FIFOs. It validates canonical primary and auxiliary PAX declarations, streamed
+auxiliary hashes, sparse maps, capture reports, profile dependencies,
+FileEntry flags, native-record framing, hardlink mirror metadata, and the final
+selected path graph. Global PAX/GNU state, unregistered primary keys, legacy GNU
+metadata records, and inconsistent profile cross-fields are malformed rather
+than silently ignored.
 
-- ustar regular files, directories, symlinks, and hardlinks after safe-path
-  validation;
-- local PAX `path`, `linkpath`, and `size` records for the following main entry;
-- local GNU long name and long link records for the following main entry;
-- ustar mode and integer mtime parsed from the main tar header, exposed by
-  tar-decoding list/API metadata, and applied to restored regular files when
-  the platform filesystem API accepts them.
-
-Index-backed listing exposes authenticated index metadata without decoding
+Index-backed listing exposes authenticated FileEntry data without decoding
 payload envelopes. `list_index_entries`, `lookup_index_entry`, and
-`tzap list --json` include path, basename, payload size, tar kind, ustar mode,
-integer mtime, tar-member group size, frame range, compressed frame size, and
-touched envelope/block layout metadata. These layout fields describe archive
-objects touched by the file; they are not a per-file ownership claim for shared
-envelopes.
+`tzap list --json` include path, basename, logical payload size, revision-45
+summary flags, member-group size, frame range, compressed frame size, and
+touched envelope/block layout. Entry kind, mode, and mtime live in the
+authenticated primary PAX/member header and are available from payload-decoding
+list APIs and `tzap list --long`, not from the revision-45 FileEntry row.
 
-Filesystem extraction writes file payloads and supported links safely under the
-destination root. It does not currently claim ownership, xattr, ACL, sparse-file,
-nanosecond timestamp, or global tar-state restoration. Mode or mtime application
-failures are reported as degraded metadata diagnostics.
+Extraction supports `--restore content` and the default `--restore portable`.
+Content mode writes regular bytes and safe directories, skips symlinks and
+special/reparse objects, and materializes hardlink aliases as independent
+files. Portable mode additionally restores safe symlinks and hardlinks and
+ordinary mode/mtime metadata. Both modes preflight selected random-access
+restores before destination changes; sequential restores remain provisional
+until terminal verification and commit. `--restore system` requires explicit
+authorization, while unsupported native application remains a hard error unless
+`--allow-degraded` is explicitly selected.
 
-Unsupported local metadata is reported as degraded metadata instead of looking
-fully successful. `tzap list --long`, `tzap verify`, and payload-reading
-`tzap extract` operations write diagnostics such as:
-
-```text
-tzap: degraded-metadata: path/in/archive: gnu-sparse: unsupported sparse-file PAX metadata was ignored
-```
-
-Global PAX headers and global GNU state are rejected as malformed archive state.
-GNU sparse entry records are rejected; GNU sparse PAX keys, xattr/ACL PAX keys,
-PAX timestamp precision keys, and other unsupported local PAX keys are surfaced
-through degraded metadata diagnostics. The global `--quiet` flag suppresses
-success summaries where applicable; it is not a best-effort metadata-warning
-mode.
+Authenticated metadata outside the chosen policy is enumerated through
+structured diagnostics. A partial capture, unsupported required extension
+profile, skipped native stream, reparse placeholder, special object, or
+storage-layout materialization cannot be reported as full fidelity.
 
 Library callers that only need authenticated index metadata may use
 `list_index_entries` or `lookup_index_entry`. Library callers that only need
 bytes may use `extract_file`, which is explicitly payload-only. Callers that
 surface tar metadata fidelity should use `list_files`, `extract_member`,
 `extract_file_with_diagnostics`, or `extract_file_to`.
+
+### Published revision-45 conformance classes
+
+- `tzap-core`: revision-45 Core reader and physical archive reader/writer for
+  the documented archive workflows.
+- CLI/core writer: complete `portable-v1` regular-file emission. It does not
+  claim the full Portable reader/writer class because directory/link capture
+  and native filesystem metadata capture are not exposed by the current writer.
+- `tzap-plugin-keywrap`: `x509-hpke-recipient-v1` for revision 45.
+- `tzap-plugin-signing`: `ed25519-archiveroot-v1` and the revision-45 X.509
+  RootAuth profile.
+- POSIX, Linux, macOS, and Windows backup reader/writer classes are not
+  advertised. Core validates their on-wire records, but the current CLI does
+  not claim host-native capture or exact native restoration.
 
 ## Cloud directory-prefix optimization
 

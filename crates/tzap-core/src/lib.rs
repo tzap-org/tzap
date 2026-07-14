@@ -1,10 +1,11 @@
-//! Core implementation surface for the tzap v0.44 archive format.
+//! Core implementation surface for the tzap v0.45 archive format.
 //!
 //! This crate owns wire-format parsing, validation, crypto, compression, FEC,
 //! and archive read/write primitives. The CLI stays intentionally thin.
 
 pub mod compression;
 pub mod crypto;
+pub mod entry_metadata;
 pub mod fec;
 pub mod format;
 pub mod metadata;
@@ -20,6 +21,7 @@ mod raw_stream_profile;
 mod streaming_writer;
 
 pub use crypto::{HmacDomain, KdfParams, MasterKey, Subkeys};
+pub use entry_metadata::RestorePolicy;
 pub use format::{
     AeadAlgo, ArchiveWriteError, CompressionAlgo, ExtractError, FecAlgo, FormatError, KdfAlgo,
     FORMAT_VERSION, VOLUME_FORMAT_REV,

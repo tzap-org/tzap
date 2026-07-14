@@ -19,7 +19,7 @@ use crate::format::{
     CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_HEADER_HMAC_LEN, IMAGE_CRC_LEN, LOCATOR_PAIR_LEN,
     MANIFEST_FOOTER_LEN, MASTER_KEY_LEN, READER_MAX_CMRA_PARITY_PCT, READER_MAX_CRYPTO_HEADER_LEN,
     READER_MAX_KEY_WRAP_TABLE_LEN, READER_MAX_ROOT_AUTH_FOOTER_LEN, SERIALIZED_REGION_HEADER_LEN,
-    VOLUME_FORMAT_REV_44, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
+    VOLUME_FORMAT_REV_45, VOLUME_HEADER_LEN, VOLUME_TRAILER_LEN,
 };
 use crate::metadata::{
     hash_prefix, normalize_lookup_file_path, DirectoryHintShardEntry, DirectoryHintTable,
@@ -36,9 +36,10 @@ use crate::root_auth::{
     CriticalMetadataDigestInputs, DataBlockMerkleLeaf, FecLayoutObjectRow,
 };
 use crate::tar_model::{
-    parse_tar_member_group, restore_streaming_tar_member_group,
-    stream_regular_tar_member_group_to_writer, validate_tar_stream_total_extraction_size,
-    MetadataDiagnostic, NoopTarStreamObserver, OwnedTarMember, SafeExtractionOptions, TarEntryKind,
+    parse_tar_member_group, restore_phase, restore_streaming_tar_member_group,
+    stream_regular_tar_member_group_to_writer, validate_owned_restore_plan,
+    validate_tar_stream_total_extraction_size, MetadataDiagnostic, NoopTarStreamObserver,
+    OwnedTarMember, SafeExtractionOptions, StreamingMemberExpectation, TarEntryKind,
     TarMemberGroupReader, TarStreamFilesystemRestoreObserver, TarStreamObserver,
     TarStreamSummaryValidator, TarStreamTotalExtractionSizeValidator,
 };
@@ -216,9 +217,7 @@ pub struct ArchiveIndexEntry {
     pub path: String,
     pub name: String,
     pub file_data_size: u64,
-    pub kind: TarEntryKind,
-    pub mode: u32,
-    pub mtime: u64,
+    pub flags: u32,
     pub path_hash: [u8; 8],
     pub tar_member_group_size: u64,
     pub first_frame_index: u64,
@@ -246,6 +245,7 @@ pub struct ExtractedArchiveMember {
     pub kind: TarEntryKind,
     pub data: Vec<u8>,
     pub link_target: Option<String>,
+    pub reparse_placeholder: bool,
     pub diagnostics: Vec<MetadataDiagnostic>,
 }
 
@@ -420,7 +420,6 @@ pub(crate) struct StreamedArchiveOpenParts {
 struct WinningIndexEntry {
     start: u64,
     file_data_size: u64,
-    mtime: u64,
     shard_index: usize,
     file_index: usize,
 }
@@ -677,7 +676,7 @@ fn parse_volume_format_dispatch(
 ) -> Result<VolumeFormatRevision, FormatError> {
     let revision = volume_header.parse_volume_format_revision()?;
     match revision {
-        VolumeFormatRevision::V44 => Ok(revision),
+        VolumeFormatRevision::V45 => Ok(revision),
     }
 }
 
@@ -2085,7 +2084,7 @@ impl OpenedArchive {
     pub fn extract_file(&self, path: &str) -> Result<Option<Vec<u8>>, FormatError> {
         self.extract_member(path)?
             .map(|member| {
-                if member.kind != TarEntryKind::Regular {
+                if member.kind != TarEntryKind::Regular || member.reparse_placeholder {
                     return Err(FormatError::ReaderUnsupported(
                         "extract_file returns only regular file payloads",
                     ));
@@ -2103,7 +2102,7 @@ impl OpenedArchive {
     ) -> Result<Option<ExtractedRegularFile>, FormatError> {
         self.extract_member(path)?
             .map(|member| {
-                if member.kind != TarEntryKind::Regular {
+                if member.kind != TarEntryKind::Regular || member.reparse_placeholder {
                     return Err(FormatError::ReaderUnsupported(
                         "extract_file_with_diagnostics returns only regular file payloads",
                     ));
@@ -2169,11 +2168,47 @@ impl OpenedArchive {
         options: SafeExtractionOptions,
     ) -> Result<Option<Vec<MetadataDiagnostic>>, FormatError> {
         let normalized = normalize_lookup_file_path(path, self.crypto_header.max_path_length)?;
-        self.locate_index_file(&normalized)?
-            .map(|located| {
-                self.stream_loaded_file_to_path(&located.shard, located.file_index, root, options)
+        let normalized_path = std::str::from_utf8(&normalized)
+            .map_err(|_| FormatError::UnsafeArchivePath)?
+            .to_owned();
+        let shards = self.load_all_index_shards()?;
+        let winners = final_index_entry_winners(&shards)?;
+        let Some(requested) = winners.get(&normalized_path).copied() else {
+            return Ok(None);
+        };
+        let requested_member = self.decode_loaded_owned_tar_member(
+            &shards[requested.shard_index],
+            requested.file_index,
+            false,
+        )?;
+        let mut entries = Vec::with_capacity(2);
+        if requested_member.kind == TarEntryKind::Hardlink {
+            let target = requested_member
+                .link_target
+                .as_deref()
+                .ok_or(FormatError::InvalidArchive("hardlink target is missing"))?;
+            let target = std::str::from_utf8(target)
+                .map_err(|_| FormatError::UnsafeArchivePath)?
+                .to_owned();
+            let target_entry = winners
+                .get(&target)
+                .copied()
+                .ok_or(FormatError::InvalidArchive(
+                    "hardlink target is absent from the final index",
+                ))?;
+            entries.push((target, target_entry));
+        }
+        entries.push((normalized_path.clone(), requested));
+        let restored = self.extract_winning_index_entries_to(&shards, entries, root, options, 1)?;
+        restored
+            .into_iter()
+            .find_map(|(entry_path, diagnostics)| {
+                (entry_path == normalized_path).then_some(diagnostics)
             })
-            .transpose()
+            .map(Some)
+            .ok_or(FormatError::InvalidArchive(
+                "selected restore result is missing",
+            ))
     }
 
     pub fn extract_indexed_files_to(
@@ -2785,6 +2820,11 @@ impl OpenedArchive {
                         "tar member size does not match FileEntry file_data_size",
                     ));
                 }
+                if member.file_entry_flags != file.flags {
+                    return Err(FormatError::InvalidArchive(
+                        "streamed tar member metadata flags do not match FileEntry flags",
+                    ));
+                }
                 if member.group_size != file.tar_member_group_size {
                     return Err(FormatError::InvalidArchive(
                         "FileEntry does not match streamed tar member",
@@ -3057,6 +3097,7 @@ impl OpenedArchive {
                 .link_target
                 .map(|target| utf8_path(&target))
                 .transpose()?,
+            reparse_placeholder: member.reparse_placeholder,
             diagnostics: member.diagnostics,
         })
     }
@@ -3088,6 +3129,7 @@ impl OpenedArchive {
             &mut reader,
             expected_path,
             file.file_data_size,
+            file.flags,
             file.tar_member_group_size,
             self.crypto_header.max_path_length,
             writer,
@@ -3117,6 +3159,7 @@ impl OpenedArchive {
             &mut reader,
             expected_path,
             file.file_data_size,
+            file.flags,
             file.tar_member_group_size,
             self.crypto_header.max_path_length,
             &mut progress_writer,
@@ -3141,10 +3184,13 @@ impl OpenedArchive {
         let mut reader = DecodedTarMemberGroupReader::new(self, shard, file)?;
         restore_streaming_tar_member_group(
             root,
-            expected_path,
-            file.file_data_size,
-            file.tar_member_group_size,
-            self.crypto_header.max_path_length,
+            StreamingMemberExpectation {
+                path: expected_path,
+                file_data_size: file.file_data_size,
+                file_flags: file.flags,
+                group_len: file.tar_member_group_size,
+                max_path_length: self.crypto_header.max_path_length,
+            },
             options,
             &mut reader,
         )
@@ -3162,14 +3208,27 @@ impl OpenedArchive {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
-        entries
+        let mut planned = Vec::with_capacity(entries.len());
+        for (path, entry) in entries {
+            let shard = shards
+                .get(entry.shard_index)
+                .ok_or(FormatError::InvalidArchive(
+                    "winning FileEntry shard is out of bounds",
+                ))?;
+            let member = self.decode_loaded_owned_tar_member(shard, entry.file_index, false)?;
+            planned.push((path, entry, member));
+        }
+        let metadata: Vec<_> = planned.iter().map(|(_, _, member)| member).collect();
+        validate_owned_restore_plan(&metadata, options)?;
+        planned.sort_by(|left, right| {
+            restore_phase(&left.2)
+                .cmp(&restore_phase(&right.2))
+                .then_with(|| left.2.path.cmp(&right.2.path))
+        });
+        planned
             .into_iter()
-            .map(|(path, entry)| {
-                let shard = shards
-                    .get(entry.shard_index)
-                    .ok_or(FormatError::InvalidArchive(
-                        "winning FileEntry shard is out of bounds",
-                    ))?;
+            .map(|(path, entry, _)| {
+                let shard = &shards[entry.shard_index];
                 let diagnostics =
                     self.stream_loaded_file_to_path(shard, entry.file_index, root, options)?;
                 Ok((path, diagnostics))
@@ -3230,7 +3289,16 @@ impl OpenedArchive {
                 "tar member size does not match FileEntry file_data_size",
             ));
         }
-        Ok(member.to_owned_member())
+        if member.v45_metadata.file_entry_flags != file.flags {
+            return Err(FormatError::InvalidArchive(
+                "FileEntry flags do not match decoded member-group metadata",
+            ));
+        }
+        if enforce_extraction_cap {
+            member.to_owned_member()
+        } else {
+            Ok(member.to_owned_metadata())
+        }
     }
 
     fn metadata_limits(&self) -> MetadataLimits {
@@ -3777,7 +3845,6 @@ fn final_index_entry_winners(
                 if start >= winner.start {
                     winner.start = start;
                     winner.file_data_size = file.file_data_size;
-                    winner.mtime = file.mtime;
                     winner.shard_index = shard_index;
                     winner.file_index = idx;
                 }
@@ -3787,7 +3854,6 @@ fn final_index_entry_winners(
                     WinningIndexEntry {
                         start,
                         file_data_size: file.file_data_size,
-                        mtime: file.mtime,
                         shard_index,
                         file_index: idx,
                     },
@@ -3824,9 +3890,7 @@ fn archive_index_entry_from_loaded_file_with_path(
         name: archive_entry_name(&path),
         path,
         file_data_size: file.file_data_size,
-        kind: file.kind,
-        mode: file.mode,
-        mtime: file.mtime,
+        flags: file.flags,
         path_hash: file.path_hash,
         tar_member_group_size: file.tar_member_group_size,
         first_frame_index: file.first_frame_index,
@@ -4009,9 +4073,9 @@ pub(crate) fn startup_key_wrap_table(
     else {
         return Ok(None);
     };
-    if volume_header.volume_format_rev != VOLUME_FORMAT_REV_44 {
+    if volume_header.volume_format_rev != VOLUME_FORMAT_REV_45 {
         return Err(FormatError::InvalidArchive(
-            "RecipientWrap KdfParams require volume_format_rev 44",
+            "RecipientWrap KdfParams require volume_format_rev 45",
         ));
     }
     let key_wrap_table_length_usize =
@@ -10269,7 +10333,7 @@ mod tests {
     use crate::format::{
         AeadAlgo, CompressionAlgo, FecAlgo, KdfAlgo, CRYPTO_EXTENSION_HEADER_LEN,
         CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION, READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
-        VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_44,
+        VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_45,
     };
     use crate::metadata::{
         DirectoryHintEntry, DirectoryHintTableHeader, IndexRootHeader, IndexShardHeader,
@@ -10783,7 +10847,7 @@ mod tests {
         .unwrap();
         let mut bytes = archive.bytes;
         let mut header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
-        header.volume_format_rev = 45;
+        header.volume_format_rev = VOLUME_FORMAT_REV_45 + 1;
         bytes[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
 
         let mut called = false;
@@ -10798,7 +10862,7 @@ mod tests {
             err,
             FormatError::UnsupportedVolumeFormatRevision {
                 format_version: FORMAT_VERSION,
-                volume_format_rev: 45,
+                volume_format_rev: VOLUME_FORMAT_REV_45 + 1,
                 reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
             }
         );
@@ -10807,7 +10871,7 @@ mod tests {
     #[test]
     fn public_no_key_rejects_public_header_revision_mismatch() {
         let archive = write_archive_with_root_auth(
-            &[RegularFile::new("public.txt", b"public v44 only")],
+            &[RegularFile::new("public.txt", b"public v45 only")],
             &master_key(),
             single_stream_options(),
             RootAuthWriterConfig {
@@ -11311,7 +11375,7 @@ mod tests {
     #[test]
     fn image_identity_allows_matching_current_revision() {
         let archive = write_archive(
-            &[RegularFile::new("matching-v44.txt", b"payload")],
+            &[RegularFile::new("matching-v45.txt", b"payload")],
             &master_key(),
             single_stream_options(),
         )
@@ -11783,7 +11847,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_encrypted_writers_emit_v44_archives() {
+    fn ordinary_encrypted_writers_emit_v45_archives() {
         let raw_key_archive = write_archive(
             &[RegularFile::new("raw.txt", b"raw key payload")],
             &master_key(),
@@ -11791,11 +11855,11 @@ mod tests {
         )
         .unwrap();
         let raw_header = VolumeHeader::parse(&raw_key_archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
-        assert_eq!(raw_header.volume_format_rev, VOLUME_FORMAT_REV_44);
+        assert_eq!(raw_header.volume_format_rev, VOLUME_FORMAT_REV_45);
         let raw_opened = open_archive(&raw_key_archive.bytes, &master_key()).unwrap();
         assert_eq!(
             raw_opened.volume_header.volume_format_rev,
-            VOLUME_FORMAT_REV_44
+            VOLUME_FORMAT_REV_45
         );
         assert_eq!(
             raw_opened.extract_file("raw.txt").unwrap(),
@@ -11817,11 +11881,11 @@ mod tests {
         .unwrap();
         let passphrase_header =
             VolumeHeader::parse(&passphrase_archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
-        assert_eq!(passphrase_header.volume_format_rev, VOLUME_FORMAT_REV_44);
+        assert_eq!(passphrase_header.volume_format_rev, VOLUME_FORMAT_REV_45);
         let passphrase_opened = open_archive(&passphrase_archive.bytes, &master_key()).unwrap();
         assert_eq!(
             passphrase_opened.volume_header.volume_format_rev,
-            VOLUME_FORMAT_REV_44
+            VOLUME_FORMAT_REV_45
         );
         assert_eq!(
             passphrase_opened.extract_file("pass.txt").unwrap(),
@@ -11834,7 +11898,7 @@ mod tests {
         let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
         let mut bytes = archive.bytes;
         let mut header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
-        header.volume_format_rev = 45;
+        header.volume_format_rev = VOLUME_FORMAT_REV_45 + 1;
         bytes[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
         let wrong = MasterKey::from_raw_key(&[0x43; 32]).unwrap();
 
@@ -11842,16 +11906,16 @@ mod tests {
             open_archive(&bytes, &wrong).unwrap_err(),
             FormatError::UnsupportedVolumeFormatRevision {
                 format_version: FORMAT_VERSION,
-                volume_format_rev: 45,
+                volume_format_rev: VOLUME_FORMAT_REV_45 + 1,
                 reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
             }
         );
     }
 
     #[test]
-    fn open_archive_unencrypted_accepts_v44_profile() {
+    fn open_archive_unencrypted_accepts_v45_profile() {
         let archive = write_archive_unencrypted(
-            &[RegularFile::new("payload.txt", b"smoke-v44-unencrypted")],
+            &[RegularFile::new("payload.txt", b"smoke-v45-unencrypted")],
             WriterOptions {
                 aead_algo: AeadAlgo::None,
                 ..single_stream_options()
@@ -11862,21 +11926,21 @@ mod tests {
         let opened = open_archive_unencrypted(&archive.bytes).unwrap();
         let header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
 
-        assert_eq!(header.volume_format_rev, VOLUME_FORMAT_REV_44);
-        assert_eq!(opened.volume_header.volume_format_rev, VOLUME_FORMAT_REV_44);
+        assert_eq!(header.volume_format_rev, VOLUME_FORMAT_REV_45);
+        assert_eq!(opened.volume_header.volume_format_rev, VOLUME_FORMAT_REV_45);
         assert_eq!(
             opened.extract_file("payload.txt").unwrap(),
-            Some(b"smoke-v44-unencrypted".to_vec())
+            Some(b"smoke-v45-unencrypted".to_vec())
         );
         opened.verify().unwrap();
     }
 
     #[test]
-    fn root_auth_unencrypted_v44_round_trips_with_recomputed_archive_root() {
+    fn root_auth_unencrypted_v45_round_trips_with_recomputed_archive_root() {
         let archive = write_archive_with_root_auth(
             &[RegularFile::new(
-                "signed-v44.txt",
-                b"root-auth v44 plaintext",
+                "signed-v45.txt",
+                b"root-auth v45 plaintext",
             )],
             &master_key(),
             WriterOptions {
@@ -11890,11 +11954,11 @@ mod tests {
         let opened = open_archive_unencrypted(&archive.bytes).unwrap();
         let header = VolumeHeader::parse(&archive.bytes[..VOLUME_HEADER_LEN]).unwrap();
 
-        assert_eq!(header.volume_format_rev, VOLUME_FORMAT_REV_44);
-        assert_eq!(opened.volume_header.volume_format_rev, VOLUME_FORMAT_REV_44);
+        assert_eq!(header.volume_format_rev, VOLUME_FORMAT_REV_45);
+        assert_eq!(opened.volume_header.volume_format_rev, VOLUME_FORMAT_REV_45);
         assert_eq!(
-            opened.extract_file("signed-v44.txt").unwrap(),
-            Some(b"root-auth v44 plaintext".to_vec())
+            opened.extract_file("signed-v45.txt").unwrap(),
+            Some(b"root-auth v45 plaintext".to_vec())
         );
 
         let verified = opened
@@ -11904,7 +11968,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(verified.format_version, FORMAT_VERSION);
-        assert_eq!(verified.volume_format_rev, VOLUME_FORMAT_REV_44);
+        assert_eq!(verified.volume_format_rev, VOLUME_FORMAT_REV_45);
         assert_eq!(
             verified.archive_root,
             opened.root_auth_footer.as_ref().unwrap().archive_root
@@ -11925,7 +11989,7 @@ mod tests {
         let opened = open_archive_with_recipient_wrap_resolver(&archive.bytes, |context| {
             assert_eq!(
                 context.archive_identity.volume_format_rev,
-                VOLUME_FORMAT_REV_44
+                VOLUME_FORMAT_REV_45
             );
             assert_eq!(context.record.profile_id, 1);
             Ok(vec![master.0])
@@ -11955,7 +12019,7 @@ mod tests {
             |context| {
                 assert_eq!(
                     context.archive_identity.volume_format_rev,
-                    VOLUME_FORMAT_REV_44
+                    VOLUME_FORMAT_REV_45
                 );
                 assert_eq!(context.record.profile_id, 1);
                 Ok(vec![master.0])
@@ -11994,7 +12058,7 @@ mod tests {
             |context| {
                 assert_eq!(
                     context.archive_identity.volume_format_rev,
-                    VOLUME_FORMAT_REV_44
+                    VOLUME_FORMAT_REV_45
                 );
                 assert_eq!(context.record.profile_id, 1);
                 Ok(vec![master.0])
@@ -12087,7 +12151,7 @@ mod tests {
         .unwrap();
         let mut bytes = archive.bytes;
         let mut header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
-        header.volume_format_rev = VOLUME_FORMAT_REV_44 + 1;
+        header.volume_format_rev = VOLUME_FORMAT_REV_45 + 1;
         bytes[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
 
         let mut called = false;
@@ -12102,7 +12166,7 @@ mod tests {
             err,
             FormatError::UnsupportedVolumeFormatRevision {
                 format_version: FORMAT_VERSION,
-                volume_format_rev: VOLUME_FORMAT_REV_44 + 1,
+                volume_format_rev: VOLUME_FORMAT_REV_45 + 1,
                 reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
             }
         );
@@ -12199,7 +12263,7 @@ mod tests {
             called = true;
             assert_eq!(
                 context.archive_identity.volume_format_rev,
-                VOLUME_FORMAT_REV_44
+                VOLUME_FORMAT_REV_45
             );
             assert_eq!(context.record.profile_id, 1);
             Ok(vec![master.0])
@@ -12314,7 +12378,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(verified.volume_format_rev, VOLUME_FORMAT_REV_44);
+        assert_eq!(verified.volume_format_rev, VOLUME_FORMAT_REV_45);
         assert_eq!(verified.total_data_block_count, 3);
     }
 
@@ -12388,14 +12452,14 @@ mod tests {
         let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
         let mut bytes = archive.bytes;
         let mut header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
-        header.volume_format_rev = 45;
+        header.volume_format_rev = VOLUME_FORMAT_REV_45 + 1;
         bytes[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
 
         assert_eq!(
             verify_non_seekable_stream(std::io::Cursor::new(bytes), &master_key()).unwrap_err(),
             FormatError::UnsupportedVolumeFormatRevision {
                 format_version: FORMAT_VERSION,
-                volume_format_rev: 45,
+                volume_format_rev: VOLUME_FORMAT_REV_45 + 1,
                 reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
             }
         );
@@ -12406,14 +12470,14 @@ mod tests {
         let archive = write_archive(&[], &master_key(), single_stream_options()).unwrap();
         let mut bytes = archive.bytes;
         let mut header = VolumeHeader::parse(&bytes[..VOLUME_HEADER_LEN]).unwrap();
-        header.volume_format_rev = 45;
+        header.volume_format_rev = VOLUME_FORMAT_REV_45 + 1;
         bytes[..VOLUME_HEADER_LEN].copy_from_slice(&header.to_bytes());
 
         assert_eq!(
             open_seekable_archive(CountingReadAt::new(bytes, vec![]), &master_key()).unwrap_err(),
             FormatError::UnsupportedVolumeFormatRevision {
                 format_version: FORMAT_VERSION,
-                volume_format_rev: 45,
+                volume_format_rev: VOLUME_FORMAT_REV_45 + 1,
                 reader_max_supported_revision: READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
             }
         );
@@ -12469,17 +12533,13 @@ mod tests {
         assert_eq!(listed[0].path, "same.txt");
         assert_eq!(listed[0].name, "same.txt");
         assert_eq!(listed[0].file_data_size, 5);
-        assert_eq!(listed[0].kind, TarEntryKind::Regular);
-        assert_eq!(listed[0].mode, 0o644);
-        assert_eq!(listed[0].mtime, 1_700_000_100);
+        assert_eq!(listed[0].flags, crate::entry_metadata::EXTENDED_METADATA_V1);
         assert_eq!(listed[0].frame_count, 1);
         assert!(listed[0].layout.compressed_size > 0);
         let looked_up = opened.lookup_index_entry("same.txt").unwrap().unwrap();
         assert_eq!(looked_up.path, "same.txt");
         assert_eq!(looked_up.file_data_size, 5);
-        assert_eq!(looked_up.kind, TarEntryKind::Regular);
-        assert_eq!(looked_up.mode, 0o644);
-        assert_eq!(looked_up.mtime, 1_700_000_100);
+        assert_eq!(looked_up.flags, crate::entry_metadata::EXTENDED_METADATA_V1);
         assert_eq!(opened.lookup_index_entry("missing.txt").unwrap(), None);
         assert_eq!(
             opened.list_files().unwrap(),
@@ -12508,20 +12568,14 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].path, "broken.txt");
         assert_eq!(listed[0].file_data_size, b"broken payload\n".len() as u64);
-        assert_eq!(listed[0].kind, TarEntryKind::Regular);
-        assert_eq!(listed[0].mode, 0o644);
-        assert_eq!(listed[0].mtime, 0);
+        assert_eq!(listed[0].flags, crate::entry_metadata::EXTENDED_METADATA_V1);
         assert_eq!(listed[1].path, "healthy.txt");
         assert_eq!(listed[1].file_data_size, b"healthy payload\n".len() as u64);
-        assert_eq!(listed[1].kind, TarEntryKind::Regular);
-        assert_eq!(listed[1].mode, 0o644);
-        assert_eq!(listed[1].mtime, 0);
+        assert_eq!(listed[1].flags, crate::entry_metadata::EXTENDED_METADATA_V1);
         let looked_up = opened.lookup_index_entry("broken.txt").unwrap().unwrap();
         assert_eq!(looked_up.path, "broken.txt");
         assert_eq!(looked_up.file_data_size, b"broken payload\n".len() as u64);
-        assert_eq!(looked_up.kind, TarEntryKind::Regular);
-        assert_eq!(looked_up.mode, 0o644);
-        assert_eq!(looked_up.mtime, 0);
+        assert_eq!(looked_up.flags, crate::entry_metadata::EXTENDED_METADATA_V1);
         assert_eq!(opened.list_files().unwrap_err(), FormatError::AeadFailure);
     }
 
@@ -12592,8 +12646,7 @@ mod tests {
         assert_eq!(entry.path, "chunked.bin");
         assert_eq!(entry.name, "chunked.bin");
         assert_eq!(entry.file_data_size, payload.len() as u64);
-        assert_eq!(entry.kind, TarEntryKind::Regular);
-        assert_eq!(entry.mode, 0o644);
+        assert_eq!(entry.flags, file.flags);
         assert_eq!(entry.tar_member_group_size, file.tar_member_group_size);
         assert_eq!(entry.first_frame_index, file.first_frame_index);
         assert_eq!(entry.frame_count, file.frame_count);
@@ -13780,7 +13833,7 @@ mod tests {
                 called = true;
                 assert_eq!(
                     context.archive_identity.volume_format_rev,
-                    VOLUME_FORMAT_REV_44
+                    VOLUME_FORMAT_REV_45
                 );
                 assert_eq!(context.record.profile_id, 1);
                 Ok(vec![master.0])
@@ -14143,6 +14196,7 @@ mod tests {
             NonSeekableReaderOptions::default(),
             SafeExtractionOptions {
                 overwrite_existing: true,
+                ..SafeExtractionOptions::default()
             },
         )
         .unwrap();
@@ -17874,7 +17928,7 @@ mod tests {
             file.offset_in_first_frame_plaintext = 0;
             file.tar_member_group_size = healthy_member.len() as u64;
             file.file_data_size = healthy_payload.len() as u64;
-            file.flags = 0;
+            file.flags = crate::entry_metadata::EXTENDED_METADATA_V1;
             mutate(&mut file, &mut path);
             file.path_offset = 0;
             file.path_length = path.len() as u32;
@@ -18146,7 +18200,7 @@ mod tests {
                 kind: crate::tar_model::TarEntryKind::Regular,
                 mode: 0o644,
                 mtime: 0,
-                flags: 0,
+                flags: crate::entry_metadata::EXTENDED_METADATA_V1,
             });
         }
 
@@ -18186,23 +18240,34 @@ mod tests {
     }
 
     fn test_member(path: &[u8], data: &[u8]) -> Vec<u8> {
+        let records =
+            crate::entry_metadata::portable_primary_pax(path, 0o644, "other", false).unwrap();
+        let pax = crate::entry_metadata::encode_canonical_pax(&records).unwrap();
         let mut out = Vec::new();
-        out.extend_from_slice(&test_tar_header(path, data.len() as u64));
+        out.extend_from_slice(&test_tar_header(
+            b"TZAP-PAX/PRIMARY",
+            pax.len() as u64,
+            0,
+            b'x',
+        ));
+        out.extend_from_slice(&pax);
+        out.resize(out.len() + padding_to_512(pax.len()), 0);
+        out.extend_from_slice(&test_tar_header(path, data.len() as u64, 0o644, b'0'));
         out.extend_from_slice(data);
         out.resize(out.len() + padding_to_512(data.len()), 0);
         out
     }
 
-    fn test_tar_header(path: &[u8], size: u64) -> [u8; 512] {
+    fn test_tar_header(path: &[u8], size: u64, mode: u64, typeflag: u8) -> [u8; 512] {
         let mut header = [0u8; 512];
         header[..path.len()].copy_from_slice(path);
-        write_test_tar_octal(&mut header[100..108], 0o644);
+        write_test_tar_octal(&mut header[100..108], mode);
         write_test_tar_octal(&mut header[108..116], 0);
         write_test_tar_octal(&mut header[116..124], 0);
         write_test_tar_octal(&mut header[124..136], size);
         write_test_tar_octal(&mut header[136..148], 0);
         header[148..156].fill(b' ');
-        header[156] = b'0';
+        header[156] = typeflag;
         header[257..263].copy_from_slice(b"ustar\0");
         header[263..265].copy_from_slice(b"00");
         let checksum = header.iter().map(|byte| *byte as u64).sum::<u64>();
