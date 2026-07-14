@@ -476,6 +476,8 @@ pub struct PortableMetadataMirror {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberMetadata {
     pub declaration: MetadataDeclaration,
+    /// Authenticated canonical primary PAX records retained for native restore.
+    pub primary_records: PaxRecords,
     pub auxiliary: Vec<AuxiliaryRecord>,
     pub file_entry_flags: u32,
     pub sparse_layout: Option<SparseLayout>,
@@ -763,7 +765,9 @@ pub fn parse_primary_metadata(records: &PaxRecords) -> Result<PrimaryMetadata, F
     let requires_system_restore = owner_kind_posix
         || portable_mode & 0o6000 != 0
         || windows_stream_security
-        || xattr_names.iter().any(|name| system_xattr_namespace(name))
+        || xattr_names
+            .iter()
+            .any(|name| system_xattr_namespace(name, &declaration.source_os))
         || has_no_change_flags(records)?
         || records.keys().any(is_system_primary_key);
     Ok(PrimaryMetadata {
@@ -1714,8 +1718,11 @@ fn validate_profile_owned_primary_fields(
     Ok(())
 }
 
-fn system_xattr_namespace(name: &[u8]) -> bool {
-    name.starts_with(b"security.") || name.starts_with(b"trusted.") || name.starts_with(b"system.")
+fn system_xattr_namespace(name: &[u8], source_os: &str) -> bool {
+    name.starts_with(b"security.")
+        || name.starts_with(b"trusted.")
+        || name.starts_with(b"system.")
+        || (source_os == "linux" && !name.starts_with(b"user.") && !name.starts_with(b"com.apple."))
 }
 
 fn validate_builtin_auxiliary(record: &AuxiliaryRecord) -> Result<(), FormatError> {
@@ -2270,7 +2277,7 @@ fn decode_auxiliary_name(encoding: &str, value: &[u8]) -> Result<Vec<u8>, Format
     }
 }
 
-fn canonical_base64_decode(value: &[u8]) -> Result<Vec<u8>, FormatError> {
+pub fn canonical_base64_decode(value: &[u8]) -> Result<Vec<u8>, FormatError> {
     if value.contains(&b'=') || value.iter().any(|byte| base64_value(*byte).is_none()) {
         return invalid("Base64", "encoding is not unpadded RFC 4648 base64");
     }
@@ -2314,6 +2321,29 @@ fn canonical_base64_decode(value: &[u8]) -> Result<Vec<u8>, FormatError> {
     Ok(out)
 }
 
+pub fn canonical_base64_encode(value: &[u8]) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(value.len().div_ceil(3) * 4);
+    let mut chunks = value.chunks_exact(3);
+    for chunk in &mut chunks {
+        out.push(ALPHABET[(chunk[0] >> 2) as usize]);
+        out.push(ALPHABET[(((chunk[0] & 3) << 4) | (chunk[1] >> 4)) as usize]);
+        out.push(ALPHABET[(((chunk[1] & 15) << 2) | (chunk[2] >> 6)) as usize]);
+        out.push(ALPHABET[(chunk[2] & 63) as usize]);
+    }
+    let remainder = chunks.remainder();
+    if let Some(&a) = remainder.first() {
+        out.push(ALPHABET[(a >> 2) as usize]);
+        if let Some(&b) = remainder.get(1) {
+            out.push(ALPHABET[(((a & 3) << 4) | (b >> 4)) as usize]);
+            out.push(ALPHABET[((b & 15) << 2) as usize]);
+        } else {
+            out.push(ALPHABET[((a & 3) << 4) as usize]);
+        }
+    }
+    out
+}
+
 fn base64_value(byte: u8) -> Option<u8> {
     match byte {
         b'A'..=b'Z' => Some(byte - b'A'),
@@ -2325,7 +2355,7 @@ fn base64_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn decode_percent_name(value: &[u8]) -> Result<Vec<u8>, FormatError> {
+pub fn decode_percent_name(value: &[u8]) -> Result<Vec<u8>, FormatError> {
     let mut out = Vec::with_capacity(value.len());
     let mut cursor = 0usize;
     while cursor < value.len() {
@@ -2352,6 +2382,125 @@ fn decode_percent_name(value: &[u8]) -> Result<Vec<u8>, FormatError> {
             out.push(byte);
             cursor += 1;
         }
+    }
+    Ok(out)
+}
+
+pub fn encode_percent_name(value: &[u8]) -> Result<String, FormatError> {
+    if value.is_empty() || value.contains(&0) {
+        return invalid("XattrName", "xattr name is empty or contains NUL");
+    }
+    let mut out = String::with_capacity(value.len());
+    for &byte in value {
+        if (0x21..=0x7e).contains(&byte) && byte != b'%' && byte != b'=' {
+            out.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut out, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    Ok(out)
+}
+
+/// Convert Linux's version-2 POSIX ACL xattr ABI into v45 canonical SCHILY
+/// POSIX.1e text. Numeric qualifiers are retained without name-service lookup.
+pub fn linux_posix_acl_xattr_to_schily(value: &[u8]) -> Result<Vec<u8>, FormatError> {
+    if value.len() < 4 || (value.len() - 4) % 8 != 0 || value[..4] != 2u32.to_le_bytes() {
+        return invalid("LinuxAcl", "invalid POSIX ACL xattr framing");
+    }
+    let mut entries = Vec::new();
+    for entry in value[4..].chunks_exact(8) {
+        let tag = u16::from_le_bytes([entry[0], entry[1]]);
+        let permissions = u16::from_le_bytes([entry[2], entry[3]]);
+        let id = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+        if permissions & !7 != 0 {
+            return invalid("LinuxAcl", "invalid POSIX ACL permissions");
+        }
+        let perms = format!(
+            "{}{}{}",
+            if permissions & 4 != 0 { 'r' } else { '-' },
+            if permissions & 2 != 0 { 'w' } else { '-' },
+            if permissions & 1 != 0 { 'x' } else { '-' },
+        );
+        let (category, text) = match tag {
+            0x01 if id == u32::MAX => (0, format!("user::{perms}")),
+            0x04 if id == u32::MAX => (1, format!("group::{perms}")),
+            0x20 if id == u32::MAX => (2, format!("other::{perms}")),
+            0x02 if id != u32::MAX => (3, format!("user:{id}:{perms}")),
+            0x08 if id != u32::MAX => (4, format!("group:{id}:{perms}")),
+            0x10 if id == u32::MAX => (5, format!("mask::{perms}")),
+            _ => return invalid("LinuxAcl", "invalid POSIX ACL tag or qualifier"),
+        };
+        let qualifier = if matches!(category, 3 | 4) { id } else { 0 };
+        entries.push((category, qualifier, text));
+    }
+    entries.sort_by_key(|(category, qualifier, _)| (*category, *qualifier));
+    let text = entries
+        .into_iter()
+        .map(|(_, _, text)| text)
+        .collect::<Vec<_>>()
+        .join(",")
+        .into_bytes();
+    validate_posix_acl_text(&text)?;
+    Ok(text)
+}
+
+/// Convert canonical v45 SCHILY POSIX.1e text to Linux's version-2 POSIX ACL
+/// xattr ABI without consulting host user/group databases.
+pub fn schily_posix_acl_to_linux_xattr(value: &[u8]) -> Result<Vec<u8>, FormatError> {
+    validate_posix_acl_text(value)?;
+    let text = std::str::from_utf8(value)
+        .map_err(|_| FormatError::InvalidArchive("ACL text is not UTF-8"))?;
+    let mut entries = Vec::new();
+    for tuple in text.split(',') {
+        let fields = tuple.split(':').collect::<Vec<_>>();
+        let permissions = fields[2]
+            .bytes()
+            .enumerate()
+            .fold(0u16, |bits, (index, byte)| {
+                bits | if byte != b'-' { 4 >> index } else { 0 }
+            });
+        let numeric_id = |name: &str| {
+            name.parse::<u32>().or_else(|_| {
+                fields
+                    .get(3)
+                    .ok_or(())
+                    .and_then(|id| id.parse::<u32>().map_err(|_| ()))
+            })
+        };
+        let (rank, tag, id) = match (fields[0], fields[1]) {
+            ("user", "") => (0, 0x01u16, u32::MAX),
+            ("user", id) => (
+                1,
+                0x02,
+                numeric_id(id).map_err(|_| {
+                    FormatError::ReaderUnsupported(
+                        "named ACL principals require numeric qualifiers",
+                    )
+                })?,
+            ),
+            ("group", "") => (2, 0x04, u32::MAX),
+            ("group", id) => (
+                3,
+                0x08,
+                numeric_id(id).map_err(|_| {
+                    FormatError::ReaderUnsupported(
+                        "named ACL principals require numeric qualifiers",
+                    )
+                })?,
+            ),
+            ("mask", "") => (4, 0x10, u32::MAX),
+            ("other", "") => (5, 0x20, u32::MAX),
+            _ => return invalid("LinuxAcl", "unsupported POSIX ACL tuple"),
+        };
+        entries.push((rank, id, tag, permissions));
+    }
+    entries.sort_by_key(|(rank, id, _, _)| (*rank, *id));
+    let mut out = 2u32.to_le_bytes().to_vec();
+    for (_, id, tag, permissions) in entries {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&permissions.to_le_bytes());
+        out.extend_from_slice(&id.to_le_bytes());
     }
     Ok(out)
 }
@@ -2727,6 +2876,14 @@ mod tests {
         adjacent.resize(512, 0);
         adjacent.extend_from_slice(b"abcd");
         assert!(parse_sparse_payload(&adjacent, 4).is_err());
+    }
+
+    #[test]
+    fn linux_posix_acl_binary_and_canonical_text_round_trip() {
+        let text = b"user::rw-,group::r--,other::---,user:123:r--,mask::r--";
+        let binary = schily_posix_acl_to_linux_xattr(text).unwrap();
+        assert_eq!(&binary[..4], &2u32.to_le_bytes());
+        assert_eq!(linux_posix_acl_xattr_to_schily(&binary).unwrap(), text);
     }
 
     #[test]

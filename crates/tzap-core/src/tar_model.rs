@@ -8,16 +8,20 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use unicode_normalization::UnicodeNormalization;
 
+#[cfg(target_os = "linux")]
+use crate::entry_metadata::schily_posix_acl_to_linux_xattr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 use crate::entry_metadata::{
-    parse_auxiliary_record, parse_canonical_pax, parse_primary_metadata, parse_sparse_payload,
-    validate_group_metadata, ArchiveTimestamp, AuxiliaryRecord, AuxiliaryStreamValidator,
-    CaptureReportRow, CaptureStatus, MemberMetadata, PaxRecords, PortableMetadataMirror,
-    PrimaryMetadata, RestoreClass, RestorePolicy, SparseStreamValidator, CAPTURE_REPORT_KIND,
-    HAS_NATIVE_METADATA, HAS_SPARSE_EXTENTS, MAX_AGGREGATE_PAX_PAYLOAD, MAX_LOCAL_PAX_PAYLOAD,
-    REQUIRES_SYSTEM_RESTORE,
+    canonical_base64_decode, decode_percent_name, parse_auxiliary_record, parse_canonical_pax,
+    parse_primary_metadata, parse_sparse_payload, validate_group_metadata, ArchiveTimestamp,
+    AuxiliaryRecord, AuxiliaryStreamValidator, CaptureReportRow, CaptureStatus, MemberMetadata,
+    PaxRecords, PortableMetadataMirror, PrimaryMetadata, RestoreClass, RestorePolicy,
+    SparseStreamValidator, CAPTURE_REPORT_KIND, HAS_NATIVE_METADATA, HAS_SPARSE_EXTENTS,
+    MAX_AGGREGATE_PAX_PAYLOAD, MAX_LOCAL_PAX_PAYLOAD, REQUIRES_SYSTEM_RESTORE,
 };
 use crate::format::{ExtractError, FormatError};
 use crate::metadata::validate_file_path_bytes;
@@ -650,6 +654,7 @@ pub fn parse_tar_member_group<'a>(
                 let mtime = decoded_mtime(&primary, header)?;
                 let v45_metadata = MemberMetadata {
                     declaration: primary.declaration.clone(),
+                    primary_records: records.clone(),
                     auxiliary,
                     file_entry_flags,
                     sparse_layout,
@@ -1855,6 +1860,7 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
                     reparse_placeholder,
                     v45_metadata: MemberMetadata {
                         declaration: primary.declaration.clone(),
+                        primary_records: records.clone(),
                         auxiliary: metadata.auxiliary.clone(),
                         file_entry_flags,
                         sparse_layout: None,
@@ -2033,19 +2039,7 @@ pub(crate) fn validate_owned_restore_plan(
                 "restore plan contains duplicate selected paths",
             ));
         }
-        let metadata = member
-            .v45_metadata
-            .as_ref()
-            .ok_or(FormatError::InvalidArchive(
-                "revision-45 member metadata is missing",
-            ))?;
-        plan_restore(
-            &member.path,
-            metadata,
-            member.kind,
-            member.reparse_placeholder,
-            options,
-        )?;
+        plan_owned_member_restore(member, options)?;
     }
     for member in selected.values() {
         if member.kind == TarEntryKind::Hardlink {
@@ -2094,6 +2088,25 @@ pub(crate) fn validate_owned_restore_plan(
         }
     }
     Ok(())
+}
+
+pub(crate) fn plan_owned_member_restore(
+    member: &OwnedTarMember,
+    options: SafeExtractionOptions,
+) -> Result<Vec<MetadataDiagnostic>, FormatError> {
+    let metadata = member
+        .v45_metadata
+        .as_ref()
+        .ok_or(FormatError::InvalidArchive(
+            "revision-45 member metadata is missing",
+        ))?;
+    plan_restore(
+        &member.path,
+        metadata,
+        member.kind,
+        member.reparse_placeholder,
+        options,
+    )
 }
 
 pub(crate) fn restore_phase(member: &OwnedTarMember) -> u8 {
@@ -2554,6 +2567,7 @@ where
                     reparse_placeholder,
                     v45_metadata: MemberMetadata {
                         declaration: primary.declaration.clone(),
+                        primary_records: records.clone(),
                         auxiliary: auxiliary.clone(),
                         file_entry_flags,
                         sparse_layout: None,
@@ -2890,6 +2904,23 @@ fn plan_restore(
             )
             .for_restore(options.restore_policy, 4),
         );
+    } else if metadata.declaration.owner_kind_posix && !numeric_ownership_supported(metadata) {
+        if !options.allow_degraded {
+            return Err(FormatError::ReaderUnsupported(
+                "numeric ownership cannot be represented on this host",
+            ));
+        }
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                "numeric-ownership",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Unsupported,
+                "numeric ownership cannot be represented on this host",
+            )
+            .for_restore(options.restore_policy, 4),
+        );
     }
     if metadata.declaration.portable_mode & 0o6000 != 0
         && options.restore_policy != RestorePolicy::System
@@ -2947,6 +2978,47 @@ fn plan_restore(
         RestorePolicy::SameOs | RestorePolicy::System
     );
     let requests_system = options.restore_policy == RestorePolicy::System;
+    if requests_same_os && !requests_system {
+        for key in metadata
+            .primary_records
+            .keys()
+            .filter(|key| key.starts_with("LIBARCHIVE.xattr."))
+        {
+            let name = decode_percent_name(&key.as_bytes()["LIBARCHIVE.xattr.".len()..])?;
+            if system_xattr_name(&name, &metadata.declaration.source_os) {
+                diagnostics.push(
+                    MetadataDiagnostic::new(
+                        path,
+                        "linux-backup-v1",
+                        "system-extended-attribute",
+                        MetadataOperation::Plan,
+                        MetadataDiagnosticStatus::Skipped,
+                        "system-class extended attribute is outside same-os restore policy",
+                    )
+                    .for_restore(options.restore_policy, 4),
+                );
+            }
+        }
+        if metadata
+            .primary_records
+            .get("TZAP.linux.fsflags")
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+            .is_some_and(|flags| flags & 0x30 != 0)
+        {
+            diagnostics.push(
+                MetadataDiagnostic::new(
+                    path,
+                    "linux-backup-v1",
+                    "no-change-inode-flags",
+                    MetadataOperation::Plan,
+                    MetadataDiagnosticStatus::Skipped,
+                    "immutable/append-only inode flags are outside same-os restore policy",
+                )
+                .for_restore(options.restore_policy, 4),
+            );
+        }
+    }
     let profile_is_required = |profile: &str| {
         metadata
             .declaration
@@ -2975,13 +3047,17 @@ fn plan_restore(
             .required_profiles
             .iter()
             .any(|profile| profile != "portable-v1");
+    let unsupported_primary_same_os = native_primary_restore_unsupported(metadata, false);
+    let unsupported_primary_system = native_primary_restore_unsupported(metadata, true);
     let unsupported_same_os = metadata.auxiliary.iter().any(|record| {
         record.restore_class == RestoreClass::SameOs && profile_is_required(&record.profile)
-    }) || required_native_scalar;
+    }) || (required_native_scalar && unsupported_primary_same_os);
     let unsupported_system = metadata.auxiliary.iter().any(|record| {
         record.restore_class == RestoreClass::System && profile_is_required(&record.profile)
-    }) || (metadata.primary_requires_system_restore
-        && (metadata.declaration.owner_kind_posix || required_native_scalar || !cfg!(unix)))
+    }) || (metadata.declaration.owner_kind_posix
+        && !numeric_ownership_supported(metadata))
+        || (metadata.declaration.portable_mode & 0o6000 != 0 && !cfg!(unix))
+        || (required_native_scalar && unsupported_primary_system)
         || reparse_placeholder
         || matches!(
             kind,
@@ -3026,7 +3102,11 @@ fn plan_restore(
             ),
         );
     }
-    if requests_same_os && metadata.primary_has_native_scalar && !required_native_scalar {
+    if requests_same_os
+        && metadata.primary_has_native_scalar
+        && !required_native_scalar
+        && native_primary_restore_unsupported(metadata, requests_system)
+    {
         diagnostics.push(
             MetadataDiagnostic::new(
                 path,
@@ -3085,6 +3165,56 @@ fn plan_restore(
         }
     }
     Ok(diagnostics)
+}
+
+fn native_primary_restore_unsupported(metadata: &MemberMetadata, include_system: bool) -> bool {
+    metadata.primary_records.keys().any(|key| {
+        let native = key.starts_with("TZAP.linux.")
+            || key.starts_with("TZAP.macos.")
+            || key.starts_with("TZAP.windows.")
+            || key.starts_with("TZAP.posix.")
+            || key.starts_with("LIBARCHIVE.")
+            || key.starts_with("SCHILY.")
+            || key == "TZAP.unix.ctime-observed";
+        if !native {
+            return false;
+        }
+        if key == "TZAP.unix.ctime-observed" {
+            return false;
+        }
+        if key == "TZAP.linux.fsflags" {
+            return !cfg!(target_os = "linux");
+        }
+        if key.starts_with("SCHILY.acl.") || key.starts_with("TZAP.acl.") {
+            return !cfg!(target_os = "linux");
+        }
+        if let Some(encoded_name) = key.strip_prefix("LIBARCHIVE.xattr.") {
+            let system = decode_percent_name(encoded_name.as_bytes())
+                .ok()
+                .is_some_and(|name| system_xattr_name(&name, &metadata.declaration.source_os));
+            return !cfg!(unix) && (!system || include_system);
+        }
+        true
+    })
+}
+
+#[cfg(unix)]
+fn numeric_ownership_supported(metadata: &MemberMetadata) -> bool {
+    metadata
+        .portable_mirror
+        .uid
+        .and_then(|uid| libc::uid_t::try_from(uid).ok())
+        .is_some()
+        && metadata
+            .portable_mirror
+            .gid
+            .and_then(|gid| libc::gid_t::try_from(gid).ok())
+            .is_some()
+}
+
+#[cfg(not(unix))]
+fn numeric_ownership_supported(_metadata: &MemberMetadata) -> bool {
+    false
 }
 
 pub(crate) fn metadata_verification_report(
@@ -3331,6 +3461,7 @@ impl<'a> FilesystemRestoreHandler<'a> {
                 &file,
                 &member.path,
                 RestoredRegularMetadata::from(&member.v45_metadata.portable_mirror),
+                Some(&member.v45_metadata),
                 self.options,
                 &mut diagnostics,
             ) {
@@ -3787,6 +3918,36 @@ fn restore_tar_member(
     Ok(diagnostics)
 }
 
+pub(crate) fn restore_regular_file_metadata_to_open_file(
+    file: &fs::File,
+    member: &OwnedTarMember,
+    options: SafeExtractionOptions,
+) -> Result<Vec<MetadataDiagnostic>, FormatError> {
+    if member.kind != TarEntryKind::Regular {
+        return Err(FormatError::ReaderUnsupported(
+            "open-file metadata restore requires a regular archive member",
+        ));
+    }
+    let metadata = member
+        .v45_metadata
+        .as_ref()
+        .ok_or(FormatError::InvalidArchive(
+            "revision-45 member metadata is missing",
+        ))?;
+    let mut diagnostics = plan_owned_member_restore(member, options)?;
+    if options.restore_policy != RestorePolicy::Content {
+        apply_restored_regular_file_metadata_parts(
+            file,
+            &member.path,
+            RestoredRegularMetadata::from(&metadata.portable_mirror),
+            Some(metadata),
+            options,
+            &mut diagnostics,
+        )?;
+    }
+    Ok(diagnostics)
+}
+
 #[cfg(test)]
 fn apply_restored_regular_file_metadata(
     file: &fs::File,
@@ -3794,16 +3955,27 @@ fn apply_restored_regular_file_metadata(
     options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Result<(), FormatError> {
-    let metadata = member.v45_metadata.as_ref().map_or(
+    if member.v45_metadata.is_some() {
+        diagnostics.extend(restore_regular_file_metadata_to_open_file(
+            file, member, options,
+        )?);
+        return Ok(());
+    }
+    apply_restored_regular_file_metadata_parts(
+        file,
+        &member.path,
         RestoredRegularMetadata {
             mode: member.mode,
             mtime: (member.mtime.seconds, member.mtime.nanoseconds),
             attributes: None,
             mode_origin_native: false,
+            uid: None,
+            gid: None,
         },
-        |metadata| RestoredRegularMetadata::from(&metadata.portable_mirror),
-    );
-    apply_restored_regular_file_metadata_parts(file, &member.path, metadata, options, diagnostics)
+        None,
+        options,
+        diagnostics,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -3812,6 +3984,8 @@ struct RestoredRegularMetadata {
     mtime: (i64, u32),
     attributes: Option<u32>,
     mode_origin_native: bool,
+    uid: Option<u64>,
+    gid: Option<u64>,
 }
 
 impl From<&PortableMetadataMirror> for RestoredRegularMetadata {
@@ -3821,6 +3995,8 @@ impl From<&PortableMetadataMirror> for RestoredRegularMetadata {
             mtime: metadata.mtime,
             attributes: metadata.attributes,
             mode_origin_native: metadata.mode_origin_native,
+            uid: metadata.uid,
+            gid: metadata.gid,
         }
     }
 }
@@ -3829,6 +4005,7 @@ fn apply_restored_regular_file_metadata_parts(
     file: &fs::File,
     path: &[u8],
     metadata: RestoredRegularMetadata,
+    member_metadata: Option<&MemberMetadata>,
     options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Result<(), FormatError> {
@@ -3837,15 +4014,291 @@ fn apply_restored_regular_file_metadata_parts(
         mtime,
         attributes,
         mode_origin_native,
+        uid,
+        gid,
     } = metadata;
+    apply_regular_file_ownership(file, path, uid, gid, options, diagnostics)?;
     let mode = if options.restore_policy == RestorePolicy::System && options.system_authorized {
         mode
     } else {
         mode & !0o6000
     };
     apply_regular_file_mode(file, path, mode, mode_origin_native, options, diagnostics)?;
+    if let Some(member_metadata) = member_metadata {
+        apply_regular_file_posix_acl(file, path, member_metadata, options, diagnostics)?;
+        apply_regular_file_xattrs(file, path, member_metadata, options, diagnostics)?;
+    }
     apply_regular_file_mtime(file, path, mtime, options, diagnostics)?;
-    apply_regular_file_attributes(file, path, attributes, options, diagnostics)
+    apply_regular_file_attributes(file, path, attributes, options, diagnostics)?;
+    if let Some(member_metadata) = member_metadata {
+        apply_linux_inode_flags(file, path, member_metadata, options, diagnostics)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_linux_inode_flags(
+    file: &fs::File,
+    path: &[u8],
+    metadata: &MemberMetadata,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    let Some(encoded) = metadata.primary_records.get("TZAP.linux.fsflags") else {
+        return Ok(());
+    };
+    let text = std::str::from_utf8(encoded)
+        .map_err(|_| FormatError::InvalidArchive("Linux inode flags are not ASCII"))?;
+    let desired = u64::from_str_radix(text, 16)
+        .map_err(|_| FormatError::InvalidArchive("Linux inode flags are invalid"))?;
+    let no_change = desired
+        & u64::from(linux_raw_sys::general::FS_IMMUTABLE_FL | linux_raw_sys::general::FS_APPEND_FL)
+        != 0;
+    if !matches!(
+        options.restore_policy,
+        RestorePolicy::SameOs | RestorePolicy::System
+    ) || (no_change
+        && !(options.restore_policy == RestorePolicy::System && options.system_authorized))
+    {
+        return Ok(());
+    }
+    let mut current: libc::c_long = 0;
+    // SAFETY: these ioctls read/write one c_long through valid pointers and
+    // operate on the live descriptor owned by `file`.
+    let get_result = unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            linux_raw_sys::ioctl::FS_IOC_GETFLAGS as libc::c_ulong,
+            &mut current,
+        )
+    };
+    if get_result == 0 {
+        let modifiable = u64::from(linux_raw_sys::general::FS_FL_USER_MODIFIABLE);
+        let mut restored =
+            ((current as u64 & !modifiable) | (desired & modifiable)) as libc::c_long;
+        // SAFETY: as above, SETFLAGS reads the initialized c_long value.
+        if unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                linux_raw_sys::ioctl::FS_IOC_SETFLAGS as libc::c_ulong,
+                &mut restored,
+            )
+        } == 0
+        {
+            return Ok(());
+        }
+    }
+    let error = std::io::Error::last_os_error();
+    record_metadata_application_failure(
+        diagnostics,
+        MetadataDiagnostic::new(
+            path,
+            "linux-backup-v1",
+            "inode-flags",
+            MetadataOperation::Restore,
+            MetadataDiagnosticStatus::Failed,
+            "failed to apply Linux inode flags",
+        )
+        .for_restore(options.restore_policy, 4)
+        .with_native_error(&error),
+        options,
+        "failed to apply Linux inode flags",
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_linux_inode_flags(
+    _file: &fs::File,
+    _path: &[u8],
+    _metadata: &MemberMetadata,
+    _options: SafeExtractionOptions,
+    _diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_regular_file_posix_acl(
+    file: &fs::File,
+    path: &[u8],
+    metadata: &MemberMetadata,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use xattr::FileExt as _;
+
+    if !matches!(
+        options.restore_policy,
+        RestorePolicy::SameOs | RestorePolicy::System
+    ) {
+        return Ok(());
+    }
+    for (key, name) in [
+        ("SCHILY.acl.access", "system.posix_acl_access"),
+        ("SCHILY.acl.default", "system.posix_acl_default"),
+    ] {
+        let Some(text) = metadata.primary_records.get(key) else {
+            continue;
+        };
+        let value = schily_posix_acl_to_linux_xattr(text)?;
+        if let Err(error) = file.set_xattr(name, &value) {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    "posix-backup-v1",
+                    "posix-acl",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "failed to apply POSIX ACL",
+                )
+                .for_restore(options.restore_policy, 4)
+                .with_native_error(&error),
+                options,
+                "failed to apply POSIX ACL",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_regular_file_posix_acl(
+    _file: &fs::File,
+    _path: &[u8],
+    _metadata: &MemberMetadata,
+    _options: SafeExtractionOptions,
+    _diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn apply_regular_file_xattrs(
+    file: &fs::File,
+    path: &[u8],
+    metadata: &MemberMetadata,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use xattr::FileExt as _;
+
+    if !matches!(
+        options.restore_policy,
+        RestorePolicy::SameOs | RestorePolicy::System
+    ) {
+        return Ok(());
+    }
+    for (key, encoded) in metadata
+        .primary_records
+        .iter()
+        .filter(|(key, _)| key.starts_with("LIBARCHIVE.xattr."))
+    {
+        let name = decode_percent_name(&key.as_bytes()["LIBARCHIVE.xattr.".len()..])?;
+        let system = system_xattr_name(&name, &metadata.declaration.source_os);
+        if system && !(options.restore_policy == RestorePolicy::System && options.system_authorized)
+        {
+            continue;
+        }
+        let value = canonical_base64_decode(encoded)?;
+        if let Err(error) = file.set_xattr(OsStr::from_bytes(&name), &value) {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    if system {
+                        "linux-backup-v1"
+                    } else {
+                        "posix-backup-v1"
+                    },
+                    "extended-attribute",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "failed to apply extended attribute",
+                )
+                .for_restore(options.restore_policy, 4)
+                .with_native_error(&error),
+                options,
+                "failed to apply extended attribute",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_regular_file_xattrs(
+    _file: &fs::File,
+    _path: &[u8],
+    _metadata: &MemberMetadata,
+    _options: SafeExtractionOptions,
+    _diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    Ok(())
+}
+
+fn system_xattr_name(name: &[u8], source_os: &str) -> bool {
+    name.starts_with(b"security.")
+        || name.starts_with(b"trusted.")
+        || name.starts_with(b"system.")
+        || (source_os == "linux" && !name.starts_with(b"user.") && !name.starts_with(b"com.apple."))
+}
+
+#[cfg(unix)]
+fn apply_regular_file_ownership(
+    file: &fs::File,
+    path: &[u8],
+    uid: Option<u64>,
+    gid: Option<u64>,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    if options.restore_policy != RestorePolicy::System || !options.system_authorized {
+        return Ok(());
+    }
+    let (Some(uid), Some(gid)) = (uid, gid) else {
+        return Ok(());
+    };
+    let uid = libc::uid_t::try_from(uid)
+        .map_err(|_| FormatError::FilesystemExtractionFailed("archived UID exceeds host uid_t"))?;
+    let gid = libc::gid_t::try_from(gid)
+        .map_err(|_| FormatError::FilesystemExtractionFailed("archived GID exceeds host gid_t"))?;
+
+    // SAFETY: fchown only observes the valid descriptor owned by `file`; both
+    // numeric arguments were range-checked for this host ABI.
+    if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                "numeric-ownership",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to apply numeric ownership",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "failed to apply numeric ownership",
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_regular_file_ownership(
+    _file: &fs::File,
+    _path: &[u8],
+    _uid: Option<u64>,
+    _gid: Option<u64>,
+    _options: SafeExtractionOptions,
+    _diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    Ok(())
 }
 
 #[cfg(windows)]

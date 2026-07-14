@@ -3103,9 +3103,16 @@ fn cli_verify_json_success_reports_machine_readable_summary() {
     assert_eq!(archives[0].as_str().unwrap(), archive.to_str().unwrap());
     let metadata = value.get("metadata").unwrap();
     assert!(metadata.get("capture_complete").unwrap().as_bool().unwrap());
+    let expected_profiles = if cfg!(target_os = "linux") {
+        serde_json::json!(["linux-backup-v1", "portable-v1", "posix-backup-v1"])
+    } else if cfg!(unix) {
+        serde_json::json!(["portable-v1", "posix-backup-v1"])
+    } else {
+        serde_json::json!(["portable-v1"])
+    };
     assert_eq!(
         metadata.get("profiles_present").unwrap(),
-        &serde_json::json!(["portable-v1"])
+        &expected_profiles
     );
     let metadata_entries = metadata.get("entries").unwrap().as_array().unwrap();
     assert_eq!(metadata_entries.len(), 1);
@@ -6807,7 +6814,7 @@ fn cli_list_with_long_output_includes_kind_mode_mtime() {
 #[cfg(unix)]
 #[test]
 fn cli_list_with_long_output_preserves_unix_mode_bits() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let temp = tempdir().unwrap();
     let input = temp.path().join("script.sh");
@@ -6819,6 +6826,12 @@ fn cli_list_with_long_output_preserves_unix_mode_bits() {
     let mut permissions = fs::metadata(&input).unwrap().permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(&input, permissions).unwrap();
+    let source_metadata = fs::metadata(&input).unwrap();
+    let expected_mtime = format!(
+        "{}.{:09}",
+        source_metadata.mtime(),
+        source_metadata.mtime_nsec()
+    );
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -6844,7 +6857,9 @@ fn cli_list_with_long_output_preserves_unix_mode_bits() {
         ])
         .assert()
         .success()
-        .stdout(predicate::eq("11\tfile\t448\t0\tscript.sh\n"));
+        .stdout(predicate::eq(format!(
+            "11\tfile\t448\t{expected_mtime}\tscript.sh\n"
+        )));
 }
 
 #[test]
@@ -6896,7 +6911,11 @@ fn cli_list_outputs_stable_json() {
     assert_eq!(file.get("path").unwrap().as_str().unwrap(), "json.txt");
     assert_eq!(file.get("name").unwrap().as_str().unwrap(), "json.txt");
     assert_eq!(file.get("size").unwrap().as_u64().unwrap(), 12);
-    assert_eq!(file.get("flags").unwrap().as_u64().unwrap(), 1);
+    let flags = file.get("flags").unwrap().as_u64().unwrap();
+    assert_eq!(flags & 1, 1);
+    if cfg!(unix) {
+        assert_ne!(flags, 1, "native metadata flags should be present on Unix");
+    }
     assert!(file.get("path_hash").unwrap().as_str().unwrap().len() == 16);
     assert!(file.get("tar_member_group_size").unwrap().as_u64().unwrap() >= 1536);
     assert_eq!(file.get("first_frame_index").unwrap().as_u64().unwrap(), 0);

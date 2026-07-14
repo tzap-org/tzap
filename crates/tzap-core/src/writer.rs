@@ -17,8 +17,9 @@ use crate::crypto::{
     Subkeys,
 };
 use crate::entry_metadata::{
-    encode_canonical_pax, is_source_os, portable_primary_pax, valid_filesystem_token,
-    ArchiveTimestamp, EXTENDED_METADATA_V1, REQUIRES_SYSTEM_RESTORE,
+    encode_canonical_pax, is_source_os, parse_primary_metadata, portable_primary_pax,
+    valid_filesystem_token, ArchiveTimestamp, EXTENDED_METADATA_V1, HAS_NATIVE_METADATA,
+    REQUIRES_SYSTEM_RESTORE,
 };
 use crate::fec::encode_parity_gf16;
 use crate::format::{
@@ -327,6 +328,18 @@ pub struct PortablePosixOwner {
     pub gname: Option<String>,
 }
 
+/// Canonical v45 native metadata carried by the primary local-PAX record.
+///
+/// The writer validates the complete record set using the same parser as the
+/// reader. Callers supply only profile-owned native keys; portable identity,
+/// timestamps, paths, and the metadata declaration remain writer-owned.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NativeFileMetadata {
+    pub required_profiles: Vec<String>,
+    pub optional_profiles: Vec<String>,
+    pub primary_pax_records: BTreeMap<String, Vec<u8>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortableFileMetadata {
     pub source_os: String,
@@ -334,6 +347,7 @@ pub struct PortableFileMetadata {
     pub mode_origin: PortableModeOrigin,
     pub posix_owner: Option<PortablePosixOwner>,
     pub attributes: Option<u32>,
+    pub native: NativeFileMetadata,
 }
 
 impl Default for PortableFileMetadata {
@@ -344,6 +358,7 @@ impl Default for PortableFileMetadata {
             mode_origin: PortableModeOrigin::Projected,
             posix_owner: None,
             attributes: None,
+            native: NativeFileMetadata::default(),
         }
     }
 }
@@ -6556,6 +6571,7 @@ fn build_regular_file_member_prefix(
             format!("{attributes:08x}").into_bytes(),
         );
     }
+    merge_native_primary_metadata(&mut pax_records, &portable_metadata.native)?;
     let primary_identity = prepare_primary_tar_identity(&mut pax_records, portable_metadata)?;
     let header_mtime = if mtime.nanoseconds == 0 && mtime.seconds >= 0 {
         let seconds = mtime.seconds as u64;
@@ -6569,6 +6585,9 @@ fn build_regular_file_member_prefix(
         pax_records.insert("mtime".into(), mtime.canonical_pax_value()?);
         0
     };
+    parse_primary_metadata(&pax_records).map_err(|_| {
+        FormatError::WriterUnsupported("native primary metadata is not a valid v45 declaration")
+    })?;
     let pax_payload = encode_canonical_pax(&pax_records)?;
     let pax_header = build_ustar_header(b"TZAP-PAX/PRIMARY", pax_payload.len() as u64, 0, 0, b'x')?;
     out.extend_from_slice(&pax_header);
@@ -6585,6 +6604,57 @@ fn build_regular_file_member_prefix(
     apply_primary_tar_identity(&mut header, &primary_identity)?;
     out.extend_from_slice(&header);
     Ok(out)
+}
+
+fn merge_native_primary_metadata(
+    pax_records: &mut crate::entry_metadata::PaxRecords,
+    native: &NativeFileMetadata,
+) -> Result<(), FormatError> {
+    if native.required_profiles.is_empty()
+        && native.optional_profiles.is_empty()
+        && native.primary_pax_records.is_empty()
+    {
+        return Ok(());
+    }
+    let mut required = native.required_profiles.clone();
+    required.push("portable-v1".into());
+    required.sort();
+    required.dedup();
+    let mut optional = native.optional_profiles.clone();
+    optional.sort();
+    optional.dedup();
+    if required
+        .iter()
+        .any(|profile| optional.binary_search(profile).is_ok())
+    {
+        return Err(FormatError::WriterUnsupported(
+            "metadata profile is both required and optional",
+        ));
+    }
+    pax_records.insert(
+        "TZAP.metadata.required-profiles".into(),
+        required.join(",").into_bytes(),
+    );
+    pax_records.insert(
+        "TZAP.metadata.optional-profiles".into(),
+        optional.join(",").into_bytes(),
+    );
+    for (key, value) in &native.primary_pax_records {
+        if pax_records.contains_key(key)
+            || matches!(
+                key.as_str(),
+                "path" | "linkpath" | "size" | "uid" | "gid" | "uname" | "gname" | "mtime"
+            )
+            || key.starts_with("TZAP.metadata.")
+            || key.starts_with("TZAP.portable.")
+        {
+            return Err(FormatError::WriterUnsupported(
+                "native metadata collides with a writer-owned primary key",
+            ));
+        }
+        pax_records.insert(key.clone(), value.clone());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -6705,11 +6775,44 @@ fn path_requires_pax(path: &[u8]) -> bool {
 
 fn v45_portable_file_entry_flags(mode: u32, metadata: &PortableFileMetadata) -> u32 {
     EXTENDED_METADATA_V1
-        | if mode & 0o6000 != 0 || metadata.posix_owner.is_some() {
+        | if !metadata.native.required_profiles.is_empty()
+            || !metadata.native.optional_profiles.is_empty()
+            || !metadata.native.primary_pax_records.is_empty()
+        {
+            HAS_NATIVE_METADATA
+        } else {
+            0
+        }
+        | if mode & 0o6000 != 0
+            || metadata.posix_owner.is_some()
+            || native_metadata_requires_system_restore(&metadata.native, &metadata.source_os)
+        {
             REQUIRES_SYSTEM_RESTORE
         } else {
             0
         }
+}
+
+fn native_metadata_requires_system_restore(native: &NativeFileMetadata, source_os: &str) -> bool {
+    native.primary_pax_records.iter().any(|(key, value)| {
+        key.starts_with("TZAP.posix.device-")
+            || key == "TZAP.linux.whiteout"
+            || key == "TZAP.linux.project-id"
+            || key == "TZAP.windows.reparse-placeholder"
+            || key == "TZAP.windows.directory-case-sensitive"
+            || key.starts_with("LIBARCHIVE.xattr.security")
+            || key.starts_with("LIBARCHIVE.xattr.trusted")
+            || key.starts_with("LIBARCHIVE.xattr.system")
+            || (source_os == "linux"
+                && key.starts_with("LIBARCHIVE.xattr.")
+                && !key.starts_with("LIBARCHIVE.xattr.user.")
+                && !key.starts_with("LIBARCHIVE.xattr.com.apple."))
+            || (key == "TZAP.linux.fsflags"
+                && std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|value| u64::from_str_radix(value, 16).ok())
+                    .is_some_and(|flags| flags & 0x30 != 0))
+    })
 }
 
 fn build_ustar_header(
@@ -7388,6 +7491,7 @@ mod tests {
                 gname: Some("archive".into()),
             }),
             attributes: Some(1),
+            native: NativeFileMetadata::default(),
         };
         let group = build_regular_file_member_group(
             b"owned.txt",
@@ -7432,6 +7536,50 @@ mod tests {
             )
             .unwrap_err(),
             FormatError::WriterUnsupported("portable attributes contain reserved bits")
+        );
+    }
+
+    #[test]
+    fn regular_file_writer_emits_and_flags_valid_native_primary_metadata() {
+        let mut native = NativeFileMetadata {
+            required_profiles: vec!["posix-backup-v1".into()],
+            ..NativeFileMetadata::default()
+        };
+        native.primary_pax_records.insert(
+            "LIBARCHIVE.xattr.user.comment".into(),
+            crate::entry_metadata::canonical_base64_encode(b"preserved"),
+        );
+        let metadata = PortableFileMetadata {
+            source_os: "linux".into(),
+            source_filesystem: "ext4".into(),
+            native,
+            ..PortableFileMetadata::default()
+        };
+        let group = build_regular_file_member_group(
+            b"native.txt",
+            b"data",
+            0o640,
+            ArchiveTimestamp::UNIX_EPOCH,
+            &metadata,
+        )
+        .unwrap();
+        let parsed = parse_tar_member_group(&group, 4096).unwrap();
+
+        assert_eq!(
+            parsed.v45_metadata.declaration.required_profiles,
+            vec!["portable-v1", "posix-backup-v1"]
+        );
+        assert_eq!(
+            parsed
+                .v45_metadata
+                .primary_records
+                .get("LIBARCHIVE.xattr.user.comment")
+                .map(Vec::as_slice),
+            Some(b"cHJlc2VydmVk".as_slice())
+        );
+        assert_ne!(
+            parsed.v45_metadata.file_entry_flags & HAS_NATIVE_METADATA,
+            0
         );
     }
 

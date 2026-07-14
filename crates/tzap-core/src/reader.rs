@@ -37,13 +37,13 @@ use crate::root_auth::{
     CriticalMetadataDigestInputs, DataBlockMerkleLeaf, FecLayoutObjectRow,
 };
 use crate::tar_model::{
-    metadata_verification_report, parse_tar_member_group, restore_phase,
-    restore_streaming_tar_member_group, stream_regular_tar_member_group_to_writer,
-    validate_owned_restore_plan, validate_tar_stream_total_extraction_size, MetadataDiagnostic,
-    MetadataVerificationReport, NoopTarStreamObserver, OwnedTarMember, SafeExtractionOptions,
-    StreamingMemberExpectation, TarEntryKind, TarMemberGroupReader,
-    TarStreamFilesystemRestoreObserver, TarStreamObserver, TarStreamSummaryValidator,
-    TarStreamTotalExtractionSizeValidator,
+    metadata_verification_report, parse_tar_member_group, plan_owned_member_restore, restore_phase,
+    restore_regular_file_metadata_to_open_file, restore_streaming_tar_member_group,
+    stream_regular_tar_member_group_to_writer, validate_owned_restore_plan,
+    validate_tar_stream_total_extraction_size, MetadataDiagnostic, MetadataVerificationReport,
+    NoopTarStreamObserver, OwnedTarMember, SafeExtractionOptions, StreamingMemberExpectation,
+    TarEntryKind, TarMemberGroupReader, TarStreamFilesystemRestoreObserver, TarStreamObserver,
+    TarStreamSummaryValidator, TarStreamTotalExtractionSizeValidator,
 };
 use crate::wire::{
     compute_key_wrap_table_digest, BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage,
@@ -2095,6 +2095,30 @@ impl OpenedArchive {
             .collect()
     }
 
+    /// Validate metadata restoration for the final archive entries without
+    /// creating destination paths.
+    pub fn plan_metadata_restore(
+        &self,
+        options: SafeExtractionOptions,
+    ) -> Result<Vec<(String, Vec<MetadataDiagnostic>)>, FormatError> {
+        let shards = self.load_all_index_shards()?;
+        let mut planned = Vec::new();
+        for (path, winner) in final_index_entry_winners(&shards)? {
+            let member = self.decode_loaded_owned_tar_member(
+                &shards[winner.shard_index],
+                winner.file_index,
+                false,
+            )?;
+            planned.push((path, member));
+        }
+        let members: Vec<_> = planned.iter().map(|(_, member)| member).collect();
+        validate_owned_restore_plan(&members, options)?;
+        planned
+            .into_iter()
+            .map(|(path, member)| Ok((path, plan_owned_member_restore(&member, options)?)))
+            .collect()
+    }
+
     /// Return only the regular-file payload bytes for `path`.
     ///
     /// This is a payload-only convenience for callers that do not need tar
@@ -2169,6 +2193,31 @@ impl OpenedArchive {
                 )
             })
             .transpose()
+    }
+
+    /// Apply the selected restore policy's regular-file metadata to an already
+    /// materialized output file without rewriting its payload.
+    pub fn restore_file_metadata_to_open_file(
+        &self,
+        path: &str,
+        file: &File,
+        options: SafeExtractionOptions,
+    ) -> Result<Option<Vec<MetadataDiagnostic>>, FormatError> {
+        let normalized = normalize_lookup_file_path(path, self.crypto_header.max_path_length)?;
+        let normalized_path = std::str::from_utf8(&normalized)
+            .map_err(|_| FormatError::UnsafeArchivePath)?
+            .to_owned();
+        let shards = self.load_all_index_shards()?;
+        let winners = final_index_entry_winners(&shards)?;
+        let Some(requested) = winners.get(&normalized_path).copied() else {
+            return Ok(None);
+        };
+        let member = self.decode_loaded_owned_tar_member(
+            &shards[requested.shard_index],
+            requested.file_index,
+            false,
+        )?;
+        restore_regular_file_metadata_to_open_file(file, &member, options).map(Some)
     }
 
     pub fn extract_member(
@@ -10419,6 +10468,7 @@ mod tests {
     use super::*;
     use crate::compression::compress_zstd_frame;
     use crate::crypto::{compute_hmac, encrypt_padded_aead_object};
+    use crate::entry_metadata::RestorePolicy;
     use crate::fec::encode_parity_gf16;
     use crate::format::{
         AeadAlgo, CompressionAlgo, FecAlgo, KdfAlgo, CRYPTO_EXTENSION_HEADER_LEN,
@@ -10443,8 +10493,8 @@ mod tests {
         write_archive, write_archive_unencrypted, write_archive_with_dictionary,
         write_archive_with_kdf, write_archive_with_recipient_wrap_records,
         write_archive_with_root_auth, write_archive_with_root_auth_and_recipient_wrap_records,
-        PortableFileMetadata, PortableModeOrigin, PortablePosixOwner, RegularFile,
-        RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions,
+        NativeFileMetadata, PortableFileMetadata, PortableModeOrigin, PortablePosixOwner,
+        RegularFile, RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions,
     };
 
     fn master_key() -> MasterKey {
@@ -11807,6 +11857,7 @@ mod tests {
                         gname: Some("staff".into()),
                     }),
                     attributes: Some(1),
+                    native: Default::default(),
                 },
                 ..RegularFile::new("header-fields.txt", b"header metadata")
             },
@@ -11824,6 +11875,7 @@ mod tests {
                         gname: Some("g".repeat(40)),
                     }),
                     attributes: Some(2),
+                    native: Default::default(),
                 },
                 ..RegularFile::new("pax-overrides.txt", b"PAX metadata")
             },
@@ -12019,12 +12071,29 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn compressed_archive_extraction_restores_setid_bits_only_for_authorized_system_policy() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        // SAFETY: these process identity getters have no preconditions.
+        let uid = unsafe { libc::geteuid() } as u64;
+        let gid = unsafe { libc::getegid() } as u64;
 
         let archive = write_archive(
             &[RegularFile {
                 mode: 0o7751,
                 mtime: ArchiveTimestamp::from_seconds(1_700_000_000),
+                portable_metadata: PortableFileMetadata {
+                    source_os: "other-unix".into(),
+                    source_filesystem: "unknown".into(),
+                    mode_origin: PortableModeOrigin::Native,
+                    posix_owner: Some(PortablePosixOwner {
+                        uid,
+                        gid,
+                        uname: None,
+                        gname: None,
+                    }),
+                    attributes: None,
+                    native: Default::default(),
+                },
                 ..RegularFile::new("privileged.sh", b"#!/bin/sh\n")
             }],
             &master_key(),
@@ -12053,6 +12122,10 @@ mod tests {
             .unwrap();
         assert!(portable_diagnostics.iter().any(|diagnostic| {
             diagnostic.metadata_class == "setid-mode"
+                && diagnostic.status == crate::tar_model::MetadataDiagnosticStatus::Skipped
+        }));
+        assert!(portable_diagnostics.iter().any(|diagnostic| {
+            diagnostic.metadata_class == "numeric-ownership"
                 && diagnostic.status == crate::tar_model::MetadataDiagnosticStatus::Skipped
         }));
         assert_eq!(
@@ -12124,6 +12197,231 @@ mod tests {
                 & 0o7777,
             0o7751
         );
+        let restored = fs::metadata(system_root.path().join("privileged.sh")).unwrap();
+        assert_eq!(restored.uid() as u64, uid);
+        assert_eq!(restored.gid() as u64, gid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compressed_archive_extraction_restores_native_xattrs_only_under_native_policy() {
+        let mut native = NativeFileMetadata {
+            required_profiles: vec!["posix-backup-v1".into()],
+            ..NativeFileMetadata::default()
+        };
+        native.primary_pax_records.insert(
+            "LIBARCHIVE.xattr.user.tzap-test".into(),
+            crate::entry_metadata::canonical_base64_encode(b"native value"),
+        );
+        let archive = write_archive(
+            &[RegularFile {
+                portable_metadata: PortableFileMetadata {
+                    source_os: source_os_for_test().into(),
+                    native,
+                    ..PortableFileMetadata::default()
+                },
+                ..RegularFile::new("xattr.txt", b"payload")
+            }],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+
+        let portable_root = tempfile::tempdir().unwrap();
+        opened
+            .extract_file_to(
+                "xattr.txt",
+                portable_root.path(),
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::Portable,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            xattr::get(portable_root.path().join("xattr.txt"), "user.tzap-test").unwrap(),
+            None
+        );
+
+        let native_root = tempfile::tempdir().unwrap();
+        opened
+            .extract_file_to(
+                "xattr.txt",
+                native_root.path(),
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::SameOs,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            xattr::get(native_root.path().join("xattr.txt"), "user.tzap-test").unwrap(),
+            Some(b"native value".to_vec())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn same_os_restore_reports_system_xattr_as_policy_skipped() {
+        let mut native = NativeFileMetadata {
+            required_profiles: vec!["posix-backup-v1".into(), "linux-backup-v1".into()],
+            ..NativeFileMetadata::default()
+        };
+        native.primary_pax_records.insert(
+            "LIBARCHIVE.xattr.security.selinux".into(),
+            crate::entry_metadata::canonical_base64_encode(b"label"),
+        );
+        let archive = write_archive(
+            &[RegularFile {
+                portable_metadata: PortableFileMetadata {
+                    source_os: "linux".into(),
+                    native,
+                    ..PortableFileMetadata::default()
+                },
+                ..RegularFile::new("label.txt", b"payload")
+            }],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let diagnostics = opened
+            .extract_file_to(
+                "label.txt",
+                root.path(),
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::SameOs,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.metadata_class == "system-extended-attribute"
+                && diagnostic.status == crate::tar_model::MetadataDiagnosticStatus::Skipped
+        }));
+        assert_eq!(
+            xattr::get(root.path().join("label.txt"), "security.selinux").unwrap(),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn source_os_for_test() -> &'static str {
+        "linux"
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn source_os_for_test() -> &'static str {
+        "other-unix"
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compressed_archive_extraction_restores_linux_inode_flags() {
+        use std::os::fd::AsRawFd;
+
+        let mut native = NativeFileMetadata {
+            required_profiles: vec!["posix-backup-v1".into(), "linux-backup-v1".into()],
+            ..NativeFileMetadata::default()
+        };
+        native
+            .primary_pax_records
+            .insert("TZAP.linux.fsflags".into(), b"0000000000000040".to_vec());
+        let archive = write_archive(
+            &[RegularFile {
+                portable_metadata: PortableFileMetadata {
+                    source_os: "linux".into(),
+                    native,
+                    ..PortableFileMetadata::default()
+                },
+                ..RegularFile::new("flags.txt", b"payload")
+            }],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        opened
+            .extract_file_to(
+                "flags.txt",
+                root.path(),
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::SameOs,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+        let file = fs::File::open(root.path().join("flags.txt")).unwrap();
+        let mut flags: libc::c_long = 0;
+        // SAFETY: GETFLAGS writes one c_long to a valid pointer.
+        assert_eq!(
+            unsafe {
+                libc::ioctl(
+                    file.as_raw_fd(),
+                    linux_raw_sys::ioctl::FS_IOC_GETFLAGS as libc::c_ulong,
+                    &mut flags,
+                )
+            },
+            0
+        );
+        assert_ne!(flags as u64 & 0x40, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compressed_archive_extraction_restores_canonical_posix_acl() {
+        let acl = b"user::rw-,group::r--,other::---,user:123:r--,mask::r--";
+        let mut native = NativeFileMetadata {
+            required_profiles: vec!["posix-backup-v1".into()],
+            ..NativeFileMetadata::default()
+        };
+        native
+            .primary_pax_records
+            .insert("SCHILY.acl.access".into(), acl.to_vec());
+        native
+            .primary_pax_records
+            .insert("TZAP.acl.projection".into(), b"exact".to_vec());
+        native.primary_pax_records.insert(
+            "TZAP.acl.syntax".into(),
+            b"schily-posix1e-extra-id-v1".to_vec(),
+        );
+        let archive = write_archive(
+            &[RegularFile {
+                mode: 0o640,
+                portable_metadata: PortableFileMetadata {
+                    source_os: "linux".into(),
+                    native,
+                    ..PortableFileMetadata::default()
+                },
+                ..RegularFile::new("acl.txt", b"payload")
+            }],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        opened
+            .extract_file_to(
+                "acl.txt",
+                root.path(),
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::SameOs,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+        let binary = xattr::get(root.path().join("acl.txt"), "system.posix_acl_access")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::entry_metadata::linux_posix_acl_xattr_to_schily(&binary).unwrap(),
+            acl
+        );
     }
 
     #[cfg(windows)]
@@ -12138,6 +12436,7 @@ mod tests {
                     mode_origin: PortableModeOrigin::Projected,
                     posix_owner: None,
                     attributes: Some(1),
+                    native: Default::default(),
                 },
                 ..RegularFile::new("readonly.txt", b"readonly")
             }],

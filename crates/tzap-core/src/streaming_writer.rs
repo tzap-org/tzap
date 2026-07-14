@@ -407,6 +407,7 @@ where
                         gname,
                     }),
                     attributes: None,
+                    native: Default::default(),
                 };
                 metadata = LocalTarMetadata::default();
 
@@ -913,6 +914,7 @@ mod tests {
                 gname: None,
             }),
             attributes: None,
+            native: Default::default(),
         };
         file
     }

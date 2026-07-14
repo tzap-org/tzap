@@ -22,6 +22,7 @@ chacha20poly1305.workspace = true
 crc32c.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
+libc.workspace = true
 sha2.workspace = true
 tar.workspace = true
 tempfile.workspace = true
@@ -34,6 +35,12 @@ zstd-safe.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
 sha2 = { workspace = true, features = ["asm"] }
+
+[target.'cfg(unix)'.dependencies]
+xattr.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-raw-sys.workspace = true
 
 [dev-dependencies]
 hex.workspace = true

@@ -20,12 +20,15 @@ use tzap_core::format::{
     READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST,
     READER_MAX_SUPPORTED_VOLUME_FORMAT_REV, VOLUME_FORMAT_REV_45, VOLUME_HEADER_LEN,
 };
+#[cfg(target_os = "linux")]
+use tzap_core::linux_posix_acl_xattr_to_schily;
 use tzap_core::reader::{ArchiveEntry, ArchiveIndexEntry, RecipientWrapRecordContext};
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
 #[cfg(unix)]
 use tzap_core::PortablePosixOwner;
 use tzap_core::{
-    extract_non_seekable_stream_to_dir, extract_non_seekable_stream_to_dir_with_bootstrap_sidecar,
+    canonical_base64_encode, encode_percent_name, extract_non_seekable_stream_to_dir,
+    extract_non_seekable_stream_to_dir_with_bootstrap_sidecar,
     extract_non_seekable_stream_to_dir_with_recipient_wrap_resolver,
     extract_non_seekable_stream_to_dir_with_recipient_wrap_resolver_and_bootstrap_sidecar,
     extract_unencrypted_non_seekable_stream_to_dir,
@@ -52,11 +55,11 @@ use tzap_core::{
     write_tar_stream_archive_to_sink_with_kdf_and_root_auth, AeadAlgo, ArchiveContentVerification,
     ArchiveRepairPatch, ArchiveTimestamp, ArchiveWriteError, ArchiveWriteSink, ExtractError,
     KdfAlgo, KdfParams, MasterKey, MetadataDiagnostic, MetadataVerificationReport,
-    NonSeekableReaderOptions, OpenedArchive, PortableFileMetadata, PortableModeOrigin,
-    PublicNoKeyVerification, ReaderOptions, RegularFile, RegularFileSource, RestorePolicy,
-    RootAuthSigningRequest, RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions,
-    SequentialRootAuthStatus, StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind,
-    WriterOptions, WriterTimings, WrittenArchiveSummary,
+    NativeFileMetadata, NonSeekableReaderOptions, OpenedArchive, PortableFileMetadata,
+    PortableModeOrigin, PublicNoKeyVerification, ReaderOptions, RegularFile, RegularFileSource,
+    RestorePolicy, RootAuthSigningRequest, RootAuthVerification, RootAuthWriterConfig,
+    SafeExtractionOptions, SequentialRootAuthStatus, StreamingRawWriterSummary,
+    StreamingTarWriterSummary, TarEntryKind, WriterOptions, WriterTimings, WrittenArchiveSummary,
 };
 #[cfg(test)]
 use tzap_core::{MetadataDiagnosticStatus, MetadataOperation};
@@ -3078,6 +3081,8 @@ struct InputIdentity {
     #[cfg(unix)]
     change_time_nanoseconds: i64,
     #[cfg(unix)]
+    creation_time: Option<ArchiveTimestamp>,
+    #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
     ino: u64,
@@ -3311,7 +3316,7 @@ fn collect_one_input_spec(
     let archive_path = archive_path_to_string(archive_path)?;
     let identity = input_identity(&metadata)
         .with_context(|| format!("failed to identify input {}", input.display()))?;
-    let portable_metadata = portable_input_metadata(identity);
+    let portable_metadata = portable_input_metadata(identity, input)?;
     out.push(InputSpec {
         source: input.to_owned(),
         archive_path,
@@ -3360,6 +3365,11 @@ fn input_identity(metadata: &fs::Metadata) -> io::Result<InputIdentity> {
             use std::os::unix::fs::MetadataExt;
             metadata.ctime_nsec()
         },
+        #[cfg(unix)]
+        creation_time: metadata
+            .created()
+            .ok()
+            .and_then(|time| archive_timestamp(time).ok()),
         #[cfg(unix)]
         dev: {
             use std::os::unix::fs::MetadataExt;
@@ -3495,8 +3505,8 @@ fn readonly_mode(metadata: &fs::Metadata) -> u32 {
     }
 }
 
-fn portable_input_metadata(identity: InputIdentity) -> PortableFileMetadata {
-    PortableFileMetadata {
+fn portable_input_metadata(identity: InputIdentity, input: &Path) -> Result<PortableFileMetadata> {
+    Ok(PortableFileMetadata {
         source_os: source_os_label().into(),
         source_filesystem: "unknown".into(),
         mode_origin: if cfg!(unix) {
@@ -3514,7 +3524,153 @@ fn portable_input_metadata(identity: InputIdentity) -> PortableFileMetadata {
         #[cfg(not(unix))]
         posix_owner: None,
         attributes: identity.attributes,
+        native: capture_native_file_metadata(input, identity)?,
+    })
+}
+
+#[cfg(unix)]
+fn capture_native_file_metadata(
+    input: &Path,
+    identity: InputIdentity,
+) -> Result<NativeFileMetadata> {
+    use std::os::unix::ffi::OsStrExt;
+    use xattr::FileExt as _;
+
+    let file = File::open(input)
+        .with_context(|| format!("failed to open {} for metadata capture", input.display()))?;
+    let mut native = NativeFileMetadata::default();
+    #[cfg(target_os = "linux")]
+    let mut captured_posix_acl = false;
+    for name in file
+        .list_xattr()
+        .with_context(|| format!("failed to list xattrs for {}", input.display()))?
+    {
+        let name_bytes = name.as_bytes();
+        let Some(value) = file
+            .get_xattr(&name)
+            .with_context(|| format!("failed to read xattr on {}", input.display()))?
+        else {
+            bail!("xattr changed while scanning {}", input.display());
+        };
+        #[cfg(target_os = "linux")]
+        if name_bytes == b"system.posix_acl_access" || name_bytes == b"system.posix_acl_default" {
+            let key = if name_bytes.ends_with(b"access") {
+                "SCHILY.acl.access"
+            } else {
+                "SCHILY.acl.default"
+            };
+            native.primary_pax_records.insert(
+                key.into(),
+                linux_posix_acl_xattr_to_schily(&value).map_err(|error| anyhow!(error))?,
+            );
+            captured_posix_acl = true;
+            native.required_profiles.push("posix-backup-v1".into());
+            continue;
+        }
+        let encoded_name = encode_percent_name(name_bytes).map_err(|error| anyhow!(error))?;
+        native.primary_pax_records.insert(
+            format!("LIBARCHIVE.xattr.{encoded_name}"),
+            canonical_base64_encode(&value),
+        );
+        let profile = if name_bytes.starts_with(b"security.")
+            || name_bytes.starts_with(b"trusted.")
+            || name_bytes.starts_with(b"system.")
+        {
+            "linux-backup-v1"
+        } else if name_bytes.starts_with(b"com.apple.") {
+            "macos-backup-v1"
+        } else {
+            "posix-backup-v1"
+        };
+        native.required_profiles.push(profile.into());
     }
+    #[cfg(target_os = "linux")]
+    if captured_posix_acl {
+        native
+            .primary_pax_records
+            .insert("TZAP.acl.projection".into(), b"exact".to_vec());
+        native.primary_pax_records.insert(
+            "TZAP.acl.syntax".into(),
+            b"schily-posix1e-extra-id-v1".to_vec(),
+        );
+    }
+    native.required_profiles.sort();
+    native.required_profiles.dedup();
+    capture_linux_inode_flags(&file, &mut native).with_context(|| {
+        format!(
+            "failed to capture Linux inode flags for {}",
+            input.display()
+        )
+    })?;
+    native.primary_pax_records.insert(
+        "TZAP.unix.ctime-observed".into(),
+        ArchiveTimestamp::new(
+            identity.change_time_seconds,
+            identity.change_time_nanoseconds as u32,
+        )
+        .canonical_pax_value()
+        .map_err(|error| anyhow!(error))?,
+    );
+    if let Some(creation_time) = identity.creation_time {
+        native.primary_pax_records.insert(
+            "LIBARCHIVE.creationtime".into(),
+            creation_time
+                .canonical_pax_value()
+                .map_err(|error| anyhow!(error))?,
+        );
+    }
+    native.required_profiles.push("posix-backup-v1".into());
+    if cfg!(target_os = "linux") {
+        native.required_profiles.push("linux-backup-v1".into());
+    } else if cfg!(target_os = "macos") {
+        native.required_profiles.push("macos-backup-v1".into());
+    }
+    native.required_profiles.sort();
+    native.required_profiles.dedup();
+    Ok(native)
+}
+
+#[cfg(not(unix))]
+fn capture_native_file_metadata(
+    _input: &Path,
+    _identity: InputIdentity,
+) -> Result<NativeFileMetadata> {
+    Ok(NativeFileMetadata::default())
+}
+
+#[cfg(target_os = "linux")]
+fn capture_linux_inode_flags(file: &File, native: &mut NativeFileMetadata) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let mut flags: libc::c_long = 0;
+    // SAFETY: the request writes one c_long to a valid pointer and observes a
+    // live file descriptor owned by `file`.
+    if unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            linux_raw_sys::ioctl::FS_IOC_GETFLAGS as libc::c_ulong,
+            &mut flags,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOTTY)
+            || error.raw_os_error() == Some(libc::EOPNOTSUPP)
+        {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    native.primary_pax_records.insert(
+        "TZAP.linux.fsflags".into(),
+        format!("{:016x}", flags as u64).into_bytes(),
+    );
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn capture_linux_inode_flags(_file: &File, _native: &mut NativeFileMetadata) -> io::Result<()> {
+    Ok(())
 }
 
 fn source_os_label() -> &'static str {
@@ -7423,5 +7579,35 @@ mod tests {
             ]
         );
         assert_eq!(metadata_diagnostic_lines_for_entries(&entries).len(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn filesystem_scan_captures_linux_native_profile_and_user_xattr() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("native.txt");
+        fs::write(&path, b"payload").unwrap();
+        xattr::set(&path, "user.tzap-test", b"metadata").unwrap();
+        let identity = input_identity(&fs::metadata(&path).unwrap()).unwrap();
+
+        let native = capture_native_file_metadata(&path, identity).unwrap();
+
+        assert_eq!(
+            native.required_profiles,
+            vec!["linux-backup-v1", "posix-backup-v1"]
+        );
+        assert_eq!(
+            native
+                .primary_pax_records
+                .get("LIBARCHIVE.xattr.user.tzap-test")
+                .map(Vec::as_slice),
+            Some(b"bWV0YWRhdGE".as_slice())
+        );
+        assert!(native
+            .primary_pax_records
+            .contains_key("TZAP.linux.fsflags"));
+        assert!(native
+            .primary_pax_records
+            .contains_key("TZAP.unix.ctime-observed"));
     }
 }

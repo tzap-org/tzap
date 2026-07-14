@@ -31,6 +31,13 @@ tzap-core = { path = "../tzap-core", version = "0.1.10" }
 tzap-plugin-keywrap = { path = "../tzap-plugin-keywrap", version = "0.1.10" }
 tzap-plugin-signing = { path = "../tzap-plugin-signing", version = "0.1.10" }
 
+[target.'cfg(unix)'.dependencies]
+xattr.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+linux-raw-sys.workspace = true
+
 [dev-dependencies]
 assert_cmd.workspace = true
 predicates.workspace = true

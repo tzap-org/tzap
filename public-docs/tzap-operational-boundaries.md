@@ -561,9 +561,14 @@ PAX `mtime` whenever the value is pre-epoch, too large for ustar, or has a
 fraction, and rechecks size, mode, and mtime after the final source read.
 Filesystem inputs also preserve native-vs-projected mode origin, POSIX numeric
 UID/GID where applicable, and the Windows readonly/hidden/system/archive
-portable projection; these values participate in the same final identity
-recheck. Library writers expose the same representation as
-`ArchiveTimestamp`. The writer does not emit global PAX state, GNU long-name
+portable projection. Unix regular-file creation additionally captures readable
+extended attributes, observed ctime, available creation time, and source-native
+profiles. Linux creation captures the exact inode-flag scalar and converts
+Linux POSIX ACL xattrs to canonical `SCHILY.acl.*` records rather than
+duplicating filesystem-internal ACL xattrs. These values participate in the
+same final identity recheck. Library writers expose native primary-PAX records
+through `NativeFileMetadata` and timestamps through `ArchiveTimestamp`. The
+writer does not emit global PAX state, GNU long-name
 records, legacy sparse formats, or the tar two-zero-block end marker.
 On Unix, create rejects two selected paths that resolve to the same hardlinked
 filesystem object because this regular-file-only writer cannot yet emit their
@@ -592,7 +597,12 @@ Extraction supports `--restore content` and the default `--restore portable`.
 Content mode writes regular bytes and safe directories, skips symlinks and
 special/reparse objects, and materializes hardlink aliases as independent
 files. Portable mode additionally restores safe symlinks and hardlinks and
-ordinary regular-file mode/mtime metadata. Directory mode/mtime finalization
+ordinary regular-file mode/mtime metadata. Same-OS regular-file restore applies
+ordinary xattrs, canonical Linux POSIX ACLs, and modifiable Linux inode flags.
+System restore, after explicit authorization, also applies numeric UID/GID,
+set-ID modes, privileged xattr namespaces, and immutable/append-only Linux
+flags. Application is descriptor-based and ordered as ownership, mode, ACL,
+xattrs, timestamps/attributes, then no-change flags. Directory mode/mtime finalization
 and symlink mtime application are not implemented by the current Core reader;
 requesting them stops during preflight unless `--allow-degraded` is explicit.
 Both modes preflight selected random-access
@@ -621,15 +631,18 @@ surface tar metadata fidelity should use `list_files`, `extract_member`,
 
 - `tzap-core`: revision-45 Core reader and physical archive reader/writer for
   the documented archive workflows.
-- CLI/core writer: complete `portable-v1` regular-file emission. It does not
-  claim the full Portable reader/writer class because directory/link capture
-  and native filesystem metadata capture are not exposed by the current writer.
+- CLI/core writer: complete `portable-v1` regular-file emission plus declared
+  POSIX/Linux regular-file native records. It does not claim the full Portable,
+  POSIX backup, or Linux backup reader/writer class because directory/link
+  capture and auxiliary native streams are not exposed by the current writer.
 - `tzap-plugin-keywrap`: `x509-hpke-recipient-v1` for revision 45.
 - `tzap-plugin-signing`: `ed25519-archiveroot-v1` and the revision-45 X.509
   RootAuth profile.
 - POSIX, Linux, macOS, and Windows backup reader/writer classes are not
-  advertised. Core validates their on-wire records, but the current CLI does
-  not claim host-native capture or exact native restoration.
+  advertised. POSIX/Linux regular-file ownership, xattrs, ACLs, and flags are
+  captured/applied as described above; macOS dedicated auxiliary records,
+  Windows backup streams/security metadata, and remaining non-regular-file
+  capture are still parser/validator-only.
 
 ## Cloud directory-prefix optimization
 

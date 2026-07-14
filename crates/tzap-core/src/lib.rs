@@ -21,7 +21,11 @@ mod raw_stream_profile;
 mod streaming_writer;
 
 pub use crypto::{HmacDomain, KdfParams, MasterKey, Subkeys};
-pub use entry_metadata::{ArchiveTimestamp, RestorePolicy};
+pub use entry_metadata::{
+    canonical_base64_encode, decode_percent_name, encode_percent_name,
+    linux_posix_acl_xattr_to_schily, schily_posix_acl_to_linux_xattr, ArchiveTimestamp,
+    RestorePolicy,
+};
 pub use format::{
     AeadAlgo, ArchiveWriteError, CompressionAlgo, ExtractError, FecAlgo, FormatError, KdfAlgo,
     FORMAT_VERSION, VOLUME_FORMAT_REV,
@@ -83,7 +87,7 @@ pub use writer::{
     write_archive_with_kdf, write_archive_with_recipient_wrap_records,
     write_archive_with_root_auth, write_archive_with_root_auth_and_kdf, write_empty_archive,
     ArchiveWritePhase, ArchiveWriteProgressSink, ArchiveWriteSink, KeyWrapRecordSource,
-    MemoryArchiveSink, PortableFileMetadata, PortableModeOrigin, PortablePosixOwner, RegularFile,
-    RegularFileSource, RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions, WriterTimings,
-    WrittenArchiveSummary,
+    MemoryArchiveSink, NativeFileMetadata, PortableFileMetadata, PortableModeOrigin,
+    PortablePosixOwner, RegularFile, RegularFileSource, RootAuthSigningRequest,
+    RootAuthWriterConfig, WriterOptions, WriterTimings, WrittenArchiveSummary,
 };

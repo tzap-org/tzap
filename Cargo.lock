@@ -1659,6 +1659,8 @@ dependencies = [
  "assert_cmd",
  "clap",
  "ed25519-dalek",
+ "libc",
+ "linux-raw-sys",
  "memmap2",
  "openssl",
  "predicates",
@@ -1670,6 +1672,7 @@ dependencies = [
  "tzap-core",
  "tzap-plugin-keywrap",
  "tzap-plugin-signing",
+ "xattr",
 ]
 
 [[package]]
@@ -1686,12 +1689,15 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "libc",
+ "linux-raw-sys",
  "sha2",
  "tar",
  "tempfile",
  "thiserror",
  "unicode-normalization",
  "uuid",
+ "xattr",
  "zeroize",
  "zstd",
  "zstd-safe",
