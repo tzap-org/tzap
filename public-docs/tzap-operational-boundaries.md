@@ -556,8 +556,18 @@ The v0.45 CLI create path emits complete `portable-v1` regular-file member
 groups. Every group starts with the mandatory canonical
 `TZAP-PAX/PRIMARY` record, followed by the primary ustar entry. Archive paths
 are normalized safe relative NFC UTF-8 paths using `/` separators. The writer
-does not emit global PAX state, GNU long-name records, legacy sparse formats, or
-the tar two-zero-block end marker.
+captures source mtimes as signed Unix seconds plus nanoseconds, uses canonical
+PAX `mtime` whenever the value is pre-epoch, too large for ustar, or has a
+fraction, and rechecks size, mode, and mtime after the final source read.
+Filesystem inputs also preserve native-vs-projected mode origin, POSIX numeric
+UID/GID where applicable, and the Windows readonly/hidden/system/archive
+portable projection; these values participate in the same final identity
+recheck. Library writers expose the same representation as
+`ArchiveTimestamp`. The writer does not emit global PAX state, GNU long-name
+records, legacy sparse formats, or the tar two-zero-block end marker.
+On Unix, create rejects two selected paths that resolve to the same hardlinked
+filesystem object because this regular-file-only writer cannot yet emit their
+topology without weakening the complete-capture declaration.
 
 The core reader implements the revision-45 member-group grammar for regular
 files, directories, symlinks, hardlinks, character devices, block devices, and
@@ -574,13 +584,18 @@ payload envelopes. `list_index_entries`, `lookup_index_entry`, and
 summary flags, member-group size, frame range, compressed frame size, and
 touched envelope/block layout. Entry kind, mode, and mtime live in the
 authenticated primary PAX/member header and are available from payload-decoding
-list APIs and `tzap list --long`, not from the revision-45 FileEntry row.
+list APIs and `tzap list --long`, not from the revision-45 FileEntry row. The
+decoded mtime is an `ArchiveTimestamp`, so pre-epoch values and nanoseconds are
+not truncated.
 
 Extraction supports `--restore content` and the default `--restore portable`.
 Content mode writes regular bytes and safe directories, skips symlinks and
 special/reparse objects, and materializes hardlink aliases as independent
 files. Portable mode additionally restores safe symlinks and hardlinks and
-ordinary mode/mtime metadata. Both modes preflight selected random-access
+ordinary regular-file mode/mtime metadata. Directory mode/mtime finalization
+and symlink mtime application are not implemented by the current Core reader;
+requesting them stops during preflight unless `--allow-degraded` is explicit.
+Both modes preflight selected random-access
 restores before destination changes; sequential restores remain provisional
 until terminal verification and commit. `--restore system` requires explicit
 authorization, while unsupported native application remains a hard error unless
@@ -590,6 +605,11 @@ Authenticated metadata outside the chosen policy is enumerated through
 structured diagnostics. A partial capture, unsupported required extension
 profile, skipped native stream, reparse placeholder, special object, or
 storage-layout materialization cannot be reported as full fidelity.
+`ArchiveContentVerification::metadata_report()` and
+`SequentialVerifyReport.metadata` separately report capture completeness,
+profiles and auxiliary kinds, all four restore-policy capabilities,
+full-fidelity possibility, skipped/conversion diagnostics, and storage-layout
+degradation. CLI `verify --json` exposes the same structure.
 
 Library callers that only need authenticated index metadata may use
 `list_index_entries` or `lookup_index_entry`. Library callers that only need

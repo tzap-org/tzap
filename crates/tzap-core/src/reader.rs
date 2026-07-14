@@ -11,6 +11,7 @@ use crate::crypto::{
     decrypt_padded_aead_object, verify_integrity_tag, AeadObjectContext, HmacDomain, KdfParams,
     MasterKey, Subkeys,
 };
+use crate::entry_metadata::ArchiveTimestamp;
 use crate::fec::{encode_parity_gf16, repair_data_gf16};
 use crate::format::{
     AeadAlgo, BlockKind, ExtractError, FormatError, KdfAlgo, VolumeFormatRevision,
@@ -36,12 +37,13 @@ use crate::root_auth::{
     CriticalMetadataDigestInputs, DataBlockMerkleLeaf, FecLayoutObjectRow,
 };
 use crate::tar_model::{
-    parse_tar_member_group, restore_phase, restore_streaming_tar_member_group,
-    stream_regular_tar_member_group_to_writer, validate_owned_restore_plan,
-    validate_tar_stream_total_extraction_size, MetadataDiagnostic, NoopTarStreamObserver,
-    OwnedTarMember, SafeExtractionOptions, StreamingMemberExpectation, TarEntryKind,
-    TarMemberGroupReader, TarStreamFilesystemRestoreObserver, TarStreamObserver,
-    TarStreamSummaryValidator, TarStreamTotalExtractionSizeValidator,
+    metadata_verification_report, parse_tar_member_group, restore_phase,
+    restore_streaming_tar_member_group, stream_regular_tar_member_group_to_writer,
+    validate_owned_restore_plan, validate_tar_stream_total_extraction_size, MetadataDiagnostic,
+    MetadataVerificationReport, NoopTarStreamObserver, OwnedTarMember, SafeExtractionOptions,
+    StreamingMemberExpectation, TarEntryKind, TarMemberGroupReader,
+    TarStreamFilesystemRestoreObserver, TarStreamObserver, TarStreamSummaryValidator,
+    TarStreamTotalExtractionSizeValidator,
 };
 use crate::wire::{
     compute_key_wrap_table_digest, BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage,
@@ -208,7 +210,7 @@ pub struct ArchiveEntry {
     pub file_data_size: u64,
     pub kind: TarEntryKind,
     pub mode: u32,
-    pub mtime: u64,
+    pub mtime: ArchiveTimestamp,
     pub diagnostics: Vec<MetadataDiagnostic>,
 }
 
@@ -290,6 +292,16 @@ pub struct OpenedArchive {
 pub struct ArchiveContentVerification<'a> {
     archive: &'a OpenedArchive,
     mode: ContentVerificationMode,
+    metadata_report: Option<MetadataVerificationReport>,
+}
+
+impl ArchiveContentVerification<'_> {
+    /// Per-entry revision-45 capture, profile, restore-capability, and fidelity
+    /// results. Fast verification returns `None` when payload semantics were
+    /// deliberately deferred.
+    pub fn metadata_report(&self) -> Option<&MetadataVerificationReport> {
+        self.metadata_report.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2063,12 +2075,20 @@ impl OpenedArchive {
                 let shard = &shards[winner.shard_index];
                 let member =
                     self.decode_loaded_owned_tar_member(shard, winner.file_index, false)?;
+                let mtime = member
+                    .v45_metadata
+                    .as_ref()
+                    .ok_or(FormatError::InvalidArchive(
+                        "revision-45 member metadata is missing",
+                    ))?
+                    .portable_mirror
+                    .mtime;
                 Ok(ArchiveEntry {
                     path,
                     file_data_size: winner.file_data_size,
                     kind: member.kind,
                     mode: member.mode,
-                    mtime: member.mtime,
+                    mtime: ArchiveTimestamp::new(mtime.0, mtime.1),
                     diagnostics: member.diagnostics,
                 })
             })
@@ -2079,8 +2099,8 @@ impl OpenedArchive {
     ///
     /// This is a payload-only convenience for callers that do not need tar
     /// metadata fidelity diagnostics. Use [`Self::extract_file_with_diagnostics`]
-    /// or [`Self::extract_member`] when unsupported local PAX/GNU metadata must
-    /// be reported to users.
+    /// or [`Self::extract_member`] when revision-45 metadata fidelity
+    /// diagnostics must be reported to users.
     pub fn extract_file(&self, path: &str) -> Result<Option<Vec<u8>>, FormatError> {
         self.extract_member(path)?
             .map(|member| {
@@ -2229,6 +2249,73 @@ impl OpenedArchive {
         self.extract_winning_index_entries_to(&shards, entries, root, options, jobs)
     }
 
+    /// Restore a selected final-view path set after preflighting it as one graph.
+    ///
+    /// Canonical hardlink targets are included as restore dependencies. No
+    /// selected destination is written until every selected member and added
+    /// dependency passes metadata-policy and path-graph validation.
+    pub fn extract_selected_files_to(
+        &self,
+        paths: &[String],
+        root: &std::path::Path,
+        options: SafeExtractionOptions,
+        jobs: usize,
+    ) -> Result<Vec<(String, Vec<MetadataDiagnostic>)>, FormatError> {
+        if jobs == 0 {
+            return Err(FormatError::ReaderUnsupported("jobs must be at least 1"));
+        }
+
+        let shards = self.load_all_index_shards()?;
+        let winners = final_index_entry_winners(&shards)?;
+        let mut selected = BTreeMap::new();
+        for path in paths {
+            let normalized = normalize_lookup_file_path(path, self.crypto_header.max_path_length)?;
+            let normalized = std::str::from_utf8(&normalized)
+                .map_err(|_| FormatError::UnsafeArchivePath)?
+                .to_owned();
+            let entry = winners
+                .get(&normalized)
+                .copied()
+                .ok_or(FormatError::ReaderUnsupported(
+                    "selected archive path is absent from the final index",
+                ))?;
+            selected.insert(normalized, entry);
+        }
+
+        let requested = selected
+            .iter()
+            .map(|(path, entry)| (path.clone(), *entry))
+            .collect::<Vec<_>>();
+        for (_, entry) in requested {
+            let member = self.decode_loaded_owned_tar_member(
+                &shards[entry.shard_index],
+                entry.file_index,
+                false,
+            )?;
+            if member.kind != TarEntryKind::Hardlink {
+                continue;
+            }
+            let target = member
+                .link_target
+                .as_deref()
+                .ok_or(FormatError::InvalidArchive("hardlink target is missing"))?;
+            let target = std::str::from_utf8(target)
+                .map_err(|_| FormatError::UnsafeArchivePath)?
+                .to_owned();
+            let target_entry = winners
+                .get(&target)
+                .copied()
+                .ok_or(FormatError::InvalidArchive(
+                    "hardlink target is absent from the final index",
+                ))?;
+            selected.entry(target).or_insert(target_entry);
+        }
+
+        let mut entries = selected.into_iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(_, entry)| entry.start);
+        self.extract_winning_index_entries_to(&shards, entries, root, options, jobs)
+    }
+
     pub fn verify(&self) -> Result<(), FormatError> {
         self.verify_content().map(|_| ())
     }
@@ -2246,6 +2333,7 @@ impl OpenedArchive {
             return Ok(ArchiveContentVerification {
                 archive: self,
                 mode: ContentVerificationMode::Fast,
+                metadata_report: None,
             });
         }
         self.verify_content_with_parity_policy(
@@ -2320,9 +2408,11 @@ impl OpenedArchive {
             parity_policy,
         )?;
         self.validate_streamed_payload_summary(&tables, &streamed, false, true)?;
+        let metadata_report = metadata_verification_report(&streamed.tar.members)?;
         Ok(ArchiveContentVerification {
             archive: self,
             mode,
+            metadata_report: Some(metadata_report),
         })
     }
 
@@ -10699,7 +10789,7 @@ mod tests {
                 file_data_size: 8,
                 kind: TarEntryKind::Regular,
                 mode: 0o644,
-                mtime: 0,
+                mtime: ArchiveTimestamp::UNIX_EPOCH,
                 diagnostics: Vec::new(),
             }]
         );
@@ -11731,6 +11821,33 @@ mod tests {
     }
 
     #[test]
+    fn selected_restore_preflights_every_path_before_writing() {
+        let archive = write_archive(
+            &[RegularFile::new("alpha.txt", b"alpha")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let error = opened
+            .extract_selected_files_to(
+                &["alpha.txt".into(), "missing.txt".into()],
+                tmp.path(),
+                SafeExtractionOptions::default(),
+                2,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            FormatError::ReaderUnsupported("selected archive path is absent from the final index")
+        );
+        assert!(!tmp.path().join("alpha.txt").exists());
+    }
+
+    #[test]
     fn safe_extract_rejects_overwriting_existing_file_by_default() {
         let archive = write_archive(
             &[RegularFile::new("hello.txt", b"new")],
@@ -11933,6 +12050,31 @@ mod tests {
             Some(b"smoke-v45-unencrypted".to_vec())
         );
         opened.verify().unwrap();
+    }
+
+    #[test]
+    fn full_verification_reports_v45_metadata_capabilities_separately() {
+        let archive = write_archive(
+            &[RegularFile::new("report.txt", b"report")],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let verification = opened.verify_content().unwrap();
+        let report = verification.metadata_report().unwrap();
+
+        assert!(report.all_capture_complete);
+        assert!(report.full_fidelity_possible);
+        assert_eq!(report.profiles_present, ["portable-v1"]);
+        assert!(report.auxiliary_kinds_present.is_empty());
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].path, b"report.txt");
+        assert!(report.entries[0]
+            .policy_capabilities
+            .iter()
+            .all(|capability| capability.policy_complete));
+        assert!(report.entries[0].diagnostics.is_empty());
     }
 
     #[test]
@@ -12514,11 +12656,11 @@ mod tests {
         let archive = write_archive(
             &[
                 RegularFile {
-                    mtime: 1_700_000_000,
+                    mtime: crate::ArchiveTimestamp::from_seconds(1_700_000_000),
                     ..RegularFile::new("same.txt", b"old")
                 },
                 RegularFile {
-                    mtime: 1_700_000_100,
+                    mtime: crate::ArchiveTimestamp::from_seconds(1_700_000_100),
                     ..RegularFile::new("same.txt", b"newer")
                 },
             ],
@@ -12548,7 +12690,7 @@ mod tests {
                 file_data_size: 5,
                 kind: TarEntryKind::Regular,
                 mode: 0o644,
-                mtime: 1_700_000_100,
+                mtime: ArchiveTimestamp::from_seconds(1_700_000_100),
                 diagnostics: Vec::new(),
             }]
         );
@@ -13059,7 +13201,7 @@ mod tests {
                 file_data_size: 13,
                 kind: TarEntryKind::Regular,
                 mode: 0o644,
-                mtime: 0,
+                mtime: ArchiveTimestamp::UNIX_EPOCH,
                 diagnostics: Vec::new(),
             }]
         );
@@ -13205,7 +13347,7 @@ mod tests {
                 file_data_size: 44,
                 kind: TarEntryKind::Regular,
                 mode: 0o644,
-                mtime: 0,
+                mtime: ArchiveTimestamp::UNIX_EPOCH,
                 diagnostics: Vec::new(),
             }]
         );
@@ -18197,9 +18339,6 @@ mod tests {
                 offset_in_first_frame_plaintext: 0,
                 tar_member_group_size: file.member_group_size,
                 file_data_size: file.file_data_size,
-                kind: crate::tar_model::TarEntryKind::Regular,
-                mode: 0o644,
-                mtime: 0,
                 flags: crate::entry_metadata::EXTENDED_METADATA_V1,
             });
         }

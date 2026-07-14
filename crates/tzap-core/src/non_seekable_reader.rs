@@ -10,6 +10,7 @@ use crate::crypto::{
     decrypt_padded_aead_object, verify_integrity_tag, AeadObjectContext, HmacDomain, MasterKey,
     Subkeys,
 };
+use crate::entry_metadata::ArchiveTimestamp;
 use crate::fec::repair_data_gf16;
 use crate::format::{
     BlockKind, ExtractError, FormatError, BLOCK_RECORD_FRAMING_LEN, VOLUME_HEADER_LEN,
@@ -26,8 +27,9 @@ use crate::reader::{
     StreamedArchiveOpenParts,
 };
 use crate::tar_model::{
-    NoopTarStreamObserver, SafeExtractionOptions, TarStreamFilesystemRestoreObserver,
-    TarStreamMemberSummary, TarStreamObserver, TarStreamSummary, TarStreamSummaryValidator,
+    metadata_verification_report, MetadataVerificationReport, NoopTarStreamObserver,
+    SafeExtractionOptions, TarStreamFilesystemRestoreObserver, TarStreamMemberSummary,
+    TarStreamObserver, TarStreamSummary, TarStreamSummaryValidator,
 };
 use crate::wire::{
     BlockRecord, CryptoHeader, CryptoHeaderFixed, ExtensionTlv, RootAuthFooterV1, VolumeHeader,
@@ -62,6 +64,7 @@ pub struct SequentialVerifyReport {
     pub tar_total_size: u64,
     pub content_sha256: [u8; 32],
     pub root_auth: SequentialRootAuthStatus,
+    pub metadata: MetadataVerificationReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -932,6 +935,7 @@ where
         tar_total_size: opened.index_root.header.tar_total_size,
         content_sha256: opened.index_root.header.content_sha256,
         root_auth,
+        metadata: metadata_verification_report(&streamed_payload.tar.members)?,
     };
 
     Ok(SequentialStreamOutcome {
@@ -980,7 +984,10 @@ fn streamed_list_entries(
                 file_data_size: entry.file_data_size,
                 kind: member.kind,
                 mode: member.mode,
-                mtime: member.mtime,
+                mtime: ArchiveTimestamp::new(
+                    member.v45_metadata.portable_mirror.mtime.0,
+                    member.v45_metadata.portable_mirror.mtime.1,
+                ),
                 diagnostics: member.diagnostics.clone(),
             })
         })

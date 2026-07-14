@@ -1,14 +1,16 @@
 use std::io::{self, ErrorKind, Read};
 
 use crate::crypto::{KdfParams, MasterKey};
+use crate::entry_metadata::ArchiveTimestamp;
 use crate::format::{ArchiveWriteError, FormatError};
 use crate::metadata::{
     normalize_lookup_file_path, validate_directory_path_bytes, validate_file_path_bytes,
 };
 use crate::writer::{
     write_ordered_parallel_stream_archive_to_sink, ArchiveWriteSink, MemoryArchiveSink,
-    RootAuthAuthenticator, RootAuthWriterConfig, StreamingRegularMember, WriterOptions,
-    WrittenArchive, WrittenArchiveSummary,
+    PortableFileMetadata, PortableModeOrigin, PortablePosixOwner, RootAuthAuthenticator,
+    RootAuthWriterConfig, StreamingRegularMember, WriterOptions, WrittenArchive,
+    WrittenArchiveSummary,
 };
 
 const TAR_BLOCK_LEN: usize = 512;
@@ -38,8 +40,9 @@ struct TarStdinInputSummary {
 struct TarStdinRegularMember {
     path: Vec<u8>,
     mode: u32,
-    mtime: u64,
+    mtime: ArchiveTimestamp,
     logical_size: u64,
+    portable_metadata: PortableFileMetadata,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -48,7 +51,11 @@ struct LocalTarMetadata {
     pax_path: Option<Vec<u8>>,
     pax_size: Option<u64>,
     pax_mode: Option<u32>,
-    pax_mtime: Option<u64>,
+    pax_mtime: Option<ArchiveTimestamp>,
+    pax_uid: Option<u64>,
+    pax_gid: Option<u64>,
+    pax_uname: Option<Vec<u8>>,
+    pax_gname: Option<Vec<u8>>,
     gnu_long_name: Option<Vec<u8>>,
 }
 
@@ -59,6 +66,10 @@ impl LocalTarMetadata {
             || self.pax_size.is_some()
             || self.pax_mode.is_some()
             || self.pax_mtime.is_some()
+            || self.pax_uid.is_some()
+            || self.pax_gid.is_some()
+            || self.pax_uname.is_some()
+            || self.pax_gname.is_some()
             || self.gnu_long_name.is_some()
     }
 }
@@ -143,7 +154,8 @@ where
                     archive_path,
                     file_data_size: input_size,
                     mode: 0o644,
-                    mtime: 0,
+                    mtime: ArchiveTimestamp::UNIX_EPOCH,
+                    portable_metadata: PortableFileMetadata::default(),
                 },
                 &mut payload,
             )?;
@@ -199,6 +211,7 @@ where
                             file_data_size: member.logical_size,
                             mode: member.mode,
                             mtime: member.mtime,
+                            portable_metadata: member.portable_metadata,
                         },
                         payload,
                     )
@@ -363,10 +376,38 @@ where
                 let mode = metadata
                     .pax_mode
                     .unwrap_or(parse_tar_number(&header[100..108])? as u32);
-                let mtime = metadata
-                    .pax_mtime
-                    .unwrap_or(parse_tar_number(&header[136..148])?);
+                let mtime = if let Some(mtime) = metadata.pax_mtime {
+                    mtime
+                } else {
+                    ArchiveTimestamp::from_seconds(
+                        i64::try_from(parse_tar_number(&header[136..148])?).map_err(|_| {
+                            FormatError::WriterUnsupported(
+                                "input tar mtime exceeds revision-45 i64 range",
+                            )
+                        })?,
+                    )
+                };
                 let path = canonical_main_path(&header, typeflag, &metadata, max_path_length)?;
+                let uid = metadata
+                    .pax_uid
+                    .unwrap_or(parse_tar_number(&header[108..116])?);
+                let gid = metadata
+                    .pax_gid
+                    .unwrap_or(parse_tar_number(&header[116..124])?);
+                let uname = tar_owner_name(metadata.pax_uname.as_deref(), &header[265..297])?;
+                let gname = tar_owner_name(metadata.pax_gname.as_deref(), &header[297..329])?;
+                let portable_metadata = PortableFileMetadata {
+                    source_os: "other-unix".into(),
+                    source_filesystem: "unknown".into(),
+                    mode_origin: PortableModeOrigin::Native,
+                    posix_owner: Some(PortablePosixOwner {
+                        uid,
+                        gid,
+                        uname,
+                        gname,
+                    }),
+                    attributes: None,
+                };
                 metadata = LocalTarMetadata::default();
 
                 match typeflag {
@@ -376,6 +417,7 @@ where
                             mode,
                             mtime,
                             logical_size: effective_size,
+                            portable_metadata,
                         };
                         {
                             let mut payload = LimitedTarPayloadReader {
@@ -643,6 +685,10 @@ fn parse_pax_records(payload: &[u8], metadata: &mut LocalTarMetadata) -> Result<
                 )
             }
             "mtime" => metadata.pax_mtime = Some(parse_pax_mtime(value)?),
+            "uid" => metadata.pax_uid = Some(parse_decimal_u64(value)?),
+            "gid" => metadata.pax_gid = Some(parse_decimal_u64(value)?),
+            "uname" => metadata.pax_uname = Some(value.to_vec()),
+            "gname" => metadata.pax_gname = Some(value.to_vec()),
             key if key.starts_with("GNU.sparse.") => {
                 return Err(FormatError::ReaderUnsupported(
                     "unsupported GNU sparse tar entry",
@@ -741,9 +787,66 @@ fn parse_decimal_u64(bytes: &[u8]) -> Result<u64, FormatError> {
     Ok(value)
 }
 
-fn parse_pax_mtime(bytes: &[u8]) -> Result<u64, FormatError> {
-    let whole = bytes.split(|byte| *byte == b'.').next().unwrap_or(bytes);
-    parse_decimal_u64(whole)
+fn parse_pax_mtime(bytes: &[u8]) -> Result<ArchiveTimestamp, FormatError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| FormatError::InvalidArchive("PAX mtime is not ASCII"))?;
+    let (integer, fraction) = text
+        .split_once('.')
+        .map_or((text, None), |(integer, fraction)| {
+            (integer, Some(fraction))
+        });
+    if integer.is_empty()
+        || integer == "+"
+        || integer == "-"
+        || !integer
+            .trim_start_matches(['+', '-'])
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return Err(FormatError::InvalidArchive("malformed PAX mtime"));
+    }
+    let seconds = integer
+        .parse::<i64>()
+        .map_err(|_| FormatError::InvalidArchive("PAX mtime exceeds i64"))?;
+    let nanoseconds = match fraction {
+        None => 0,
+        Some(fraction)
+            if !fraction.is_empty()
+                && fraction.len() <= 9
+                && fraction.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            let mut padded = fraction.to_owned();
+            padded.extend(std::iter::repeat_n('0', 9 - fraction.len()));
+            padded
+                .parse::<u32>()
+                .map_err(|_| FormatError::InvalidArchive("malformed PAX mtime fraction"))?
+        }
+        Some(_) => return Err(FormatError::InvalidArchive("malformed PAX mtime fraction")),
+    };
+    if integer.starts_with('-') && seconds == 0 && nanoseconds != 0 {
+        return Err(FormatError::WriterUnsupported(
+            "negative fractional PAX mtime between -1 and 0 has no canonical revision-45 encoding",
+        ));
+    }
+    Ok(ArchiveTimestamp::new(seconds, nanoseconds))
+}
+
+fn tar_owner_name(
+    pax_value: Option<&[u8]>,
+    header_field: &[u8],
+) -> Result<Option<String>, FormatError> {
+    let value = pax_value.unwrap_or_else(|| nul_trimmed(header_field));
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let value = std::str::from_utf8(value)
+        .map_err(|_| FormatError::WriterUnsupported("input tar owner name is not UTF-8"))?;
+    if value.contains('\0') {
+        return Err(FormatError::InvalidArchive(
+            "input tar owner name contains NUL",
+        ));
+    }
+    Ok(Some(value.to_owned()))
 }
 
 fn trimmed_metadata_payload(payload: &[u8]) -> Vec<u8> {
@@ -795,6 +898,23 @@ mod tests {
 
     fn master_key() -> MasterKey {
         MasterKey::from_raw_key(&[0x31; MASTER_KEY_LEN]).unwrap()
+    }
+
+    fn tar_equivalent_regular_file<'a>(path: &'a str, contents: &'a [u8]) -> RegularFile<'a> {
+        let mut file = RegularFile::new(path, contents);
+        file.portable_metadata = PortableFileMetadata {
+            source_os: "other-unix".into(),
+            source_filesystem: "unknown".into(),
+            mode_origin: PortableModeOrigin::Native,
+            posix_owner: Some(PortablePosixOwner {
+                uid: 0,
+                gid: 0,
+                uname: None,
+                gname: None,
+            }),
+            attributes: None,
+        };
+        file
     }
 
     fn options() -> WriterOptions {
@@ -982,6 +1102,22 @@ mod tests {
             opened.extract_file("dir/beta.txt").unwrap(),
             Some(b"beta payload".to_vec())
         );
+    }
+
+    #[test]
+    fn pax_mtime_preserves_fraction_and_pre_epoch_value() {
+        assert_eq!(
+            parse_pax_mtime(b"1700000000.123456789").unwrap(),
+            ArchiveTimestamp::new(1_700_000_000, 123_456_789)
+        );
+        assert_eq!(
+            parse_pax_mtime(b"-1.5").unwrap(),
+            ArchiveTimestamp::new(-1, 500_000_000)
+        );
+        assert!(matches!(
+            parse_pax_mtime(b"-0.5"),
+            Err(FormatError::WriterUnsupported(_))
+        ));
     }
 
     #[test]
@@ -1178,8 +1314,8 @@ mod tests {
         let streaming = write_tar_stream_archive(&input[..], &master_key(), options).unwrap();
         let legacy = write_archive(
             &[
-                RegularFile::new("alpha.txt", b"alpha payload"),
-                RegularFile::new("dir/beta.txt", b"beta payload"),
+                tar_equivalent_regular_file("alpha.txt", b"alpha payload"),
+                tar_equivalent_regular_file("dir/beta.txt", b"beta payload"),
             ],
             &master_key(),
             options,
@@ -1201,8 +1337,8 @@ mod tests {
         let streaming = write_tar_stream_archive(&input[..], &master_key(), options).unwrap();
         let legacy = write_archive(
             &[
-                RegularFile::new("alpha.txt", b"alpha payload"),
-                RegularFile::new("dir/beta.txt", b"beta payload"),
+                tar_equivalent_regular_file("alpha.txt", b"alpha payload"),
+                tar_equivalent_regular_file("dir/beta.txt", b"beta payload"),
             ],
             &master_key(),
             options,

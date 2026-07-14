@@ -177,9 +177,6 @@ pub struct FileEntry {
     pub offset_in_first_frame_plaintext: u32,
     pub tar_member_group_size: u64,
     pub file_data_size: u64,
-    pub kind: crate::tar_model::TarEntryKind,
-    pub mode: u32,
-    pub mtime: u64,
     pub flags: u32,
 }
 
@@ -1106,10 +1103,7 @@ fn parse_file_entry(bytes: &[u8]) -> Result<FileEntry, FormatError> {
         offset_in_first_frame_plaintext: read_u32(bytes, 28, "FileEntry")?,
         tar_member_group_size: read_u64(bytes, 32, "FileEntry")?,
         file_data_size: read_u64(bytes, 40, "FileEntry")?,
-        kind: crate::tar_model::TarEntryKind::Regular,
-        mode: 0,
         flags: read_u32(bytes, 48, "FileEntry")?,
-        mtime: 0,
     })
 }
 
@@ -2652,9 +2646,6 @@ mod tests {
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: 1536,
             file_data_size: 0,
-            kind: crate::tar_model::TarEntryKind::Regular,
-            mode: 0o644,
-            mtime: 0,
             flags: EXTENDED_METADATA_V1,
         };
         let frame = FrameEntry {
@@ -2822,9 +2813,6 @@ mod tests {
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: 1536,
             file_data_size: 0,
-            kind: crate::tar_model::TarEntryKind::Regular,
-            mode: 0o644,
-            mtime: 0,
             flags: EXTENDED_METADATA_V1,
         };
         let frame = FrameEntry {
@@ -3059,9 +3047,6 @@ mod tests {
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: 1536,
             file_data_size: 0,
-            kind: crate::tar_model::TarEntryKind::Regular,
-            mode: 0o644,
-            mtime: 0,
             flags: EXTENDED_METADATA_V1,
         };
         let frame = FrameEntry {
@@ -3315,9 +3300,6 @@ mod tests {
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: 1536,
             file_data_size: 0,
-            kind: crate::tar_model::TarEntryKind::Regular,
-            mode: 0o644,
-            mtime: 0,
             flags: EXTENDED_METADATA_V1,
         };
         let frame = FrameEntry {

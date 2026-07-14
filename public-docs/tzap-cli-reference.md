@@ -174,8 +174,8 @@ Useful flags:
 - `--dry-run`: show what would be extracted
 - `--restore {content,portable,same-os,system}`: choose the authenticated
   metadata restore policy; defaults to `portable`
-- `--allow-degraded`: explicitly permit requested but unsupported native
-  metadata to be skipped with diagnostics
+- `--allow-degraded`: explicitly permit requested but unsupported metadata or
+  storage-layout fidelity to be skipped/materialized with diagnostics
 - `--bootstrap`: bootstrap sidecar path
 - `--recipient-key`: open a v45 RecipientWrap archive with a local recipient
   private key
@@ -269,7 +269,8 @@ Notes:
   with `--bootstrap` rejects before reading archive files with
   `unsupported-feature`.
 - Long listing decodes tar member groups and exposes parsed tar kind, size,
-  ustar mode, and integer mtime. Unsupported local tar metadata profiles are
+  portable mode, and exact signed mtime with up to nanosecond precision.
+  Unsupported local tar metadata profiles are
   reported to stderr as `tzap: degraded-metadata: ...`; global PAX/GNU state is
   rejected.
 
@@ -303,7 +304,10 @@ Useful flags:
 - `--json`: machine-readable status output. Verify JSON includes separate
   status axes for `revision_mode`, `header_base_integrity`,
   `decryption_keywrap`, `root_auth_signer`, `trust_policy`, and
-  `public_no_key_metadata_only`.
+  `public_no_key_metadata_only`. Full verification also includes per-entry
+  capture status, required/optional profiles, auxiliary kinds, restore-policy
+  capabilities, full-fidelity possibility, and structured diagnostics under
+  `metadata`.
 - `--quiet`: suppress success summary
 - `--trusted-public-key`: verify Ed25519 RootAuth with a trusted public key
 - `--trusted-ca-cert`: verify X.509 RootAuth with a trusted CA certificate

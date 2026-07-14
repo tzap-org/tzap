@@ -40,12 +40,14 @@ want direct access to the format from application code.
 
 ```rust
 use tzap_core::{
-    open_archive, write_archive, MasterKey, RegularFile, WriterOptions,
+    open_archive, write_archive, ArchiveTimestamp, MasterKey, RegularFile, WriterOptions,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = MasterKey::from_raw_key(&[0x42; 32])?;
-    let files = [RegularFile::new("notes/readme.txt", b"hello from tzap")];
+    let mut file = RegularFile::new("notes/readme.txt", b"hello from tzap");
+    file.mtime = ArchiveTimestamp::new(1_700_000_000, 123_456_789);
+    let files = [file];
     let options = WriterOptions {
         stripe_width: 1,
         volume_loss_tolerance: 0,

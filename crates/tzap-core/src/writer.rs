@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use crate::compression::{
@@ -16,7 +17,8 @@ use crate::crypto::{
     Subkeys,
 };
 use crate::entry_metadata::{
-    encode_canonical_pax, portable_primary_pax, EXTENDED_METADATA_V1, REQUIRES_SYSTEM_RESTORE,
+    encode_canonical_pax, is_source_os, portable_primary_pax, valid_filesystem_token,
+    ArchiveTimestamp, EXTENDED_METADATA_V1, REQUIRES_SYSTEM_RESTORE,
 };
 use crate::fec::encode_parity_gf16;
 use crate::format::{
@@ -42,7 +44,6 @@ use crate::root_auth::{
     index_digest_for_revision, root_auth_descriptor_digest_for_revision, signer_identity_digest,
     ArchiveRootInputs, CriticalMetadataDigestInputs, FecLayoutObjectRow,
 };
-use crate::tar_model::TarEntryKind;
 use crate::wire::{
     compute_key_wrap_table_digest, BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage,
     CriticalMetadataRecoveryHeader, CriticalMetadataRecoveryShard, CriticalRecoveryLocator,
@@ -311,12 +312,49 @@ pub struct RootAuthSigningRequest {
 pub type RootAuthAuthenticator<'a> =
     dyn FnMut(&RootAuthSigningRequest) -> Result<Vec<u8>, FormatError> + 'a;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PortableModeOrigin {
+    Native,
+    #[default]
+    Projected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortablePosixOwner {
+    pub uid: u64,
+    pub gid: u64,
+    pub uname: Option<String>,
+    pub gname: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortableFileMetadata {
+    pub source_os: String,
+    pub source_filesystem: String,
+    pub mode_origin: PortableModeOrigin,
+    pub posix_owner: Option<PortablePosixOwner>,
+    pub attributes: Option<u32>,
+}
+
+impl Default for PortableFileMetadata {
+    fn default() -> Self {
+        Self {
+            source_os: "other".into(),
+            source_filesystem: "unknown".into(),
+            mode_origin: PortableModeOrigin::Projected,
+            posix_owner: None,
+            attributes: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegularFile<'a> {
     pub path: &'a str,
     pub contents: &'a [u8],
     pub mode: u32,
-    pub mtime: u64,
+    pub mtime: ArchiveTimestamp,
+    pub portable_metadata: PortableFileMetadata,
 }
 
 impl<'a> RegularFile<'a> {
@@ -325,7 +363,8 @@ impl<'a> RegularFile<'a> {
             path,
             contents,
             mode: 0o644,
-            mtime: 0,
+            mtime: ArchiveTimestamp::UNIX_EPOCH,
+            portable_metadata: PortableFileMetadata::default(),
         }
     }
 }
@@ -338,7 +377,10 @@ pub trait RegularFileSource {
     fn archive_path(&self) -> &str;
     fn file_data_size(&self) -> u64;
     fn mode(&self) -> u32;
-    fn mtime(&self) -> u64;
+    fn mtime(&self) -> ArchiveTimestamp;
+    fn portable_metadata(&self) -> PortableFileMetadata {
+        PortableFileMetadata::default()
+    }
     fn open(&self) -> Result<Box<dyn Read + '_>, ArchiveWriteError>;
 }
 
@@ -355,8 +397,12 @@ impl RegularFileSource for RegularFile<'_> {
         self.mode
     }
 
-    fn mtime(&self) -> u64 {
+    fn mtime(&self) -> ArchiveTimestamp {
         self.mtime
+    }
+
+    fn portable_metadata(&self) -> PortableFileMetadata {
+        self.portable_metadata.clone()
     }
 
     fn open(&self) -> Result<Box<dyn Read + '_>, ArchiveWriteError> {
@@ -451,8 +497,12 @@ impl<S: RegularFileSource> RegularFileSource for ProgressRegularFileSource<'_, S
         self.inner.mode()
     }
 
-    fn mtime(&self) -> u64 {
+    fn mtime(&self) -> ArchiveTimestamp {
         self.inner.mtime()
+    }
+
+    fn portable_metadata(&self) -> PortableFileMetadata {
+        self.inner.portable_metadata()
     }
 
     fn open(&self) -> Result<Box<dyn Read + '_>, ArchiveWriteError> {
@@ -592,9 +642,9 @@ struct TarMember {
     tar_member_group_start: u64,
     tar_member_group_size: u64,
     file_data_size: u64,
-    kind: TarEntryKind,
     mode: u32,
-    mtime: u64,
+    mtime: ArchiveTimestamp,
+    portable_metadata: PortableFileMetadata,
 }
 
 #[derive(Debug, Clone)]
@@ -827,7 +877,8 @@ pub(crate) struct StreamingRegularMember {
     pub archive_path: Vec<u8>,
     pub file_data_size: u64,
     pub mode: u32,
-    pub mtime: u64,
+    pub mtime: ArchiveTimestamp,
+    pub portable_metadata: PortableFileMetadata,
 }
 
 struct WriterEmissionState {
@@ -1206,6 +1257,7 @@ where
                         file_data_size: file.file_data_size(),
                         mode: file.mode(),
                         mtime: file.mtime(),
+                        portable_metadata: file.portable_metadata(),
                     },
                     reader.as_mut(),
                 )?;
@@ -1251,6 +1303,7 @@ where
                         file_data_size: file.file_data_size(),
                         mode: file.mode(),
                         mtime: file.mtime(),
+                        portable_metadata: file.portable_metadata(),
                     },
                     reader.as_mut(),
                 )?;
@@ -1296,6 +1349,7 @@ where
                         file_data_size: file.file_data_size(),
                         mode: file.mode(),
                         mtime: file.mtime(),
+                        portable_metadata: file.portable_metadata(),
                     },
                     reader.as_mut(),
                 )?;
@@ -1853,11 +1907,13 @@ fn plan_payload_stream<S: RegularFileSource>(
 
     for (member_index, file) in files.iter().enumerate() {
         let path = normalize_lookup_file_path(file.archive_path(), options.max_path_length)?;
+        let portable_metadata = file.portable_metadata();
         let prefix = build_regular_file_member_prefix(
             &path,
             file.file_data_size(),
             file.mode(),
             file.mtime(),
+            &portable_metadata,
         )?;
         let member_start = tar_total_size;
         let member_group_size = checked_u64_add(
@@ -1874,9 +1930,9 @@ fn plan_payload_stream<S: RegularFileSource>(
             tar_member_group_start: member_start,
             tar_member_group_size: member_group_size,
             file_data_size: file.file_data_size(),
-            kind: TarEntryKind::Regular,
             mode: file.mode(),
             mtime: file.mtime(),
+            portable_metadata,
         });
         let mut reader = StreamingMemberReader::new(file.open()?, prefix, file.file_data_size());
         let mut member_offset = 0u64;
@@ -2173,6 +2229,7 @@ where
                         file_data_size: file.file_data_size(),
                         mode: file.mode(),
                         mtime: file.mtime(),
+                        portable_metadata: file.portable_metadata(),
                     },
                     reader.as_mut(),
                 )?;
@@ -2457,6 +2514,7 @@ impl<O: ArchiveWriteSink> OrderedParallelArchiveWriter<'_, O> {
             member.file_data_size,
             member.mode,
             member.mtime,
+            &member.portable_metadata,
         )?;
         let member_start = self.ordered.tar_total_size;
         let member_group_size = checked_u64_add(
@@ -2474,9 +2532,9 @@ impl<O: ArchiveWriteSink> OrderedParallelArchiveWriter<'_, O> {
             tar_member_group_start: member_start,
             tar_member_group_size: member_group_size,
             file_data_size: member.file_data_size,
-            kind: TarEntryKind::Regular,
             mode: member.mode,
             mtime: member.mtime,
+            portable_metadata: member.portable_metadata.clone(),
         });
 
         let mut reader =
@@ -3044,6 +3102,7 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
             member.file_data_size,
             member.mode,
             member.mtime,
+            &member.portable_metadata,
         )?;
         let member_start = self.tar_total_size;
         let member_group_size = checked_u64_add(
@@ -3061,9 +3120,9 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
             tar_member_group_start: member_start,
             tar_member_group_size: member_group_size,
             file_data_size: member.file_data_size,
-            kind: TarEntryKind::Regular,
             mode: member.mode,
             mtime: member.mtime,
+            portable_metadata: member.portable_metadata.clone(),
         });
 
         let mut reader =
@@ -4037,6 +4096,7 @@ where
             || file.file_data_size() != member.file_data_size
             || file.mode() != member.mode
             || file.mtime() != member.mtime
+            || file.portable_metadata() != member.portable_metadata
         {
             return Err(FormatError::WriterInvariant(
                 "file source changed between planning and emission",
@@ -4048,6 +4108,7 @@ where
             member.file_data_size,
             member.mode,
             member.mtime,
+            &member.portable_metadata,
         )?;
         let mut reader = StreamingMemberReader::new(file.open()?, prefix, member.file_data_size);
         let mut member_offset = 0u64;
@@ -4500,17 +4561,22 @@ fn build_tar_stream(
     for file in files {
         let path = normalize_lookup_file_path(file.path, max_path_length)?;
         let start = stream.len() as u64;
-        let member_group =
-            build_regular_file_member_group(&path, file.contents, file.mode, file.mtime)?;
+        let member_group = build_regular_file_member_group(
+            &path,
+            file.contents,
+            file.mode,
+            file.mtime,
+            &file.portable_metadata,
+        )?;
         stream.extend_from_slice(&member_group);
         members.push(TarMember {
             path,
             tar_member_group_start: start,
             tar_member_group_size: member_group.len() as u64,
             file_data_size: file.contents.len() as u64,
-            kind: TarEntryKind::Regular,
             mode: file.mode,
             mtime: file.mtime,
+            portable_metadata: file.portable_metadata.clone(),
         });
     }
     Ok((stream, members))
@@ -4784,10 +4850,7 @@ fn build_index_shard_plaintext(
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: row.member.tar_member_group_size,
             file_data_size: row.member.file_data_size,
-            kind: row.member.kind,
-            mode: row.member.mode,
-            mtime: row.member.mtime,
-            flags: v45_portable_file_entry_flags(row.member.mode),
+            flags: v45_portable_file_entry_flags(row.member.mode, &row.member.portable_metadata),
         });
     }
 
@@ -6468,11 +6531,44 @@ fn build_regular_file_member_prefix(
     path: &[u8],
     file_size: u64,
     mode: u32,
-    mtime: u64,
+    mtime: ArchiveTimestamp,
+    portable_metadata: &PortableFileMetadata,
 ) -> Result<Vec<u8>, FormatError> {
     let mut out = Vec::new();
     let use_path_override = path_requires_pax(path);
-    let pax_records = portable_primary_pax(path, mode, writer_source_os(), use_path_override)?;
+    validate_portable_file_metadata(portable_metadata)?;
+    let mut pax_records =
+        portable_primary_pax(path, mode, &portable_metadata.source_os, use_path_override)?;
+    pax_records.insert(
+        "TZAP.metadata.source-filesystem".into(),
+        portable_metadata.source_filesystem.as_bytes().to_vec(),
+    );
+    pax_records.insert(
+        "TZAP.portable.mode-origin".into(),
+        match portable_metadata.mode_origin {
+            PortableModeOrigin::Native => b"native".to_vec(),
+            PortableModeOrigin::Projected => b"projected".to_vec(),
+        },
+    );
+    if let Some(attributes) = portable_metadata.attributes {
+        pax_records.insert(
+            "TZAP.portable.attributes".into(),
+            format!("{attributes:08x}").into_bytes(),
+        );
+    }
+    let primary_identity = prepare_primary_tar_identity(&mut pax_records, portable_metadata)?;
+    let header_mtime = if mtime.nanoseconds == 0 && mtime.seconds >= 0 {
+        let seconds = mtime.seconds as u64;
+        if tar_octal_fits(12, seconds) {
+            seconds
+        } else {
+            pax_records.insert("mtime".into(), mtime.canonical_pax_value()?);
+            0
+        }
+    } else {
+        pax_records.insert("mtime".into(), mtime.canonical_pax_value()?);
+        0
+    };
     let pax_payload = encode_canonical_pax(&pax_records)?;
     let pax_header = build_ustar_header(b"TZAP-PAX/PRIMARY", pax_payload.len() as u64, 0, 0, b'x')?;
     out.extend_from_slice(&pax_header);
@@ -6485,9 +6581,102 @@ fn build_regular_file_member_prefix(
         path.to_vec()
     };
 
-    let header = build_ustar_header(&header_path, file_size, mode, mtime, b'0')?;
+    let mut header = build_ustar_header(&header_path, file_size, mode, header_mtime, b'0')?;
+    apply_primary_tar_identity(&mut header, &primary_identity)?;
     out.extend_from_slice(&header);
     Ok(out)
+}
+
+#[derive(Debug, Default)]
+struct PrimaryTarIdentity {
+    uid: u64,
+    gid: u64,
+    uname: Vec<u8>,
+    gname: Vec<u8>,
+}
+
+fn validate_portable_file_metadata(metadata: &PortableFileMetadata) -> Result<(), FormatError> {
+    if !is_source_os(&metadata.source_os) {
+        return Err(FormatError::WriterUnsupported("invalid metadata source OS"));
+    }
+    if !valid_filesystem_token(&metadata.source_filesystem) {
+        return Err(FormatError::WriterUnsupported(
+            "invalid metadata source filesystem",
+        ));
+    }
+    if metadata
+        .attributes
+        .is_some_and(|attributes| attributes & !0x0f != 0)
+    {
+        return Err(FormatError::WriterUnsupported(
+            "portable attributes contain reserved bits",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_primary_tar_identity(
+    pax_records: &mut crate::entry_metadata::PaxRecords,
+    metadata: &PortableFileMetadata,
+) -> Result<PrimaryTarIdentity, FormatError> {
+    let Some(owner) = &metadata.posix_owner else {
+        return Ok(PrimaryTarIdentity::default());
+    };
+    pax_records.insert("TZAP.portable.owner-kind".into(), b"posix".to_vec());
+    let uid = if tar_octal_fits(8, owner.uid) {
+        owner.uid
+    } else {
+        pax_records.insert("uid".into(), owner.uid.to_string().into_bytes());
+        0
+    };
+    let gid = if tar_octal_fits(8, owner.gid) {
+        owner.gid
+    } else {
+        pax_records.insert("gid".into(), owner.gid.to_string().into_bytes());
+        0
+    };
+    let uname = prepare_primary_name(pax_records, "uname", owner.uname.as_deref())?;
+    let gname = prepare_primary_name(pax_records, "gname", owner.gname.as_deref())?;
+    Ok(PrimaryTarIdentity {
+        uid,
+        gid,
+        uname,
+        gname,
+    })
+}
+
+fn prepare_primary_name(
+    pax_records: &mut crate::entry_metadata::PaxRecords,
+    key: &'static str,
+    name: Option<&str>,
+) -> Result<Vec<u8>, FormatError> {
+    let Some(name) = name else {
+        return Ok(Vec::new());
+    };
+    if name.is_empty() || name.contains('\0') || name.nfc().collect::<String>() != name {
+        return Err(FormatError::WriterUnsupported(
+            "portable owner name is not canonical NFC UTF-8",
+        ));
+    }
+    if name.len() <= 32 {
+        Ok(name.as_bytes().to_vec())
+    } else {
+        pax_records.insert(key.into(), name.as_bytes().to_vec());
+        Ok(Vec::new())
+    }
+}
+
+fn apply_primary_tar_identity(
+    header: &mut [u8; TAR_BLOCK_LEN],
+    identity: &PrimaryTarIdentity,
+) -> Result<(), FormatError> {
+    write_tar_octal(&mut header[108..116], identity.uid)?;
+    write_tar_octal(&mut header[116..124], identity.gid)?;
+    header[265..297].fill(0);
+    header[265..265 + identity.uname.len()].copy_from_slice(&identity.uname);
+    header[297..329].fill(0);
+    header[297..297 + identity.gname.len()].copy_from_slice(&identity.gname);
+    finalize_tar_checksum(header)
 }
 
 #[cfg(test)]
@@ -6495,9 +6684,16 @@ fn build_regular_file_member_group(
     path: &[u8],
     contents: &[u8],
     mode: u32,
-    mtime: u64,
+    mtime: ArchiveTimestamp,
+    portable_metadata: &PortableFileMetadata,
 ) -> Result<Vec<u8>, FormatError> {
-    let mut out = build_regular_file_member_prefix(path, contents.len() as u64, mode, mtime)?;
+    let mut out = build_regular_file_member_prefix(
+        path,
+        contents.len() as u64,
+        mode,
+        mtime,
+        portable_metadata,
+    )?;
     out.extend_from_slice(contents);
     out.resize(out.len() + padding_to_512(contents.len()), 0);
     Ok(out)
@@ -6507,29 +6703,9 @@ fn path_requires_pax(path: &[u8]) -> bool {
     path.len() > 100
 }
 
-fn writer_source_os() -> &'static str {
-    if cfg!(target_os = "linux") {
-        "linux"
-    } else if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "windows") {
-        "windows"
-    } else if cfg!(target_os = "freebsd") {
-        "freebsd"
-    } else if cfg!(target_os = "netbsd") {
-        "netbsd"
-    } else if cfg!(target_os = "openbsd") {
-        "openbsd"
-    } else if cfg!(target_family = "unix") {
-        "other-unix"
-    } else {
-        "other"
-    }
-}
-
-fn v45_portable_file_entry_flags(mode: u32) -> u32 {
+fn v45_portable_file_entry_flags(mode: u32, metadata: &PortableFileMetadata) -> u32 {
     EXTENDED_METADATA_V1
-        | if mode & 0o6000 != 0 {
+        | if mode & 0o6000 != 0 || metadata.posix_owner.is_some() {
             REQUIRES_SYSTEM_RESTORE
         } else {
             0
@@ -6559,9 +6735,14 @@ fn build_ustar_header(
     header[156] = typeflag;
     header[257..263].copy_from_slice(b"ustar\0");
     header[263..265].copy_from_slice(b"00");
-    let checksum = header.iter().map(|byte| *byte as u32).sum::<u32>() as u64;
-    write_tar_checksum(&mut header[148..156], checksum)?;
+    finalize_tar_checksum(&mut header)?;
     Ok(header)
+}
+
+fn finalize_tar_checksum(header: &mut [u8; TAR_BLOCK_LEN]) -> Result<(), FormatError> {
+    header[148..156].fill(b' ');
+    let checksum = header.iter().map(|byte| *byte as u32).sum::<u32>() as u64;
+    write_tar_checksum(&mut header[148..156], checksum)
 }
 
 fn write_tar_octal(field: &mut [u8], value: u64) -> Result<(), FormatError> {
@@ -6576,6 +6757,10 @@ fn write_tar_octal(field: &mut [u8], value: u64) -> Result<(), FormatError> {
     }
     field[padding..padding + digits.len()].copy_from_slice(digits.as_bytes());
     Ok(())
+}
+
+fn tar_octal_fits(field_len: usize, value: u64) -> bool {
+    format!("{value:o}").len() < field_len
 }
 
 fn write_tar_checksum(field: &mut [u8], value: u64) -> Result<(), FormatError> {
@@ -6961,9 +7146,9 @@ mod tests {
                 tar_member_group_start: idx as u64 * 512,
                 tar_member_group_size: 512,
                 file_data_size: 0,
-                kind: TarEntryKind::Regular,
                 mode: 0o644,
-                mtime: 0,
+                mtime: ArchiveTimestamp::UNIX_EPOCH,
+                portable_metadata: PortableFileMetadata::default(),
             })
             .collect::<Vec<_>>();
 
@@ -7017,9 +7202,9 @@ mod tests {
                     tar_member_group_start: 0,
                     tar_member_group_size: 512,
                     file_data_size: 0,
-                    kind: TarEntryKind::Regular,
                     mode: 0o644,
-                    mtime: 0,
+                    mtime: ArchiveTimestamp::UNIX_EPOCH,
+                    portable_metadata: PortableFileMetadata::default(),
                 },
             }],
             vec![FileRow {
@@ -7031,9 +7216,9 @@ mod tests {
                     tar_member_group_start: 512,
                     tar_member_group_size: 512,
                     file_data_size: 0,
-                    kind: TarEntryKind::Regular,
                     mode: 0o644,
-                    mtime: 0,
+                    mtime: ArchiveTimestamp::UNIX_EPOCH,
+                    portable_metadata: PortableFileMetadata::default(),
                 },
             }],
         ];
@@ -7136,14 +7321,118 @@ mod tests {
 
     #[test]
     fn regular_file_writer_round_trips_mode_and_mtime() {
-        let group =
-            build_regular_file_member_group(b"script.sh", b"#!/bin/sh\n", 0o755, 1_700_000_000)
-                .unwrap();
+        let group = build_regular_file_member_group(
+            b"script.sh",
+            b"#!/bin/sh\n",
+            0o755,
+            ArchiveTimestamp::from_seconds(1_700_000_000),
+            &PortableFileMetadata::default(),
+        )
+        .unwrap();
 
         let parsed = parse_tar_member_group(&group, 4096).unwrap();
 
         assert_eq!(parsed.mode, 0o755);
-        assert_eq!(parsed.mtime, 1_700_000_000);
+        assert_eq!(parsed.mtime, ArchiveTimestamp::from_seconds(1_700_000_000));
+    }
+
+    #[test]
+    fn regular_file_writer_round_trips_nanosecond_and_pre_epoch_mtimes() {
+        for expected in [
+            ArchiveTimestamp::new(1_700_000_000, 123_456_789),
+            ArchiveTimestamp::new(-1, 500_000_000),
+        ] {
+            let group = build_regular_file_member_group(
+                b"dated.txt",
+                b"dated",
+                0o644,
+                expected,
+                &PortableFileMetadata::default(),
+            )
+            .unwrap();
+            let parsed = parse_tar_member_group(&group, 4096).unwrap();
+            assert_eq!(parsed.mtime, expected);
+            assert_eq!(
+                parsed.v45_metadata.portable_mirror.mtime,
+                (expected.seconds, expected.nanoseconds)
+            );
+        }
+    }
+
+    #[test]
+    fn regular_file_writer_rejects_invalid_timestamp_nanoseconds() {
+        assert!(matches!(
+            build_regular_file_member_group(
+                b"dated.txt",
+                b"dated",
+                0o644,
+                ArchiveTimestamp::new(0, 1_000_000_000),
+                &PortableFileMetadata::default(),
+            ),
+            Err(FormatError::WriterUnsupported(
+                "timestamp nanoseconds must be less than one billion"
+            ))
+        ));
+    }
+
+    #[test]
+    fn regular_file_writer_round_trips_portable_owner_origin_and_attributes() {
+        let portable_metadata = PortableFileMetadata {
+            source_os: "other-unix".into(),
+            source_filesystem: "ext4".into(),
+            mode_origin: PortableModeOrigin::Native,
+            posix_owner: Some(PortablePosixOwner {
+                uid: 9_000_000,
+                gid: 42,
+                uname: Some("tést-user".into()),
+                gname: Some("archive".into()),
+            }),
+            attributes: Some(1),
+        };
+        let group = build_regular_file_member_group(
+            b"owned.txt",
+            b"owned",
+            0o640,
+            ArchiveTimestamp::UNIX_EPOCH,
+            &portable_metadata,
+        )
+        .unwrap();
+        let parsed = parse_tar_member_group(&group, 4096).unwrap();
+
+        assert!(parsed.v45_metadata.declaration.owner_kind_posix);
+        assert!(parsed.v45_metadata.declaration.mode_origin_native);
+        assert_eq!(parsed.v45_metadata.declaration.source_os, "other-unix");
+        assert_eq!(parsed.v45_metadata.declaration.source_filesystem, "ext4");
+        assert_eq!(parsed.v45_metadata.portable_mirror.uid, Some(9_000_000));
+        assert_eq!(parsed.v45_metadata.portable_mirror.gid, Some(42));
+        assert_eq!(
+            parsed.v45_metadata.portable_mirror.uname.as_deref(),
+            Some("tést-user".as_bytes())
+        );
+        assert_eq!(parsed.v45_metadata.portable_mirror.attributes, Some(1));
+        assert_ne!(
+            parsed.v45_metadata.file_entry_flags & REQUIRES_SYSTEM_RESTORE,
+            0
+        );
+    }
+
+    #[test]
+    fn regular_file_writer_rejects_reserved_portable_attribute_bits() {
+        let portable_metadata = PortableFileMetadata {
+            attributes: Some(1 << 4),
+            ..PortableFileMetadata::default()
+        };
+        assert_eq!(
+            build_regular_file_member_group(
+                b"attributes.txt",
+                b"data",
+                0o644,
+                ArchiveTimestamp::UNIX_EPOCH,
+                &portable_metadata,
+            )
+            .unwrap_err(),
+            FormatError::WriterUnsupported("portable attributes contain reserved bits")
+        );
     }
 
     #[test]
@@ -8426,8 +8715,8 @@ mod tests {
             0o644
         }
 
-        fn mtime(&self) -> u64 {
-            0
+        fn mtime(&self) -> ArchiveTimestamp {
+            ArchiveTimestamp::UNIX_EPOCH
         }
 
         fn open(&self) -> Result<Box<dyn Read + '_>, ArchiveWriteError> {
@@ -8591,9 +8880,9 @@ mod tests {
                 tar_member_group_start: idx as u64 * 512,
                 tar_member_group_size: 512,
                 file_data_size: 0,
-                kind: TarEntryKind::Regular,
                 mode: 0o644,
-                mtime: 0,
+                mtime: ArchiveTimestamp::UNIX_EPOCH,
+                portable_metadata: PortableFileMetadata::default(),
             },
         }
     }

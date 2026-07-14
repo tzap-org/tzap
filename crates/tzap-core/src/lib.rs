@@ -21,7 +21,7 @@ mod raw_stream_profile;
 mod streaming_writer;
 
 pub use crypto::{HmacDomain, KdfParams, MasterKey, Subkeys};
-pub use entry_metadata::RestorePolicy;
+pub use entry_metadata::{ArchiveTimestamp, RestorePolicy};
 pub use format::{
     AeadAlgo, ArchiveWriteError, CompressionAlgo, ExtractError, FecAlgo, FormatError, KdfAlgo,
     FORMAT_VERSION, VOLUME_FORMAT_REV,
@@ -65,7 +65,10 @@ pub use streaming_writer::{
     write_tar_stream_archive_to_sink, write_tar_stream_archive_to_sink_with_kdf_and_root_auth,
     StreamingRawWriterSummary, StreamingTarWriterSummary,
 };
-pub use tar_model::{MetadataDiagnostic, SafeExtractionOptions, TarEntryKind};
+pub use tar_model::{
+    EntryMetadataVerification, MetadataDiagnostic, MetadataDiagnosticStatus, MetadataOperation,
+    MetadataVerificationReport, RestorePolicyCapability, SafeExtractionOptions, TarEntryKind,
+};
 pub use writer::{
     write_archive, write_archive_sources_to_sink, write_archive_sources_to_sink_ordered_parallel,
     write_archive_sources_to_sink_ordered_parallel_with_progress,
@@ -80,6 +83,7 @@ pub use writer::{
     write_archive_with_kdf, write_archive_with_recipient_wrap_records,
     write_archive_with_root_auth, write_archive_with_root_auth_and_kdf, write_empty_archive,
     ArchiveWritePhase, ArchiveWriteProgressSink, ArchiveWriteSink, KeyWrapRecordSource,
-    MemoryArchiveSink, RegularFile, RegularFileSource, RootAuthSigningRequest,
-    RootAuthWriterConfig, WriterOptions, WriterTimings, WrittenArchiveSummary,
+    MemoryArchiveSink, PortableFileMetadata, PortableModeOrigin, PortablePosixOwner, RegularFile,
+    RegularFileSource, RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions, WriterTimings,
+    WrittenArchiveSummary,
 };

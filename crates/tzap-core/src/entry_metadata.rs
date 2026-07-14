@@ -1,6 +1,7 @@
 //! Revision-45 per-entry metadata, canonical PAX, and auxiliary-stream rules.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
@@ -33,6 +34,63 @@ pub const CORE_PROFILE: &str = "tzap-core-v1";
 pub const CAPTURE_REPORT_KIND: &str = "tzap.capture-report";
 
 pub type PaxRecords = BTreeMap<String, Vec<u8>>;
+
+/// A revision-45 timestamp represented as signed Unix seconds plus nanoseconds.
+///
+/// `nanoseconds` must be less than one billion. Writers validate this invariant
+/// before serializing the value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ArchiveTimestamp {
+    pub seconds: i64,
+    pub nanoseconds: u32,
+}
+
+impl ArchiveTimestamp {
+    pub const UNIX_EPOCH: Self = Self::from_seconds(0);
+
+    pub const fn from_seconds(seconds: i64) -> Self {
+        Self {
+            seconds,
+            nanoseconds: 0,
+        }
+    }
+
+    pub const fn new(seconds: i64, nanoseconds: u32) -> Self {
+        Self {
+            seconds,
+            nanoseconds,
+        }
+    }
+
+    pub fn canonical_pax_value(self) -> Result<Vec<u8>, FormatError> {
+        if self.nanoseconds >= 1_000_000_000 {
+            return Err(FormatError::WriterUnsupported(
+                "timestamp nanoseconds must be less than one billion",
+            ));
+        }
+        if self.nanoseconds == 0 {
+            return Ok(self.seconds.to_string().into_bytes());
+        }
+        let fraction = format!("{:09}", self.nanoseconds);
+        let fraction = fraction.trim_end_matches('0');
+        Ok(format!("{}.{fraction}", self.seconds).into_bytes())
+    }
+}
+
+impl fmt::Display for ArchiveTimestamp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.nanoseconds == 0 {
+            return write!(formatter, "{}", self.seconds);
+        }
+        let fraction = format!("{:09}", self.nanoseconds);
+        write!(
+            formatter,
+            "{}.{fraction}",
+            self.seconds,
+            fraction = fraction.trim_end_matches('0')
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureStatus {
@@ -103,6 +161,20 @@ impl MetadataDeclaration {
         self.required_profiles
             .iter()
             .any(|profile| !is_known_profile(profile))
+    }
+
+    pub fn unknown_required_profiles(&self) -> impl Iterator<Item = &str> {
+        self.required_profiles
+            .iter()
+            .map(String::as_str)
+            .filter(|profile| !is_known_profile(profile))
+    }
+
+    pub fn unknown_optional_profiles(&self) -> impl Iterator<Item = &str> {
+        self.optional_profiles
+            .iter()
+            .map(String::as_str)
+            .filter(|profile| !is_known_profile(profile))
     }
 }
 
@@ -1298,6 +1370,13 @@ fn validate_scalar_encodings(records: &PaxRecords) -> Result<Vec<Vec<u8>>, Forma
         .filter(|(key, _)| key.starts_with("LIBARCHIVE.xattr."))
     {
         let name = decode_percent_name(&key.as_bytes()["LIBARCHIVE.xattr.".len()..])?;
+        if name.len() > MAX_AUXILIARY_NAME_LEN {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "decoded xattr name bytes",
+                cap: MAX_AUXILIARY_NAME_LEN as u64,
+                actual: name.len() as u64,
+            });
+        }
         if name.is_empty() || !decoded_xattrs.insert(name) {
             return invalid("PrimaryMetadata", "duplicate or empty decoded xattr name");
         }
@@ -2280,12 +2359,15 @@ fn decode_percent_name(value: &[u8]) -> Result<Vec<u8>, FormatError> {
 fn parse_timestamp(value: &[u8]) -> Result<(i64, u32), FormatError> {
     let text = std::str::from_utf8(value)
         .map_err(|_| FormatError::InvalidArchive("timestamp is not ASCII"))?;
-    if text.is_empty() || text.starts_with('+') || text == "-0" {
+    if text.is_empty() || text.starts_with('+') {
         return invalid("Timestamp", "timestamp is not canonical");
     }
     let (integer, fraction) = text
         .split_once('.')
         .map_or((text, None), |(a, b)| (a, Some(b)));
+    if integer == "-0" {
+        return invalid("Timestamp", "timestamp is not canonical");
+    }
     let unsigned = integer.strip_prefix('-').unwrap_or(integer);
     if unsigned.is_empty()
         || !unsigned.bytes().all(|byte| byte.is_ascii_digit())
@@ -2450,7 +2532,7 @@ fn ascii_string(value: &[u8], field: &'static str) -> Result<String, FormatError
     Ok(std::str::from_utf8(value).unwrap().to_owned())
 }
 
-fn is_source_os(value: &str) -> bool {
+pub(crate) fn is_source_os(value: &str) -> bool {
     matches!(
         value,
         "linux"
@@ -2465,7 +2547,7 @@ fn is_source_os(value: &str) -> bool {
     )
 }
 
-fn valid_filesystem_token(value: &str) -> bool {
+pub(crate) fn valid_filesystem_token(value: &str) -> bool {
     value == "unknown"
         || (1..=32).contains(&value.len())
             && value.bytes().all(|byte| {
@@ -2624,6 +2706,13 @@ mod tests {
             .collect::<Vec<_>>();
         reversed.swap(0, 1);
         assert!(parse_canonical_pax(&reversed.concat()).is_err());
+    }
+
+    #[test]
+    fn timestamp_rejects_negative_zero_integer_component() {
+        assert!(parse_timestamp(b"-0").is_err());
+        assert!(parse_timestamp(b"-0.5").is_err());
+        assert_eq!(parse_timestamp(b"-1.5").unwrap(), (-1, 500_000_000));
     }
 
     #[test]

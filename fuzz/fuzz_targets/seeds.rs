@@ -1,4 +1,5 @@
 use tzap_core::compression::compress_zstd_frame;
+use tzap_core::entry_metadata::EXTENDED_METADATA_V1;
 use tzap_core::format::{
     AeadAlgo, BlockKind, CompressionAlgo, FecAlgo, KdfAlgo, CRITICAL_METADATA_RECOVERY_HEADER_LEN,
     CRYPTO_EXTENSION_HEADER_LEN, CRYPTO_HEADER_FIXED_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION,
@@ -12,7 +13,6 @@ use tzap_core::metadata::{
     INDEX_SHARD_HEADER_LEN,
 };
 use tzap_core::padding::suffix_pad_for_aead;
-use tzap_core::tar_model::TarEntryKind;
 use tzap_core::wire::{
     BlockRecord, BootstrapSidecarHeader, CriticalMetadataImage, CriticalMetadataRecoveryHeader,
     CriticalMetadataRecoveryShard, CriticalRecoveryLocator, CryptoHeaderFixed, ManifestFooter,
@@ -518,12 +518,9 @@ fn valid_index_shard() -> Vec<u8> {
             first_frame_index: 0,
             frame_count: 1,
             offset_in_first_frame_plaintext: 0,
-            tar_member_group_size: 512,
+            tar_member_group_size: 1536,
             file_data_size: 0,
-            kind: TarEntryKind::Regular,
-            mode: 0o644,
-            mtime: 0,
-            flags: 0,
+            flags: EXTENDED_METADATA_V1,
         }
         .to_bytes(),
     );
@@ -533,7 +530,7 @@ fn valid_index_shard() -> Vec<u8> {
             envelope_index: 0,
             offset_in_envelope: 0,
             compressed_size: 128,
-            decompressed_size: 512,
+            decompressed_size: 1536,
             flags: 0,
             tar_stream_offset: 0,
         }

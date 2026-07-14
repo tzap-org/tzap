@@ -19,7 +19,7 @@ through every parser harness. Add minimized repro bytes to the matching
 regression test.
 
 The seed manifest at `fuzz/corpus/manifest.tsv` maps each target to the legacy
-v0.36 section 28.1 corpus cases it keeps warm and the current v44 structured
+v0.36 section 28.1 corpus cases it keeps warm and the current v45 structured
 seeds it builds deterministically in `fuzz/fuzz_targets/seeds.rs`. Small file
 seeds live under `fuzz/corpus/<target>/`.
 

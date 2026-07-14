@@ -34,13 +34,15 @@ tzap-core = "0.1.10"
 ```rust
 use tzap_core::{
     open_archive, open_archive_unencrypted, open_seekable_archive, write_archive,
-    write_archive_unencrypted, MasterKey, RegularFile, WriterOptions,
+    write_archive_unencrypted, ArchiveTimestamp, MasterKey, RegularFile, WriterOptions,
 };
 use std::fs::File;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = MasterKey::from_raw_key(&[0x42; 32])?;
-    let files = [RegularFile::new("notes/readme.txt", b"hello from tzap")];
+    let mut file = RegularFile::new("notes/readme.txt", b"hello from tzap");
+    file.mtime = ArchiveTimestamp::new(1_700_000_000, 123_456_789);
+    let files = [file];
 
     let written = write_archive(&files, &key, WriterOptions::default())?;
     let opened = open_archive(&written.bytes, &key)?;
@@ -61,6 +63,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+`ArchiveTimestamp` and decoded `ArchiveEntry::mtime` preserve signed pre-epoch
+seconds and nanosecond precision. Full verification exposes per-entry metadata
+results through `ArchiveContentVerification::metadata_report()`. Custom
+`RegularFileSource` implementations can return `PortableFileMetadata` to carry
+mode origin, POSIX numeric ownership, portable attributes, and source identity.
 
 ## RootAuth Integration
 

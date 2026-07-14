@@ -13,10 +13,11 @@ use std::os::unix::fs::PermissionsExt;
 
 use crate::entry_metadata::{
     parse_auxiliary_record, parse_canonical_pax, parse_primary_metadata, parse_sparse_payload,
-    validate_group_metadata, AuxiliaryRecord, AuxiliaryStreamValidator, CaptureReportRow,
-    CaptureStatus, MemberMetadata, PaxRecords, PortableMetadataMirror, PrimaryMetadata,
-    RestoreClass, RestorePolicy, SparseStreamValidator, CAPTURE_REPORT_KIND, HAS_NATIVE_METADATA,
-    MAX_AGGREGATE_PAX_PAYLOAD, MAX_LOCAL_PAX_PAYLOAD, REQUIRES_SYSTEM_RESTORE,
+    validate_group_metadata, ArchiveTimestamp, AuxiliaryRecord, AuxiliaryStreamValidator,
+    CaptureReportRow, CaptureStatus, MemberMetadata, PaxRecords, PortableMetadataMirror,
+    PrimaryMetadata, RestoreClass, RestorePolicy, SparseStreamValidator, CAPTURE_REPORT_KIND,
+    HAS_NATIVE_METADATA, HAS_SPARSE_EXTENTS, MAX_AGGREGATE_PAX_PAYLOAD, MAX_LOCAL_PAX_PAYLOAD,
+    REQUIRES_SYSTEM_RESTORE,
 };
 use crate::format::{ExtractError, FormatError};
 use crate::metadata::validate_file_path_bytes;
@@ -35,9 +36,107 @@ pub enum TarEntryKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataOperation {
+    Capture,
+    Parse,
+    Verify,
+    Plan,
+    Restore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataDiagnosticStatus {
+    Partial,
+    Unsupported,
+    Skipped,
+    Materialized,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataDiagnostic {
-    pub profile: &'static str,
-    pub message: &'static str,
+    pub path: Vec<u8>,
+    pub profile: String,
+    pub metadata_class: String,
+    pub operation: MetadataOperation,
+    pub status: MetadataDiagnosticStatus,
+    pub message: String,
+    pub restore_policy: Option<RestorePolicy>,
+    pub restore_phase: Option<u8>,
+    pub native_host_error: Option<String>,
+    pub bytes_staged: Option<u64>,
+    pub bytes_committed: Option<u64>,
+}
+
+impl MetadataDiagnostic {
+    fn new(
+        path: &[u8],
+        profile: impl Into<String>,
+        metadata_class: impl Into<String>,
+        operation: MetadataOperation,
+        status: MetadataDiagnosticStatus,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: path.to_vec(),
+            profile: profile.into(),
+            metadata_class: metadata_class.into(),
+            operation,
+            status,
+            message: message.into(),
+            restore_policy: None,
+            restore_phase: None,
+            native_host_error: None,
+            bytes_staged: None,
+            bytes_committed: None,
+        }
+    }
+
+    fn for_restore(mut self, policy: RestorePolicy, phase: u8) -> Self {
+        self.restore_policy = Some(policy);
+        self.restore_phase = Some(phase);
+        self
+    }
+
+    fn with_native_error(mut self, error: &std::io::Error) -> Self {
+        self.native_host_error = Some(error.to_string());
+        self
+    }
+
+    fn with_bytes(mut self, staged: u64, committed: u64) -> Self {
+        self.bytes_staged = Some(staged);
+        self.bytes_committed = Some(committed);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestorePolicyCapability {
+    pub policy: RestorePolicy,
+    pub policy_complete: bool,
+    pub degraded_restore_available: bool,
+    pub reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryMetadataVerification {
+    pub path: Vec<u8>,
+    pub capture_status: CaptureStatus,
+    pub required_profiles: Vec<String>,
+    pub optional_profiles: Vec<String>,
+    pub auxiliary_kinds: Vec<String>,
+    pub policy_capabilities: Vec<RestorePolicyCapability>,
+    pub full_fidelity_possible: bool,
+    pub diagnostics: Vec<MetadataDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataVerificationReport {
+    pub all_capture_complete: bool,
+    pub full_fidelity_possible: bool,
+    pub profiles_present: Vec<String>,
+    pub auxiliary_kinds_present: Vec<String>,
+    pub entries: Vec<EntryMetadataVerification>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +146,7 @@ pub struct OwnedTarMember {
     pub data: Vec<u8>,
     pub link_target: Option<Vec<u8>>,
     pub mode: u32,
-    pub mtime: u64,
+    pub mtime: ArchiveTimestamp,
     pub logical_size: u64,
     pub reparse_placeholder: bool,
     pub v45_metadata: Option<MemberMetadata>,
@@ -61,7 +160,7 @@ pub struct ParsedTarMember<'a> {
     pub data: &'a [u8],
     pub link_target: Option<Vec<u8>>,
     pub mode: u32,
-    pub mtime: u64,
+    pub mtime: ArchiveTimestamp,
     pub logical_size: u64,
     pub reparse_placeholder: bool,
     pub diagnostics: Vec<MetadataDiagnostic>,
@@ -151,7 +250,7 @@ pub(crate) struct StreamedTarMemberMetadata {
     pub kind: TarEntryKind,
     pub link_target: Option<Vec<u8>>,
     pub mode: u32,
-    pub mtime: u64,
+    pub mtime: ArchiveTimestamp,
     pub logical_size: u64,
     pub file_entry_flags: u32,
     pub reparse_placeholder: bool,
@@ -165,11 +264,11 @@ pub(crate) struct TarStreamMemberSummary {
     pub kind: TarEntryKind,
     pub link_target: Option<Vec<u8>>,
     pub mode: u32,
-    pub mtime: u64,
+    pub mtime: ArchiveTimestamp,
     pub logical_size: u64,
     pub file_entry_flags: u32,
     pub reparse_placeholder: bool,
-    pub portable_mirror: PortableMetadataMirror,
+    pub v45_metadata: MemberMetadata,
     pub diagnostics: Vec<MetadataDiagnostic>,
     pub group_start: u64,
     pub group_size: u64,
@@ -547,20 +646,8 @@ pub fn parse_tar_member_group<'a>(
                     is_sparse,
                     capture_report.as_deref(),
                 )?;
-                let mut diagnostics = Vec::new();
-                let (mtime_seconds, _mtime_nanos) = primary.mtime.unwrap_or((
-                    i64::try_from(parse_tar_octal(&header[136..148])?).unwrap_or(i64::MAX),
-                    0,
-                ));
-                let mtime = if mtime_seconds < 0 {
-                    diagnostics.push(MetadataDiagnostic {
-                        profile: "portable-v1",
-                        message: "pre-epoch mtime requires a signed-time restore API",
-                    });
-                    0
-                } else {
-                    mtime_seconds as u64
-                };
+                let diagnostics = Vec::new();
+                let mtime = decoded_mtime(&primary, header)?;
                 let v45_metadata = MemberMetadata {
                     declaration: primary.declaration.clone(),
                     auxiliary,
@@ -770,6 +857,21 @@ fn validate_v45_primary_header(
         )?;
     }
     Ok(())
+}
+
+fn decoded_mtime(
+    primary: &PrimaryMetadata,
+    header: &[u8],
+) -> Result<ArchiveTimestamp, FormatError> {
+    let (seconds, nanoseconds) = match primary.mtime {
+        Some(value) => value,
+        None => (
+            i64::try_from(parse_tar_octal(&header[136..148])?)
+                .map_err(|_| FormatError::InvalidArchive("ustar mtime exceeds i64"))?,
+            0,
+        ),
+    };
+    Ok(ArchiveTimestamp::new(seconds, nanoseconds))
 }
 
 fn portable_metadata_mirror(
@@ -1740,26 +1842,8 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
                         ));
                     }
                 }
-                let mut diagnostics = Vec::new();
-                let (mtime_seconds, _) = primary.mtime.unwrap_or((
-                    i64::try_from(parse_tar_octal(&header[136..148])?).unwrap_or(i64::MAX),
-                    0,
-                ));
-                let mtime = if mtime_seconds < 0 {
-                    diagnostics.push(MetadataDiagnostic {
-                        profile: "portable-v1",
-                        message: "pre-epoch mtime requires a signed-time restore API",
-                    });
-                    0
-                } else {
-                    mtime_seconds as u64
-                };
-                if is_sparse {
-                    diagnostics.push(MetadataDiagnostic {
-                        profile: "portable-v1",
-                        message: "sparse layout was materialized as logical zero bytes",
-                    });
-                }
+                let diagnostics = Vec::new();
+                let mtime = decoded_mtime(&primary, &header)?;
                 let member = StreamedTarMemberMetadata {
                     path,
                     kind,
@@ -1865,7 +1949,7 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
                     logical_size: member.logical_size,
                     file_entry_flags: member.file_entry_flags,
                     reparse_placeholder: member.reparse_placeholder,
-                    portable_mirror: member.v45_metadata.portable_mirror,
+                    v45_metadata: member.v45_metadata,
                     diagnostics,
                     group_start,
                     group_size,
@@ -1907,7 +1991,7 @@ pub(crate) fn validate_v45_member_graph(
                     "hardlink target is not a canonical regular primary",
                 ));
             }
-            if member.portable_mirror != target.portable_mirror {
+            if member.v45_metadata.portable_mirror != target.v45_metadata.portable_mirror {
                 return Err(FormatError::InvalidArchive(
                     "hardlink portable metadata mirror differs from canonical target",
                 ));
@@ -1955,7 +2039,13 @@ pub(crate) fn validate_owned_restore_plan(
             .ok_or(FormatError::InvalidArchive(
                 "revision-45 member metadata is missing",
             ))?;
-        plan_restore(metadata, member.kind, member.reparse_placeholder, options)?;
+        plan_restore(
+            &member.path,
+            metadata,
+            member.kind,
+            member.reparse_placeholder,
+            options,
+        )?;
     }
     for member in selected.values() {
         if member.kind == TarEntryKind::Hardlink {
@@ -2007,10 +2097,14 @@ pub(crate) fn validate_owned_restore_plan(
 }
 
 pub(crate) fn restore_phase(member: &OwnedTarMember) -> u8 {
-    if member.reparse_placeholder {
+    restore_phase_for_kind(member.kind, member.reparse_placeholder)
+}
+
+fn restore_phase_for_kind(kind: TarEntryKind, reparse_placeholder: bool) -> u8 {
+    if reparse_placeholder {
         return 3;
     }
-    match member.kind {
+    match kind {
         TarEntryKind::Directory => 0,
         TarEntryKind::Regular => 1,
         TarEntryKind::Symlink
@@ -2447,26 +2541,8 @@ where
                     sparse,
                     capture_report.as_deref(),
                 )?;
-                let mut diagnostics = Vec::new();
-                let (mtime_seconds, _) = primary.mtime.unwrap_or((
-                    i64::try_from(parse_tar_octal(&header[136..148])?).unwrap_or(i64::MAX),
-                    0,
-                ));
-                let mtime = if mtime_seconds < 0 {
-                    diagnostics.push(MetadataDiagnostic {
-                        profile: "portable-v1",
-                        message: "pre-epoch mtime requires a signed-time restore API",
-                    });
-                    0
-                } else {
-                    mtime_seconds as u64
-                };
-                if sparse {
-                    diagnostics.push(MetadataDiagnostic {
-                        profile: "portable-v1",
-                        message: "sparse layout was materialized as logical zero bytes",
-                    });
-                }
+                let diagnostics = Vec::new();
+                let mtime = decoded_mtime(&primary, &header)?;
                 let member = StreamedTarMemberMetadata {
                     path,
                     kind,
@@ -2540,6 +2616,7 @@ where
 }
 
 fn plan_restore(
+    path: &[u8],
     metadata: &MemberMetadata,
     kind: TarEntryKind,
     reparse_placeholder: bool,
@@ -2553,10 +2630,44 @@ fn plan_restore(
 
     let mut diagnostics = Vec::new();
     if metadata.declaration.capture_status == CaptureStatus::Partial {
-        diagnostics.push(MetadataDiagnostic {
-            profile: "tzap-core-v1",
-            message: "entry capture is partial; full-fidelity restoration is impossible",
-        });
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                "tzap-core-v1",
+                "capture-completeness",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Partial,
+                "entry capture is partial; full-fidelity restoration is impossible",
+            )
+            .for_restore(
+                options.restore_policy,
+                restore_phase_for_kind(kind, reparse_placeholder),
+            ),
+        );
+        if let Some(rows) = &metadata.capture_report {
+            diagnostics.extend(rows.iter().map(|row| {
+                let message = if row.encoded_detail.is_empty() {
+                    format!("capture omission: {}", row.reason)
+                } else {
+                    format!(
+                        "capture omission: {}; detail={}",
+                        row.reason, row.encoded_detail
+                    )
+                };
+                MetadataDiagnostic::new(
+                    path,
+                    &row.profile,
+                    &row.metadata_class,
+                    MetadataOperation::Capture,
+                    MetadataDiagnosticStatus::Partial,
+                    message,
+                )
+                .for_restore(
+                    options.restore_policy,
+                    restore_phase_for_kind(kind, reparse_placeholder),
+                )
+            }));
+        }
         let required_omission = metadata.capture_report.as_ref().is_some_and(|rows| {
             rows.iter().any(|row| {
                 metadata
@@ -2572,16 +2683,263 @@ fn plan_restore(
             ));
         }
     }
-    if metadata.declaration.has_unknown_required_profile() {
+    let unknown_required_profiles = metadata
+        .declaration
+        .unknown_required_profiles()
+        .collect::<Vec<_>>();
+    if !unknown_required_profiles.is_empty() {
         if !options.allow_degraded {
             return Err(FormatError::ReaderUnsupported(
                 "requested restore policy requires an unsupported required profile",
             ));
         }
-        diagnostics.push(MetadataDiagnostic {
-            profile: "extension-profile",
-            message: "unsupported required profile was preserved but not restored",
-        });
+        diagnostics.extend(unknown_required_profiles.into_iter().map(|profile| {
+            MetadataDiagnostic::new(
+                path,
+                profile,
+                "required-profile",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Unsupported,
+                "unsupported required profile was preserved but not restored",
+            )
+            .for_restore(
+                options.restore_policy,
+                restore_phase_for_kind(kind, reparse_placeholder),
+            )
+        }));
+    }
+    diagnostics.extend(
+        metadata
+            .declaration
+            .unknown_optional_profiles()
+            .map(|profile| {
+                MetadataDiagnostic::new(
+                    path,
+                    profile,
+                    "optional-profile",
+                    MetadataOperation::Plan,
+                    MetadataDiagnosticStatus::Skipped,
+                    "unsupported optional profile was preserved but not restored",
+                )
+                .for_restore(
+                    options.restore_policy,
+                    restore_phase_for_kind(kind, reparse_placeholder),
+                )
+            }),
+    );
+
+    if options.restore_policy == RestorePolicy::Content {
+        for (metadata_class, message) in [
+            ("mode", "portable mode is outside content restore policy"),
+            (
+                "mtime",
+                "modification time is outside content restore policy",
+            ),
+        ] {
+            diagnostics.push(
+                MetadataDiagnostic::new(
+                    path,
+                    "portable-v1",
+                    metadata_class,
+                    MetadataOperation::Plan,
+                    MetadataDiagnosticStatus::Skipped,
+                    message,
+                )
+                .for_restore(options.restore_policy, 4),
+            );
+        }
+    }
+
+    if options.restore_policy == RestorePolicy::Content && kind == TarEntryKind::Symlink {
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                "symlink",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Skipped,
+                "symlink skipped by content restore policy",
+            )
+            .for_restore(options.restore_policy, 2),
+        );
+    }
+    if reparse_placeholder {
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                "reparse-data",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Skipped,
+                if options.restore_policy == RestorePolicy::System {
+                    "reparse placeholder restoration is unsupported on this host"
+                } else {
+                    "reparse placeholder is outside the selected restore policy"
+                },
+            )
+            .for_restore(options.restore_policy, 3),
+        );
+    }
+    if matches!(
+        kind,
+        TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
+    ) {
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                "posix-backup-v1",
+                "special-object",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Skipped,
+                if options.restore_policy == RestorePolicy::System {
+                    "special object restoration is unsupported on this host"
+                } else {
+                    "special object is outside the selected restore policy"
+                },
+            )
+            .for_restore(options.restore_policy, 2),
+        );
+    }
+    if options.restore_policy != RestorePolicy::Content
+        && matches!(kind, TarEntryKind::Directory | TarEntryKind::Symlink)
+    {
+        if !options.allow_degraded {
+            return Err(FormatError::ReaderUnsupported(
+                "portable directory/symlink metadata restoration needs explicit degraded restore",
+            ));
+        }
+        let (class, message) = if kind == TarEntryKind::Directory {
+            (
+                "mode-and-mtime",
+                "directory mode/mtime finalization is not supported by this conformance class",
+            )
+        } else {
+            (
+                "mtime",
+                "symlink mtime restoration is not supported by this conformance class",
+            )
+        };
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                class,
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Unsupported,
+                message,
+            )
+            .for_restore(options.restore_policy, 4),
+        );
+    }
+
+    if metadata.file_entry_flags & HAS_SPARSE_EXTENTS != 0 {
+        if options.restore_policy != RestorePolicy::Content && !options.allow_degraded {
+            return Err(FormatError::ReaderUnsupported(
+                "sparse layout materialization needs explicit degraded restore",
+            ));
+        }
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                "sparse-layout",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Materialized,
+                if options.restore_policy == RestorePolicy::Content {
+                    "sparse layout is outside content policy; logical bytes will be materialized"
+                } else {
+                    "sparse layout will be materialized as logical zero bytes"
+                },
+            )
+            .for_restore(options.restore_policy, 1),
+        );
+    }
+
+    if options.restore_policy != RestorePolicy::Content
+        && !cfg!(unix)
+        && metadata.declaration.mode_origin_native
+        && !matches!(metadata.declaration.portable_mode & 0o1777, 0o444 | 0o666)
+    {
+        if !options.allow_degraded {
+            return Err(FormatError::ReaderUnsupported(
+                "portable mode cannot be represented exactly on this host",
+            ));
+        }
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                "mode",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Partial,
+                "portable mode can only be projected to host readonly state",
+            )
+            .for_restore(options.restore_policy, 4),
+        );
+    }
+
+    if metadata.declaration.owner_kind_posix && options.restore_policy != RestorePolicy::System {
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                "numeric-ownership",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Skipped,
+                "numeric ownership is outside the selected restore policy",
+            )
+            .for_restore(options.restore_policy, 4),
+        );
+    }
+    if metadata.declaration.portable_mode & 0o6000 != 0
+        && options.restore_policy != RestorePolicy::System
+    {
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                "setid-mode",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Skipped,
+                "setuid/setgid mode bits are outside the selected restore policy",
+            )
+            .for_restore(options.restore_policy, 4),
+        );
+    }
+    if let Some(attributes) = metadata.declaration.portable_attributes {
+        let portable_bits = attributes & 0x03;
+        let same_os_bits = attributes & 0x0c;
+        let unsupported_requested = match options.restore_policy {
+            RestorePolicy::Content => false,
+            RestorePolicy::Portable => {
+                portable_bits != 0 && (!cfg!(windows) || portable_bits & !1 != 0)
+            }
+            RestorePolicy::SameOs | RestorePolicy::System => {
+                (portable_bits != 0 && (!cfg!(windows) || portable_bits & !1 != 0))
+                    || same_os_bits != 0
+            }
+        };
+        if unsupported_requested && !options.allow_degraded {
+            return Err(FormatError::ReaderUnsupported(
+                "requested portable attribute projection needs explicit degraded restore",
+            ));
+        }
+        if options.restore_policy == RestorePolicy::Content
+            || unsupported_requested
+            || (options.restore_policy == RestorePolicy::Portable && same_os_bits != 0)
+        {
+            diagnostics.push(
+                MetadataDiagnostic::new(
+                    path,
+                    "portable-v1",
+                    "portable-attributes",
+                    MetadataOperation::Plan,
+                    MetadataDiagnosticStatus::Skipped,
+                    "portable attribute projection was wholly or partly outside host policy capability",
+                )
+                .for_restore(options.restore_policy, 4),
+            );
+        }
     }
 
     let requests_same_os = matches!(
@@ -2589,19 +2947,41 @@ fn plan_restore(
         RestorePolicy::SameOs | RestorePolicy::System
     );
     let requests_system = options.restore_policy == RestorePolicy::System;
-    let unsupported_same_os = metadata
+    let profile_is_required = |profile: &str| {
+        metadata
+            .declaration
+            .required_profiles
+            .binary_search_by(|candidate| candidate.as_str().cmp(profile))
+            .is_ok()
+    };
+    let native_profile = metadata
         .auxiliary
         .iter()
-        .any(|record| record.restore_class == RestoreClass::SameOs)
-        || metadata.primary_has_native_scalar;
-    let unsupported_system = metadata
-        .auxiliary
-        .iter()
-        .any(|record| record.restore_class == RestoreClass::System)
-        || (metadata.primary_requires_system_restore
-            && (metadata.declaration.owner_kind_posix
-                || metadata.primary_has_native_scalar
-                || !cfg!(unix)))
+        .find(|record| record.native || record.restore_class >= RestoreClass::SameOs)
+        .map(|record| record.profile.as_str())
+        .or_else(|| {
+            metadata
+                .declaration
+                .required_profiles
+                .iter()
+                .chain(&metadata.declaration.optional_profiles)
+                .find(|profile| profile.as_str() != "portable-v1")
+                .map(String::as_str)
+        })
+        .unwrap_or("portable-v1");
+    let required_native_scalar = metadata.primary_has_native_scalar
+        && metadata
+            .declaration
+            .required_profiles
+            .iter()
+            .any(|profile| profile != "portable-v1");
+    let unsupported_same_os = metadata.auxiliary.iter().any(|record| {
+        record.restore_class == RestoreClass::SameOs && profile_is_required(&record.profile)
+    }) || required_native_scalar;
+    let unsupported_system = metadata.auxiliary.iter().any(|record| {
+        record.restore_class == RestoreClass::System && profile_is_required(&record.profile)
+    }) || (metadata.primary_requires_system_restore
+        && (metadata.declaration.owner_kind_posix || required_native_scalar || !cfg!(unix)))
         || reparse_placeholder
         || matches!(
             kind,
@@ -2614,17 +2994,53 @@ fn plan_restore(
                 "requested native metadata is not supported by this conformance class",
             ));
         }
-        diagnostics.push(MetadataDiagnostic {
-            profile: "native-metadata",
-            message: "requested native metadata was skipped under explicit degraded restore",
-        });
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                native_profile,
+                "native-metadata",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Skipped,
+                "requested native metadata was skipped under explicit degraded restore",
+            )
+            .for_restore(
+                options.restore_policy,
+                restore_phase_for_kind(kind, reparse_placeholder),
+            ),
+        );
     }
 
     if metadata.file_entry_flags & HAS_NATIVE_METADATA != 0 && !requests_same_os {
-        diagnostics.push(MetadataDiagnostic {
-            profile: "native-metadata",
-            message: "authenticated native metadata is outside the selected restore policy",
-        });
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                native_profile,
+                "native-metadata",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Skipped,
+                "authenticated native metadata is outside the selected restore policy",
+            )
+            .for_restore(
+                options.restore_policy,
+                restore_phase_for_kind(kind, reparse_placeholder),
+            ),
+        );
+    }
+    if requests_same_os && metadata.primary_has_native_scalar && !required_native_scalar {
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                native_profile,
+                "optional-native-scalar",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Skipped,
+                "optional native scalar metadata is unsupported on this host",
+            )
+            .for_restore(
+                options.restore_policy,
+                restore_phase_for_kind(kind, reparse_placeholder),
+            ),
+        );
     }
     for record in &metadata.auxiliary {
         let requested = match options.restore_policy {
@@ -2633,14 +3049,157 @@ fn plan_restore(
             RestorePolicy::SameOs => record.restore_class <= RestoreClass::SameOs,
             RestorePolicy::System => true,
         };
-        if !requested && record.restore_class != RestoreClass::None {
-            diagnostics.push(MetadataDiagnostic {
-                profile: "auxiliary-metadata",
-                message: "authenticated auxiliary record is outside the selected restore policy",
-            });
+        if requested
+            && record.restore_class != RestoreClass::None
+            && !profile_is_required(&record.profile)
+        {
+            diagnostics.push(
+                MetadataDiagnostic::new(
+                    path,
+                    &record.profile,
+                    &record.kind,
+                    MetadataOperation::Plan,
+                    MetadataDiagnosticStatus::Skipped,
+                    "optional auxiliary record is unsupported on this host",
+                )
+                .for_restore(
+                    options.restore_policy,
+                    restore_phase_for_kind(kind, reparse_placeholder),
+                ),
+            );
+        } else if !requested && record.restore_class != RestoreClass::None {
+            diagnostics.push(
+                MetadataDiagnostic::new(
+                    path,
+                    &record.profile,
+                    &record.kind,
+                    MetadataOperation::Plan,
+                    MetadataDiagnosticStatus::Skipped,
+                    "authenticated auxiliary record is outside the selected restore policy",
+                )
+                .for_restore(
+                    options.restore_policy,
+                    restore_phase_for_kind(kind, reparse_placeholder),
+                ),
+            );
         }
     }
     Ok(diagnostics)
+}
+
+pub(crate) fn metadata_verification_report(
+    members: &[TarStreamMemberSummary],
+) -> Result<MetadataVerificationReport, FormatError> {
+    let mut profiles_present = std::collections::BTreeSet::new();
+    let mut auxiliary_kinds_present = std::collections::BTreeSet::new();
+    let mut entries = Vec::with_capacity(members.len());
+
+    for member in members {
+        let metadata = &member.v45_metadata;
+        profiles_present.extend(metadata.declaration.required_profiles.iter().cloned());
+        profiles_present.extend(metadata.declaration.optional_profiles.iter().cloned());
+        let mut auxiliary_kinds = metadata
+            .auxiliary
+            .iter()
+            .map(|record| record.kind.clone())
+            .collect::<Vec<_>>();
+        auxiliary_kinds.sort();
+        auxiliary_kinds.dedup();
+        auxiliary_kinds_present.extend(auxiliary_kinds.iter().cloned());
+
+        let mut policy_capabilities = Vec::with_capacity(4);
+        for policy in [
+            RestorePolicy::Content,
+            RestorePolicy::Portable,
+            RestorePolicy::SameOs,
+            RestorePolicy::System,
+        ] {
+            let strict = SafeExtractionOptions {
+                restore_policy: policy,
+                allow_degraded: false,
+                system_authorized: policy == RestorePolicy::System,
+                ..SafeExtractionOptions::default()
+            };
+            let (policy_complete, reason) = match plan_restore(
+                &member.path,
+                metadata,
+                member.kind,
+                member.reparse_placeholder,
+                strict,
+            ) {
+                Ok(_) => (true, None),
+                Err(FormatError::ReaderUnsupported(reason)) => (false, Some(reason)),
+                Err(error) => return Err(error),
+            };
+            let degraded_restore_available = if policy_complete {
+                true
+            } else {
+                plan_restore(
+                    &member.path,
+                    metadata,
+                    member.kind,
+                    member.reparse_placeholder,
+                    SafeExtractionOptions {
+                        allow_degraded: true,
+                        ..strict
+                    },
+                )
+                .is_ok()
+            };
+            policy_capabilities.push(RestorePolicyCapability {
+                policy,
+                policy_complete,
+                degraded_restore_available,
+                reason,
+            });
+        }
+
+        let mut diagnostics = member.diagnostics.clone();
+        diagnostics.extend(plan_restore(
+            &member.path,
+            metadata,
+            member.kind,
+            member.reparse_placeholder,
+            SafeExtractionOptions {
+                allow_degraded: true,
+                ..SafeExtractionOptions::default()
+            },
+        )?);
+        let system_complete = policy_capabilities
+            .iter()
+            .find(|capability| capability.policy == RestorePolicy::System)
+            .is_some_and(|capability| capability.policy_complete);
+        let full_fidelity_possible = metadata.declaration.capture_status == CaptureStatus::Complete
+            && system_complete
+            && !diagnostics.iter().any(|diagnostic| {
+                matches!(
+                    diagnostic.status,
+                    MetadataDiagnosticStatus::Materialized
+                        | MetadataDiagnosticStatus::Unsupported
+                        | MetadataDiagnosticStatus::Failed
+                )
+            });
+        entries.push(EntryMetadataVerification {
+            path: member.path.clone(),
+            capture_status: metadata.declaration.capture_status,
+            required_profiles: metadata.declaration.required_profiles.clone(),
+            optional_profiles: metadata.declaration.optional_profiles.clone(),
+            auxiliary_kinds,
+            policy_capabilities,
+            full_fidelity_possible,
+            diagnostics,
+        });
+    }
+
+    Ok(MetadataVerificationReport {
+        all_capture_complete: entries
+            .iter()
+            .all(|entry| entry.capture_status == CaptureStatus::Complete),
+        full_fidelity_possible: entries.iter().all(|entry| entry.full_fidelity_possible),
+        profiles_present: profiles_present.into_iter().collect(),
+        auxiliary_kinds_present: auxiliary_kinds_present.into_iter().collect(),
+        entries,
+    })
 }
 
 struct RegularWriterHandler<'a, W> {
@@ -2732,12 +3291,19 @@ impl<'a> FilesystemRestoreHandler<'a> {
         member: &StreamedTarMemberMetadata,
     ) -> Result<Vec<MetadataDiagnostic>, ExtractError> {
         let mut diagnostics = member.diagnostics.clone();
+        for diagnostic in &mut diagnostics {
+            if diagnostic.operation == MetadataOperation::Restore
+                && diagnostic.restore_policy.is_none()
+            {
+                diagnostic.restore_policy = Some(self.options.restore_policy);
+                diagnostic.restore_phase = Some(restore_phase_for_kind(
+                    member.kind,
+                    member.reparse_placeholder,
+                ));
+            }
+        }
         diagnostics.append(&mut self.planned_diagnostics);
         if self.skipped_reparse_placeholder {
-            diagnostics.push(MetadataDiagnostic {
-                profile: "windows-backup-v1",
-                message: "reparse placeholder skipped by portable restore policy",
-            });
             return Ok(diagnostics);
         }
         if self.skipped_by_policy {
@@ -2761,13 +3327,17 @@ impl<'a> FilesystemRestoreHandler<'a> {
         ))?;
         let file = publish_regular_file(&destination, &temp_leaf, file, self.options)?;
         if self.options.restore_policy != RestorePolicy::Content {
-            apply_restored_regular_file_metadata_parts(
+            if let Err(error) = apply_restored_regular_file_metadata_parts(
                 &file,
-                member.mode,
-                member.mtime,
+                &member.path,
+                RestoredRegularMetadata::from(&member.v45_metadata.portable_mirror),
                 self.options,
                 &mut diagnostics,
-            );
+            ) {
+                drop(file);
+                let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
+                return Err(error.into());
+            }
         }
         Ok(diagnostics)
     }
@@ -2796,6 +3366,7 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
         self.materialized_hardlink = false;
         self.planned_diagnostics.clear();
         self.planned_diagnostics = plan_restore(
+            &member.path,
             &member.v45_metadata,
             member.kind,
             member.reparse_placeholder,
@@ -2803,6 +3374,19 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
         )?;
         if member.reparse_placeholder {
             self.skipped_reparse_placeholder = true;
+            return Ok(());
+        }
+        if member.kind == TarEntryKind::Symlink
+            && self.options.restore_policy == RestorePolicy::Content
+        {
+            self.skipped_by_policy = true;
+            return Ok(());
+        }
+        if matches!(
+            member.kind,
+            TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
+        ) {
+            self.skipped_by_policy = true;
             return Ok(());
         }
         let destination = prepare_destination(self.root, &member.path, member.kind, self.options)?;
@@ -2813,16 +3397,10 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                 self.temp_leaf = Some(temp_leaf);
                 self.file = Some(file);
             }
-            TarEntryKind::Directory => create_directory(&destination)?,
+            TarEntryKind::Directory => {
+                create_directory(&destination)?;
+            }
             TarEntryKind::Symlink => {
-                if self.options.restore_policy == RestorePolicy::Content {
-                    self.skipped_by_policy = true;
-                    self.planned_diagnostics.push(MetadataDiagnostic {
-                        profile: "portable-v1",
-                        message: "symlink skipped by content restore policy",
-                    });
-                    return Ok(());
-                }
                 let target = member
                     .link_target
                     .as_deref()
@@ -2840,10 +3418,17 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                         .push((member.path.clone(), target.to_vec()));
                     self.skipped_by_policy = true;
                     if self.options.restore_policy == RestorePolicy::Content {
-                        self.planned_diagnostics.push(MetadataDiagnostic {
-                            profile: "portable-v1",
-                            message: "hardlink topology was materialized by content restore policy",
-                        });
+                        self.planned_diagnostics.push(
+                            MetadataDiagnostic::new(
+                                &member.path,
+                                "portable-v1",
+                                "hardlink-topology",
+                                MetadataOperation::Restore,
+                                MetadataDiagnosticStatus::Materialized,
+                                "hardlink topology was materialized by content restore policy",
+                            )
+                            .for_restore(self.options.restore_policy, 3),
+                        );
                     }
                     return Ok(());
                 }
@@ -2851,30 +3436,34 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                 if self.options.restore_policy == RestorePolicy::Content {
                     let (temp_leaf, mut output) = create_temp_regular_file(&destination)?;
                     let mut input = open_existing_regular_file(&target_path)?;
-                    std::io::copy(&mut input, &mut output).map_err(|_| {
-                        FormatError::FilesystemExtractionFailed(
-                            "failed to materialize hardlink target",
-                        )
-                    })?;
+                    let materialized_bytes =
+                        std::io::copy(&mut input, &mut output).map_err(|_| {
+                            FormatError::FilesystemExtractionFailed(
+                                "failed to materialize hardlink target",
+                            )
+                        })?;
                     self.destination = Some(destination);
                     self.temp_leaf = Some(temp_leaf);
                     self.file = Some(output);
                     self.materialized_hardlink = true;
-                    self.planned_diagnostics.push(MetadataDiagnostic {
-                        profile: "portable-v1",
-                        message: "hardlink topology was materialized by content restore policy",
-                    });
+                    self.planned_diagnostics.push(
+                        MetadataDiagnostic::new(
+                            &member.path,
+                            "portable-v1",
+                            "hardlink-topology",
+                            MetadataOperation::Restore,
+                            MetadataDiagnosticStatus::Materialized,
+                            "hardlink topology was materialized by content restore policy",
+                        )
+                        .for_restore(self.options.restore_policy, 3)
+                        .with_bytes(materialized_bytes, materialized_bytes),
+                    );
                 } else {
                     create_hardlink(&destination, &target_path, self.options)?;
                 }
             }
             TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo => {
-                // Default portable extraction never creates privileged special objects.
-                self.skipped_by_policy = true;
-                self.planned_diagnostics.push(MetadataDiagnostic {
-                    profile: "posix-backup-v1",
-                    message: "special object skipped by selected restore policy",
-                });
+                unreachable!("special objects return before destination preparation")
             }
         }
         Ok(())
@@ -3074,30 +3663,62 @@ fn tar_member_group_end(stream: &[u8], start: usize) -> Result<usize, FormatErro
     ))
 }
 
-pub fn restore_tar_member(
+#[cfg(test)]
+fn restore_tar_member(
     root: &Path,
     member: &OwnedTarMember,
     options: SafeExtractionOptions,
 ) -> Result<Vec<MetadataDiagnostic>, FormatError> {
-    let destination = prepare_destination(root, &member.path, member.kind, options)?;
     let mut diagnostics = member.diagnostics.clone();
     if let Some(metadata) = &member.v45_metadata {
         diagnostics.extend(plan_restore(
+            &member.path,
             metadata,
             member.kind,
             member.reparse_placeholder,
             options,
         )?);
     }
+    if member.reparse_placeholder {
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                &member.path,
+                "windows-backup-v1",
+                "reparse-data",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Skipped,
+                "reparse placeholder skipped by portable restore policy",
+            )
+            .for_restore(options.restore_policy, 3),
+        );
+        return Ok(diagnostics);
+    }
+    if member.kind == TarEntryKind::Symlink && options.restore_policy == RestorePolicy::Content {
+        return Ok(diagnostics);
+    }
+    if matches!(
+        member.kind,
+        TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
+    ) {
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                &member.path,
+                "posix-backup-v1",
+                "special-object",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Skipped,
+                "special object skipped by portable restore policy",
+            )
+            .for_restore(
+                options.restore_policy,
+                restore_phase_for_kind(member.kind, member.reparse_placeholder),
+            ),
+        );
+        return Ok(diagnostics);
+    }
+    let destination = prepare_destination(root, &member.path, member.kind, options)?;
     match member.kind {
         TarEntryKind::Regular => {
-            if member.reparse_placeholder {
-                diagnostics.push(MetadataDiagnostic {
-                    profile: "windows-backup-v1",
-                    message: "reparse placeholder skipped by portable restore policy",
-                });
-                return Ok(diagnostics);
-            }
             let (temp_leaf, mut file) = create_temp_regular_file(&destination)?;
             file.write_all(&member.data).map_err(|_| {
                 FormatError::FilesystemExtractionFailed("failed to write regular file")
@@ -3107,18 +3728,19 @@ pub fn restore_tar_member(
             })?;
             let file = publish_regular_file(&destination, &temp_leaf, file, options)?;
             if options.restore_policy != RestorePolicy::Content {
-                apply_restored_regular_file_metadata(&file, member, options, &mut diagnostics);
+                if let Err(error) =
+                    apply_restored_regular_file_metadata(&file, member, options, &mut diagnostics)
+                {
+                    drop(file);
+                    let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
+                    return Err(error);
+                }
             }
         }
-        TarEntryKind::Directory => create_directory(&destination)?,
+        TarEntryKind::Directory => {
+            create_directory(&destination)?;
+        }
         TarEntryKind::Symlink => {
-            if options.restore_policy == RestorePolicy::Content {
-                diagnostics.push(MetadataDiagnostic {
-                    profile: "portable-v1",
-                    message: "symlink skipped by content restore policy",
-                });
-                return Ok(diagnostics);
-            }
             let target = member
                 .link_target
                 .as_deref()
@@ -3135,127 +3757,344 @@ pub fn restore_tar_member(
             if options.restore_policy == RestorePolicy::Content {
                 let (temp_leaf, mut output) = create_temp_regular_file(&destination)?;
                 let mut input = open_existing_regular_file(&target_path)?;
-                std::io::copy(&mut input, &mut output).map_err(|_| {
+                let materialized_bytes = std::io::copy(&mut input, &mut output).map_err(|_| {
                     FormatError::FilesystemExtractionFailed("failed to materialize hardlink target")
                 })?;
                 output.flush().map_err(|_| {
                     FormatError::FilesystemExtractionFailed("failed to materialize hardlink target")
                 })?;
                 publish_regular_file(&destination, &temp_leaf, output, options)?;
-                diagnostics.push(MetadataDiagnostic {
-                    profile: "portable-v1",
-                    message: "hardlink topology was materialized by content restore policy",
-                });
+                diagnostics.push(
+                    MetadataDiagnostic::new(
+                        &member.path,
+                        "portable-v1",
+                        "hardlink-topology",
+                        MetadataOperation::Restore,
+                        MetadataDiagnosticStatus::Materialized,
+                        "hardlink topology was materialized by content restore policy",
+                    )
+                    .for_restore(options.restore_policy, 3)
+                    .with_bytes(materialized_bytes, materialized_bytes),
+                );
             } else {
                 create_hardlink(&destination, &target_path, options)?;
             }
         }
         TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo => {
-            diagnostics.push(MetadataDiagnostic {
-                profile: "posix-backup-v1",
-                message: "special object skipped by portable restore policy",
-            });
+            unreachable!("special objects return before destination preparation")
         }
     }
     Ok(diagnostics)
 }
 
+#[cfg(test)]
 fn apply_restored_regular_file_metadata(
     file: &fs::File,
     member: &OwnedTarMember,
     options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
-) {
-    apply_restored_regular_file_metadata_parts(
-        file,
-        member.mode,
-        member.mtime,
-        options,
-        diagnostics,
+) -> Result<(), FormatError> {
+    let metadata = member.v45_metadata.as_ref().map_or(
+        RestoredRegularMetadata {
+            mode: member.mode,
+            mtime: (member.mtime.seconds, member.mtime.nanoseconds),
+            attributes: None,
+            mode_origin_native: false,
+        },
+        |metadata| RestoredRegularMetadata::from(&metadata.portable_mirror),
     );
+    apply_restored_regular_file_metadata_parts(file, &member.path, metadata, options, diagnostics)
+}
+
+#[derive(Clone, Copy)]
+struct RestoredRegularMetadata {
+    mode: u32,
+    mtime: (i64, u32),
+    attributes: Option<u32>,
+    mode_origin_native: bool,
+}
+
+impl From<&PortableMetadataMirror> for RestoredRegularMetadata {
+    fn from(metadata: &PortableMetadataMirror) -> Self {
+        Self {
+            mode: metadata.mode,
+            mtime: metadata.mtime,
+            attributes: metadata.attributes,
+            mode_origin_native: metadata.mode_origin_native,
+        }
+    }
 }
 
 fn apply_restored_regular_file_metadata_parts(
     file: &fs::File,
-    mode: u32,
-    mtime: u64,
+    path: &[u8],
+    metadata: RestoredRegularMetadata,
     options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
-) {
-    apply_regular_file_mtime(file, mtime, diagnostics);
+) -> Result<(), FormatError> {
+    let RestoredRegularMetadata {
+        mode,
+        mtime,
+        attributes,
+        mode_origin_native,
+    } = metadata;
     let mode = if options.restore_policy == RestorePolicy::System && options.system_authorized {
         mode
     } else {
         mode & !0o6000
     };
-    apply_regular_file_mode(file, mode, diagnostics);
+    apply_regular_file_mode(file, path, mode, mode_origin_native, options, diagnostics)?;
+    apply_regular_file_mtime(file, path, mtime, options, diagnostics)?;
+    apply_regular_file_attributes(file, path, attributes, options, diagnostics)
+}
+
+#[cfg(windows)]
+fn apply_regular_file_attributes(
+    file: &fs::File,
+    path: &[u8],
+    attributes: Option<u32>,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    let Some(attributes) = attributes else {
+        return Ok(());
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    "portable-v1",
+                    "portable-attributes",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "failed to inspect file before applying readonly attribute projection",
+                )
+                .for_restore(options.restore_policy, 4)
+                .with_native_error(&error),
+                options,
+                "failed to inspect file before applying readonly attribute projection",
+            );
+        }
+    };
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(attributes & 1 != 0);
+    if let Err(error) = file.set_permissions(permissions) {
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                "portable-attributes",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to apply readonly attribute projection",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "failed to apply readonly attribute projection",
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn apply_regular_file_attributes(
+    _file: &fs::File,
+    _path: &[u8],
+    _attributes: Option<u32>,
+    _options: SafeExtractionOptions,
+    _diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    Ok(())
 }
 
 #[cfg(unix)]
-fn apply_regular_file_mode(file: &fs::File, mode: u32, diagnostics: &mut Vec<MetadataDiagnostic>) {
+fn apply_regular_file_mode(
+    file: &fs::File,
+    path: &[u8],
+    mode: u32,
+    _mode_origin_native: bool,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
     match file.metadata() {
         Ok(metadata) => {
             let mut permissions = metadata.permissions();
             permissions.set_mode(mode & 0o7777);
-            if file.set_permissions(permissions).is_err() {
-                diagnostics.push(MetadataDiagnostic {
-                    profile: "ustar-baseline",
-                    message: "failed to apply mode metadata",
-                });
+            if let Err(error) = file.set_permissions(permissions) {
+                return record_metadata_application_failure(
+                    diagnostics,
+                    MetadataDiagnostic::new(
+                        path,
+                        "portable-v1",
+                        "mode",
+                        MetadataOperation::Restore,
+                        MetadataDiagnosticStatus::Failed,
+                        "failed to apply mode metadata",
+                    )
+                    .for_restore(options.restore_policy, 4)
+                    .with_native_error(&error),
+                    options,
+                    "failed to apply mode metadata",
+                );
             }
         }
-        Err(_) => diagnostics.push(MetadataDiagnostic {
-            profile: "ustar-baseline",
-            message: "failed to apply mode metadata",
-        }),
+        Err(error) => {
+            return record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    "portable-v1",
+                    "mode",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "failed to inspect file before applying mode metadata",
+                )
+                .for_restore(options.restore_policy, 4)
+                .with_native_error(&error),
+                options,
+                "failed to inspect file before applying mode metadata",
+            );
+        }
     }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn apply_regular_file_mode(file: &fs::File, mode: u32, diagnostics: &mut Vec<MetadataDiagnostic>) {
+fn apply_regular_file_mode(
+    file: &fs::File,
+    path: &[u8],
+    mode: u32,
+    mode_origin_native: bool,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
     match file.metadata() {
         Ok(metadata) => {
             let mut permissions = metadata.permissions();
             permissions.set_readonly(mode & 0o222 == 0);
-            if file.set_permissions(permissions).is_err() {
-                diagnostics.push(MetadataDiagnostic {
-                    profile: "ustar-baseline",
-                    message: "failed to apply mode metadata",
-                });
-                return;
+            if let Err(error) = file.set_permissions(permissions) {
+                return record_metadata_application_failure(
+                    diagnostics,
+                    MetadataDiagnostic::new(
+                        path,
+                        "portable-v1",
+                        "mode",
+                        MetadataOperation::Restore,
+                        MetadataDiagnosticStatus::Failed,
+                        "failed to apply mode metadata",
+                    )
+                    .for_restore(options.restore_policy, 4)
+                    .with_native_error(&error),
+                    options,
+                    "failed to apply mode metadata",
+                );
             }
-            if mode & 0o777 != 0o444 && mode & 0o777 != 0o666 {
-                diagnostics.push(MetadataDiagnostic {
-                    profile: "ustar-baseline",
-                    message: "mode metadata was only partially applied on this platform",
-                });
+            if mode_origin_native && mode & 0o777 != 0o444 && mode & 0o777 != 0o666 {
+                let diagnostic = MetadataDiagnostic::new(
+                    path,
+                    "portable-v1",
+                    "mode",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Partial,
+                    "mode metadata was only partially applied on this platform",
+                )
+                .for_restore(options.restore_policy, 4);
+                if options.allow_degraded {
+                    diagnostics.push(diagnostic);
+                } else {
+                    return Err(FormatError::FilesystemExtractionFailed(
+                        "portable mode cannot be represented exactly on this host",
+                    ));
+                }
             }
         }
-        Err(_) => diagnostics.push(MetadataDiagnostic {
-            profile: "ustar-baseline",
-            message: "failed to apply mode metadata",
-        }),
+        Err(error) => {
+            return record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    "portable-v1",
+                    "mode",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "failed to inspect file before applying mode metadata",
+                )
+                .for_restore(options.restore_policy, 4)
+                .with_native_error(&error),
+                options,
+                "failed to inspect file before applying mode metadata",
+            );
+        }
     }
+    Ok(())
 }
 
 fn apply_regular_file_mtime(
     file: &fs::File,
-    mtime: u64,
+    path: &[u8],
+    (seconds, nanoseconds): (i64, u32),
+    options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
-) {
-    let Some(modified) = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(mtime)) else {
-        diagnostics.push(MetadataDiagnostic {
-            profile: "ustar-baseline",
-            message: "failed to apply mtime metadata",
-        });
-        return;
+) -> Result<(), FormatError> {
+    let duration = Duration::new(seconds.unsigned_abs(), nanoseconds);
+    let modified = if seconds < 0 {
+        SystemTime::UNIX_EPOCH.checked_sub(duration)
+    } else {
+        SystemTime::UNIX_EPOCH.checked_add(duration)
+    };
+    let Some(modified) = modified else {
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                "mtime",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to apply mtime metadata",
+            )
+            .for_restore(options.restore_policy, 4),
+            options,
+            "mtime cannot be represented on this host",
+        );
     };
     let times = fs::FileTimes::new().set_modified(modified);
-    if file.set_times(times).is_err() {
-        diagnostics.push(MetadataDiagnostic {
-            profile: "ustar-baseline",
-            message: "failed to apply mtime metadata",
-        });
+    if let Err(error) = file.set_times(times) {
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                "mtime",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to apply mtime metadata",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "failed to apply mtime metadata",
+        );
+    }
+    Ok(())
+}
+
+fn record_metadata_application_failure(
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+    diagnostic: MetadataDiagnostic,
+    options: SafeExtractionOptions,
+    strict_error: &'static str,
+) -> Result<(), FormatError> {
+    if options.allow_degraded {
+        diagnostics.push(diagnostic);
+        Ok(())
+    } else {
+        Err(FormatError::FilesystemExtractionFailed(strict_error))
     }
 }
 
@@ -4192,8 +5031,10 @@ mod tests {
             data: b"blocked".to_vec(),
             link_target: None,
             mode: 0o644,
-            mtime: 0,
+            mtime: ArchiveTimestamp::UNIX_EPOCH,
             logical_size: 7,
+            reparse_placeholder: false,
+            v45_metadata: None,
             diagnostics: Vec::new(),
         };
 
@@ -4269,7 +5110,7 @@ mod tests {
             data: Vec::new(),
             link_target: Some(b"target.txt".to_vec()),
             mode: 0o644,
-            mtime: 0,
+            mtime: ArchiveTimestamp::UNIX_EPOCH,
             logical_size: 0,
             reparse_placeholder: false,
             v45_metadata: None,
@@ -4290,7 +5131,7 @@ mod tests {
             data: b"#!/bin/sh\n".to_vec(),
             link_target: None,
             mode: 0o755,
-            mtime: 0,
+            mtime: ArchiveTimestamp::UNIX_EPOCH,
             logical_size: 10,
             reparse_placeholder: false,
             v45_metadata: None,
@@ -4318,7 +5159,7 @@ mod tests {
             data: b"dated".to_vec(),
             link_target: None,
             mode: 0o666,
-            mtime: 1_700_000_000,
+            mtime: ArchiveTimestamp::from_seconds(1_700_000_000),
             logical_size: 5,
             reparse_placeholder: false,
             v45_metadata: None,
@@ -4348,7 +5189,7 @@ mod tests {
             data: Vec::new(),
             link_target: Some(b"/outside".to_vec()),
             mode: 0o644,
-            mtime: 0,
+            mtime: ArchiveTimestamp::UNIX_EPOCH,
             logical_size: 0,
             reparse_placeholder: false,
             v45_metadata: None,
@@ -4363,6 +5204,44 @@ mod tests {
     }
 
     #[test]
+    fn skipped_entries_do_not_create_destination_parents() {
+        let tmp = tempdir().unwrap();
+        for (path, kind, target) in [
+            (
+                b"symlink-parent/link".as_slice(),
+                TarEntryKind::Symlink,
+                Some(b"target".to_vec()),
+            ),
+            (b"special-parent/fifo".as_slice(), TarEntryKind::Fifo, None),
+        ] {
+            let member = OwnedTarMember {
+                path: path.to_vec(),
+                kind,
+                data: Vec::new(),
+                link_target: target,
+                mode: 0o644,
+                mtime: ArchiveTimestamp::UNIX_EPOCH,
+                logical_size: 0,
+                reparse_placeholder: false,
+                v45_metadata: None,
+                diagnostics: Vec::new(),
+            };
+            restore_tar_member(
+                tmp.path(),
+                &member,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::Content,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+        }
+
+        assert!(!tmp.path().join("symlink-parent").exists());
+        assert!(!tmp.path().join("special-parent").exists());
+    }
+
+    #[test]
     fn safe_restore_rejects_directory_over_existing_file_even_with_overwrite() {
         let tmp = tempdir().unwrap();
         let conflict = tmp.path().join("conflict");
@@ -4373,7 +5252,7 @@ mod tests {
             data: Vec::new(),
             link_target: None,
             mode: 0o644,
-            mtime: 0,
+            mtime: ArchiveTimestamp::UNIX_EPOCH,
             logical_size: 0,
             reparse_placeholder: false,
             v45_metadata: None,
@@ -4406,7 +5285,7 @@ mod tests {
             data: Vec::new(),
             link_target: Some(b"a/a".to_vec()),
             mode: 0o644,
-            mtime: 0,
+            mtime: ArchiveTimestamp::UNIX_EPOCH,
             logical_size: 0,
             reparse_placeholder: false,
             v45_metadata: None,
@@ -4438,7 +5317,7 @@ mod tests {
             logical_size: parsed.logical_size,
             file_entry_flags: parsed.v45_metadata.file_entry_flags,
             reparse_placeholder: parsed.reparse_placeholder,
-            portable_mirror: parsed.v45_metadata.portable_mirror,
+            v45_metadata: parsed.v45_metadata,
             diagnostics: parsed.diagnostics,
             group_start,
             group_size: bytes.len() as u64,
@@ -4454,7 +5333,7 @@ mod tests {
         assert!(validate_v45_member_graph(&[alias.clone(), target.clone()]).is_ok());
 
         let mut mismatched_alias = alias;
-        mismatched_alias.portable_mirror.mode = 0o600;
+        mismatched_alias.v45_metadata.portable_mirror.mode = 0o600;
         assert_eq!(
             validate_v45_member_graph(&[mismatched_alias, target]).unwrap_err(),
             FormatError::InvalidArchive(
@@ -4479,6 +5358,68 @@ mod tests {
     }
 
     #[test]
+    fn partial_capture_diagnostics_preserve_authenticated_omission_details() {
+        let bytes = member(b"file.txt", b'0', b"payload", b"");
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+        let mut metadata = parsed.v45_metadata;
+        metadata.declaration.capture_status = CaptureStatus::Partial;
+        metadata.capture_report = Some(vec![CaptureReportRow {
+            profile: "portable-v1".into(),
+            metadata_class: "sparse-layout".into(),
+            reason: "changed-during-read".into(),
+            encoded_detail: "extent%20map%20changed".into(),
+        }]);
+
+        let diagnostics = plan_restore(
+            b"file.txt",
+            &metadata,
+            TarEntryKind::Regular,
+            false,
+            SafeExtractionOptions {
+                allow_degraded: true,
+                ..SafeExtractionOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.profile == "portable-v1"
+                && diagnostic.metadata_class == "sparse-layout"
+                && diagnostic.operation == MetadataOperation::Capture
+                && diagnostic.status == MetadataDiagnosticStatus::Partial
+                && diagnostic.message
+                    == "capture omission: changed-during-read; detail=extent%20map%20changed"
+        }));
+    }
+
+    #[test]
+    fn content_restore_reports_portable_mode_and_mtime_as_skipped() {
+        let bytes = member(b"file.txt", b'0', b"payload", b"");
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+
+        let diagnostics = plan_restore(
+            b"file.txt",
+            &parsed.v45_metadata,
+            TarEntryKind::Regular,
+            false,
+            SafeExtractionOptions {
+                restore_policy: RestorePolicy::Content,
+                ..SafeExtractionOptions::default()
+            },
+        )
+        .unwrap();
+
+        for metadata_class in ["mode", "mtime"] {
+            assert!(diagnostics.iter().any(|diagnostic| {
+                diagnostic.profile == "portable-v1"
+                    && diagnostic.metadata_class == metadata_class
+                    && diagnostic.status == MetadataDiagnosticStatus::Skipped
+                    && diagnostic.restore_policy == Some(RestorePolicy::Content)
+            }));
+        }
+    }
+
+    #[test]
     fn unsupported_required_profile_needs_explicit_degraded_restore() {
         let bytes = member(b"file.txt", b'0', b"payload", b"");
         let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
@@ -4487,9 +5428,14 @@ mod tests {
             .declaration
             .required_profiles
             .push("x.com.example.test-v1".into());
+        metadata
+            .declaration
+            .optional_profiles
+            .push("x.com.example.optional-v1".into());
 
         assert_eq!(
             plan_restore(
+                b"file.txt",
                 &metadata,
                 TarEntryKind::Regular,
                 false,
@@ -4500,7 +5446,8 @@ mod tests {
                 "requested restore policy requires an unsupported required profile"
             )
         );
-        assert!(plan_restore(
+        let diagnostics = plan_restore(
+            b"file.txt",
             &metadata,
             TarEntryKind::Regular,
             false,
@@ -4509,6 +5456,109 @@ mod tests {
                 ..SafeExtractionOptions::default()
             },
         )
-        .is_ok());
+        .unwrap();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.profile == "x.com.example.test-v1"
+                && diagnostic.metadata_class == "required-profile"
+                && diagnostic.status == MetadataDiagnosticStatus::Unsupported
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.profile == "x.com.example.optional-v1"
+                && diagnostic.metadata_class == "optional-profile"
+                && diagnostic.status == MetadataDiagnosticStatus::Skipped
+        }));
+    }
+
+    #[test]
+    fn portable_directory_metadata_requires_explicit_degraded_restore() {
+        let bytes = member(b"dir", b'5', b"", b"");
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+
+        assert_eq!(
+            plan_restore(
+                b"dir",
+                &parsed.v45_metadata,
+                TarEntryKind::Directory,
+                false,
+                SafeExtractionOptions::default(),
+            )
+            .unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "portable directory/symlink metadata restoration needs explicit degraded restore"
+            )
+        );
+        let diagnostics = plan_restore(
+            b"dir",
+            &parsed.v45_metadata,
+            TarEntryKind::Directory,
+            false,
+            SafeExtractionOptions {
+                allow_degraded: true,
+                ..SafeExtractionOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == b"dir"
+                && diagnostic.metadata_class == "mode-and-mtime"
+                && diagnostic.operation == MetadataOperation::Plan
+                && diagnostic.status == MetadataDiagnosticStatus::Unsupported
+                && diagnostic.restore_policy == Some(RestorePolicy::Portable)
+                && diagnostic.restore_phase == Some(4)
+        }));
+    }
+
+    #[test]
+    fn sparse_layout_materialization_requires_explicit_degraded_portable_restore() {
+        let bytes = member(b"sparse.bin", b'0', b"data", b"");
+        let mut parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+        parsed.v45_metadata.file_entry_flags |= HAS_SPARSE_EXTENTS;
+
+        assert_eq!(
+            plan_restore(
+                b"sparse.bin",
+                &parsed.v45_metadata,
+                TarEntryKind::Regular,
+                false,
+                SafeExtractionOptions::default(),
+            )
+            .unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "sparse layout materialization needs explicit degraded restore"
+            )
+        );
+
+        let degraded = plan_restore(
+            b"sparse.bin",
+            &parsed.v45_metadata,
+            TarEntryKind::Regular,
+            false,
+            SafeExtractionOptions {
+                allow_degraded: true,
+                ..SafeExtractionOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(degraded.iter().any(|diagnostic| {
+            diagnostic.metadata_class == "sparse-layout"
+                && diagnostic.status == MetadataDiagnosticStatus::Materialized
+                && diagnostic.restore_policy == Some(RestorePolicy::Portable)
+        }));
+
+        let content = plan_restore(
+            b"sparse.bin",
+            &parsed.v45_metadata,
+            TarEntryKind::Regular,
+            false,
+            SafeExtractionOptions {
+                restore_policy: RestorePolicy::Content,
+                ..SafeExtractionOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(content.iter().any(|diagnostic| {
+            diagnostic.metadata_class == "sparse-layout"
+                && diagnostic.restore_policy == Some(RestorePolicy::Content)
+        }));
     }
 }

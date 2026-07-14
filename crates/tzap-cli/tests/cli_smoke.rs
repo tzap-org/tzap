@@ -22,8 +22,8 @@ use tzap_core::wire::{
     VolumeTrailer,
 };
 use tzap_core::{
-    crypto::compute_hmac, write_archive_with_recipient_wrap_records, HmacDomain, MasterKey,
-    RegularFile, Subkeys, WriterOptions,
+    crypto::compute_hmac, write_archive_with_recipient_wrap_records, ArchiveTimestamp, HmacDomain,
+    MasterKey, RegularFile, Subkeys, WriterOptions,
 };
 use tzap_plugin_keywrap::{wrap_master_key_for_recipient, ArchiveIdentity, KeyWrapSuite};
 
@@ -1383,6 +1383,7 @@ fn cli_create_tar_stdin_round_trips_list_verify_and_extract() {
             "extract",
             "--jobs",
             "2",
+            "--allow-degraded",
             "--keyfile",
             keyfile.to_str().unwrap(),
             "-C",
@@ -1471,6 +1472,7 @@ fn cli_create_tar_stdin_multi_volume_round_trips_list_verify_and_extract() {
         .unwrap()
         .args([
             "extract",
+            "--allow-degraded",
             "--keyfile",
             keyfile.to_str().unwrap(),
             "-C",
@@ -3099,6 +3101,25 @@ fn cli_verify_json_success_reports_machine_readable_summary() {
     let archives = value.get("archives").unwrap().as_array().unwrap();
     assert_eq!(archives.len(), 1);
     assert_eq!(archives[0].as_str().unwrap(), archive.to_str().unwrap());
+    let metadata = value.get("metadata").unwrap();
+    assert!(metadata.get("capture_complete").unwrap().as_bool().unwrap());
+    assert_eq!(
+        metadata.get("profiles_present").unwrap(),
+        &serde_json::json!(["portable-v1"])
+    );
+    let metadata_entries = metadata.get("entries").unwrap().as_array().unwrap();
+    assert_eq!(metadata_entries.len(), 1);
+    assert_eq!(
+        metadata_entries[0]
+            .get("policy_capabilities")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|capability| capability.get("policy").unwrap().as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["content", "portable", "same-os", "system"]
+    );
 }
 
 #[test]
@@ -6747,6 +6768,12 @@ fn cli_list_with_long_output_includes_kind_mode_mtime() {
     fs::write(&keyfile, KEY_HEX).unwrap();
     fs::write(&input, b"abcde\n").unwrap();
     let expected_mode = expected_input_mode(&input);
+    let modified = fs::metadata(&input).unwrap().modified().unwrap();
+    let modified_since_epoch = modified.duration_since(std::time::UNIX_EPOCH).unwrap();
+    let expected_mtime = ArchiveTimestamp {
+        seconds: i64::try_from(modified_since_epoch.as_secs()).unwrap(),
+        nanoseconds: modified_since_epoch.subsec_nanos(),
+    };
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -6773,7 +6800,7 @@ fn cli_list_with_long_output_includes_kind_mode_mtime() {
         .assert()
         .success()
         .stdout(predicate::eq(format!(
-            "6\tfile\t{expected_mode}\t0\tpayload.bin\n"
+            "6\tfile\t{expected_mode}\t{expected_mtime}\tpayload.bin\n"
         )));
 }
 

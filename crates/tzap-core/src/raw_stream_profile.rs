@@ -7,7 +7,7 @@ pub const RAW_STREAM_CONTENT_MODEL_EXTENSION_CRITICAL_TAG: u16 =
     0x8000 | RAW_STREAM_CONTENT_MODEL_EXTENSION_TAG;
 pub const RAW_STREAM_CONTENT_MODEL_VALUE: &[u8] = b"raw_stream_v1";
 pub const RAW_STREAM_UNSUPPORTED_MESSAGE: &str =
-    "raw-stream content profile is not supported by the base v41 tar reader";
+    "raw-stream content profile is not supported by the revision-45 tar reader";
 
 #[cfg(test)]
 pub const RAW_STREAM_INDEX_ROOT_V1_MAGIC: [u8; 8] = *b"TZRSIDX1";

@@ -22,6 +22,8 @@ use tzap_core::format::{
 };
 use tzap_core::reader::{ArchiveEntry, ArchiveIndexEntry, RecipientWrapRecordContext};
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
+#[cfg(unix)]
+use tzap_core::PortablePosixOwner;
 use tzap_core::{
     extract_non_seekable_stream_to_dir, extract_non_seekable_stream_to_dir_with_bootstrap_sidecar,
     extract_non_seekable_stream_to_dir_with_recipient_wrap_resolver,
@@ -48,13 +50,16 @@ use tzap_core::{
     write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
     write_tar_stream_archive_to_sink_with_kdf_and_root_auth, AeadAlgo, ArchiveContentVerification,
-    ArchiveRepairPatch, ArchiveWriteError, ArchiveWriteSink, ExtractError, KdfAlgo, KdfParams,
-    MasterKey, MetadataDiagnostic, NonSeekableReaderOptions, OpenedArchive,
+    ArchiveRepairPatch, ArchiveTimestamp, ArchiveWriteError, ArchiveWriteSink, ExtractError,
+    KdfAlgo, KdfParams, MasterKey, MetadataDiagnostic, MetadataVerificationReport,
+    NonSeekableReaderOptions, OpenedArchive, PortableFileMetadata, PortableModeOrigin,
     PublicNoKeyVerification, ReaderOptions, RegularFile, RegularFileSource, RestorePolicy,
     RootAuthSigningRequest, RootAuthVerification, RootAuthWriterConfig, SafeExtractionOptions,
     SequentialRootAuthStatus, StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind,
     WriterOptions, WriterTimings, WrittenArchiveSummary,
 };
+#[cfg(test)]
+use tzap_core::{MetadataDiagnosticStatus, MetadataOperation};
 use tzap_plugin_keywrap::{
     dispatch_key_wrap_record, wrap_master_key_for_recipient,
     ArchiveIdentity as KeyWrapArchiveIdentity, KeyWrapOutcome, KeyWrapSuite, PrivateKeyLookup,
@@ -1354,6 +1359,7 @@ fn run(cli: Cli) -> Result<()> {
                     contents: &file.contents,
                     mode: file.mode,
                     mtime: file.mtime,
+                    portable_metadata: file.portable_metadata.clone(),
                 })
                 .collect::<Vec<_>>();
             let core_writer_started = Instant::now();
@@ -1676,13 +1682,7 @@ fn run(cli: Cli) -> Result<()> {
             let diagnostics = if paths.is_empty() {
                 opened.extract_indexed_files_to(&root, options, reader_options.jobs)?
             } else {
-                extract_entries_to_dir_parallel(
-                    &opened,
-                    requested_entries,
-                    &root,
-                    options,
-                    reader_options.jobs,
-                )?
+                opened.extract_selected_files_to(&paths, &root, options, reader_options.jobs)?
             };
             for (path, diagnostics) in diagnostics {
                 extracted_count = extracted_count
@@ -2084,6 +2084,7 @@ fn run(cli: Cli) -> Result<()> {
                             "volume_count": report.total_volumes,
                             "file_count": report.file_count,
                             "tar_total_size": report.tar_total_size,
+                            "metadata": metadata_verification_json(&report.metadata),
                         }))
                         .context("failed to encode verify output as JSON")?
                     );
@@ -2105,6 +2106,7 @@ fn run(cli: Cli) -> Result<()> {
                         "root-auth: wire-valid-only (signer trust not checked)",
                     )?;
                 }
+                emit_metadata_verification_stdout(quiet, &report.metadata)?;
                 return Ok(());
             }
             if public_no_key {
@@ -2227,6 +2229,7 @@ fn run(cli: Cli) -> Result<()> {
             let file_count = opened.index_root.header.file_count;
             match result {
                 Ok(content_verification) => {
+                    let metadata_report = content_verification.metadata_report().cloned();
                     let root_auth = if fast {
                         None
                     } else {
@@ -2253,8 +2256,18 @@ fn run(cli: Cli) -> Result<()> {
                             }
                         }
                     };
-                    let entries = opened.list_files()?;
-                    emit_entry_metadata_diagnostics(quiet, &entries)?;
+                    if let Some(report) = &metadata_report {
+                        for entry in &report.entries {
+                            emit_member_metadata_diagnostics(
+                                quiet,
+                                &String::from_utf8_lossy(&entry.path),
+                                &entry.diagnostics,
+                            )?;
+                        }
+                    } else {
+                        let entries = opened.list_files()?;
+                        emit_entry_metadata_diagnostics(quiet, &entries)?;
+                    }
                     let repaired_outputs = if write_repaired {
                         match write_repaired_archive_copies(&archive_paths, &opened) {
                             Ok(outputs) => outputs,
@@ -2302,6 +2315,9 @@ fn run(cli: Cli) -> Result<()> {
                                 });
                             }
                         }
+                        if let Some(report) = &metadata_report {
+                            payload["metadata"] = metadata_verification_json(report);
+                        }
                         if write_repaired {
                             payload["repaired_outputs"] = json!(repaired_outputs
                                 .iter()
@@ -2335,6 +2351,9 @@ fn run(cli: Cli) -> Result<()> {
                         emit_fast_verify_diagnostics_stdout(quiet, &opened)?;
                     } else if let Some(root_auth) = &root_auth {
                         emit_root_auth_stdout(quiet, root_auth)?;
+                    }
+                    if let Some(report) = &metadata_report {
+                        emit_metadata_verification_stdout(quiet, report)?;
                     }
                     if write_repaired {
                         if repaired_outputs.is_empty() {
@@ -2692,10 +2711,25 @@ fn non_seekable_reader_options(reader: ReaderOptions) -> NonSeekableReaderOption
 }
 
 fn metadata_diagnostic_line(path: &str, diagnostic: &MetadataDiagnostic) -> String {
-    format!(
-        "tzap: degraded-metadata: {}: {}: {}",
-        path, diagnostic.profile, diagnostic.message
-    )
+    let mut line = format!(
+        "tzap: degraded-metadata: {}: {}: {}: {:?}/{:?}: {}",
+        path,
+        diagnostic.profile,
+        diagnostic.metadata_class,
+        diagnostic.operation,
+        diagnostic.status,
+        diagnostic.message
+    );
+    if let (Some(policy), Some(phase)) = (diagnostic.restore_policy, diagnostic.restore_phase) {
+        line.push_str(&format!(" [policy={policy:?} phase={phase}]"));
+    }
+    if let Some(error) = &diagnostic.native_host_error {
+        line.push_str(&format!(" [native-error={error}]"));
+    }
+    if let (Some(staged), Some(committed)) = (diagnostic.bytes_staged, diagnostic.bytes_committed) {
+        line.push_str(&format!(" [staged={staged} committed={committed}]"));
+    }
+    line
 }
 
 fn emit_member_metadata_diagnostics(
@@ -2744,6 +2778,101 @@ fn emit_entry_metadata_diagnostics(quiet: bool, entries: &[ArchiveEntry]) -> io:
     }
     for line in metadata_diagnostic_lines_for_entries(entries) {
         eprintln!("{line}");
+    }
+    Ok(())
+}
+
+fn restore_policy_label(policy: RestorePolicy) -> &'static str {
+    match policy {
+        RestorePolicy::Content => "content",
+        RestorePolicy::Portable => "portable",
+        RestorePolicy::SameOs => "same-os",
+        RestorePolicy::System => "system",
+    }
+}
+
+fn metadata_verification_json(report: &MetadataVerificationReport) -> serde_json::Value {
+    json!({
+        "capture_complete": report.all_capture_complete,
+        "full_fidelity_possible": report.full_fidelity_possible,
+        "profiles_present": report.profiles_present,
+        "auxiliary_kinds_present": report.auxiliary_kinds_present,
+        "entries": report.entries.iter().map(|entry| json!({
+            "path": String::from_utf8_lossy(&entry.path),
+            "capture_status": format!("{:?}", entry.capture_status).to_ascii_lowercase(),
+            "required_profiles": entry.required_profiles,
+            "optional_profiles": entry.optional_profiles,
+            "auxiliary_kinds": entry.auxiliary_kinds,
+            "full_fidelity_possible": entry.full_fidelity_possible,
+            "policy_capabilities": entry.policy_capabilities.iter().map(|capability| json!({
+                "policy": restore_policy_label(capability.policy),
+                "policy_complete": capability.policy_complete,
+                "degraded_restore_available": capability.degraded_restore_available,
+                "reason": capability.reason,
+            })).collect::<Vec<_>>(),
+            "diagnostics": entry.diagnostics.iter().map(|diagnostic| json!({
+                "path": String::from_utf8_lossy(&diagnostic.path),
+                "profile": diagnostic.profile,
+                "metadata_class": diagnostic.metadata_class,
+                "operation": format!("{:?}", diagnostic.operation).to_ascii_lowercase(),
+                "status": format!("{:?}", diagnostic.status).to_ascii_lowercase(),
+                "reason": diagnostic.message,
+                "restore_policy": diagnostic.restore_policy.map(restore_policy_label),
+                "restore_phase": diagnostic.restore_phase,
+                "native_host_error": diagnostic.native_host_error,
+                "bytes_staged": diagnostic.bytes_staged,
+                "bytes_committed": diagnostic.bytes_committed,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn emit_metadata_verification_stdout(
+    quiet: bool,
+    report: &MetadataVerificationReport,
+) -> io::Result<()> {
+    emit_success_stdout(
+        quiet,
+        &format!(
+            "metadata: capture={} full-fidelity={} profiles=[{}] auxiliary-kinds=[{}]",
+            if report.all_capture_complete {
+                "complete"
+            } else {
+                "partial"
+            },
+            if report.full_fidelity_possible {
+                "possible"
+            } else {
+                "not-possible"
+            },
+            report.profiles_present.join(","),
+            report.auxiliary_kinds_present.join(","),
+        ),
+    )?;
+    for policy in [
+        RestorePolicy::Content,
+        RestorePolicy::Portable,
+        RestorePolicy::SameOs,
+        RestorePolicy::System,
+    ] {
+        let complete = report
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .policy_capabilities
+                    .iter()
+                    .any(|capability| capability.policy == policy && capability.policy_complete)
+            })
+            .count();
+        emit_success_stdout(
+            quiet,
+            &format!(
+                "metadata-policy {}: {complete}/{} entries policy-complete",
+                restore_policy_label(policy),
+                report.entries.len()
+            ),
+        )?;
     }
     Ok(())
 }
@@ -2882,7 +3011,8 @@ struct InputFile {
     archive_path: String,
     contents: Vec<u8>,
     mode: u32,
-    mtime: u64,
+    mtime: ArchiveTimestamp,
+    portable_metadata: PortableFileMetadata,
 }
 
 #[derive(Debug)]
@@ -2890,7 +3020,8 @@ struct InputSpec {
     source: PathBuf,
     archive_path: String,
     mode: u32,
-    mtime: u64,
+    mtime: ArchiveTimestamp,
+    portable_metadata: PortableFileMetadata,
     size: u64,
     identity: InputIdentity,
 }
@@ -2908,24 +3039,50 @@ impl RegularFileSource for InputSpec {
         self.mode
     }
 
-    fn mtime(&self) -> u64 {
+    fn mtime(&self) -> ArchiveTimestamp {
         self.mtime
+    }
+
+    fn portable_metadata(&self) -> PortableFileMetadata {
+        self.portable_metadata.clone()
     }
 
     fn open(&self) -> std::result::Result<Box<dyn Read + '_>, ArchiveWriteError> {
         let file = File::open(&self.source).map_err(ArchiveWriteError::Io)?;
         validate_opened_input_identity(&file, self.identity).map_err(ArchiveWriteError::Io)?;
-        Ok(Box::new(file) as Box<dyn Read + '_>)
+        Ok(Box::new(IdentityCheckedInputReader {
+            file,
+            expected: self.identity,
+            remaining: self.size,
+            validated: false,
+        }) as Box<dyn Read + '_>)
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct InputIdentity {
     len: u64,
+    mtime: ArchiveTimestamp,
+    mode: u32,
+    attributes: Option<u32>,
+    #[cfg(unix)]
+    uid: u64,
+    #[cfg(unix)]
+    gid: u64,
+    #[cfg(unix)]
+    raw_mode: u32,
+    #[cfg(unix)]
+    link_count: u64,
+    #[cfg(unix)]
+    change_time_seconds: i64,
+    #[cfg(unix)]
+    change_time_nanoseconds: i64,
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
     ino: u64,
+    #[cfg(windows)]
+    creation_time_100ns: u64,
 }
 
 #[derive(Debug)]
@@ -3067,7 +3224,29 @@ fn collect_input_specs(paths: &[String]) -> Result<Vec<InputSpec>> {
             .with_context(|| format!("failed to collect input {path}"))?;
     }
     out.sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
+    #[cfg(unix)]
+    reject_unrepresentable_selected_hardlinks(&out)?;
     Ok(out)
+}
+
+#[cfg(unix)]
+fn reject_unrepresentable_selected_hardlinks(specs: &[InputSpec]) -> Result<()> {
+    let mut selected_objects = BTreeMap::<(u64, u64), &str>::new();
+    for spec in specs {
+        if spec.identity.link_count < 2 {
+            continue;
+        }
+        let identity = (spec.identity.dev, spec.identity.ino);
+        if let Some(previous) = selected_objects.insert(identity, &spec.archive_path) {
+            if previous != spec.archive_path {
+                bail!(
+                    "selected hardlink topology is unsupported by the current v45 writer: {previous} and {} name the same filesystem object",
+                    spec.archive_path
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn input_specs_total_size(specs: &[InputSpec]) -> Result<u64> {
@@ -3096,6 +3275,7 @@ fn collect_input_files(specs: &[InputSpec]) -> Result<Vec<InputFile>> {
             contents,
             mode: spec.mode,
             mtime: spec.mtime,
+            portable_metadata: spec.portable_metadata.clone(),
         });
     }
     Ok(out)
@@ -3129,20 +3309,57 @@ fn collect_one_input_spec(
         bail!("unsupported input type {}", input.display());
     }
     let archive_path = archive_path_to_string(archive_path)?;
+    let identity = input_identity(&metadata)
+        .with_context(|| format!("failed to identify input {}", input.display()))?;
+    let portable_metadata = portable_input_metadata(identity);
     out.push(InputSpec {
         source: input.to_owned(),
         archive_path,
         mode: readonly_mode(&metadata),
-        mtime: 0,
+        mtime: identity.mtime,
+        portable_metadata,
         size: metadata.len(),
-        identity: input_identity(&metadata),
+        identity,
     });
     Ok(())
 }
 
-fn input_identity(metadata: &fs::Metadata) -> InputIdentity {
-    InputIdentity {
+fn input_identity(metadata: &fs::Metadata) -> io::Result<InputIdentity> {
+    Ok(InputIdentity {
         len: metadata.len(),
+        mtime: archive_timestamp(metadata.modified()?)?,
+        mode: readonly_mode(metadata),
+        attributes: portable_attributes(metadata),
+        #[cfg(unix)]
+        uid: {
+            use std::os::unix::fs::MetadataExt;
+            metadata.uid() as u64
+        },
+        #[cfg(unix)]
+        gid: {
+            use std::os::unix::fs::MetadataExt;
+            metadata.gid() as u64
+        },
+        #[cfg(unix)]
+        raw_mode: {
+            use std::os::unix::fs::MetadataExt;
+            metadata.mode()
+        },
+        #[cfg(unix)]
+        link_count: {
+            use std::os::unix::fs::MetadataExt;
+            metadata.nlink()
+        },
+        #[cfg(unix)]
+        change_time_seconds: {
+            use std::os::unix::fs::MetadataExt;
+            metadata.ctime()
+        },
+        #[cfg(unix)]
+        change_time_nanoseconds: {
+            use std::os::unix::fs::MetadataExt;
+            metadata.ctime_nsec()
+        },
         #[cfg(unix)]
         dev: {
             use std::os::unix::fs::MetadataExt;
@@ -3153,16 +3370,77 @@ fn input_identity(metadata: &fs::Metadata) -> InputIdentity {
             use std::os::unix::fs::MetadataExt;
             metadata.ino()
         },
-    }
+        #[cfg(windows)]
+        creation_time_100ns: {
+            use std::os::windows::fs::MetadataExt;
+            metadata.creation_time()
+        },
+    })
 }
 
 fn validate_opened_input_identity(file: &File, expected: InputIdentity) -> io::Result<()> {
     let actual_metadata = file.metadata()?;
-    let actual = input_identity(&actual_metadata);
+    let actual = input_identity(&actual_metadata)?;
     if actual != expected {
         return Err(io::Error::other("input changed after scan"));
     }
     Ok(())
+}
+
+struct IdentityCheckedInputReader {
+    file: File,
+    expected: InputIdentity,
+    remaining: u64,
+    validated: bool,
+}
+
+impl Read for IdentityCheckedInputReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            if !self.validated {
+                validate_opened_input_identity(&self.file, self.expected)?;
+                self.validated = true;
+            }
+            return Ok(0);
+        }
+        let max_read = out
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let count = self.file.read(&mut out[..max_read])?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "input ended before its scanned size",
+            ));
+        }
+        self.remaining -= count as u64;
+        if self.remaining == 0 {
+            validate_opened_input_identity(&self.file, self.expected)?;
+            self.validated = true;
+        }
+        Ok(count)
+    }
+}
+
+fn archive_timestamp(time: SystemTime) -> io::Result<ArchiveTimestamp> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => Ok(ArchiveTimestamp::new(
+            i64::try_from(duration.as_secs())
+                .map_err(|_| io::Error::other("input mtime exceeds revision-45 i64 range"))?,
+            duration.subsec_nanos(),
+        )),
+        Err(error) => {
+            let duration = error.duration();
+            if duration.as_secs() == 0 && duration.subsec_nanos() != 0 {
+                return Err(io::Error::other(
+                    "input mtime between -1 and 0 cannot use canonical revision-45 encoding",
+                ));
+            }
+            let seconds = i64::try_from(-i128::from(duration.as_secs()))
+                .map_err(|_| io::Error::other("input mtime exceeds revision-45 i64 range"))?;
+            Ok(ArchiveTimestamp::new(seconds, duration.subsec_nanos()))
+        }
+    }
 }
 
 fn resolve_extract_index_entries(
@@ -3182,61 +3460,6 @@ fn resolve_extract_index_entries(
         }
     }
     Ok((resolved, missing))
-}
-
-fn extract_entries_to_dir_parallel(
-    opened: &OpenedArchive,
-    entries: Vec<ArchiveIndexEntry>,
-    root: &Path,
-    options: SafeExtractionOptions,
-    jobs: usize,
-) -> Result<Vec<(String, Vec<MetadataDiagnostic>)>> {
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
-    if jobs <= 1 || entries.len() <= 1 {
-        return entries
-            .into_iter()
-            .map(|entry| {
-                let path = entry.path;
-                let diagnostics = opened
-                    .extract_file_to(&path, root, options)?
-                    .ok_or_else(|| anyhow!("path not found in archive: {path}"))?;
-                Ok((path, diagnostics))
-            })
-            .collect();
-    }
-
-    let worker_count = jobs.min(entries.len());
-    let chunk_size = entries.len().div_ceil(worker_count);
-    std::thread::scope(|scope| {
-        let handles = entries
-            .chunks(chunk_size)
-            .map(|chunk| {
-                let chunk = chunk.to_vec();
-                scope.spawn(move || {
-                    chunk
-                        .into_iter()
-                        .map(|entry| {
-                            let path = entry.path;
-                            let diagnostics = opened
-                                .extract_file_to(&path, root, options)?
-                                .ok_or_else(|| anyhow!("path not found in archive: {path}"))?;
-                            Ok((path, diagnostics))
-                        })
-                        .collect::<Result<Vec<_>>>()
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut out = Vec::new();
-        for handle in handles {
-            let mut chunk = handle
-                .join()
-                .map_err(|_| anyhow!("extract worker panicked"))??;
-            out.append(&mut chunk);
-        }
-        Ok(out)
-    })
 }
 
 fn archive_path_to_string(path: &Path) -> Result<String> {
@@ -3260,12 +3483,78 @@ fn archive_path_to_string(path: &Path) -> Result<String> {
 #[cfg(unix)]
 fn readonly_mode(metadata: &fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    metadata.permissions().mode() & 0o777
+    metadata.permissions().mode() & 0o7777
 }
 
 #[cfg(not(unix))]
-fn readonly_mode(_metadata: &fs::Metadata) -> u32 {
-    0o644
+fn readonly_mode(metadata: &fs::Metadata) -> u32 {
+    if metadata.permissions().readonly() {
+        0o444
+    } else {
+        0o644
+    }
+}
+
+fn portable_input_metadata(identity: InputIdentity) -> PortableFileMetadata {
+    PortableFileMetadata {
+        source_os: source_os_label().into(),
+        source_filesystem: "unknown".into(),
+        mode_origin: if cfg!(unix) {
+            PortableModeOrigin::Native
+        } else {
+            PortableModeOrigin::Projected
+        },
+        #[cfg(unix)]
+        posix_owner: Some(PortablePosixOwner {
+            uid: identity.uid,
+            gid: identity.gid,
+            uname: None,
+            gname: None,
+        }),
+        #[cfg(not(unix))]
+        posix_owner: None,
+        attributes: identity.attributes,
+    }
+}
+
+fn source_os_label() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else if cfg!(target_os = "netbsd") {
+        "netbsd"
+    } else if cfg!(target_os = "openbsd") {
+        "openbsd"
+    } else if cfg!(target_os = "solaris") {
+        "solaris"
+    } else if cfg!(target_family = "unix") {
+        "other-unix"
+    } else {
+        "other"
+    }
+}
+
+#[cfg(windows)]
+fn portable_attributes(metadata: &fs::Metadata) -> Option<u32> {
+    use std::os::windows::fs::MetadataExt;
+
+    let attributes = metadata.file_attributes();
+    let mut projection = 0u32;
+    projection |= u32::from(attributes & 0x0000_0001 != 0);
+    projection |= u32::from(attributes & 0x0000_0002 != 0) << 1;
+    projection |= u32::from(attributes & 0x0000_0004 != 0) << 2;
+    projection |= u32::from(attributes & 0x0000_0020 != 0) << 3;
+    Some(projection)
+}
+
+#[cfg(not(windows))]
+fn portable_attributes(_metadata: &fs::Metadata) -> Option<u32> {
+    None
 }
 
 fn write_archive_outputs(output: &str, volumes: &[Vec<u8>], force: bool) -> Result<()> {
@@ -6770,6 +7059,26 @@ mod tests {
         assert_eq!(layout.block_size, 64 * 1024);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn create_rejects_selected_hardlinks_when_topology_cannot_be_emitted() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.txt");
+        let second = temp.path().join("second.txt");
+        fs::write(&first, b"shared").unwrap();
+        fs::hard_link(&first, &second).unwrap();
+
+        let error = collect_input_specs(&[
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("selected hardlink topology is unsupported"));
+    }
+
     #[test]
     fn tar_stdin_signer_failure_removes_temporary_archive_output() {
         let temp = tempfile::tempdir().unwrap();
@@ -7041,14 +7350,23 @@ mod tests {
         let line = metadata_diagnostic_line(
             "path/in/archive",
             &MetadataDiagnostic {
-                profile: "gnu-sparse",
-                message: "unsupported sparse-file PAX metadata was ignored",
+                path: b"path/in/archive".to_vec(),
+                profile: "gnu-sparse".into(),
+                metadata_class: "sparse-layout".into(),
+                operation: MetadataOperation::Plan,
+                status: MetadataDiagnosticStatus::Unsupported,
+                message: "unsupported sparse-file PAX metadata was ignored".into(),
+                restore_policy: None,
+                restore_phase: None,
+                native_host_error: None,
+                bytes_staged: None,
+                bytes_committed: None,
             },
         );
 
         assert_eq!(
             line,
-            "tzap: degraded-metadata: path/in/archive: gnu-sparse: unsupported sparse-file PAX metadata was ignored"
+            "tzap: degraded-metadata: path/in/archive: gnu-sparse: sparse-layout: Plan/Unsupported: unsupported sparse-file PAX metadata was ignored"
         );
     }
 
@@ -7060,10 +7378,19 @@ mod tests {
                 file_data_size: 1,
                 kind: TarEntryKind::Regular,
                 mode: 0o644,
-                mtime: 0,
+                mtime: ArchiveTimestamp::UNIX_EPOCH,
                 diagnostics: vec![MetadataDiagnostic {
-                    profile: "pax-posix-2001",
-                    message: "unsupported PAX key was ignored",
+                    path: b"selected.txt".to_vec(),
+                    profile: "pax-posix-2001".into(),
+                    metadata_class: "pax-key".into(),
+                    operation: MetadataOperation::Plan,
+                    status: MetadataDiagnosticStatus::Unsupported,
+                    message: "unsupported PAX key was ignored".into(),
+                    restore_policy: None,
+                    restore_phase: None,
+                    native_host_error: None,
+                    bytes_staged: None,
+                    bytes_committed: None,
                 }],
             },
             ArchiveEntry {
@@ -7071,10 +7398,19 @@ mod tests {
                 file_data_size: 1,
                 kind: TarEntryKind::Regular,
                 mode: 0o644,
-                mtime: 0,
+                mtime: ArchiveTimestamp::UNIX_EPOCH,
                 diagnostics: vec![MetadataDiagnostic {
-                    profile: "gnu-sparse",
-                    message: "unsupported sparse-file PAX metadata was ignored",
+                    path: b"other.txt".to_vec(),
+                    profile: "gnu-sparse".into(),
+                    metadata_class: "sparse-layout".into(),
+                    operation: MetadataOperation::Plan,
+                    status: MetadataDiagnosticStatus::Unsupported,
+                    message: "unsupported sparse-file PAX metadata was ignored".into(),
+                    restore_policy: None,
+                    restore_phase: None,
+                    native_host_error: None,
+                    bytes_staged: None,
+                    bytes_committed: None,
                 }],
             },
         ];
@@ -7082,7 +7418,7 @@ mod tests {
         assert_eq!(
             metadata_diagnostic_lines_for_paths(&entries, &["selected.txt".to_string()]),
             vec![
-                "tzap: degraded-metadata: selected.txt: pax-posix-2001: unsupported PAX key was ignored"
+                "tzap: degraded-metadata: selected.txt: pax-posix-2001: pax-key: Plan/Unsupported: unsupported PAX key was ignored"
                     .to_string()
             ]
         );
