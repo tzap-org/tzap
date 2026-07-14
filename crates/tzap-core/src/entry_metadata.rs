@@ -1,0 +1,2716 @@
+//! Revision-45 per-entry metadata, canonical PAX, and auxiliary-stream rules.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
+
+use crate::format::FormatError;
+
+pub const EXTENDED_METADATA_V1: u32 = 1 << 0;
+pub const HAS_AUXILIARY_STREAMS: u32 = 1 << 1;
+pub const HAS_NATIVE_METADATA: u32 = 1 << 2;
+pub const HAS_SPARSE_EXTENTS: u32 = 1 << 3;
+pub const CAPTURE_PARTIAL: u32 = 1 << 4;
+pub const REQUIRES_SYSTEM_RESTORE: u32 = 1 << 5;
+pub const FILE_ENTRY_KNOWN_FLAGS: u32 = (1 << 6) - 1;
+
+pub const MAX_PROFILE_COUNT: usize = 64;
+pub const MAX_PROFILE_ID_LEN: usize = 64;
+pub const MAX_AUXILIARY_COUNT: usize = 65_535;
+pub const MAX_AUXILIARY_NAME_LEN: usize = 65_535;
+pub const MAX_LOCAL_PAX_PAYLOAD: usize = 64 * 1024 * 1024;
+pub const MAX_AGGREGATE_PAX_PAYLOAD: usize = 128 * 1024 * 1024;
+pub const MAX_CAPTURE_REPORT_ROWS: usize = 1_048_576;
+pub const MAX_SPARSE_EXTENTS: usize = 1_048_576;
+
+pub const PORTABLE_PROFILE: &str = "portable-v1";
+pub const POSIX_PROFILE: &str = "posix-backup-v1";
+pub const LINUX_PROFILE: &str = "linux-backup-v1";
+pub const MACOS_PROFILE: &str = "macos-backup-v1";
+pub const WINDOWS_PROFILE: &str = "windows-backup-v1";
+pub const CORE_PROFILE: &str = "tzap-core-v1";
+pub const CAPTURE_REPORT_KIND: &str = "tzap.capture-report";
+
+pub type PaxRecords = BTreeMap<String, Vec<u8>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureStatus {
+    Complete,
+    Partial,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RestorePolicy {
+    Content,
+    #[default]
+    Portable,
+    SameOs,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RestoreClass {
+    None,
+    Portable,
+    SameOs,
+    System,
+}
+
+impl RestoreClass {
+    fn parse(value: &[u8]) -> Result<Self, FormatError> {
+        match value {
+            b"none" => Ok(Self::None),
+            b"portable" => Ok(Self::Portable),
+            b"same-os" => Ok(Self::SameOs),
+            b"system" => Ok(Self::System),
+            _ => invalid("AuxiliaryMetadata", "invalid restore class"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataDeclaration {
+    pub required_profiles: Vec<String>,
+    pub optional_profiles: Vec<String>,
+    pub source_os: String,
+    pub source_filesystem: String,
+    pub capture_status: CaptureStatus,
+    pub owner_kind_posix: bool,
+    pub mode_origin_native: bool,
+    pub portable_mode: u32,
+    pub portable_attributes: Option<u32>,
+}
+
+impl MetadataDeclaration {
+    pub fn profile_selected(&self, profile: &str) -> bool {
+        self.required_profiles
+            .binary_search_by(|candidate| candidate.as_str().cmp(profile))
+            .is_ok()
+            || self
+                .optional_profiles
+                .binary_search_by(|candidate| candidate.as_str().cmp(profile))
+                .is_ok()
+    }
+
+    pub fn profile_required(&self, profile: &str) -> bool {
+        self.required_profiles
+            .binary_search_by(|candidate| candidate.as_str().cmp(profile))
+            .is_ok()
+    }
+
+    pub fn has_unknown_required_profile(&self) -> bool {
+        self.required_profiles
+            .iter()
+            .any(|profile| !is_known_profile(profile))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseExtent {
+    pub offset: u64,
+    pub length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseLayout {
+    pub logical_size: u64,
+    pub map_and_padding_size: usize,
+    pub extents: Vec<SparseExtent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuxiliaryRecord {
+    pub ordinal: u32,
+    pub kind: String,
+    pub profile: String,
+    pub restore_class: RestoreClass,
+    pub native: bool,
+    pub name_encoding: String,
+    pub decoded_name: Vec<u8>,
+    pub flags: u64,
+    pub logical_size: u64,
+    pub stored_size: u64,
+    pub sha256: [u8; 32],
+    pub meta: BTreeMap<String, Vec<u8>>,
+    pub sparse_layout: Option<SparseLayout>,
+    pub capture_report_payload: Option<Vec<u8>>,
+}
+
+/// Incrementally validates one revision-45 auxiliary payload. Large ordinary
+/// and sparse streams are hashed and structurally checked without retaining
+/// their data bytes.
+pub struct AuxiliaryStreamValidator {
+    record: AuxiliaryRecord,
+    hasher: Sha256,
+    received: u64,
+    sparse: Option<SparseStreamValidator>,
+    retained: Option<Vec<u8>>,
+    retained_cap: usize,
+}
+
+impl AuxiliaryStreamValidator {
+    pub fn new(records: &PaxRecords, ordinal: u32, stored_size: u64) -> Result<Self, FormatError> {
+        let record = parse_auxiliary_declaration(records, ordinal, stored_size)?;
+        let sparse =
+            (record.flags & 1 != 0).then(|| SparseStreamValidator::new(record.logical_size));
+        let retained_cap = retained_auxiliary_cap(&record.kind);
+        let retained = (retained_cap != 0).then(Vec::new);
+        Ok(Self {
+            record,
+            hasher: Sha256::new(),
+            received: 0,
+            sparse,
+            retained,
+            retained_cap,
+        })
+    }
+
+    pub fn observe(&mut self, bytes: &[u8]) -> Result<(), FormatError> {
+        self.received =
+            self.received
+                .checked_add(bytes.len() as u64)
+                .ok_or(FormatError::InvalidArchive(
+                    "auxiliary payload size overflow",
+                ))?;
+        if self.received > self.record.stored_size {
+            return invalid(
+                "AuxiliaryMetadata",
+                "auxiliary payload exceeds declared size",
+            );
+        }
+        self.hasher.update(bytes);
+        if let Some(sparse) = &mut self.sparse {
+            sparse.observe(bytes)?;
+        }
+        if let Some(retained) = &mut self.retained {
+            let next =
+                retained
+                    .len()
+                    .checked_add(bytes.len())
+                    .ok_or(FormatError::InvalidArchive(
+                        "auxiliary retention size overflow",
+                    ))?;
+            if next > self.retained_cap {
+                return Err(FormatError::ReaderResourceLimitExceeded {
+                    field: "structured auxiliary payload bytes",
+                    cap: self.retained_cap as u64,
+                    actual: next as u64,
+                });
+            }
+            retained.extend_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<AuxiliaryRecord, FormatError> {
+        if self.received != self.record.stored_size {
+            return invalid("AuxiliaryMetadata", "auxiliary payload length mismatch");
+        }
+        if self.hasher.finalize().as_slice() != self.record.sha256 {
+            return invalid("AuxiliaryMetadata", "auxiliary payload SHA-256 mismatch");
+        }
+        self.record.sparse_layout = self.sparse.map(SparseStreamValidator::finish).transpose()?;
+        if self.record.kind == CAPTURE_REPORT_KIND {
+            self.record.capture_report_payload = self.retained.clone();
+        }
+        validate_builtin_auxiliary_payload(&self.record, self.retained.as_deref())?;
+        Ok(self.record)
+    }
+}
+
+pub(crate) struct SparseStreamValidator {
+    logical_size: u64,
+    position: u64,
+    line: Vec<u8>,
+    extent_count: Option<usize>,
+    values_remaining: usize,
+    pending_offset: Option<u64>,
+    previous_end: u64,
+    stored_extent_bytes: u64,
+    extents: Vec<SparseExtent>,
+    map_and_padding_size: Option<u64>,
+}
+
+impl SparseStreamValidator {
+    pub(crate) fn new(logical_size: u64) -> Self {
+        Self {
+            logical_size,
+            position: 0,
+            line: Vec::new(),
+            extent_count: None,
+            values_remaining: 0,
+            pending_offset: None,
+            previous_end: 0,
+            stored_extent_bytes: 0,
+            extents: Vec::new(),
+            map_and_padding_size: None,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, bytes: &[u8]) -> Result<(), FormatError> {
+        for byte in bytes {
+            if let Some(padded_end) = self.map_and_padding_size {
+                if self.position < padded_end && *byte != 0 {
+                    return invalid("SparsePayload", "sparse map padding is invalid");
+                }
+                self.position = self
+                    .position
+                    .checked_add(1)
+                    .ok_or(FormatError::InvalidArchive("sparse payload size overflow"))?;
+                continue;
+            }
+
+            self.position = self
+                .position
+                .checked_add(1)
+                .ok_or(FormatError::InvalidArchive("sparse payload size overflow"))?;
+            if *byte != b'\n' {
+                if self.line.len() == 20 || !byte.is_ascii_digit() {
+                    return invalid("SparsePayload", "sparse map value is not canonical decimal");
+                }
+                self.line.push(*byte);
+                continue;
+            }
+            let value = parse_decimal_u64(&self.line, "sparse map value")?;
+            self.line.clear();
+            if self.extent_count.is_none() {
+                let count = usize::try_from(value).map_err(|_| FormatError::InvalidMetadata {
+                    structure: "sparse extent count",
+                    reason: "decimal value exceeds usize",
+                })?;
+                if count > MAX_SPARSE_EXTENTS {
+                    return Err(FormatError::ReaderResourceLimitExceeded {
+                        field: "sparse extent count",
+                        cap: MAX_SPARSE_EXTENTS as u64,
+                        actual: count as u64,
+                    });
+                }
+                self.extent_count = Some(count);
+                self.values_remaining = count
+                    .checked_mul(2)
+                    .ok_or(FormatError::InvalidArchive("sparse extent count overflow"))?;
+                self.extents.reserve(count);
+            } else if self.values_remaining != 0 {
+                if self.pending_offset.is_none() {
+                    self.pending_offset = Some(value);
+                } else {
+                    let offset = self.pending_offset.take().unwrap();
+                    let length = value;
+                    if length == 0 || offset < self.previous_end {
+                        return invalid("SparsePayload", "extents overlap or have zero length");
+                    }
+                    if !self.extents.is_empty() && offset == self.previous_end {
+                        return invalid("SparsePayload", "adjacent extents are not merged");
+                    }
+                    let end = offset
+                        .checked_add(length)
+                        .ok_or(FormatError::InvalidArchive("sparse extent overflow"))?;
+                    if end > self.logical_size {
+                        return invalid("SparsePayload", "extent exceeds logical size");
+                    }
+                    self.stored_extent_bytes = self
+                        .stored_extent_bytes
+                        .checked_add(length)
+                        .ok_or(FormatError::InvalidArchive("sparse stored size overflow"))?;
+                    self.previous_end = end;
+                    self.extents.push(SparseExtent { offset, length });
+                }
+                self.values_remaining -= 1;
+            } else {
+                return invalid("SparsePayload", "sparse map has trailing lines");
+            }
+
+            if self.extent_count.is_some() && self.values_remaining == 0 {
+                self.map_and_padding_size = Some(
+                    self.position
+                        .checked_add(511)
+                        .ok_or(FormatError::InvalidArchive("sparse map padding overflow"))?
+                        / 512
+                        * 512,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn layout_if_map_complete(&self) -> Option<SparseLayout> {
+        self.map_and_padding_size.map(|padded| SparseLayout {
+            logical_size: self.logical_size,
+            map_and_padding_size: padded as usize,
+            extents: self.extents.clone(),
+        })
+    }
+
+    pub(crate) fn position(&self) -> u64 {
+        self.position
+    }
+
+    pub(crate) fn finish(self) -> Result<SparseLayout, FormatError> {
+        if !self.line.is_empty() || self.extent_count.is_none() || self.values_remaining != 0 {
+            return invalid("SparsePayload", "sparse map is truncated");
+        }
+        let padded = self
+            .map_and_padding_size
+            .ok_or(FormatError::InvalidArchive("sparse map is missing"))?;
+        if self.position < padded || self.position - padded != self.stored_extent_bytes {
+            return invalid("SparsePayload", "sparse extent bytes do not match map");
+        }
+        Ok(SparseLayout {
+            logical_size: self.logical_size,
+            map_and_padding_size: usize::try_from(padded).map_err(|_| {
+                FormatError::InvalidArchive("sparse map size exceeds platform limits")
+            })?,
+            extents: self.extents,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureReportRow {
+    pub profile: String,
+    pub metadata_class: String,
+    pub reason: String,
+    pub encoded_detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimaryMetadata {
+    pub declaration: MetadataDeclaration,
+    pub path: Option<Vec<u8>>,
+    pub linkpath: Option<Vec<u8>>,
+    pub stored_size: Option<u64>,
+    pub mtime: Option<(i64, u32)>,
+    pub sparse_logical_size: Option<u64>,
+    pub has_native_scalar: bool,
+    pub requires_system_restore: bool,
+    pub xattr_names: Vec<Vec<u8>>,
+}
+
+/// Decoded portable fields that hardlink aliases must mirror exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortableMetadataMirror {
+    pub owner_kind_posix: bool,
+    pub mode_origin_native: bool,
+    pub mode: u32,
+    pub attributes: Option<u32>,
+    pub uid: Option<u64>,
+    pub gid: Option<u64>,
+    pub uname: Option<Vec<u8>>,
+    pub gname: Option<Vec<u8>>,
+    pub mtime: (i64, u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberMetadata {
+    pub declaration: MetadataDeclaration,
+    pub auxiliary: Vec<AuxiliaryRecord>,
+    pub file_entry_flags: u32,
+    pub sparse_layout: Option<SparseLayout>,
+    pub capture_report: Option<Vec<CaptureReportRow>>,
+    pub primary_has_native_scalar: bool,
+    pub primary_requires_system_restore: bool,
+    pub portable_mirror: PortableMetadataMirror,
+}
+
+pub fn parse_canonical_pax(payload: &[u8]) -> Result<PaxRecords, FormatError> {
+    if payload.is_empty() {
+        return invalid("PAX", "payload is empty");
+    }
+    if payload.len() > MAX_LOCAL_PAX_PAYLOAD {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "local PAX payload bytes",
+            cap: MAX_LOCAL_PAX_PAYLOAD as u64,
+            actual: payload.len() as u64,
+        });
+    }
+
+    let mut records = BTreeMap::new();
+    let mut previous_key: Option<String> = None;
+    let mut cursor = 0usize;
+    while cursor < payload.len() {
+        let relative_space = payload[cursor..]
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or(FormatError::InvalidArchive("PAX record length is missing"))?;
+        let space = cursor
+            .checked_add(relative_space)
+            .ok_or(FormatError::InvalidArchive("PAX arithmetic overflow"))?;
+        let digits = &payload[cursor..space];
+        if digits.is_empty()
+            || !digits.iter().all(u8::is_ascii_digit)
+            || (digits.len() > 1 && digits[0] == b'0')
+        {
+            return invalid("PAX", "record length is not minimal decimal");
+        }
+        let declared = parse_decimal_usize(digits, "PAX record length")?;
+        if declared.to_string().as_bytes() != digits {
+            return invalid("PAX", "record length is not canonical");
+        }
+        let end = cursor
+            .checked_add(declared)
+            .ok_or(FormatError::InvalidArchive("PAX arithmetic overflow"))?;
+        if end > payload.len() || end <= space + 2 || payload[end - 1] != b'\n' {
+            return invalid("PAX", "record length does not frame one record");
+        }
+        let body = &payload[space + 1..end - 1];
+        let equals =
+            body.iter()
+                .position(|byte| *byte == b'=')
+                .ok_or(FormatError::InvalidArchive(
+                    "PAX record equals sign is missing",
+                ))?;
+        let key_bytes = &body[..equals];
+        let value = &body[equals + 1..];
+        if key_bytes.is_empty()
+            || !key_bytes
+                .iter()
+                .all(|byte| (0x21..=0x7e).contains(byte) && *byte != b'=')
+        {
+            return invalid("PAX", "key is not canonical ASCII");
+        }
+        if value.contains(&0) {
+            return invalid("PAX", "value contains NUL");
+        }
+        let key = std::str::from_utf8(key_bytes)
+            .map_err(|_| FormatError::InvalidArchive("PAX key is not ASCII"))?
+            .to_owned();
+        if previous_key
+            .as_ref()
+            .is_some_and(|previous| previous >= &key)
+        {
+            return invalid("PAX", "keys are not strictly sorted and unique");
+        }
+        previous_key = Some(key.clone());
+        records.insert(key, value.to_vec());
+        cursor = end;
+    }
+    Ok(records)
+}
+
+pub fn encode_canonical_pax(records: &PaxRecords) -> Result<Vec<u8>, FormatError> {
+    if records.is_empty() {
+        return Err(FormatError::WriterInvariant("PAX payload cannot be empty"));
+    }
+    let mut out = Vec::new();
+    for (key, value) in records {
+        if key.is_empty()
+            || !key
+                .as_bytes()
+                .iter()
+                .all(|byte| (0x21..=0x7e).contains(byte) && *byte != b'=')
+            || value.contains(&0)
+        {
+            return Err(FormatError::WriterInvariant("invalid canonical PAX record"));
+        }
+        let body_len = key
+            .len()
+            .checked_add(value.len())
+            .and_then(|value| value.checked_add(3))
+            .ok_or(FormatError::WriterInvariant("PAX record length overflow"))?;
+        let mut digits = 1usize;
+        let record_len = loop {
+            let length = digits
+                .checked_add(body_len)
+                .ok_or(FormatError::WriterInvariant("PAX record length overflow"))?;
+            let next_digits = length.to_string().len();
+            if next_digits == digits {
+                break length;
+            }
+            digits = next_digits;
+        };
+        out.extend_from_slice(record_len.to_string().as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(key.as_bytes());
+        out.push(b'=');
+        out.extend_from_slice(value);
+        out.push(b'\n');
+    }
+    if out.len() > MAX_LOCAL_PAX_PAYLOAD {
+        return Err(FormatError::WriterUnsupported(
+            "local PAX payload exceeds revision-45 limit",
+        ));
+    }
+    Ok(out)
+}
+
+pub fn portable_primary_pax(
+    path: &[u8],
+    mode: u32,
+    source_os: &str,
+    path_requires_override: bool,
+) -> Result<PaxRecords, FormatError> {
+    if mode & !0x0fff != 0 {
+        return Err(FormatError::WriterUnsupported(
+            "portable mode contains bits outside revision-45 mode mask",
+        ));
+    }
+    if !is_source_os(source_os) {
+        return Err(FormatError::WriterUnsupported("invalid metadata source OS"));
+    }
+    let mut records = PaxRecords::new();
+    records.insert("TZAP.metadata.capture-status".into(), b"complete".to_vec());
+    records.insert("TZAP.metadata.optional-profiles".into(), Vec::new());
+    records.insert(
+        "TZAP.metadata.required-profiles".into(),
+        PORTABLE_PROFILE.as_bytes().to_vec(),
+    );
+    records.insert(
+        "TZAP.metadata.source-filesystem".into(),
+        b"unknown".to_vec(),
+    );
+    records.insert(
+        "TZAP.metadata.source-os".into(),
+        source_os.as_bytes().to_vec(),
+    );
+    records.insert("TZAP.metadata.version".into(), b"1".to_vec());
+    records.insert(
+        "TZAP.portable.mode".into(),
+        format!("{mode:08x}").into_bytes(),
+    );
+    records.insert("TZAP.portable.mode-origin".into(), b"projected".to_vec());
+    records.insert("TZAP.portable.owner-kind".into(), b"none".to_vec());
+    if path_requires_override {
+        records.insert("path".into(), path.to_vec());
+    }
+    Ok(records)
+}
+
+pub fn parse_primary_metadata(records: &PaxRecords) -> Result<PrimaryMetadata, FormatError> {
+    validate_primary_key_registry(records)?;
+    expect_value(records, "TZAP.metadata.version", b"1", "PrimaryMetadata")?;
+    let required_profiles =
+        parse_profile_list(required(records, "TZAP.metadata.required-profiles")?)?;
+    let optional_profiles =
+        parse_profile_list(required(records, "TZAP.metadata.optional-profiles")?)?;
+    validate_profile_sets(&required_profiles, &optional_profiles)?;
+
+    let source_os = ascii_string(required(records, "TZAP.metadata.source-os")?, "source OS")?;
+    if !is_source_os(&source_os) {
+        return invalid("PrimaryMetadata", "unknown source OS");
+    }
+    let source_filesystem = ascii_string(
+        required(records, "TZAP.metadata.source-filesystem")?,
+        "source filesystem",
+    )?;
+    if !valid_filesystem_token(&source_filesystem) {
+        return invalid("PrimaryMetadata", "invalid source filesystem token");
+    }
+    validate_profile_dependencies(&required_profiles, &optional_profiles, &source_os)?;
+
+    let capture_status = match required(records, "TZAP.metadata.capture-status")? {
+        b"complete" => CaptureStatus::Complete,
+        b"partial" => CaptureStatus::Partial,
+        _ => return invalid("PrimaryMetadata", "invalid capture status"),
+    };
+    let owner_kind_posix = match required(records, "TZAP.portable.owner-kind")? {
+        b"none" => false,
+        b"posix" => true,
+        _ => return invalid("PrimaryMetadata", "invalid portable owner kind"),
+    };
+    let mode_origin_native = match required(records, "TZAP.portable.mode-origin")? {
+        b"projected" => false,
+        b"native" => true,
+        _ => return invalid("PrimaryMetadata", "invalid portable mode origin"),
+    };
+    let portable_mode =
+        parse_fixed_hex_u32(required(records, "TZAP.portable.mode")?, 8, "portable mode")?;
+    if portable_mode & !0x0fff != 0 {
+        return invalid("PrimaryMetadata", "portable mode has reserved bits");
+    }
+    let portable_attributes = records
+        .get("TZAP.portable.attributes")
+        .map(|value| parse_fixed_hex_u32(value, 8, "portable attributes"))
+        .transpose()?;
+    if portable_attributes.is_some_and(|value| value & !0x0f != 0) {
+        return invalid("PrimaryMetadata", "portable attributes have reserved bits");
+    }
+
+    validate_owner_fields(records, owner_kind_posix)?;
+    let xattr_names = validate_scalar_encodings(records)?;
+    validate_acl_fields(records)?;
+    validate_profile_owned_primary_fields(
+        records,
+        &required_profiles,
+        &optional_profiles,
+        &source_os,
+    )?;
+
+    let path = records.get("path").cloned();
+    let linkpath = records.get("linkpath").cloned();
+    let stored_size = records
+        .get("size")
+        .map(|value| parse_decimal_u64(value, "PAX size"))
+        .transpose()?;
+    let mtime = records
+        .get("mtime")
+        .map(|value| parse_timestamp(value))
+        .transpose()?;
+
+    let sparse_keys = [
+        "GNU.sparse.major",
+        "GNU.sparse.minor",
+        "GNU.sparse.name",
+        "GNU.sparse.realsize",
+    ];
+    let sparse_count = sparse_keys
+        .iter()
+        .filter(|key| records.contains_key(**key))
+        .count();
+    let sparse_logical_size = if sparse_count == 0 {
+        None
+    } else {
+        if sparse_count != sparse_keys.len() {
+            return invalid("PrimaryMetadata", "incomplete GNU sparse 1.0 declaration");
+        }
+        expect_value(records, "GNU.sparse.major", b"1", "PrimaryMetadata")?;
+        expect_value(records, "GNU.sparse.minor", b"0", "PrimaryMetadata")?;
+        Some(parse_decimal_u64(
+            required(records, "GNU.sparse.realsize")?,
+            "GNU sparse logical size",
+        )?)
+    };
+
+    let declaration = MetadataDeclaration {
+        required_profiles,
+        optional_profiles,
+        source_os,
+        source_filesystem,
+        capture_status,
+        owner_kind_posix,
+        mode_origin_native,
+        portable_mode,
+        portable_attributes,
+    };
+    let has_native_scalar = records.keys().any(is_native_primary_key);
+    let windows_stream_security = records
+        .get("TZAP.windows.data-stream-attributes")
+        .map(|value| parse_fixed_hex_u32(value, 8, "Windows stream attributes"))
+        .transpose()?
+        .is_some_and(|value| value & 0x0000_0002 != 0);
+    let requires_system_restore = owner_kind_posix
+        || portable_mode & 0o6000 != 0
+        || windows_stream_security
+        || xattr_names.iter().any(|name| system_xattr_namespace(name))
+        || has_no_change_flags(records)?
+        || records.keys().any(is_system_primary_key);
+    Ok(PrimaryMetadata {
+        declaration,
+        path,
+        linkpath,
+        stored_size,
+        mtime,
+        sparse_logical_size,
+        has_native_scalar,
+        requires_system_restore,
+        xattr_names,
+    })
+}
+
+pub fn parse_auxiliary_record(
+    records: &PaxRecords,
+    ordinal: u32,
+    stored_size: u64,
+    payload: &[u8],
+) -> Result<AuxiliaryRecord, FormatError> {
+    let mut validator = AuxiliaryStreamValidator::new(records, ordinal, stored_size)?;
+    validator.observe(payload)?;
+    validator.finish()
+}
+
+fn parse_auxiliary_declaration(
+    records: &PaxRecords,
+    ordinal: u32,
+    stored_size: u64,
+) -> Result<AuxiliaryRecord, FormatError> {
+    let structure = "AuxiliaryMetadata";
+    expect_value(records, "TZAP.aux.version", b"1", structure)?;
+    for key in records.keys() {
+        if !matches!(
+            key.as_str(),
+            "TZAP.aux.version"
+                | "TZAP.aux.kind"
+                | "TZAP.aux.profile"
+                | "TZAP.aux.restore-class"
+                | "TZAP.aux.native"
+                | "TZAP.aux.name-encoding"
+                | "TZAP.aux.name"
+                | "TZAP.aux.flags"
+                | "TZAP.aux.logical-size"
+                | "TZAP.aux.sha256"
+                | "size"
+        ) && !key.starts_with("TZAP.aux.meta.")
+        {
+            return invalid(structure, "unregistered auxiliary PAX key");
+        }
+    }
+    let kind = ascii_string(required(records, "TZAP.aux.kind")?, "auxiliary kind")?;
+    if !valid_profile_token(&kind)
+        || !(is_builtin_aux_kind(&kind) || kind.starts_with("x.") && kind.len() > 2)
+    {
+        return invalid(structure, "invalid auxiliary kind");
+    }
+    let profile = ascii_string(required(records, "TZAP.aux.profile")?, "auxiliary profile")?;
+    if profile != CORE_PROFILE && !is_valid_profile_id(&profile) {
+        return invalid(structure, "invalid auxiliary owner profile");
+    }
+    let restore_class = RestoreClass::parse(required(records, "TZAP.aux.restore-class")?)?;
+    let native = match required(records, "TZAP.aux.native")? {
+        b"0" => false,
+        b"1" => true,
+        _ => return invalid(structure, "invalid auxiliary native flag"),
+    };
+    let name_encoding = ascii_string(
+        required(records, "TZAP.aux.name-encoding")?,
+        "auxiliary name encoding",
+    )?;
+    let decoded_name = decode_auxiliary_name(&name_encoding, required(records, "TZAP.aux.name")?)?;
+    if decoded_name.len() > MAX_AUXILIARY_NAME_LEN {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "decoded auxiliary name bytes",
+            cap: MAX_AUXILIARY_NAME_LEN as u64,
+            actual: decoded_name.len() as u64,
+        });
+    }
+    let flags = parse_fixed_hex_u64(required(records, "TZAP.aux.flags")?, 16, "auxiliary flags")?;
+    if !kind.starts_with("x.") && flags & !1 != 0 {
+        return invalid(structure, "built-in auxiliary flags have reserved bits");
+    }
+    let logical_size = parse_decimal_u64(
+        required(records, "TZAP.aux.logical-size")?,
+        "auxiliary logical size",
+    )?;
+    if let Some(size) = records.get("size") {
+        if parse_decimal_u64(size, "auxiliary PAX size")? != stored_size {
+            return invalid(structure, "PAX size does not match auxiliary stored size");
+        }
+    }
+    let sha256 = parse_fixed_hex_32(required(records, "TZAP.aux.sha256")?)?;
+    if flags & 1 == 0 && logical_size != stored_size {
+        return invalid(structure, "non-sparse logical and stored sizes differ");
+    }
+    let mut meta = BTreeMap::new();
+    for (key, value) in records
+        .iter()
+        .filter(|(key, _)| key.starts_with("TZAP.aux.meta."))
+    {
+        let suffix = &key["TZAP.aux.meta.".len()..];
+        if !valid_profile_token(suffix) {
+            return invalid(structure, "invalid auxiliary metadata field name");
+        }
+        meta.insert(key.clone(), value.clone());
+    }
+    let record = AuxiliaryRecord {
+        ordinal,
+        kind,
+        profile,
+        restore_class,
+        native,
+        name_encoding,
+        decoded_name,
+        flags,
+        logical_size,
+        stored_size,
+        sha256,
+        meta,
+        sparse_layout: None,
+        capture_report_payload: None,
+    };
+    validate_builtin_auxiliary(&record)?;
+    Ok(record)
+}
+
+pub fn validate_group_metadata(
+    primary: &PrimaryMetadata,
+    auxiliary: &[AuxiliaryRecord],
+) -> Result<(u32, Option<Vec<CaptureReportRow>>), FormatError> {
+    if auxiliary.len() > MAX_AUXILIARY_COUNT {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "auxiliary record count",
+            cap: MAX_AUXILIARY_COUNT as u64,
+            actual: auxiliary.len() as u64,
+        });
+    }
+    let mut identities = BTreeSet::new();
+    let mut capture_report = None;
+    for record in auxiliary {
+        if record.kind == CAPTURE_REPORT_KIND {
+            if capture_report.is_some() {
+                return invalid("MemberGroup", "duplicate capture report");
+            }
+            if record.profile != CORE_PROFILE {
+                return invalid("MemberGroup", "capture report owner is not tzap-core-v1");
+            }
+        } else if !primary.declaration.profile_selected(&record.profile) {
+            return invalid("MemberGroup", "auxiliary owner profile is not selected");
+        }
+        let identity = if record.kind.starts_with("x.") {
+            format!("{}\0{}\0", record.profile, record.kind).into_bytes()
+        } else {
+            let mut value = record.kind.as_bytes().to_vec();
+            value.push(0);
+            value
+        };
+        let mut identity = identity;
+        identity.extend_from_slice(&record.decoded_name);
+        if !identities.insert(identity) {
+            return invalid("MemberGroup", "duplicate auxiliary identity");
+        }
+    }
+
+    let report_records: Vec<_> = auxiliary
+        .iter()
+        .filter(|record| record.kind == CAPTURE_REPORT_KIND)
+        .collect();
+    match primary.declaration.capture_status {
+        CaptureStatus::Complete if !report_records.is_empty() => {
+            return invalid("MemberGroup", "complete capture has a capture report")
+        }
+        CaptureStatus::Partial if report_records.len() != 1 => {
+            return invalid("MemberGroup", "partial capture requires one capture report")
+        }
+        _ => {}
+    }
+
+    if let Some(record) = report_records.first() {
+        // The payload has already been hashed by the caller. Capture report parsing is
+        // exposed separately for streaming readers that retain its bounded payload.
+        capture_report = Some(parse_capture_report(
+            record
+                .capture_report_payload
+                .as_deref()
+                .ok_or(FormatError::InvalidArchive(
+                    "capture report payload is missing",
+                ))?,
+            &primary.declaration,
+        )?);
+        if record.flags != 0
+            || record.profile != CORE_PROFILE
+            || record.restore_class != RestoreClass::None
+            || record.native
+            || record.name_encoding != "none"
+            || !record.decoded_name.is_empty()
+        {
+            return invalid("MemberGroup", "capture report declaration is not canonical");
+        }
+    }
+
+    let mut flags = EXTENDED_METADATA_V1;
+    if !auxiliary.is_empty() {
+        flags |= HAS_AUXILIARY_STREAMS;
+    }
+    if primary.declaration.required_profiles != [PORTABLE_PROFILE]
+        || !primary.declaration.optional_profiles.is_empty()
+        || primary.has_native_scalar
+        || auxiliary.iter().any(|record| record.native)
+    {
+        flags |= HAS_NATIVE_METADATA;
+    }
+    if primary.sparse_logical_size.is_some() || auxiliary.iter().any(|record| record.flags & 1 != 0)
+    {
+        flags |= HAS_SPARSE_EXTENTS;
+    }
+    if primary.declaration.capture_status == CaptureStatus::Partial {
+        flags |= CAPTURE_PARTIAL;
+    }
+    if primary.requires_system_restore
+        || auxiliary
+            .iter()
+            .any(|record| record.restore_class == RestoreClass::System)
+    {
+        flags |= REQUIRES_SYSTEM_RESTORE;
+    }
+    Ok((flags, capture_report))
+}
+
+pub fn parse_capture_report(
+    payload: &[u8],
+    declaration: &MetadataDeclaration,
+) -> Result<Vec<CaptureReportRow>, FormatError> {
+    if payload.len() > MAX_LOCAL_PAX_PAYLOAD {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "capture report payload bytes",
+            cap: MAX_LOCAL_PAX_PAYLOAD as u64,
+            actual: payload.len() as u64,
+        });
+    }
+    let text = std::str::from_utf8(payload)
+        .map_err(|_| FormatError::InvalidArchive("capture report is not UTF-8"))?;
+    if !text.starts_with("tzap-capture-report-v1\n") || !text.ends_with('\n') {
+        return invalid("CaptureReport", "invalid framing");
+    }
+    let mut rows = Vec::new();
+    let mut previous: Option<&str> = None;
+    for line in text["tzap-capture-report-v1\n".len()..].split_terminator('\n') {
+        if line.is_empty() {
+            return invalid("CaptureReport", "empty row");
+        }
+        if rows.len() >= MAX_CAPTURE_REPORT_ROWS {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "capture report rows",
+                cap: MAX_CAPTURE_REPORT_ROWS as u64,
+                actual: rows.len() as u64 + 1,
+            });
+        }
+        if previous.is_some_and(|value| value >= line) {
+            return invalid("CaptureReport", "rows are not strictly sorted and unique");
+        }
+        previous = Some(line);
+        let mut fields = line.split('\t');
+        let profile = fields.next().unwrap_or_default();
+        let metadata_class = fields.next().unwrap_or_default();
+        let reason = fields.next().unwrap_or_default();
+        let encoded_detail = fields.next().unwrap_or_default();
+        if fields.next().is_some()
+            || !declaration.profile_selected(profile)
+            || !valid_profile_token(metadata_class)
+            || !matches!(
+                reason,
+                "excluded-policy"
+                    | "unsupported-host"
+                    | "unsupported-filesystem"
+                    | "permission-denied"
+                    | "changed-during-read"
+                    | "limit-exceeded"
+                    | "io-error"
+                    | "invalid-source-metadata"
+            )
+            || !valid_percent_encoded_detail(encoded_detail.as_bytes())
+        {
+            return invalid("CaptureReport", "invalid row");
+        }
+        rows.push(CaptureReportRow {
+            profile: profile.to_owned(),
+            metadata_class: metadata_class.to_owned(),
+            reason: reason.to_owned(),
+            encoded_detail: encoded_detail.to_owned(),
+        });
+    }
+    if rows.is_empty() {
+        return invalid("CaptureReport", "report has no rows");
+    }
+    Ok(rows)
+}
+
+pub fn parse_sparse_payload(
+    payload: &[u8],
+    logical_size: u64,
+) -> Result<SparseLayout, FormatError> {
+    let first_newline =
+        payload
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or(FormatError::InvalidArchive(
+                "sparse extent count is missing",
+            ))?;
+    let count = parse_decimal_usize(&payload[..first_newline], "sparse extent count")?;
+    if count > MAX_SPARSE_EXTENTS {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "sparse extent count",
+            cap: MAX_SPARSE_EXTENTS as u64,
+            actual: count as u64,
+        });
+    }
+    let mut cursor = first_newline + 1;
+    let mut extents = Vec::with_capacity(count);
+    let mut previous_end = 0u64;
+    let mut stored_extent_bytes = 0u64;
+    for _ in 0..count {
+        let offset = parse_sparse_line(payload, &mut cursor)?;
+        let length = parse_sparse_line(payload, &mut cursor)?;
+        if length == 0 || offset < previous_end {
+            return invalid("SparsePayload", "extents overlap or have zero length");
+        }
+        if !extents.is_empty() && offset == previous_end {
+            return invalid("SparsePayload", "adjacent extents are not merged");
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or(FormatError::InvalidArchive("sparse extent overflow"))?;
+        if end > logical_size {
+            return invalid("SparsePayload", "extent exceeds logical size");
+        }
+        stored_extent_bytes = stored_extent_bytes
+            .checked_add(length)
+            .ok_or(FormatError::InvalidArchive("sparse stored size overflow"))?;
+        extents.push(SparseExtent { offset, length });
+        previous_end = end;
+    }
+    let map_and_padding_size = cursor
+        .checked_add(511)
+        .ok_or(FormatError::InvalidArchive("sparse map padding overflow"))?
+        / 512
+        * 512;
+    if map_and_padding_size > payload.len()
+        || payload[cursor..map_and_padding_size]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return invalid("SparsePayload", "sparse map padding is invalid");
+    }
+    if payload.len() as u64 - map_and_padding_size as u64 != stored_extent_bytes {
+        return invalid("SparsePayload", "sparse extent bytes do not match map");
+    }
+    Ok(SparseLayout {
+        logical_size,
+        map_and_padding_size,
+        extents,
+    })
+}
+
+fn validate_primary_key_registry(records: &PaxRecords) -> Result<(), FormatError> {
+    for key in records.keys() {
+        let allowed = matches!(
+            key.as_str(),
+            "TZAP.metadata.version"
+                | "TZAP.metadata.required-profiles"
+                | "TZAP.metadata.optional-profiles"
+                | "TZAP.metadata.source-os"
+                | "TZAP.metadata.source-filesystem"
+                | "TZAP.metadata.capture-status"
+                | "TZAP.portable.owner-kind"
+                | "TZAP.portable.mode-origin"
+                | "TZAP.portable.mode"
+                | "TZAP.portable.attributes"
+                | "path"
+                | "linkpath"
+                | "size"
+                | "uid"
+                | "gid"
+                | "uname"
+                | "gname"
+                | "mtime"
+                | "atime"
+                | "LIBARCHIVE.creationtime"
+                | "SCHILY.acl.access"
+                | "SCHILY.acl.default"
+                | "SCHILY.acl.ace"
+                | "SCHILY.fflags"
+                | "GNU.sparse.major"
+                | "GNU.sparse.minor"
+                | "GNU.sparse.name"
+                | "GNU.sparse.realsize"
+                | "TZAP.unix.ctime-observed"
+                | "TZAP.windows.change-time"
+                | "TZAP.posix.device-major"
+                | "TZAP.posix.device-minor"
+                | "TZAP.acl.projection"
+                | "TZAP.acl.syntax"
+                | "TZAP.linux.fsflags"
+                | "TZAP.bsd.st-flags"
+                | "TZAP.macos.st-flags"
+                | "TZAP.linux.project-id"
+                | "TZAP.linux.whiteout"
+                | "TZAP.macos.clone-group"
+                | "TZAP.windows.file-attributes"
+                | "TZAP.windows.data-stream-attributes"
+                | "TZAP.windows.directory-case-sensitive"
+                | "TZAP.windows.reparse-placeholder"
+        ) || key.starts_with("LIBARCHIVE.xattr.");
+        if !allowed {
+            return invalid("PrimaryMetadata", "unregistered primary PAX key");
+        }
+    }
+    Ok(())
+}
+
+fn parse_profile_list(value: &[u8]) -> Result<Vec<String>, FormatError> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let text = ascii_string(value, "profile list")?;
+    let profiles: Vec<_> = text.split(',').map(str::to_owned).collect();
+    if profiles.len() > MAX_PROFILE_COUNT {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "metadata profiles per list",
+            cap: MAX_PROFILE_COUNT as u64,
+            actual: profiles.len() as u64,
+        });
+    }
+    if profiles.iter().any(|profile| !is_valid_profile_id(profile))
+        || profiles.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return invalid("PrimaryMetadata", "profile list is not canonical");
+    }
+    Ok(profiles)
+}
+
+fn validate_profile_sets(required: &[String], optional: &[String]) -> Result<(), FormatError> {
+    if required
+        .binary_search_by(|value| value.as_str().cmp(PORTABLE_PROFILE))
+        .is_err()
+    {
+        return invalid("PrimaryMetadata", "portable-v1 is not required");
+    }
+    if required.iter().any(|profile| profile == CORE_PROFILE)
+        || optional.iter().any(|profile| profile == CORE_PROFILE)
+        || required
+            .iter()
+            .any(|profile| optional.binary_search(profile).is_ok())
+    {
+        return invalid(
+            "PrimaryMetadata",
+            "profile lists overlap or contain reserved profile",
+        );
+    }
+    Ok(())
+}
+
+fn validate_profile_dependencies(
+    required: &[String],
+    optional: &[String],
+    source_os: &str,
+) -> Result<(), FormatError> {
+    let req = |profile: &str| {
+        required
+            .binary_search_by(|value| value.as_str().cmp(profile))
+            .is_ok()
+    };
+    let opt = |profile: &str| {
+        optional
+            .binary_search_by(|value| value.as_str().cmp(profile))
+            .is_ok()
+    };
+    if (req(LINUX_PROFILE) || req(MACOS_PROFILE)) && !req(POSIX_PROFILE) {
+        return invalid(
+            "PrimaryMetadata",
+            "required native profile dependency is missing",
+        );
+    }
+    if (opt(LINUX_PROFILE) || opt(MACOS_PROFILE)) && !(req(POSIX_PROFILE) || opt(POSIX_PROFILE)) {
+        return invalid(
+            "PrimaryMetadata",
+            "optional native profile dependency is missing",
+        );
+    }
+    if (req(LINUX_PROFILE) || opt(LINUX_PROFILE)) && source_os != "linux"
+        || (req(MACOS_PROFILE) || opt(MACOS_PROFILE)) && source_os != "macos"
+        || (req(WINDOWS_PROFILE) || opt(WINDOWS_PROFILE)) && source_os != "windows"
+    {
+        return invalid("PrimaryMetadata", "native profile does not match source OS");
+    }
+    Ok(())
+}
+
+fn validate_owner_fields(records: &PaxRecords, posix: bool) -> Result<(), FormatError> {
+    let ownership = ["uid", "gid", "uname", "gname"];
+    if !posix && ownership.iter().any(|key| records.contains_key(*key)) {
+        return invalid(
+            "PrimaryMetadata",
+            "owner-kind none has POSIX ownership fields",
+        );
+    }
+    if posix {
+        if let Some(value) = records.get("uid") {
+            parse_decimal_u64(value, "uid")?;
+        }
+        if let Some(value) = records.get("gid") {
+            parse_decimal_u64(value, "gid")?;
+        }
+        for key in ["uname", "gname"] {
+            if let Some(value) = records.get(key) {
+                let text = std::str::from_utf8(value)
+                    .map_err(|_| FormatError::InvalidArchive("owner name is not UTF-8"))?;
+                if text.nfc().collect::<String>() != text {
+                    return invalid("PrimaryMetadata", "owner name is not NFC");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_scalar_encodings(records: &PaxRecords) -> Result<Vec<Vec<u8>>, FormatError> {
+    for key in [
+        "mtime",
+        "atime",
+        "LIBARCHIVE.creationtime",
+        "TZAP.unix.ctime-observed",
+        "TZAP.windows.change-time",
+    ] {
+        if let Some(value) = records.get(key) {
+            parse_timestamp(value)?;
+        }
+    }
+    for key in ["TZAP.posix.device-major", "TZAP.posix.device-minor"] {
+        if let Some(value) = records.get(key) {
+            parse_decimal_u64(value, "primary decimal scalar")?;
+        }
+    }
+    if let Some(value) = records.get("TZAP.linux.project-id") {
+        let parsed = parse_decimal_u64(value, "Linux project ID")?;
+        if parsed > u32::MAX as u64 {
+            return invalid("PrimaryMetadata", "Linux project ID exceeds u32");
+        }
+    }
+    for key in [
+        "TZAP.linux.fsflags",
+        "TZAP.bsd.st-flags",
+        "TZAP.macos.st-flags",
+    ] {
+        if let Some(value) = records.get(key) {
+            parse_fixed_hex_u64(value, 16, "native flags")?;
+        }
+    }
+    if let Some(value) = records.get("SCHILY.fflags") {
+        let text = ascii_string(value, "SCHILY file flags")?;
+        if text.is_empty()
+            || text
+                .split(',')
+                .any(|token| !valid_profile_token(token) || token.bytes().any(|byte| byte == b'.'))
+            || text
+                .split(',')
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return invalid("PrimaryMetadata", "SCHILY file flags are not canonical");
+        }
+    }
+    for key in [
+        "TZAP.windows.file-attributes",
+        "TZAP.windows.data-stream-attributes",
+    ] {
+        if let Some(value) = records.get(key) {
+            parse_fixed_hex_u32(value, 8, "Windows attributes")?;
+        }
+    }
+    if let Some(value) = records.get("TZAP.macos.clone-group") {
+        if value.len() != 32 || !value.iter().all(is_lower_hex) {
+            return invalid("PrimaryMetadata", "invalid macOS clone group");
+        }
+    }
+    for key in ["TZAP.linux.whiteout", "TZAP.windows.reparse-placeholder"] {
+        if let Some(value) = records.get(key) {
+            if value != b"1" {
+                return invalid("PrimaryMetadata", "invalid boolean scalar");
+            }
+        }
+    }
+    if let Some(value) = records.get("TZAP.windows.directory-case-sensitive") {
+        if value != b"0" && value != b"1" {
+            return invalid("PrimaryMetadata", "invalid Windows case-sensitive scalar");
+        }
+    }
+    let mut decoded_xattrs = BTreeSet::new();
+    for (key, value) in records
+        .iter()
+        .filter(|(key, _)| key.starts_with("LIBARCHIVE.xattr."))
+    {
+        let name = decode_percent_name(&key.as_bytes()["LIBARCHIVE.xattr.".len()..])?;
+        if name.is_empty() || !decoded_xattrs.insert(name) {
+            return invalid("PrimaryMetadata", "duplicate or empty decoded xattr name");
+        }
+        let decoded = canonical_base64_decode(value)?;
+        if decoded.len() > MAX_LOCAL_PAX_PAYLOAD {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "decoded xattr value bytes",
+                cap: MAX_LOCAL_PAX_PAYLOAD as u64,
+                actual: decoded.len() as u64,
+            });
+        }
+    }
+    for reserved in [
+        b"com.apple.ResourceFork".as_slice(),
+        b"com.apple.FinderInfo".as_slice(),
+    ] {
+        if decoded_xattrs.contains(reserved) {
+            return invalid(
+                "PrimaryMetadata",
+                "macOS resource fork or FinderInfo is encoded as a generic xattr",
+            );
+        }
+    }
+    Ok(decoded_xattrs.into_iter().collect())
+}
+
+fn validate_acl_fields(records: &PaxRecords) -> Result<(), FormatError> {
+    let posix =
+        records.contains_key("SCHILY.acl.access") || records.contains_key("SCHILY.acl.default");
+    let nfs4 = records.contains_key("SCHILY.acl.ace");
+    if posix && nfs4 {
+        return invalid("PrimaryMetadata", "multiple textual ACL models are present");
+    }
+    let projection = records.get("TZAP.acl.projection");
+    let syntax = records.get("TZAP.acl.syntax");
+    if posix || nfs4 {
+        if !matches!(projection.map(Vec::as_slice), Some(b"exact" | b"lossy")) {
+            return invalid("PrimaryMetadata", "textual ACL projection is missing");
+        }
+        let expected = if posix {
+            b"schily-posix1e-extra-id-v1".as_slice()
+        } else {
+            b"schily-nfs4-full-extra-id-v1".as_slice()
+        };
+        if syntax.map(Vec::as_slice) != Some(expected) {
+            return invalid("PrimaryMetadata", "textual ACL syntax does not match model");
+        }
+    } else if (projection.is_some() || syntax.is_some())
+        && (projection.map(Vec::as_slice) != Some(b"none") || syntax.is_some())
+    {
+        return invalid(
+            "PrimaryMetadata",
+            "ACL declaration has no matching ACL data",
+        );
+    }
+    for key in ["SCHILY.acl.access", "SCHILY.acl.default"] {
+        if let Some(value) = records.get(key) {
+            validate_posix_acl_text(value)?;
+        }
+    }
+    if let Some(value) = records.get("SCHILY.acl.ace") {
+        validate_nfs4_acl_text(value)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PosixAclSortKey {
+    category: u8,
+    numeric_qualifier: u64,
+    name: String,
+}
+
+fn validate_posix_acl_text(value: &[u8]) -> Result<(), FormatError> {
+    let text = canonical_acl_text(value)?;
+    let mut previous: Option<PosixAclSortKey> = None;
+    let mut principals = BTreeSet::new();
+    let mut base = [false; 3];
+    let mut mask_count = 0usize;
+    let mut named_count = 0usize;
+    for serialized in text.split(',') {
+        let fields: Vec<_> = serialized.split(':').collect();
+        if !(fields.len() == 3 || fields.len() == 4) {
+            return invalid("PrimaryMetadata", "POSIX ACL tuple has invalid field count");
+        }
+        let tag = fields[0];
+        let name = fields[1];
+        validate_posix_permissions(fields[2])?;
+        let id = if fields.len() == 4 {
+            Some(parse_acl_id(fields[3])?)
+        } else {
+            None
+        };
+        let (category, numeric_qualifier) = match (tag, name.is_empty()) {
+            ("user", true) => {
+                if id.is_some() || std::mem::replace(&mut base[0], true) {
+                    return invalid(
+                        "PrimaryMetadata",
+                        "duplicate or invalid POSIX owner-user ACL entry",
+                    );
+                }
+                (0, 0)
+            }
+            ("group", true) => {
+                if id.is_some() || std::mem::replace(&mut base[1], true) {
+                    return invalid(
+                        "PrimaryMetadata",
+                        "duplicate or invalid POSIX owner-group ACL entry",
+                    );
+                }
+                (1, 0)
+            }
+            ("other", true) => {
+                if id.is_some() || std::mem::replace(&mut base[2], true) {
+                    return invalid(
+                        "PrimaryMetadata",
+                        "duplicate or invalid POSIX other ACL entry",
+                    );
+                }
+                (2, 0)
+            }
+            ("user", false) => {
+                named_count += 1;
+                (3, validate_acl_name_and_id(name, id)?)
+            }
+            ("group", false) => {
+                named_count += 1;
+                (4, validate_acl_name_and_id(name, id)?)
+            }
+            ("mask", true) => {
+                if id.is_some() || mask_count != 0 {
+                    return invalid("PrimaryMetadata", "duplicate or invalid POSIX ACL mask");
+                }
+                mask_count += 1;
+                (5, 0)
+            }
+            _ => return invalid("PrimaryMetadata", "invalid POSIX ACL tag or qualifier"),
+        };
+        let key = PosixAclSortKey {
+            category,
+            numeric_qualifier,
+            name: name.to_owned(),
+        };
+        if previous.as_ref().is_some_and(|prior| prior >= &key) {
+            return invalid(
+                "PrimaryMetadata",
+                "POSIX ACL entries are not canonically ordered",
+            );
+        }
+        previous = Some(key);
+        if !principals.insert((tag.to_owned(), name.to_owned(), id)) {
+            return invalid("PrimaryMetadata", "duplicate POSIX ACL principal");
+        }
+    }
+    if !base.into_iter().all(|present| present) || (named_count != 0 && mask_count != 1) {
+        return invalid("PrimaryMetadata", "POSIX ACL required entries are missing");
+    }
+    Ok(())
+}
+
+fn validate_nfs4_acl_text(value: &[u8]) -> Result<(), FormatError> {
+    let text = canonical_acl_text(value)?;
+    let mut tuples = BTreeSet::new();
+    for serialized in text.split(',') {
+        if !tuples.insert(serialized) {
+            return invalid("PrimaryMetadata", "duplicate NFSv4 ACL tuple");
+        }
+        let fields: Vec<_> = serialized.split(':').collect();
+        let named = matches!(fields.first().copied(), Some("user" | "group"));
+        let expected_fields = if named { 5..=6 } else { 4..=4 };
+        if !expected_fields.contains(&fields.len()) {
+            return invalid("PrimaryMetadata", "NFSv4 ACL tuple has invalid field count");
+        }
+        let offset = if named {
+            let id = if fields.len() == 6 {
+                Some(parse_acl_id(fields[5])?)
+            } else {
+                None
+            };
+            validate_acl_name_and_id(fields[1], id)?;
+            1
+        } else {
+            if !matches!(fields[0], "owner@" | "group@" | "everyone@") {
+                return invalid("PrimaryMetadata", "invalid NFSv4 ACL principal");
+            }
+            0
+        };
+        validate_fixed_acl_bits(fields[1 + offset], b"rwxpDdaARWcCos", "NFSv4 permissions")?;
+        validate_fixed_acl_bits(fields[2 + offset], b"fdinSFI", "NFSv4 inheritance flags")?;
+        if !matches!(fields[3 + offset], "allow" | "deny" | "audit" | "alarm") {
+            return invalid("PrimaryMetadata", "invalid NFSv4 ACL entry type");
+        }
+    }
+    Ok(())
+}
+
+fn canonical_acl_text(value: &[u8]) -> Result<&str, FormatError> {
+    let text = std::str::from_utf8(value)
+        .map_err(|_| FormatError::InvalidArchive("ACL text is not UTF-8"))?;
+    if text.is_empty()
+        || text.starts_with(',')
+        || text.ends_with(',')
+        || text.contains("default:")
+        || text
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte == b'#' || byte == 0)
+    {
+        return invalid("PrimaryMetadata", "ACL text is not canonical");
+    }
+    Ok(text)
+}
+
+fn validate_posix_permissions(value: &str) -> Result<(), FormatError> {
+    if value.len() != 3
+        || !value
+            .bytes()
+            .zip(*b"rwx")
+            .all(|(actual, expected)| actual == expected || actual == b'-')
+    {
+        return invalid("PrimaryMetadata", "POSIX ACL permissions are not canonical");
+    }
+    Ok(())
+}
+
+fn validate_fixed_acl_bits(
+    value: &str,
+    positions: &[u8],
+    label: &'static str,
+) -> Result<(), FormatError> {
+    if value.len() != positions.len()
+        || !value
+            .bytes()
+            .zip(positions.iter().copied())
+            .all(|(actual, expected)| actual == expected || actual == b'-')
+    {
+        return invalid("PrimaryMetadata", label);
+    }
+    Ok(())
+}
+
+fn parse_acl_id(value: &str) -> Result<u64, FormatError> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || value.len() > 1 && value.starts_with('0')
+    {
+        return invalid("PrimaryMetadata", "ACL numeric ID is not minimal decimal");
+    }
+    value
+        .parse()
+        .map_err(|_| FormatError::InvalidArchive("ACL numeric ID exceeds u64"))
+}
+
+fn validate_acl_name_and_id(name: &str, id: Option<u64>) -> Result<u64, FormatError> {
+    if name.is_empty()
+        || name.nfc().collect::<String>() != name
+        || name
+            .bytes()
+            .any(|byte| matches!(byte, b',' | b':' | b'\r' | b'\n' | 0))
+    {
+        return invalid("PrimaryMetadata", "ACL name is not canonical NFC UTF-8");
+    }
+    if name.bytes().all(|byte| byte.is_ascii_digit()) {
+        let numeric_name = parse_acl_id(name)?;
+        if id.is_some() {
+            return invalid(
+                "PrimaryMetadata",
+                "numeric ACL name has a redundant extra ID",
+            );
+        }
+        Ok(numeric_name)
+    } else {
+        Ok(id.unwrap_or(u64::MAX))
+    }
+}
+
+fn validate_profile_owned_primary_fields(
+    records: &PaxRecords,
+    required: &[String],
+    optional: &[String],
+    source_os: &str,
+) -> Result<(), FormatError> {
+    let selected = |profile: &str| {
+        required
+            .binary_search_by(|value| value.as_str().cmp(profile))
+            .is_ok()
+            || optional
+                .binary_search_by(|value| value.as_str().cmp(profile))
+                .is_ok()
+    };
+    let source_profile = match source_os {
+        "linux" => LINUX_PROFILE,
+        "macos" => MACOS_PROFILE,
+        "windows" => WINDOWS_PROFILE,
+        "freebsd" | "netbsd" | "openbsd" | "solaris" | "other-unix" => POSIX_PROFILE,
+        _ => "",
+    };
+    for key in records.keys() {
+        let owner = if key.starts_with("TZAP.linux.") {
+            LINUX_PROFILE
+        } else if key.starts_with("TZAP.macos.") {
+            MACOS_PROFILE
+        } else if key.starts_with("TZAP.windows.") {
+            WINDOWS_PROFILE
+        } else if key.starts_with("TZAP.posix.") {
+            POSIX_PROFILE
+        } else if key.starts_with("LIBARCHIVE.xattr.") {
+            let name = decode_percent_name(&key.as_bytes()["LIBARCHIVE.xattr.".len()..])?;
+            if name.starts_with(b"security.")
+                || name.starts_with(b"trusted.")
+                || name.starts_with(b"system.")
+            {
+                LINUX_PROFILE
+            } else if name.starts_with(b"com.apple.") {
+                MACOS_PROFILE
+            } else {
+                POSIX_PROFILE
+            }
+        } else if key.starts_with("SCHILY.acl.") || key.starts_with("TZAP.acl.") {
+            POSIX_PROFILE
+        } else if key.starts_with("SCHILY.")
+            || key == "LIBARCHIVE.creationtime"
+            || key == "TZAP.unix.ctime-observed"
+        {
+            source_profile
+        } else {
+            ""
+        };
+        if !owner.is_empty() && !selected(owner) {
+            return invalid(
+                "PrimaryMetadata",
+                "primary key owner profile is not selected",
+            );
+        }
+    }
+    Ok(())
+}
+
+fn system_xattr_namespace(name: &[u8]) -> bool {
+    name.starts_with(b"security.") || name.starts_with(b"trusted.") || name.starts_with(b"system.")
+}
+
+fn validate_builtin_auxiliary(record: &AuxiliaryRecord) -> Result<(), FormatError> {
+    let structure = "AuxiliaryMetadata";
+    let fixed = match record.kind.as_str() {
+        CAPTURE_REPORT_KIND => Some((CORE_PROFILE, RestoreClass::None, false, "none")),
+        "windows.security-descriptor" => {
+            Some((WINDOWS_PROFILE, RestoreClass::System, true, "none"))
+        }
+        "windows.reparse-data" => Some((WINDOWS_PROFILE, RestoreClass::System, true, "none")),
+        "windows.object-id" => Some((WINDOWS_PROFILE, RestoreClass::System, true, "none")),
+        "windows.efs-raw" => Some((WINDOWS_PROFILE, RestoreClass::System, true, "none")),
+        "macos.resource-fork" => Some((MACOS_PROFILE, RestoreClass::SameOs, true, "none")),
+        "macos.acl-native" => Some((MACOS_PROFILE, RestoreClass::SameOs, true, "none")),
+        "macos.finder-info" => Some((MACOS_PROFILE, RestoreClass::SameOs, true, "none")),
+        "windows.alternate-data" => Some((
+            WINDOWS_PROFILE,
+            record.restore_class,
+            true,
+            "utf16le-base64",
+        )),
+        "windows.ea-data" | "windows.property-data" => {
+            Some((WINDOWS_PROFILE, record.restore_class, true, "none"))
+        }
+        "generic.xattr" => Some((
+            record.profile.as_str(),
+            record.restore_class,
+            true,
+            "bytes-base64",
+        )),
+        "generic.named-fork" => Some((
+            record.profile.as_str(),
+            RestoreClass::SameOs,
+            true,
+            "bytes-base64",
+        )),
+        _ if record.kind.starts_with("x.") => None,
+        _ => return invalid(structure, "unknown built-in auxiliary kind"),
+    };
+    if let Some((profile, class, native, encoding)) = fixed {
+        if record.profile != profile
+            || record.restore_class != class
+            || record.native != native
+            || record.name_encoding != encoding
+        {
+            return invalid(structure, "built-in auxiliary declaration mismatch");
+        }
+    }
+    let required_meta: &[(&str, Option<&[u8]>)] = match record.kind.as_str() {
+        "windows.security-descriptor" => &[("TZAP.aux.meta.security-information", None)],
+        "windows.reparse-data" => &[("TZAP.aux.meta.reparse-tag", None)],
+        "windows.alternate-data" => &[
+            ("TZAP.aux.meta.stream-type", Some(b"00000004")),
+            ("TZAP.aux.meta.stream-attributes", None),
+        ],
+        "windows.ea-data" => &[
+            ("TZAP.aux.meta.stream-type", Some(b"00000002")),
+            ("TZAP.aux.meta.stream-attributes", None),
+        ],
+        "windows.property-data" => &[
+            ("TZAP.aux.meta.stream-type", Some(b"00000006")),
+            ("TZAP.aux.meta.stream-attributes", None),
+        ],
+        "windows.object-id" => &[
+            ("TZAP.aux.meta.stream-type", Some(b"00000007")),
+            ("TZAP.aux.meta.stream-attributes", None),
+        ],
+        "windows.efs-raw" => &[("TZAP.aux.meta.efs-version", Some(b"1"))],
+        "macos.acl-native" => &[("TZAP.aux.meta.acl-format", Some(b"darwin-acl-external-v1"))],
+        _ => &[],
+    };
+    if !record.kind.starts_with("x.")
+        && !matches!(record.kind.as_str(), "generic.xattr" | "generic.named-fork")
+        && record.meta.len() != required_meta.len()
+    {
+        return invalid(structure, "unexpected built-in auxiliary metadata field");
+    }
+    for (key, expected) in required_meta {
+        let value = record.meta.get(*key).ok_or(FormatError::InvalidArchive(
+            "required auxiliary metadata is missing",
+        ))?;
+        if let Some(expected) = expected {
+            if value != expected {
+                return invalid(structure, "auxiliary metadata value mismatch");
+            }
+        } else if key.ends_with("information")
+            || key.ends_with("tag")
+            || key.ends_with("attributes")
+        {
+            parse_fixed_hex_u32(value, 8, "auxiliary metadata hexadecimal")?;
+        }
+    }
+    if matches!(
+        record.kind.as_str(),
+        "windows.alternate-data"
+            | "windows.ea-data"
+            | "windows.property-data"
+            | "windows.object-id"
+    ) {
+        let attributes = parse_fixed_hex_u32(
+            record.meta.get("TZAP.aux.meta.stream-attributes").ok_or(
+                FormatError::InvalidArchive("Windows stream attributes are missing"),
+            )?,
+            8,
+            "Windows stream attributes",
+        )?;
+        let expected_class = if record.kind == "windows.object-id" || attributes & 0x0000_0002 != 0
+        {
+            RestoreClass::System
+        } else {
+            RestoreClass::SameOs
+        };
+        if record.restore_class != expected_class {
+            return invalid(
+                structure,
+                "Windows stream restore class disagrees with stream attributes",
+            );
+        }
+        if (attributes & 0x0000_0008 != 0) != (record.flags & 1 != 0) {
+            return invalid(
+                structure,
+                "Windows sparse stream attribute disagrees with sparse framing",
+            );
+        }
+    }
+    if record.kind == "windows.alternate-data" {
+        validate_windows_stream_name(&record.decoded_name)?;
+    }
+    if record.kind == "generic.xattr" {
+        validate_generic_xattr_declaration(record)?;
+    }
+    if record.flags & 1 != 0
+        && matches!(
+            record.kind.as_str(),
+            CAPTURE_REPORT_KIND
+                | "windows.security-descriptor"
+                | "windows.ea-data"
+                | "windows.reparse-data"
+                | "windows.object-id"
+                | "windows.property-data"
+                | "windows.efs-raw"
+                | "macos.acl-native"
+                | "macos.finder-info"
+        )
+    {
+        return invalid(structure, "auxiliary kind cannot use sparse framing");
+    }
+    Ok(())
+}
+
+fn retained_auxiliary_cap(kind: &str) -> usize {
+    match kind {
+        CAPTURE_REPORT_KIND | "windows.ea-data" => MAX_LOCAL_PAX_PAYLOAD,
+        "windows.security-descriptor" => 256 * 1024,
+        "windows.reparse-data" => 16 * 1024,
+        "windows.object-id" | "macos.finder-info" => 64,
+        _ => 0,
+    }
+}
+
+fn validate_generic_xattr_declaration(record: &AuxiliaryRecord) -> Result<(), FormatError> {
+    let name = record.decoded_name.as_slice();
+    if matches!(name, b"com.apple.ResourceFork" | b"com.apple.FinderInfo") {
+        return invalid(
+            "AuxiliaryMetadata",
+            "macOS resource fork or FinderInfo is encoded as a generic xattr",
+        );
+    }
+    let (profile, class) = if name.starts_with(b"security.")
+        || name.starts_with(b"trusted.")
+        || name.starts_with(b"system.")
+    {
+        (LINUX_PROFILE, RestoreClass::System)
+    } else if name.starts_with(b"com.apple.") {
+        (MACOS_PROFILE, RestoreClass::SameOs)
+    } else {
+        (POSIX_PROFILE, RestoreClass::SameOs)
+    };
+    if record.profile != profile || record.restore_class != class {
+        return invalid(
+            "AuxiliaryMetadata",
+            "generic xattr owner or restore class disagrees with its namespace",
+        );
+    }
+    Ok(())
+}
+
+fn validate_builtin_auxiliary_payload(
+    record: &AuxiliaryRecord,
+    retained: Option<&[u8]>,
+) -> Result<(), FormatError> {
+    match record.kind.as_str() {
+        CAPTURE_REPORT_KIND => {
+            if record.stored_size > MAX_LOCAL_PAX_PAYLOAD as u64 {
+                return Err(FormatError::ReaderResourceLimitExceeded {
+                    field: "capture report payload bytes",
+                    cap: MAX_LOCAL_PAX_PAYLOAD as u64,
+                    actual: record.stored_size,
+                });
+            }
+        }
+        "windows.security-descriptor" => {
+            let security_information = parse_fixed_hex_u32(
+                record
+                    .meta
+                    .get("TZAP.aux.meta.security-information")
+                    .ok_or(FormatError::InvalidArchive(
+                        "security-information mask is missing",
+                    ))?,
+                8,
+                "security-information mask",
+            )?;
+            validate_self_relative_security_descriptor(
+                retained.ok_or(FormatError::InvalidArchive(
+                    "security descriptor payload was not retained",
+                ))?,
+                security_information,
+            )?;
+        }
+        "windows.reparse-data" => {
+            let expected_tag = parse_fixed_hex_u32(
+                record
+                    .meta
+                    .get("TZAP.aux.meta.reparse-tag")
+                    .ok_or(FormatError::InvalidArchive("reparse tag is missing"))?,
+                8,
+                "reparse tag",
+            )?;
+            validate_reparse_buffer(
+                retained.ok_or(FormatError::InvalidArchive(
+                    "reparse payload was not retained",
+                ))?,
+                expected_tag,
+            )?;
+        }
+        "windows.ea-data" => validate_windows_ea_stream(
+            retained.ok_or(FormatError::InvalidArchive("EA payload was not retained"))?,
+        )?,
+        "windows.object-id" => {
+            if retained.map_or(0, <[u8]>::len) != 64 {
+                return invalid(
+                    "AuxiliaryMetadata",
+                    "Windows object ID payload is not 64 bytes",
+                );
+            }
+        }
+        "macos.finder-info" if retained.map_or(0, <[u8]>::len) != 32 => {
+            return invalid("AuxiliaryMetadata", "FinderInfo payload is not 32 bytes");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_windows_stream_name(name: &[u8]) -> Result<(), FormatError> {
+    let units = name
+        .chunks_exact(2)
+        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+        .collect::<Vec<_>>();
+    const SUFFIX: &[u16] = &[
+        b':' as u16,
+        b'$' as u16,
+        b'D' as u16,
+        b'A' as u16,
+        b'T' as u16,
+        b'A' as u16,
+    ];
+    if units.len() <= SUFFIX.len() + 1
+        || units.first() != Some(&(b':' as u16))
+        || !units.ends_with(SUFFIX)
+        || units[1..units.len() - SUFFIX.len()]
+            .iter()
+            .any(|unit| matches!(*unit, 0 | 0x2f | 0x3a | 0x5c))
+    {
+        return invalid(
+            "AuxiliaryMetadata",
+            "Windows alternate-data name is not canonical :name:$DATA",
+        );
+    }
+    Ok(())
+}
+
+fn validate_self_relative_security_descriptor(
+    payload: &[u8],
+    security_information: u32,
+) -> Result<(), FormatError> {
+    if payload.len() < 20 || payload[0] != 1 {
+        return invalid(
+            "SecurityDescriptor",
+            "invalid self-relative descriptor header",
+        );
+    }
+    let control = u16::from_le_bytes([payload[2], payload[3]]);
+    if control & 0x8000 == 0 {
+        return invalid("SecurityDescriptor", "descriptor is not self-relative");
+    }
+    let owner = read_le_u32(payload, 4)?;
+    let group = read_le_u32(payload, 8)?;
+    let sacl = read_le_u32(payload, 12)?;
+    let dacl = read_le_u32(payload, 16)?;
+    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+    const GROUP_SECURITY_INFORMATION: u32 = 0x0000_0002;
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    const SACL_FAMILY_SECURITY_INFORMATION: u32 = 0x0000_01f8;
+    if security_information == 0
+        || (security_information & OWNER_SECURITY_INFORMATION != 0) != (owner != 0)
+        || (security_information & GROUP_SECURITY_INFORMATION != 0) != (group != 0)
+        || (security_information & DACL_SECURITY_INFORMATION != 0) != (control & 0x0004 != 0)
+        || (security_information & SACL_FAMILY_SECURITY_INFORMATION != 0) != (control & 0x0010 != 0)
+    {
+        return invalid(
+            "SecurityDescriptor",
+            "security-information mask disagrees with captured descriptor components",
+        );
+    }
+    for offset in [owner, group, sacl, dacl] {
+        if offset != 0 && (offset < 20 || offset % 4 != 0 || offset as usize >= payload.len()) {
+            return invalid(
+                "SecurityDescriptor",
+                "descriptor component offset is out of bounds",
+            );
+        }
+    }
+    for offset in [owner, group] {
+        if offset != 0 {
+            validate_sid(payload, offset as usize)?;
+        }
+    }
+    if sacl != 0 {
+        if control & 0x0010 == 0 {
+            return invalid(
+                "SecurityDescriptor",
+                "SACL offset is present without SACL control bit",
+            );
+        }
+        validate_acl(payload, sacl as usize)?;
+    }
+    if dacl != 0 {
+        if control & 0x0004 == 0 {
+            return invalid(
+                "SecurityDescriptor",
+                "DACL offset is present without DACL control bit",
+            );
+        }
+        validate_acl(payload, dacl as usize)?;
+    }
+    Ok(())
+}
+
+fn validate_sid(payload: &[u8], offset: usize) -> Result<(), FormatError> {
+    let header = payload
+        .get(offset..offset + 8)
+        .ok_or(FormatError::InvalidArchive("SID header is out of bounds"))?;
+    if header[0] != 1 || header[1] > 15 {
+        return invalid("SecurityDescriptor", "SID header is invalid");
+    }
+    let len = 8usize
+        .checked_add(header[1] as usize * 4)
+        .ok_or(FormatError::InvalidArchive("SID size overflow"))?;
+    if offset
+        .checked_add(len)
+        .is_none_or(|end| end > payload.len())
+    {
+        return invalid("SecurityDescriptor", "SID is out of bounds");
+    }
+    Ok(())
+}
+
+fn validate_acl(payload: &[u8], offset: usize) -> Result<(), FormatError> {
+    let header = payload
+        .get(offset..offset + 8)
+        .ok_or(FormatError::InvalidArchive("ACL header is out of bounds"))?;
+    if !matches!(header[0], 2 | 4) {
+        return invalid("SecurityDescriptor", "ACL revision is unsupported");
+    }
+    let size = u16::from_le_bytes([header[2], header[3]]) as usize;
+    let count = u16::from_le_bytes([header[4], header[5]]) as usize;
+    let end = offset
+        .checked_add(size)
+        .ok_or(FormatError::InvalidArchive("ACL size overflow"))?;
+    if size < 8 || end > payload.len() {
+        return invalid("SecurityDescriptor", "ACL size is out of bounds");
+    }
+    let mut cursor = offset + 8;
+    for _ in 0..count {
+        let ace = payload
+            .get(cursor..cursor + 4)
+            .ok_or(FormatError::InvalidArchive("ACE header is out of bounds"))?;
+        let ace_size = u16::from_le_bytes([ace[2], ace[3]]) as usize;
+        if ace_size < 4 || ace_size % 4 != 0 {
+            return invalid("SecurityDescriptor", "ACE size is invalid");
+        }
+        cursor = cursor
+            .checked_add(ace_size)
+            .ok_or(FormatError::InvalidArchive("ACE size overflow"))?;
+        if cursor > end {
+            return invalid("SecurityDescriptor", "ACE exceeds ACL bounds");
+        }
+    }
+    Ok(())
+}
+
+fn validate_reparse_buffer(payload: &[u8], expected_tag: u32) -> Result<(), FormatError> {
+    if payload.len() < 8 {
+        return invalid("ReparseBuffer", "reparse buffer header is truncated");
+    }
+    let tag = read_le_u32(payload, 0)?;
+    let data_len = u16::from_le_bytes([payload[4], payload[5]]) as usize;
+    let header_len: usize = if tag & 0x8000_0000 == 0 { 24 } else { 8 };
+    if tag != expected_tag
+        || payload.len()
+            != header_len
+                .checked_add(data_len)
+                .ok_or(FormatError::InvalidArchive("reparse buffer size overflow"))?
+    {
+        return invalid("ReparseBuffer", "reparse tag or length is inconsistent");
+    }
+    let data = &payload[header_len..];
+    match tag {
+        0xa000_000c => validate_reparse_name_offsets(data, 12)?,
+        0xa000_0003 => validate_reparse_name_offsets(data, 8)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_reparse_name_offsets(
+    data: &[u8],
+    path_buffer_offset: usize,
+) -> Result<(), FormatError> {
+    if data.len() < path_buffer_offset {
+        return invalid("ReparseBuffer", "reparse name header is truncated");
+    }
+    for field in [0usize, 4] {
+        let offset = u16::from_le_bytes([data[field], data[field + 1]]) as usize;
+        let len = u16::from_le_bytes([data[field + 2], data[field + 3]]) as usize;
+        if offset % 2 != 0
+            || len % 2 != 0
+            || path_buffer_offset
+                .checked_add(offset)
+                .and_then(|start| start.checked_add(len))
+                .is_none_or(|end| end > data.len())
+        {
+            return invalid("ReparseBuffer", "reparse name offset is out of bounds");
+        }
+    }
+    Ok(())
+}
+
+fn validate_windows_ea_stream(payload: &[u8]) -> Result<(), FormatError> {
+    let mut cursor = 0usize;
+    while cursor < payload.len() {
+        let header_end = cursor
+            .checked_add(8)
+            .ok_or(FormatError::InvalidArchive("EA record offset overflow"))?;
+        let header = payload
+            .get(cursor..header_end)
+            .ok_or(FormatError::InvalidArchive("EA record header is truncated"))?;
+        let next = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let name_len = header[5] as usize;
+        let value_len = u16::from_le_bytes([header[6], header[7]]) as usize;
+        let record_len = 8usize
+            .checked_add(name_len)
+            .and_then(|value| value.checked_add(1))
+            .and_then(|value| value.checked_add(value_len))
+            .ok_or(FormatError::InvalidArchive("EA record size overflow"))?;
+        let record_end = cursor
+            .checked_add(record_len)
+            .ok_or(FormatError::InvalidArchive("EA record end overflow"))?;
+        let name_end = header_end
+            .checked_add(name_len)
+            .ok_or(FormatError::InvalidArchive("EA name end overflow"))?;
+        if name_len == 0
+            || record_end > payload.len()
+            || payload.get(name_end) != Some(&0)
+            || payload
+                .get(header_end..name_end)
+                .is_none_or(|name| name.contains(&0))
+        {
+            return invalid("WindowsEaStream", "EA record is malformed");
+        }
+        if next == 0 {
+            if record_end != payload.len() {
+                return invalid("WindowsEaStream", "EA stream has trailing bytes");
+            }
+            return Ok(());
+        }
+        let next_cursor = cursor
+            .checked_add(next)
+            .ok_or(FormatError::InvalidArchive("EA next-entry offset overflow"))?;
+        if next < record_len || next % 4 != 0 || next_cursor > payload.len() {
+            return invalid("WindowsEaStream", "EA next-entry offset is invalid");
+        }
+        if payload[record_end..next_cursor]
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return invalid("WindowsEaStream", "EA alignment padding is non-zero");
+        }
+        cursor = next_cursor;
+    }
+    if payload.is_empty() {
+        return invalid("WindowsEaStream", "EA stream is empty");
+    }
+    Ok(())
+}
+
+fn read_le_u32(payload: &[u8], offset: usize) -> Result<u32, FormatError> {
+    let bytes: [u8; 4] = payload
+        .get(offset..offset + 4)
+        .ok_or(FormatError::InvalidArchive(
+            "little-endian u32 is out of bounds",
+        ))?
+        .try_into()
+        .unwrap();
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn decode_auxiliary_name(encoding: &str, value: &[u8]) -> Result<Vec<u8>, FormatError> {
+    match encoding {
+        "none" if value.is_empty() => Ok(Vec::new()),
+        "none" => invalid("AuxiliaryMetadata", "name is non-empty for none encoding"),
+        "utf8" => {
+            let text = std::str::from_utf8(value)
+                .map_err(|_| FormatError::InvalidArchive("auxiliary UTF-8 name is invalid"))?;
+            if text.is_empty() || text.nfc().collect::<String>() != text {
+                return invalid(
+                    "AuxiliaryMetadata",
+                    "auxiliary UTF-8 name is empty or non-NFC",
+                );
+            }
+            Ok(value.to_vec())
+        }
+        "bytes-base64" => {
+            let decoded = canonical_base64_decode(value)?;
+            if decoded.is_empty() {
+                return invalid("AuxiliaryMetadata", "decoded auxiliary name is empty");
+            }
+            Ok(decoded)
+        }
+        "utf16le-base64" => {
+            let decoded = canonical_base64_decode(value)?;
+            if decoded.is_empty()
+                || decoded.len() % 2 != 0
+                || decoded.chunks_exact(2).any(|unit| unit == [0, 0])
+            {
+                return invalid("AuxiliaryMetadata", "decoded UTF-16LE name is invalid");
+            }
+            Ok(decoded)
+        }
+        _ => invalid("AuxiliaryMetadata", "unknown auxiliary name encoding"),
+    }
+}
+
+fn canonical_base64_decode(value: &[u8]) -> Result<Vec<u8>, FormatError> {
+    if value.contains(&b'=') || value.iter().any(|byte| base64_value(*byte).is_none()) {
+        return invalid("Base64", "encoding is not unpadded RFC 4648 base64");
+    }
+    if value.len() % 4 == 1 {
+        return invalid("Base64", "invalid encoded length");
+    }
+    let mut out = Vec::with_capacity(value.len() / 4 * 3 + 2);
+    let mut cursor = 0usize;
+    while cursor + 4 <= value.len() {
+        let a = base64_value(value[cursor]).unwrap();
+        let b = base64_value(value[cursor + 1]).unwrap();
+        let c = base64_value(value[cursor + 2]).unwrap();
+        let d = base64_value(value[cursor + 3]).unwrap();
+        out.push((a << 2) | (b >> 4));
+        out.push((b << 4) | (c >> 2));
+        out.push((c << 6) | d);
+        cursor += 4;
+    }
+    match value.len() - cursor {
+        0 => {}
+        2 => {
+            let a = base64_value(value[cursor]).unwrap();
+            let b = base64_value(value[cursor + 1]).unwrap();
+            if b & 0x0f != 0 {
+                return invalid("Base64", "non-zero unused bits");
+            }
+            out.push((a << 2) | (b >> 4));
+        }
+        3 => {
+            let a = base64_value(value[cursor]).unwrap();
+            let b = base64_value(value[cursor + 1]).unwrap();
+            let c = base64_value(value[cursor + 2]).unwrap();
+            if c & 0x03 != 0 {
+                return invalid("Base64", "non-zero unused bits");
+            }
+            out.push((a << 2) | (b >> 4));
+            out.push((b << 4) | (c >> 2));
+        }
+        _ => unreachable!(),
+    }
+    Ok(out)
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn decode_percent_name(value: &[u8]) -> Result<Vec<u8>, FormatError> {
+    let mut out = Vec::with_capacity(value.len());
+    let mut cursor = 0usize;
+    while cursor < value.len() {
+        if value[cursor] == b'%' {
+            if cursor + 2 >= value.len()
+                || !is_upper_hex(&value[cursor + 1])
+                || !is_upper_hex(&value[cursor + 2])
+            {
+                return invalid("XattrName", "invalid percent encoding");
+            }
+            let decoded = hex_nibble(value[cursor + 1]) * 16 + hex_nibble(value[cursor + 2]);
+            if decoded == 0
+                || ((0x21..=0x7e).contains(&decoded) && decoded != b'%' && decoded != b'=')
+            {
+                return invalid("XattrName", "percent encoding is non-canonical");
+            }
+            out.push(decoded);
+            cursor += 3;
+        } else {
+            let byte = value[cursor];
+            if !(0x21..=0x7e).contains(&byte) || byte == b'%' || byte == b'=' {
+                return invalid("XattrName", "xattr name byte must be percent encoded");
+            }
+            out.push(byte);
+            cursor += 1;
+        }
+    }
+    Ok(out)
+}
+
+fn parse_timestamp(value: &[u8]) -> Result<(i64, u32), FormatError> {
+    let text = std::str::from_utf8(value)
+        .map_err(|_| FormatError::InvalidArchive("timestamp is not ASCII"))?;
+    if text.is_empty() || text.starts_with('+') || text == "-0" {
+        return invalid("Timestamp", "timestamp is not canonical");
+    }
+    let (integer, fraction) = text
+        .split_once('.')
+        .map_or((text, None), |(a, b)| (a, Some(b)));
+    let unsigned = integer.strip_prefix('-').unwrap_or(integer);
+    if unsigned.is_empty()
+        || !unsigned.bytes().all(|byte| byte.is_ascii_digit())
+        || (unsigned.len() > 1 && unsigned.starts_with('0'))
+    {
+        return invalid("Timestamp", "timestamp integer is not canonical");
+    }
+    let seconds = integer
+        .parse::<i64>()
+        .map_err(|_| FormatError::InvalidArchive("timestamp seconds exceed i64"))?;
+    let nanos = if let Some(fraction) = fraction {
+        if fraction.is_empty()
+            || fraction.len() > 9
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+            || fraction.ends_with('0')
+        {
+            return invalid("Timestamp", "timestamp fraction is not canonical");
+        }
+        let mut padded = fraction.to_owned();
+        padded.extend(std::iter::repeat_n('0', 9 - fraction.len()));
+        padded.parse::<u32>().unwrap()
+    } else {
+        0
+    };
+    Ok((seconds, nanos))
+}
+
+fn parse_sparse_line(payload: &[u8], cursor: &mut usize) -> Result<u64, FormatError> {
+    let relative = payload[*cursor..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or(FormatError::InvalidArchive("sparse map line is truncated"))?;
+    let end = cursor
+        .checked_add(relative)
+        .ok_or(FormatError::InvalidArchive("sparse map overflow"))?;
+    let value = parse_decimal_u64(&payload[*cursor..end], "sparse map value")?;
+    *cursor = end + 1;
+    Ok(value)
+}
+
+fn required<'a>(records: &'a PaxRecords, key: &'static str) -> Result<&'a [u8], FormatError> {
+    records
+        .get(key)
+        .map(Vec::as_slice)
+        .ok_or(FormatError::InvalidArchive(
+            "required revision-45 PAX key is missing",
+        ))
+}
+
+fn expect_value(
+    records: &PaxRecords,
+    key: &'static str,
+    expected: &[u8],
+    structure: &'static str,
+) -> Result<(), FormatError> {
+    if required(records, key)? != expected {
+        return invalid(structure, "required PAX value mismatch");
+    }
+    Ok(())
+}
+
+fn parse_decimal_u64(value: &[u8], field: &'static str) -> Result<u64, FormatError> {
+    if value.is_empty()
+        || !value.iter().all(u8::is_ascii_digit)
+        || (value.len() > 1 && value[0] == b'0')
+    {
+        return Err(FormatError::InvalidMetadata {
+            structure: field,
+            reason: "value is not minimal unsigned decimal",
+        });
+    }
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .ok_or(FormatError::InvalidMetadata {
+            structure: field,
+            reason: "decimal value exceeds u64",
+        })
+}
+
+fn parse_decimal_usize(value: &[u8], field: &'static str) -> Result<usize, FormatError> {
+    let parsed = parse_decimal_u64(value, field)?;
+    usize::try_from(parsed).map_err(|_| FormatError::InvalidMetadata {
+        structure: field,
+        reason: "decimal value exceeds usize",
+    })
+}
+
+fn parse_fixed_hex_u32(
+    value: &[u8],
+    width: usize,
+    field: &'static str,
+) -> Result<u32, FormatError> {
+    if value.len() != width || !value.iter().all(is_lower_hex) {
+        return Err(FormatError::InvalidMetadata {
+            structure: field,
+            reason: "value is not fixed-width lowercase hexadecimal",
+        });
+    }
+    u32::from_str_radix(std::str::from_utf8(value).unwrap(), 16).map_err(|_| {
+        FormatError::InvalidMetadata {
+            structure: field,
+            reason: "hexadecimal value exceeds u32",
+        }
+    })
+}
+
+fn parse_fixed_hex_u64(
+    value: &[u8],
+    width: usize,
+    field: &'static str,
+) -> Result<u64, FormatError> {
+    if value.len() != width || !value.iter().all(is_lower_hex) {
+        return Err(FormatError::InvalidMetadata {
+            structure: field,
+            reason: "value is not fixed-width lowercase hexadecimal",
+        });
+    }
+    u64::from_str_radix(std::str::from_utf8(value).unwrap(), 16).map_err(|_| {
+        FormatError::InvalidMetadata {
+            structure: field,
+            reason: "hexadecimal value exceeds u64",
+        }
+    })
+}
+
+fn parse_fixed_hex_32(value: &[u8]) -> Result<[u8; 32], FormatError> {
+    if value.len() != 64 || !value.iter().all(is_lower_hex) {
+        return invalid("AuxiliaryMetadata", "SHA-256 is not lowercase hexadecimal");
+    }
+    let mut out = [0u8; 32];
+    for (index, pair) in value.chunks_exact(2).enumerate() {
+        out[index] = hex_nibble(pair[0]) * 16 + hex_nibble(pair[1]);
+    }
+    Ok(out)
+}
+
+fn is_lower_hex(byte: &u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)
+}
+
+fn is_upper_hex(byte: &u8) -> bool {
+    byte.is_ascii_digit() || (b'A'..=b'F').contains(byte)
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => 0,
+    }
+}
+
+fn ascii_string(value: &[u8], field: &'static str) -> Result<String, FormatError> {
+    if !value.is_ascii() {
+        return Err(FormatError::InvalidMetadata {
+            structure: field,
+            reason: "value is not ASCII",
+        });
+    }
+    Ok(std::str::from_utf8(value).unwrap().to_owned())
+}
+
+fn is_source_os(value: &str) -> bool {
+    matches!(
+        value,
+        "linux"
+            | "freebsd"
+            | "netbsd"
+            | "openbsd"
+            | "solaris"
+            | "macos"
+            | "windows"
+            | "other-unix"
+            | "other"
+    )
+}
+
+fn valid_filesystem_token(value: &str) -> bool {
+    value == "unknown"
+        || (1..=32).contains(&value.len())
+            && value.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'.' | b'_')
+            })
+}
+
+fn valid_profile_token(value: &str) -> bool {
+    (1..=MAX_PROFILE_ID_LEN).contains(&value.len())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.' | b'_')
+        })
+}
+
+fn is_valid_profile_id(value: &str) -> bool {
+    if is_known_profile(value) {
+        return true;
+    }
+    if !valid_profile_token(value) || !value.starts_with("x.") {
+        return false;
+    }
+    let components: Vec<_> = value.split('.').collect();
+    components.len() >= 4
+        && components[0] == "x"
+        && components[1..].iter().all(|component| {
+            !component.is_empty()
+                && component.as_bytes()[0].is_ascii_alphanumeric()
+                && component.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'_')
+                })
+        })
+}
+
+fn is_known_profile(value: &str) -> bool {
+    matches!(
+        value,
+        PORTABLE_PROFILE | POSIX_PROFILE | LINUX_PROFILE | MACOS_PROFILE | WINDOWS_PROFILE
+    )
+}
+
+fn is_builtin_aux_kind(value: &str) -> bool {
+    matches!(
+        value,
+        CAPTURE_REPORT_KIND
+            | "windows.security-descriptor"
+            | "windows.alternate-data"
+            | "windows.ea-data"
+            | "windows.reparse-data"
+            | "windows.object-id"
+            | "windows.property-data"
+            | "windows.efs-raw"
+            | "macos.resource-fork"
+            | "macos.acl-native"
+            | "macos.finder-info"
+            | "generic.xattr"
+            | "generic.named-fork"
+    )
+}
+
+fn is_native_primary_key(key: &String) -> bool {
+    key.starts_with("TZAP.linux.")
+        || key.starts_with("TZAP.macos.")
+        || key.starts_with("TZAP.windows.")
+        || key.starts_with("TZAP.posix.")
+        || key.starts_with("LIBARCHIVE.")
+        || key.starts_with("SCHILY.")
+        || key == "TZAP.unix.ctime-observed"
+}
+
+fn is_system_primary_key(key: &String) -> bool {
+    key.starts_with("TZAP.posix.device-")
+        || key == "TZAP.linux.whiteout"
+        || key == "TZAP.linux.project-id"
+        || key == "TZAP.windows.reparse-placeholder"
+        || key == "TZAP.windows.directory-case-sensitive"
+        || key.starts_with("LIBARCHIVE.xattr.security")
+        || key.starts_with("LIBARCHIVE.xattr.trusted")
+        || key.starts_with("LIBARCHIVE.xattr.system")
+}
+
+fn has_no_change_flags(records: &PaxRecords) -> Result<bool, FormatError> {
+    let linux = records
+        .get("TZAP.linux.fsflags")
+        .map(|value| parse_fixed_hex_u64(value, 16, "Linux file flags"))
+        .transpose()?
+        .is_some_and(|value| value & 0x30 != 0);
+    let bsd = records
+        .get("TZAP.bsd.st-flags")
+        .map(|value| parse_fixed_hex_u64(value, 16, "BSD file flags"))
+        .transpose()?
+        .is_some_and(|value| value & 0x0006_0006 != 0);
+    let macos = records
+        .get("TZAP.macos.st-flags")
+        .map(|value| parse_fixed_hex_u64(value, 16, "macOS file flags"))
+        .transpose()?
+        .is_some_and(|value| value & 0x0006_0006 != 0);
+    let projected = records.get("SCHILY.fflags").is_some_and(|value| {
+        value.split(|byte| *byte == b',').any(|token| {
+            matches!(
+                token,
+                b"append" | b"immutable" | b"sappnd" | b"schg" | b"uappnd" | b"uchg"
+            )
+        })
+    });
+    Ok(linux || bsd || macos || projected)
+}
+
+fn valid_percent_encoded_detail(value: &[u8]) -> bool {
+    let mut cursor = 0usize;
+    let mut decoded = Vec::with_capacity(value.len());
+    while cursor < value.len() {
+        if value[cursor].is_ascii_alphanumeric()
+            || matches!(value[cursor], b'.' | b'_' | b'~' | b'-')
+        {
+            decoded.push(value[cursor]);
+            cursor += 1;
+        } else if value[cursor] == b'%'
+            && cursor + 2 < value.len()
+            && is_upper_hex(&value[cursor + 1])
+            && is_upper_hex(&value[cursor + 2])
+        {
+            let byte = hex_nibble(value[cursor + 1]) * 16 + hex_nibble(value[cursor + 2]);
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'-') {
+                return false;
+            }
+            decoded.push(byte);
+            cursor += 3;
+        } else {
+            return false;
+        }
+    }
+    std::str::from_utf8(&decoded).is_ok()
+}
+
+fn invalid<T>(structure: &'static str, reason: &'static str) -> Result<T, FormatError> {
+    Err(FormatError::InvalidMetadata { structure, reason })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_pax_round_trip_and_order_rejection() {
+        let records = portable_primary_pax(b"file.txt", 0o644, "other", false).unwrap();
+        let encoded = encode_canonical_pax(&records).unwrap();
+        assert_eq!(parse_canonical_pax(&encoded).unwrap(), records);
+
+        let mut reversed = encoded
+            .split_inclusive(|byte| *byte == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        reversed.swap(0, 1);
+        assert!(parse_canonical_pax(&reversed.concat()).is_err());
+    }
+
+    #[test]
+    fn sparse_map_requires_merged_bounded_extents() {
+        let mut payload = b"2\n0\n2\n4\n2\n".to_vec();
+        payload.resize(512, 0);
+        payload.extend_from_slice(b"abcd");
+        let sparse = parse_sparse_payload(&payload, 6).unwrap();
+        assert_eq!(sparse.extents.len(), 2);
+
+        let mut adjacent = b"2\n0\n2\n2\n2\n".to_vec();
+        adjacent.resize(512, 0);
+        adjacent.extend_from_slice(b"abcd");
+        assert!(parse_sparse_payload(&adjacent, 4).is_err());
+    }
+
+    #[test]
+    fn profile_dependencies_and_extension_namespace_are_enforced() {
+        let mut records = portable_primary_pax(b"file.txt", 0o644, "linux", false).unwrap();
+        records.insert(
+            "TZAP.metadata.required-profiles".into(),
+            b"linux-backup-v1,portable-v1".to_vec(),
+        );
+        assert!(parse_primary_metadata(&records).is_err());
+
+        records.insert(
+            "TZAP.metadata.required-profiles".into(),
+            b"linux-backup-v1,portable-v1,posix-backup-v1".to_vec(),
+        );
+        assert!(parse_primary_metadata(&records).is_ok());
+    }
+
+    #[test]
+    fn capture_report_detail_must_decode_to_canonical_utf8() {
+        let records = portable_primary_pax(b"file.txt", 0o644, "other", false).unwrap();
+        let declaration = parse_primary_metadata(&records).unwrap().declaration;
+        let invalid = b"tzap-capture-report-v1\nportable-v1\tdata\tio-error\t%C3%28\n";
+        assert!(parse_capture_report(invalid, &declaration).is_err());
+
+        let valid = b"tzap-capture-report-v1\nportable-v1\tdata\tio-error\t%C3%A9\n";
+        assert!(parse_capture_report(valid, &declaration).is_ok());
+    }
+
+    #[test]
+    fn textual_acl_requires_canonical_tuple_order_and_fixed_fields() {
+        let mut records = portable_primary_pax(b"file.txt", 0o640, "linux", false).unwrap();
+        records.insert(
+            "TZAP.metadata.required-profiles".into(),
+            b"portable-v1,posix-backup-v1".to_vec(),
+        );
+        records.insert("TZAP.acl.projection".into(), b"exact".to_vec());
+        records.insert(
+            "TZAP.acl.syntax".into(),
+            b"schily-posix1e-extra-id-v1".to_vec(),
+        );
+        records.insert(
+            "SCHILY.acl.access".into(),
+            b"user::rw-,group::r--,other::---,user:1000:r--,mask::r--".to_vec(),
+        );
+        assert!(parse_primary_metadata(&records).is_ok());
+
+        records.insert(
+            "SCHILY.acl.access".into(),
+            b"user::rw-,user:1000:r--,group::r--,other::---,mask::r--".to_vec(),
+        );
+        assert!(parse_primary_metadata(&records).is_err());
+    }
+
+    #[test]
+    fn nfs4_acl_rejects_compact_permission_and_flag_fields() {
+        let mut records = portable_primary_pax(b"file.txt", 0o640, "macos", false).unwrap();
+        records.insert(
+            "TZAP.metadata.required-profiles".into(),
+            b"macos-backup-v1,portable-v1,posix-backup-v1".to_vec(),
+        );
+        records.insert("TZAP.acl.projection".into(), b"exact".to_vec());
+        records.insert(
+            "TZAP.acl.syntax".into(),
+            b"schily-nfs4-full-extra-id-v1".to_vec(),
+        );
+        records.insert(
+            "SCHILY.acl.ace".into(),
+            b"owner@:rwx-----------:-------:allow".to_vec(),
+        );
+        assert!(parse_primary_metadata(&records).is_ok());
+
+        records.insert("SCHILY.acl.ace".into(), b"owner@:rwx:fd:allow".to_vec());
+        assert!(parse_primary_metadata(&records).is_err());
+    }
+}
