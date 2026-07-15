@@ -27,9 +27,10 @@ use crate::reader::{
     StreamedArchiveOpenParts,
 };
 use crate::tar_model::{
-    metadata_verification_report, MetadataVerificationReport, NoopTarStreamObserver,
-    SafeExtractionOptions, TarStreamFilesystemRestoreObserver, TarStreamMemberSummary,
-    TarStreamObserver, TarStreamSummary, TarStreamSummaryValidator,
+    finalize_committed_directory_metadata, metadata_verification_report,
+    MetadataVerificationReport, NoopTarStreamObserver, SafeExtractionOptions, TarEntryKind,
+    TarStreamFilesystemRestoreObserver, TarStreamMemberSummary, TarStreamObserver,
+    TarStreamSummary, TarStreamSummaryValidator,
 };
 use crate::wire::{
     BlockRecord, CryptoHeader, CryptoHeaderFixed, ExtensionTlv, RootAuthFooterV1, VolumeHeader,
@@ -320,14 +321,22 @@ pub fn extract_non_seekable_stream_to_dir<R: Read>(
             ..extraction
         },
     );
-    let outcome = run_non_seekable_stream(
+    let mut outcome = run_non_seekable_stream(
         reader,
         NonSeekableKeySource::MasterKey(Some(master_key)),
         options,
         observer,
         None,
     )?;
+    let merged_directories =
+        existing_output_directory_paths(output_dir, &outcome.streamed_payload.tar.members);
     staging.commit(extraction)?;
+    finalize_committed_directory_metadata(
+        output_dir,
+        &mut outcome.streamed_payload.tar.members,
+        &merged_directories,
+        extraction,
+    )?;
     Ok(SequentialExtractReport {
         verification: outcome.verification,
         extracted_member_count: outcome
@@ -339,6 +348,21 @@ pub fn extract_non_seekable_stream_to_dir<R: Read>(
             .map_err(|_| FormatError::InvalidArchive("extracted member count overflow"))?,
         degraded_metadata_count: degraded_metadata_count(&outcome.streamed_payload)?,
     })
+}
+
+fn existing_output_directory_paths(
+    output_dir: &Path,
+    members: &[TarStreamMemberSummary],
+) -> Vec<Vec<u8>> {
+    members
+        .iter()
+        .filter(|member| member.kind == TarEntryKind::Directory)
+        .filter_map(|member| {
+            let path = std::str::from_utf8(&member.path).ok()?;
+            let metadata = fs::symlink_metadata(output_dir.join(path)).ok()?;
+            (metadata.is_dir() && !metadata.file_type().is_symlink()).then(|| member.path.clone())
+        })
+        .collect()
 }
 
 pub fn extract_non_seekable_stream_to_dir_with_recipient_wrap_resolver<R, F>(
@@ -362,14 +386,22 @@ where
             ..extraction
         },
     );
-    let outcome = run_non_seekable_stream(
+    let mut outcome = run_non_seekable_stream(
         reader,
         NonSeekableKeySource::RecipientWrap(&mut resolver),
         options,
         observer,
         None,
     )?;
+    let merged_directories =
+        existing_output_directory_paths(output_dir, &outcome.streamed_payload.tar.members);
     staging.commit(extraction)?;
+    finalize_committed_directory_metadata(
+        output_dir,
+        &mut outcome.streamed_payload.tar.members,
+        &merged_directories,
+        extraction,
+    )?;
     Ok(SequentialExtractReport {
         verification: outcome.verification,
         extracted_member_count: outcome
@@ -397,14 +429,22 @@ pub fn extract_unencrypted_non_seekable_stream_to_dir<R: Read>(
             ..extraction
         },
     );
-    let outcome = run_non_seekable_stream(
+    let mut outcome = run_non_seekable_stream(
         reader,
         NonSeekableKeySource::MasterKey(None),
         options,
         observer,
         None,
     )?;
+    let merged_directories =
+        existing_output_directory_paths(output_dir, &outcome.streamed_payload.tar.members);
     staging.commit(extraction)?;
+    finalize_committed_directory_metadata(
+        output_dir,
+        &mut outcome.streamed_payload.tar.members,
+        &merged_directories,
+        extraction,
+    )?;
     Ok(SequentialExtractReport {
         verification: outcome.verification,
         extracted_member_count: outcome
@@ -434,14 +474,22 @@ pub fn extract_non_seekable_stream_to_dir_with_bootstrap_sidecar<R: Read>(
             ..extraction
         },
     );
-    let outcome = run_non_seekable_stream(
+    let mut outcome = run_non_seekable_stream(
         reader,
         NonSeekableKeySource::MasterKey(Some(master_key)),
         options,
         observer,
         Some(bootstrap_sidecar),
     )?;
+    let merged_directories =
+        existing_output_directory_paths(output_dir, &outcome.streamed_payload.tar.members);
     staging.commit(extraction)?;
+    finalize_committed_directory_metadata(
+        output_dir,
+        &mut outcome.streamed_payload.tar.members,
+        &merged_directories,
+        extraction,
+    )?;
     Ok(SequentialExtractReport {
         verification: outcome.verification,
         extracted_member_count: outcome
@@ -477,14 +525,22 @@ where
             ..extraction
         },
     );
-    let outcome = run_non_seekable_stream(
+    let mut outcome = run_non_seekable_stream(
         reader,
         NonSeekableKeySource::RecipientWrap(&mut resolver),
         options,
         observer,
         Some(bootstrap_sidecar),
     )?;
+    let merged_directories =
+        existing_output_directory_paths(output_dir, &outcome.streamed_payload.tar.members);
     staging.commit(extraction)?;
+    finalize_committed_directory_metadata(
+        output_dir,
+        &mut outcome.streamed_payload.tar.members,
+        &merged_directories,
+        extraction,
+    )?;
     Ok(SequentialExtractReport {
         verification: outcome.verification,
         extracted_member_count: outcome
@@ -513,14 +569,22 @@ pub fn extract_unencrypted_non_seekable_stream_to_dir_with_bootstrap_sidecar<R: 
             ..extraction
         },
     );
-    let outcome = run_non_seekable_stream(
+    let mut outcome = run_non_seekable_stream(
         reader,
         NonSeekableKeySource::MasterKey(None),
         options,
         observer,
         Some(bootstrap_sidecar),
     )?;
+    let merged_directories =
+        existing_output_directory_paths(output_dir, &outcome.streamed_payload.tar.members);
     staging.commit(extraction)?;
+    finalize_committed_directory_metadata(
+        output_dir,
+        &mut outcome.streamed_payload.tar.members,
+        &merged_directories,
+        extraction,
+    )?;
     Ok(SequentialExtractReport {
         verification: outcome.verification,
         extracted_member_count: outcome
@@ -1150,6 +1214,22 @@ fn merge_staged_dir(
             FormatError::FilesystemExtractionFailed("failed to inspect staged extraction output")
         })?;
         if metadata.file_type().is_dir() {
+            match fs::symlink_metadata(&final_path) {
+                Ok(final_metadata)
+                    if !final_metadata.file_type().is_symlink()
+                        && final_metadata.file_type().is_dir() => {}
+                Ok(_) => return Err(FormatError::UnsafeOverwrite.into()),
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    fs::rename(&staged_path, &final_path).map_err(ExtractError::Output)?;
+                    continue;
+                }
+                Err(_) => {
+                    return Err(FormatError::FilesystemExtractionFailed(
+                        "failed to inspect extraction destination",
+                    )
+                    .into())
+                }
+            }
             merge_staged_dir(&staged_path, &final_path, options)?;
             continue;
         }

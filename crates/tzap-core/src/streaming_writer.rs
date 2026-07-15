@@ -9,7 +9,7 @@ use crate::metadata::{
 use crate::writer::{
     write_ordered_parallel_stream_archive_to_sink, ArchiveWriteSink, MemoryArchiveSink,
     PortableFileMetadata, PortableModeOrigin, PortablePosixOwner, RootAuthAuthenticator,
-    RootAuthWriterConfig, StreamingRegularMember, WriterOptions, WrittenArchive,
+    RootAuthWriterConfig, SourceEntryKind, StreamingRegularMember, WriterOptions, WrittenArchive,
     WrittenArchiveSummary,
 };
 
@@ -32,13 +32,16 @@ pub struct StreamingRawWriterSummary {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TarStdinInputSummary {
     regular_file_count: u64,
-    skipped_directory_count: u64,
+    directory_count: u64,
+    symlink_count: u64,
     input_tar_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TarStdinRegularMember {
     path: Vec<u8>,
+    entry_kind: SourceEntryKind,
+    link_target: Option<Vec<u8>>,
     mode: u32,
     mtime: ArchiveTimestamp,
     logical_size: u64,
@@ -49,6 +52,7 @@ struct TarStdinRegularMember {
 struct LocalTarMetadata {
     pending_header: bool,
     pax_path: Option<Vec<u8>>,
+    pax_linkpath: Option<Vec<u8>>,
     pax_size: Option<u64>,
     pax_mode: Option<u32>,
     pax_mtime: Option<ArchiveTimestamp>,
@@ -57,12 +61,14 @@ struct LocalTarMetadata {
     pax_uname: Option<Vec<u8>>,
     pax_gname: Option<Vec<u8>>,
     gnu_long_name: Option<Vec<u8>>,
+    gnu_long_link: Option<Vec<u8>>,
 }
 
 impl LocalTarMetadata {
     fn has_pending(&self) -> bool {
         self.pending_header
             || self.pax_path.is_some()
+            || self.pax_linkpath.is_some()
             || self.pax_size.is_some()
             || self.pax_mode.is_some()
             || self.pax_mtime.is_some()
@@ -71,6 +77,7 @@ impl LocalTarMetadata {
             || self.pax_uname.is_some()
             || self.pax_gname.is_some()
             || self.gnu_long_name.is_some()
+            || self.gnu_long_link.is_some()
     }
 }
 
@@ -152,6 +159,8 @@ where
             writer.write_regular_member_from_reader(
                 StreamingRegularMember {
                     archive_path,
+                    entry_kind: SourceEntryKind::Regular,
+                    link_target: None,
                     file_data_size: input_size,
                     mode: 0o644,
                     mtime: ArchiveTimestamp::UNIX_EPOCH,
@@ -205,9 +214,16 @@ where
                 &mut reader,
                 options.max_path_length,
                 |member, payload| {
+                    let mut empty = io::empty();
+                    let payload: &mut dyn Read = match payload {
+                        Some(payload) => payload,
+                        None => &mut empty,
+                    };
                     writer.write_regular_member_from_reader(
                         StreamingRegularMember {
                             archive_path: member.path,
+                            entry_kind: member.entry_kind,
+                            link_target: member.link_target,
                             file_data_size: member.logical_size,
                             mode: member.mode,
                             mtime: member.mtime,
@@ -226,7 +242,13 @@ where
     ))?;
     Ok(StreamingTarWriterSummary {
         archive,
-        input_member_count: input_summary.regular_file_count,
+        input_member_count: input_summary
+            .regular_file_count
+            .checked_add(input_summary.directory_count)
+            .and_then(|count| count.checked_add(input_summary.symlink_count))
+            .ok_or(FormatError::WriterUnsupported(
+                "tar input member count overflow",
+            ))?,
         input_tar_bytes: input_summary.input_tar_bytes,
     })
 }
@@ -301,7 +323,7 @@ where
     R: Read,
     F: for<'a> FnMut(
         TarStdinRegularMember,
-        &mut LimitedTarPayloadReader<'a, R>,
+        Option<&mut LimitedTarPayloadReader<'a, R>>,
     ) -> Result<(), ArchiveWriteError>,
 {
     let mut summary = TarStdinInputSummary::default();
@@ -352,9 +374,10 @@ where
                 metadata.gnu_long_name = Some(trimmed_metadata_payload(&payload));
             }
             b'K' => {
-                let _payload =
+                let payload =
                     read_metadata_payload(reader, header_size, &mut summary.input_tar_bytes)?;
                 metadata.pending_header = true;
+                metadata.gnu_long_link = Some(trimmed_metadata_payload(&payload));
             }
             b'g' => {
                 return Err(
@@ -388,6 +411,17 @@ where
                     )
                 };
                 let path = canonical_main_path(&header, typeflag, &metadata, max_path_length)?;
+                let link_target = if typeflag == b'2' {
+                    let target = metadata
+                        .pax_linkpath
+                        .clone()
+                        .or_else(|| metadata.gnu_long_link.clone())
+                        .unwrap_or_else(|| nul_trimmed(&header[157..257]).to_vec());
+                    crate::tar_model::validate_symlink_target(&path, &target)?;
+                    Some(target)
+                } else {
+                    None
+                };
                 let uid = metadata
                     .pax_uid
                     .unwrap_or(parse_tar_number(&header[108..116])?);
@@ -415,6 +449,8 @@ where
                     0 | b'0' => {
                         let member = TarStdinRegularMember {
                             path,
+                            entry_kind: SourceEntryKind::Regular,
+                            link_target: None,
                             mode,
                             mtime,
                             logical_size: effective_size,
@@ -426,7 +462,7 @@ where
                                 remaining: effective_size,
                                 input_tar_bytes: &mut summary.input_tar_bytes,
                             };
-                            on_regular(member, &mut payload)?;
+                            on_regular(member, Some(&mut payload))?;
                             if payload.remaining != 0 {
                                 return Err(FormatError::WriterInvariant(
                                     "streaming tar payload was not fully consumed",
@@ -452,15 +488,42 @@ where
                             )
                             .into());
                         }
-                        summary.skipped_directory_count = checked_input_add(
-                            summary.skipped_directory_count,
-                            1,
-                            "tar directory count",
-                        )?;
+                        let member = TarStdinRegularMember {
+                            path,
+                            entry_kind: SourceEntryKind::Directory,
+                            link_target: None,
+                            mode,
+                            mtime,
+                            logical_size: 0,
+                            portable_metadata,
+                        };
+                        on_regular(member, None)?;
+                        summary.directory_count =
+                            checked_input_add(summary.directory_count, 1, "tar directory count")?;
+                    }
+                    b'2' => {
+                        if effective_size != 0 {
+                            return Err(FormatError::InvalidArchive(
+                                "non-regular tar entry has non-zero payload size",
+                            )
+                            .into());
+                        }
+                        let member = TarStdinRegularMember {
+                            path,
+                            entry_kind: SourceEntryKind::Symlink,
+                            link_target,
+                            mode,
+                            mtime,
+                            logical_size: 0,
+                            portable_metadata,
+                        };
+                        on_regular(member, None)?;
+                        summary.symlink_count =
+                            checked_input_add(summary.symlink_count, 1, "tar symlink count")?;
                     }
                     _ => {
                         return Err(FormatError::WriterUnsupported(
-                            "streaming tar stdin supports regular files and directory entries only",
+                            "streaming tar stdin supports regular files, directories, and symlinks only",
                         )
                         .into())
                     }
@@ -678,6 +741,7 @@ fn parse_pax_records(payload: &[u8], metadata: &mut LocalTarMetadata) -> Result<
         let value = &body[eq + 1..];
         match key {
             "path" => metadata.pax_path = Some(value.to_vec()),
+            "linkpath" => metadata.pax_linkpath = Some(value.to_vec()),
             "size" => metadata.pax_size = Some(parse_decimal_u64(value)?),
             "mode" => {
                 metadata.pax_mode = Some(
@@ -1413,7 +1477,7 @@ mod tests {
     }
 
     #[test]
-    fn tar_stdin_skips_directory_entries_and_keeps_regular_children() {
+    fn tar_stdin_preserves_directory_entries_and_regular_children() {
         let mut input = Vec::new();
         input.extend_from_slice(&tar_header(b"dir/", b'5', 0));
         input.extend_from_slice(&tar_header(b"dir/file.txt", b'0', 4));
@@ -1426,7 +1490,7 @@ mod tests {
             write_tar_stream_archive_to_sink(&input[..], &master_key(), options(), &mut sink)
                 .unwrap();
 
-        assert_eq!(summary.input_member_count, 1);
+        assert_eq!(summary.input_member_count, 2);
         let opened = open_archive(&sink.volumes[0], &master_key()).unwrap();
         assert_eq!(
             opened
@@ -1435,31 +1499,33 @@ mod tests {
                 .into_iter()
                 .map(|entry| entry.path)
                 .collect::<Vec<_>>(),
-            vec!["dir/file.txt"]
+            vec!["dir", "dir/file.txt"]
         );
     }
 
     #[test]
-    fn tar_stdin_rejects_unsupported_symlink_entries() {
+    fn tar_stdin_preserves_symlink_target_and_mtime() {
         let mut input = Vec::new();
-        input.extend_from_slice(&tar_header(b"link", b'2', 0));
+        let mut header = tar_header(b"link", b'2', 0);
+        header[136..148].fill(0);
+        write_octal(&mut header[136..148], 1_700_000_321);
+        header[157..167].copy_from_slice(b"target.txt");
+        header[148..156].fill(b' ');
+        let checksum = header.iter().map(|byte| *byte as u64).sum::<u64>();
+        write_checksum(&mut header[148..156], checksum);
+        input.extend_from_slice(&header);
         input.extend_from_slice(&[0u8; TAR_BLOCK_LEN * 2]);
         let mut sink = MemoryArchiveSink::default();
 
-        let error =
+        let summary =
             write_tar_stream_archive_to_sink(&input[..], &master_key(), options(), &mut sink)
-                .unwrap_err();
+                .unwrap();
 
-        match error {
-            ArchiveWriteError::Format(error) => assert_eq!(
-                error,
-                FormatError::WriterUnsupported(
-                    "streaming tar stdin supports regular files and directory entries only"
-                )
-            ),
-            ArchiveWriteError::Io(error) => panic!("unexpected I/O error: {error}"),
-        }
-        assert!(!sink.volumes.is_empty());
+        assert_eq!(summary.input_member_count, 1);
+        let opened = open_archive(&sink.volumes[0], &master_key()).unwrap();
+        let member = opened.list_files().unwrap().pop().unwrap();
+        assert_eq!(member.kind, crate::tar_model::TarEntryKind::Symlink);
+        assert_eq!(member.mtime, ArchiveTimestamp::from_seconds(1_700_000_321));
     }
 
     #[test]

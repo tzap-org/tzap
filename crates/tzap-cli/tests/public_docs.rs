@@ -482,13 +482,14 @@ fn public_docs_pin_tar_metadata_profile() {
     let boundaries = read_workspace_file("public-docs/tzap-operational-boundaries.md");
 
     assert!(boundaries.contains("## Tar metadata profile"));
-    assert!(boundaries.contains("complete `portable-v1` regular-file member"));
+    assert!(boundaries.contains("complete `portable-v1` regular-file,"));
+    assert!(boundaries.contains("symlink emission plus declared"));
     assert!(boundaries.contains("mandatory canonical"));
     assert!(boundaries.contains("streamed"));
     assert!(boundaries.contains("auxiliary hashes"));
     assert!(boundaries.contains("Global PAX/GNU state"));
     assert!(boundaries.contains("Published revision-45 conformance classes"));
-    assert!(boundaries.contains("Native regular-file capture"));
+    assert!(boundaries.contains("Native file/directory capture"));
     assert!(boundaries.contains("Windows auxiliary payloads"));
     assert!(boundaries.contains("Windows comparison with 7-Zip 26.01"));
     assert!(boundaries.contains("Capture parity"));

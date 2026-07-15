@@ -1,4 +1,4 @@
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, SystemTimeSpec};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
 use std::collections::BTreeMap;
@@ -326,8 +326,8 @@ pub(crate) trait TarStreamObserver {
         Ok(member.diagnostics.clone())
     }
 
-    fn on_archive_complete(&mut self) -> Result<(), FormatError> {
-        Ok(())
+    fn on_archive_complete(&mut self) -> Result<Vec<MetadataDiagnostic>, FormatError> {
+        Ok(Vec::new())
     }
 }
 
@@ -369,7 +369,7 @@ impl TarStreamObserver for TarStreamFilesystemRestoreObserver<'_> {
             .map_err(format_error_from_extract_error)
     }
 
-    fn on_archive_complete(&mut self) -> Result<(), FormatError> {
+    fn on_archive_complete(&mut self) -> Result<Vec<MetadataDiagnostic>, FormatError> {
         self.handler.finish_archive()
     }
 }
@@ -1692,7 +1692,17 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
                 header, group_size, ..
             } if header.is_empty() && group_size == 0 => {
                 validate_v45_member_graph(&self.members)?;
-                self.observer.on_archive_complete()?;
+                let late_diagnostics = self.observer.on_archive_complete()?;
+                for diagnostic in late_diagnostics {
+                    let member = self
+                        .members
+                        .iter_mut()
+                        .find(|member| member.path == diagnostic.path)
+                        .ok_or(FormatError::InvalidArchive(
+                            "archive-finalization diagnostic path is missing",
+                        ))?;
+                    member.diagnostics.push(diagnostic);
+                }
                 Ok(TarStreamSummary {
                     members: self.members,
                     tar_total_size,
@@ -2120,7 +2130,7 @@ fn restore_phase_for_kind(kind: TarEntryKind, reparse_placeholder: bool) -> u8 {
         return 3;
     }
     match kind {
-        TarEntryKind::Directory => 0,
+        TarEntryKind::Directory => 4,
         TarEntryKind::Regular => 1,
         TarEntryKind::Symlink
         | TarEntryKind::CharacterDevice
@@ -2816,38 +2826,6 @@ fn plan_restore(
             .for_restore(options.restore_policy, 2),
         );
     }
-    if options.restore_policy != RestorePolicy::Content
-        && matches!(kind, TarEntryKind::Directory | TarEntryKind::Symlink)
-    {
-        if !options.allow_degraded {
-            return Err(FormatError::ReaderUnsupported(
-                "portable directory/symlink metadata restoration needs explicit degraded restore",
-            ));
-        }
-        let (class, message) = if kind == TarEntryKind::Directory {
-            (
-                "mode-and-mtime",
-                "directory mode/mtime finalization is not supported by this conformance class",
-            )
-        } else {
-            (
-                "mtime",
-                "symlink mtime restoration is not supported by this conformance class",
-            )
-        };
-        diagnostics.push(
-            MetadataDiagnostic::new(
-                path,
-                "portable-v1",
-                class,
-                MetadataOperation::Plan,
-                MetadataDiagnosticStatus::Unsupported,
-                message,
-            )
-            .for_restore(options.restore_policy, 4),
-        );
-    }
-
     if metadata.file_entry_flags & HAS_SPARSE_EXTENTS != 0 {
         if options.restore_policy != RestorePolicy::Content && !options.allow_degraded {
             return Err(FormatError::ReaderUnsupported(
@@ -3435,6 +3413,8 @@ struct FilesystemRestoreHandler<'a> {
     planned_diagnostics: Vec<MetadataDiagnostic>,
     defer_hardlinks: bool,
     deferred_hardlinks: Vec<(Vec<u8>, Vec<u8>)>,
+    defer_directories: bool,
+    deferred_directories: Vec<(Vec<u8>, MemberMetadata)>,
 }
 
 impl<'a> FilesystemRestoreHandler<'a> {
@@ -3451,16 +3431,20 @@ impl<'a> FilesystemRestoreHandler<'a> {
             planned_diagnostics: Vec::new(),
             defer_hardlinks: false,
             deferred_hardlinks: Vec::new(),
+            defer_directories: false,
+            deferred_directories: Vec::new(),
         }
     }
 
     fn new_deferred(root: &'a Path, options: SafeExtractionOptions) -> Self {
         let mut handler = Self::new(root, options);
         handler.defer_hardlinks = true;
+        handler.defer_directories = true;
         handler
     }
 
-    fn finish_archive(&mut self) -> Result<(), FormatError> {
+    fn finish_archive(&mut self) -> Result<Vec<MetadataDiagnostic>, FormatError> {
+        let mut diagnostics = Vec::new();
         for (path, target) in std::mem::take(&mut self.deferred_hardlinks) {
             let destination =
                 prepare_destination(self.root, &path, TarEntryKind::Hardlink, self.options)?;
@@ -3484,7 +3468,28 @@ impl<'a> FilesystemRestoreHandler<'a> {
                 create_hardlink(&destination, &target_path, self.options)?;
             }
         }
-        Ok(())
+        let mut directories = std::mem::take(&mut self.deferred_directories);
+        directories.sort_by(|left, right| {
+            right
+                .0
+                .iter()
+                .filter(|byte| **byte == b'/')
+                .count()
+                .cmp(&left.0.iter().filter(|byte| **byte == b'/').count())
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        if self.options.restore_policy != RestorePolicy::Content {
+            for (path, metadata) in directories {
+                apply_restored_directory_metadata(
+                    self.root,
+                    &path,
+                    &metadata,
+                    self.options,
+                    &mut diagnostics,
+                )?;
+            }
+        }
+        Ok(diagnostics)
     }
 
     fn finish(
@@ -3508,6 +3513,18 @@ impl<'a> FilesystemRestoreHandler<'a> {
             return Ok(diagnostics);
         }
         if self.skipped_by_policy {
+            return Ok(diagnostics);
+        }
+        if member.kind == TarEntryKind::Directory {
+            if !self.defer_directories && self.options.restore_policy != RestorePolicy::Content {
+                apply_restored_directory_metadata(
+                    self.root,
+                    &member.path,
+                    &member.v45_metadata,
+                    self.options,
+                    &mut diagnostics,
+                )?;
+            }
             return Ok(diagnostics);
         }
         if member.kind != TarEntryKind::Regular && !self.materialized_hardlink {
@@ -3601,6 +3618,10 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
             }
             TarEntryKind::Directory => {
                 create_directory(&destination)?;
+                if self.defer_directories {
+                    self.deferred_directories
+                        .push((member.path.clone(), member.v45_metadata.clone()));
+                }
             }
             TarEntryKind::Symlink => {
                 let target = member
@@ -3609,6 +3630,15 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                     .ok_or(FormatError::InvalidArchive("symlink target is missing"))?;
                 validate_symlink_target(&member.path, target)?;
                 create_symlink(&destination, target, self.options)?;
+                if self.options.restore_policy != RestorePolicy::Content {
+                    apply_restored_symlink_mtime(
+                        &destination,
+                        &member.path,
+                        member.v45_metadata.portable_mirror.mtime,
+                        self.options,
+                        &mut self.planned_diagnostics,
+                    )?;
+                }
             }
             TarEntryKind::Hardlink => {
                 let target = member
@@ -3941,6 +3971,21 @@ fn restore_tar_member(
         }
         TarEntryKind::Directory => {
             create_directory(&destination)?;
+            if options.restore_policy != RestorePolicy::Content {
+                let metadata = member
+                    .v45_metadata
+                    .as_ref()
+                    .ok_or(FormatError::InvalidArchive(
+                        "revision-45 member metadata is missing",
+                    ))?;
+                apply_restored_directory_metadata(
+                    root,
+                    &member.path,
+                    metadata,
+                    options,
+                    &mut diagnostics,
+                )?;
+            }
         }
         TarEntryKind::Symlink => {
             let target = member
@@ -3949,6 +3994,21 @@ fn restore_tar_member(
                 .ok_or(FormatError::InvalidArchive("symlink target is missing"))?;
             validate_symlink_target(&member.path, target)?;
             create_symlink(&destination, target, options)?;
+            if options.restore_policy != RestorePolicy::Content {
+                let metadata = member
+                    .v45_metadata
+                    .as_ref()
+                    .ok_or(FormatError::InvalidArchive(
+                        "revision-45 member metadata is missing",
+                    ))?;
+                apply_restored_symlink_mtime(
+                    &destination,
+                    &member.path,
+                    metadata.portable_mirror.mtime,
+                    options,
+                    &mut diagnostics,
+                )?;
+            }
         }
         TarEntryKind::Hardlink => {
             let target = member
@@ -4616,7 +4676,7 @@ fn record_metadata_application_failure(
     }
 }
 
-fn validate_symlink_target(link_path: &[u8], target: &[u8]) -> Result<(), FormatError> {
+pub(crate) fn validate_symlink_target(link_path: &[u8], target: &[u8]) -> Result<(), FormatError> {
     if target.is_empty()
         || target.contains(&0)
         || target.contains(&b'\\')
@@ -4775,6 +4835,142 @@ fn open_existing_regular_file(target: &PreparedDestination) -> Result<fs::File, 
                 "failed to open hardlink target for materialization",
             )
         })
+}
+
+fn open_existing_directory(target: &PreparedDestination) -> Result<fs::File, FormatError> {
+    let directory = target.parent.open_dir_nofollow(&target.leaf).map_err(|_| {
+        FormatError::FilesystemExtractionFailed("failed to open directory for metadata restoration")
+    })?;
+    #[cfg(unix)]
+    {
+        directory
+            .open(".")
+            .map(cap_std::fs::File::into_std)
+            .map_err(|_| {
+                FormatError::FilesystemExtractionFailed(
+                    "failed to reopen directory for metadata restoration",
+                )
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(directory.into_std_file())
+    }
+}
+
+fn apply_restored_directory_metadata(
+    root: &Path,
+    path: &[u8],
+    metadata: &MemberMetadata,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    let destination = prepare_destination(root, path, TarEntryKind::Directory, options)?;
+    let directory = open_existing_directory(&destination)?;
+    apply_restored_regular_file_metadata_parts(
+        &directory,
+        path,
+        RestoredRegularMetadata::from(&metadata.portable_mirror),
+        Some(metadata),
+        options,
+        diagnostics,
+    )
+}
+
+pub(crate) fn finalize_committed_directory_metadata(
+    root: &Path,
+    members: &mut [TarStreamMemberSummary],
+    merged_directory_paths: &[Vec<u8>],
+    options: SafeExtractionOptions,
+) -> Result<(), FormatError> {
+    if options.restore_policy == RestorePolicy::Content {
+        return Ok(());
+    }
+    let mut directory_indices = members
+        .iter()
+        .enumerate()
+        .filter_map(|(index, member)| {
+            (member.kind == TarEntryKind::Directory
+                && merged_directory_paths.contains(&member.path))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    directory_indices.sort_by(|left, right| {
+        let left_path = &members[*left].path;
+        let right_path = &members[*right].path;
+        right_path
+            .iter()
+            .filter(|byte| **byte == b'/')
+            .count()
+            .cmp(&left_path.iter().filter(|byte| **byte == b'/').count())
+            .then_with(|| left_path.cmp(right_path))
+    });
+    for index in directory_indices {
+        let member = &mut members[index];
+        apply_restored_directory_metadata(
+            root,
+            &member.path,
+            &member.v45_metadata,
+            options,
+            &mut member.diagnostics,
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_restored_symlink_mtime(
+    destination: &PreparedDestination,
+    path: &[u8],
+    (seconds, nanoseconds): (i64, u32),
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    let duration = Duration::new(seconds.unsigned_abs(), nanoseconds);
+    let modified = if seconds < 0 {
+        SystemTime::UNIX_EPOCH.checked_sub(duration)
+    } else {
+        SystemTime::UNIX_EPOCH.checked_add(duration)
+    };
+    let Some(modified) = modified else {
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                "mtime",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to apply symlink mtime metadata",
+            )
+            .for_restore(options.restore_policy, 4),
+            options,
+            "symlink mtime cannot be represented on this host",
+        );
+    };
+    if let Err(error) = destination.parent.set_symlink_times(
+        &destination.leaf,
+        None,
+        Some(SystemTimeSpec::Absolute(
+            cap_std::time::SystemTime::from_std(modified),
+        )),
+    ) {
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                "mtime",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to apply symlink mtime metadata",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "failed to apply symlink mtime metadata",
+        );
+    }
+    Ok(())
 }
 
 fn create_temp_regular_file(
@@ -5988,42 +6184,19 @@ mod tests {
     }
 
     #[test]
-    fn portable_directory_metadata_requires_explicit_degraded_restore() {
+    fn portable_directory_metadata_is_supported_without_degradation() {
         let bytes = member(b"dir", b'5', b"", b"");
         let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
 
-        assert_eq!(
-            plan_restore(
-                b"dir",
-                &parsed.v45_metadata,
-                TarEntryKind::Directory,
-                false,
-                SafeExtractionOptions::default(),
-            )
-            .unwrap_err(),
-            FormatError::ReaderUnsupported(
-                "portable directory/symlink metadata restoration needs explicit degraded restore"
-            )
-        );
         let diagnostics = plan_restore(
             b"dir",
             &parsed.v45_metadata,
             TarEntryKind::Directory,
             false,
-            SafeExtractionOptions {
-                allow_degraded: true,
-                ..SafeExtractionOptions::default()
-            },
+            SafeExtractionOptions::default(),
         )
         .unwrap();
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.path == b"dir"
-                && diagnostic.metadata_class == "mode-and-mtime"
-                && diagnostic.operation == MetadataOperation::Plan
-                && diagnostic.status == MetadataDiagnosticStatus::Unsupported
-                && diagnostic.restore_policy == Some(RestorePolicy::Portable)
-                && diagnostic.restore_phase == Some(4)
-        }));
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

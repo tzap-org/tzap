@@ -89,6 +89,6 @@ pub use writer::{
     ArchiveWritePhase, ArchiveWriteProgressSink, ArchiveWriteSink, KeyWrapRecordSource,
     MemoryArchiveSink, NativeAuxiliaryMetadata, NativeAuxiliaryNameEncoding, NativeFileMetadata,
     PortableFileMetadata, PortableModeOrigin, PortablePosixOwner, RegularFile, RegularFileSource,
-    RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions, WriterTimings,
+    RootAuthSigningRequest, RootAuthWriterConfig, SourceEntryKind, WriterOptions, WriterTimings,
     WrittenArchiveSummary,
 };

@@ -398,6 +398,19 @@ pub struct PortableFileMetadata {
     pub native: NativeFileMetadata,
 }
 
+/// Filesystem object kind emitted by a [`RegularFileSource`].
+///
+/// The trait predates revision-45 directory capture, so its historical name is
+/// retained for API compatibility. Implementations may now describe a regular
+/// file, explicit directory, or symbolic-link member.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SourceEntryKind {
+    #[default]
+    Regular,
+    Directory,
+    Symlink,
+}
+
 impl Default for PortableFileMetadata {
     fn default() -> Self {
         Self {
@@ -432,12 +445,20 @@ impl<'a> RegularFile<'a> {
     }
 }
 
-/// Re-openable source for one regular file written into an archive.
+/// Re-openable source for one primary archive member.
 ///
 /// The writer may replan when options such as target volume sizing need another
 /// pass, so implementations must return a fresh reader from each `open` call.
+/// Directory sources return an empty reader and a zero `file_data_size`.
 pub trait RegularFileSource {
     fn archive_path(&self) -> &str;
+    fn entry_kind(&self) -> SourceEntryKind {
+        SourceEntryKind::Regular
+    }
+    /// Link target bytes for a symbolic-link source.
+    fn link_target(&self) -> Option<&[u8]> {
+        None
+    }
     fn file_data_size(&self) -> u64;
     fn mode(&self) -> u32;
     fn mtime(&self) -> ArchiveTimestamp;
@@ -550,6 +571,14 @@ struct ProgressRegularFileSource<'a, S> {
 impl<S: RegularFileSource> RegularFileSource for ProgressRegularFileSource<'_, S> {
     fn archive_path(&self) -> &str {
         self.inner.archive_path()
+    }
+
+    fn entry_kind(&self) -> SourceEntryKind {
+        self.inner.entry_kind()
+    }
+
+    fn link_target(&self) -> Option<&[u8]> {
+        self.inner.link_target()
     }
 
     fn file_data_size(&self) -> u64 {
@@ -702,6 +731,8 @@ pub struct WrittenArchive {
 #[derive(Debug, Clone)]
 struct TarMember {
     path: Vec<u8>,
+    entry_kind: SourceEntryKind,
+    link_target: Option<Vec<u8>>,
     tar_member_group_start: u64,
     tar_member_group_size: u64,
     file_data_size: u64,
@@ -938,6 +969,8 @@ fn payload_frame_metadata(input: PayloadFrameMetadataInput) -> Result<PayloadFra
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StreamingRegularMember {
     pub archive_path: Vec<u8>,
+    pub entry_kind: SourceEntryKind,
+    pub link_target: Option<Vec<u8>>,
     pub file_data_size: u64,
     pub mode: u32,
     pub mtime: ArchiveTimestamp,
@@ -1317,6 +1350,8 @@ where
                 writer.write_regular_member_from_reader(
                     StreamingRegularMember {
                         archive_path,
+                        entry_kind: file.entry_kind(),
+                        link_target: file.link_target().map(<[u8]>::to_vec),
                         file_data_size: file.file_data_size(),
                         mode: file.mode(),
                         mtime: file.mtime(),
@@ -1363,6 +1398,8 @@ where
                 writer.write_regular_member_from_reader(
                     StreamingRegularMember {
                         archive_path,
+                        entry_kind: file.entry_kind(),
+                        link_target: file.link_target().map(<[u8]>::to_vec),
                         file_data_size: file.file_data_size(),
                         mode: file.mode(),
                         mtime: file.mtime(),
@@ -1409,6 +1446,8 @@ where
                 writer.write_regular_member_from_reader(
                     StreamingRegularMember {
                         archive_path,
+                        entry_kind: file.entry_kind(),
+                        link_target: file.link_target().map(<[u8]>::to_vec),
                         file_data_size: file.file_data_size(),
                         mode: file.mode(),
                         mtime: file.mtime(),
@@ -1970,9 +2009,19 @@ fn plan_payload_stream<S: RegularFileSource>(
 
     for (member_index, file) in files.iter().enumerate() {
         let path = normalize_lookup_file_path(file.archive_path(), options.max_path_length)?;
+        let entry_kind = file.entry_kind();
+        if entry_kind != SourceEntryKind::Regular && file.file_data_size() != 0 {
+            return Err(FormatError::WriterInvariant(
+                "non-regular source has non-zero file data size",
+            )
+            .into());
+        }
+        let link_target = file.link_target().map(<[u8]>::to_vec);
         let portable_metadata = file.portable_metadata();
-        let prefix = build_regular_file_member_prefix(
+        let prefix = build_primary_member_prefix(
             &path,
+            entry_kind,
+            link_target.as_deref(),
             file.file_data_size(),
             file.mode(),
             file.mtime(),
@@ -1990,6 +2039,8 @@ fn plan_payload_stream<S: RegularFileSource>(
         )?;
         tar_members.push(TarMember {
             path,
+            entry_kind,
+            link_target,
             tar_member_group_start: member_start,
             tar_member_group_size: member_group_size,
             file_data_size: file.file_data_size(),
@@ -2289,6 +2340,8 @@ where
                 writer.write_regular_member_from_reader(
                     StreamingRegularMember {
                         archive_path,
+                        entry_kind: file.entry_kind(),
+                        link_target: file.link_target().map(<[u8]>::to_vec),
                         file_data_size: file.file_data_size(),
                         mode: file.mode(),
                         mtime: file.mtime(),
@@ -2572,8 +2625,16 @@ impl<O: ArchiveWriteSink> OrderedParallelArchiveWriter<'_, O> {
     ) -> Result<(), ArchiveWriteError> {
         let path = member.archive_path;
         validate_file_path_bytes(&path, self.options.max_path_length)?;
-        let prefix = build_regular_file_member_prefix(
+        if member.entry_kind != SourceEntryKind::Regular && member.file_data_size != 0 {
+            return Err(FormatError::WriterInvariant(
+                "non-regular source has non-zero file data size",
+            )
+            .into());
+        }
+        let prefix = build_primary_member_prefix(
             &path,
+            member.entry_kind,
+            member.link_target.as_deref(),
             member.file_data_size,
             member.mode,
             member.mtime,
@@ -2592,6 +2653,8 @@ impl<O: ArchiveWriteSink> OrderedParallelArchiveWriter<'_, O> {
         let member_index = self.ordered.tar_members.len();
         self.ordered.tar_members.push(TarMember {
             path,
+            entry_kind: member.entry_kind,
+            link_target: member.link_target,
             tar_member_group_start: member_start,
             tar_member_group_size: member_group_size,
             file_data_size: member.file_data_size,
@@ -3160,8 +3223,16 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
     ) -> Result<(), ArchiveWriteError> {
         let path = member.archive_path;
         validate_file_path_bytes(&path, self.options.max_path_length)?;
-        let prefix = build_regular_file_member_prefix(
+        if member.entry_kind != SourceEntryKind::Regular && member.file_data_size != 0 {
+            return Err(FormatError::WriterInvariant(
+                "non-regular source has non-zero file data size",
+            )
+            .into());
+        }
+        let prefix = build_primary_member_prefix(
             &path,
+            member.entry_kind,
+            member.link_target.as_deref(),
             member.file_data_size,
             member.mode,
             member.mtime,
@@ -3180,6 +3251,8 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
         let member_index = self.tar_members.len();
         self.tar_members.push(TarMember {
             path,
+            entry_kind: member.entry_kind,
+            link_target: member.link_target,
             tar_member_group_start: member_start,
             tar_member_group_size: member_group_size,
             file_data_size: member.file_data_size,
@@ -4156,6 +4229,8 @@ where
         let current_path =
             normalize_lookup_file_path(file.archive_path(), plan.options.max_path_length)?;
         if current_path != member.path
+            || file.entry_kind() != member.entry_kind
+            || file.link_target() != member.link_target.as_deref()
             || file.file_data_size() != member.file_data_size
             || file.mode() != member.mode
             || file.mtime() != member.mtime
@@ -4166,8 +4241,10 @@ where
             )
             .into());
         }
-        let prefix = build_regular_file_member_prefix(
+        let prefix = build_primary_member_prefix(
             &member.path,
+            member.entry_kind,
+            member.link_target.as_deref(),
             member.file_data_size,
             member.mode,
             member.mtime,
@@ -4634,6 +4711,8 @@ fn build_tar_stream(
         stream.extend_from_slice(&member_group);
         members.push(TarMember {
             path,
+            entry_kind: SourceEntryKind::Regular,
+            link_target: None,
             tar_member_group_start: start,
             tar_member_group_size: member_group.len() as u64,
             file_data_size: file.contents.len() as u64,
@@ -6590,6 +6669,7 @@ impl Read for StreamingMemberReader<'_> {
     }
 }
 
+#[cfg(test)]
 fn build_regular_file_member_prefix(
     path: &[u8],
     file_size: u64,
@@ -6597,6 +6677,47 @@ fn build_regular_file_member_prefix(
     mtime: ArchiveTimestamp,
     portable_metadata: &PortableFileMetadata,
 ) -> Result<Vec<u8>, FormatError> {
+    build_primary_member_prefix(
+        path,
+        SourceEntryKind::Regular,
+        None,
+        file_size,
+        mode,
+        mtime,
+        portable_metadata,
+    )
+}
+
+fn build_primary_member_prefix(
+    path: &[u8],
+    entry_kind: SourceEntryKind,
+    link_target: Option<&[u8]>,
+    file_size: u64,
+    mode: u32,
+    mtime: ArchiveTimestamp,
+    portable_metadata: &PortableFileMetadata,
+) -> Result<Vec<u8>, FormatError> {
+    if entry_kind != SourceEntryKind::Regular && file_size != 0 {
+        return Err(FormatError::WriterInvariant(
+            "non-regular member has non-zero file data size",
+        ));
+    }
+    match (entry_kind, link_target) {
+        (SourceEntryKind::Symlink, Some(target)) => {
+            crate::tar_model::validate_symlink_target(path, target)?;
+        }
+        (SourceEntryKind::Symlink, None) => {
+            return Err(FormatError::WriterInvariant(
+                "symlink member has no link target",
+            ));
+        }
+        (_, Some(_)) => {
+            return Err(FormatError::WriterInvariant(
+                "non-link member has a link target",
+            ));
+        }
+        (_, None) => {}
+    }
     let mut out = Vec::new();
     let use_path_override = path_requires_pax(path);
     validate_portable_file_metadata(portable_metadata)?;
@@ -6620,6 +6741,13 @@ fn build_regular_file_member_prefix(
         );
     }
     merge_native_primary_metadata(&mut pax_records, &portable_metadata.native)?;
+    let use_linkpath_override = link_target.is_some_and(|target| target.len() > 100);
+    if use_linkpath_override {
+        pax_records.insert(
+            "linkpath".into(),
+            link_target.expect("link target was checked").to_vec(),
+        );
+    }
     let primary_identity = prepare_primary_tar_identity(&mut pax_records, portable_metadata)?;
     let header_mtime = if mtime.nanoseconds == 0 && mtime.seconds >= 0 {
         let seconds = mtime.seconds as u64;
@@ -6665,7 +6793,16 @@ fn build_regular_file_member_prefix(
         path.to_vec()
     };
 
-    let mut header = build_ustar_header(&header_path, file_size, mode, header_mtime, b'0')?;
+    let typeflag = match entry_kind {
+        SourceEntryKind::Regular => b'0',
+        SourceEntryKind::Directory => b'5',
+        SourceEntryKind::Symlink => b'2',
+    };
+    let mut header = build_ustar_header(&header_path, file_size, mode, header_mtime, typeflag)?;
+    if let Some(target) = link_target.filter(|_| !use_linkpath_override) {
+        header[157..157 + target.len()].copy_from_slice(target);
+        finalize_tar_checksum(&mut header)?;
+    }
     apply_primary_tar_identity(&mut header, &primary_identity)?;
     out.extend_from_slice(&header);
     Ok(out)
@@ -7437,6 +7574,8 @@ mod tests {
         let members = (0..=DEFAULT_FILES_PER_INDEX_SHARD)
             .map(|idx| TarMember {
                 path: format!("file-{idx:05}.txt").into_bytes(),
+                entry_kind: SourceEntryKind::Regular,
+                link_target: None,
                 tar_member_group_start: idx as u64 * 512,
                 tar_member_group_size: 512,
                 file_data_size: 0,
@@ -7493,6 +7632,8 @@ mod tests {
                 member_index: 0,
                 member: TarMember {
                     path: b"a/b/one.txt".to_vec(),
+                    entry_kind: SourceEntryKind::Regular,
+                    link_target: None,
                     tar_member_group_start: 0,
                     tar_member_group_size: 512,
                     file_data_size: 0,
@@ -7507,6 +7648,8 @@ mod tests {
                 member_index: 1,
                 member: TarMember {
                     path: b"a/c/two.txt".to_vec(),
+                    entry_kind: SourceEntryKind::Regular,
+                    link_target: None,
                     tar_member_group_start: 512,
                     tar_member_group_size: 512,
                     file_data_size: 0,
@@ -7708,6 +7851,71 @@ mod tests {
         assert_ne!(
             parsed.v45_metadata.file_entry_flags & REQUIRES_SYSTEM_RESTORE,
             0
+        );
+    }
+
+    #[test]
+    fn directory_writer_emits_type_and_portable_ownership_metadata() {
+        let portable_metadata = PortableFileMetadata {
+            source_os: "other-unix".into(),
+            source_filesystem: "unknown".into(),
+            mode_origin: PortableModeOrigin::Native,
+            posix_owner: Some(PortablePosixOwner {
+                uid: 9_000_000,
+                gid: 42,
+                uname: Some("directory-owner".into()),
+                gname: Some("archive".into()),
+            }),
+            attributes: None,
+            native: NativeFileMetadata::default(),
+        };
+        let bytes = build_primary_member_prefix(
+            b"empty-dir",
+            SourceEntryKind::Directory,
+            None,
+            0,
+            0o2750,
+            ArchiveTimestamp::new(1_700_000_000, 123_456_789),
+            &portable_metadata,
+        )
+        .unwrap();
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+
+        assert_eq!(parsed.kind, crate::tar_model::TarEntryKind::Directory);
+        assert_eq!(parsed.logical_size, 0);
+        assert_eq!(parsed.v45_metadata.portable_mirror.mode, 0o2750);
+        assert_eq!(parsed.v45_metadata.portable_mirror.uid, Some(9_000_000));
+        assert_eq!(parsed.v45_metadata.portable_mirror.gid, Some(42));
+        assert_eq!(
+            parsed.v45_metadata.portable_mirror.mtime,
+            (1_700_000_000, 123_456_789)
+        );
+    }
+
+    #[test]
+    fn symlink_writer_emits_target_and_fractional_mtime() {
+        let mtime = ArchiveTimestamp::new(1_700_000_321, 654_321_000);
+        let bytes = build_primary_member_prefix(
+            b"links/current",
+            SourceEntryKind::Symlink,
+            Some(b"../target.txt"),
+            0,
+            0o777,
+            mtime,
+            &PortableFileMetadata::default(),
+        )
+        .unwrap();
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+
+        assert_eq!(parsed.kind, crate::tar_model::TarEntryKind::Symlink);
+        assert_eq!(
+            parsed.link_target.as_deref(),
+            Some(b"../target.txt".as_slice())
+        );
+        assert_eq!(parsed.mtime, mtime);
+        assert_eq!(
+            parsed.v45_metadata.portable_mirror.mtime,
+            (mtime.seconds, mtime.nanoseconds)
         );
     }
 
@@ -9330,6 +9538,8 @@ mod tests {
             member_index: idx,
             member: TarMember {
                 path,
+                entry_kind: SourceEntryKind::Regular,
+                link_target: None,
                 tar_member_group_start: idx as u64 * 512,
                 tar_member_group_size: 512,
                 file_data_size: 0,

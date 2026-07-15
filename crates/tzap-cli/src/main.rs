@@ -46,22 +46,22 @@ use tzap_core::{
     verify_non_seekable_stream_with_recipient_wrap_resolver_and_bootstrap_sidecar,
     verify_non_seekable_stream_with_recipient_wrap_resolver_options,
     verify_unencrypted_non_seekable_stream_with_bootstrap_sidecar,
-    verify_unencrypted_non_seekable_stream_with_options, write_archive,
+    verify_unencrypted_non_seekable_stream_with_options, write_archive_sources_to_sink,
     write_archive_sources_to_sink_ordered_parallel,
     write_archive_sources_to_sink_ordered_parallel_with_recipient_wrap_records,
-    write_archive_with_dictionary, write_archive_with_dictionary_and_kdf,
-    write_archive_with_dictionary_and_root_auth, write_archive_with_dictionary_kdf_and_root_auth,
-    write_archive_with_kdf, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
     write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
     write_tar_stream_archive_to_sink_with_kdf_and_root_auth, AeadAlgo, ArchiveContentVerification,
     ArchiveRepairPatch, ArchiveTimestamp, ArchiveWriteError, ArchiveWriteSink, ExtractError,
-    KdfAlgo, KdfParams, MasterKey, MetadataDiagnostic, MetadataVerificationReport,
-    NativeFileMetadata, NonSeekableReaderOptions, OpenedArchive, PortableFileMetadata,
-    PortableModeOrigin, PublicNoKeyVerification, ReaderOptions, RegularFile, RegularFileSource,
-    RestorePolicy, RootAuthSigningRequest, RootAuthVerification, RootAuthWriterConfig,
-    SafeExtractionOptions, SequentialRootAuthStatus, StreamingRawWriterSummary,
-    StreamingTarWriterSummary, TarEntryKind, WriterOptions, WriterTimings, WrittenArchiveSummary,
+    KdfAlgo, KdfParams, MasterKey, MemoryArchiveSink, MetadataDiagnostic,
+    MetadataVerificationReport, NativeFileMetadata, NonSeekableReaderOptions, OpenedArchive,
+    PortableFileMetadata, PortableModeOrigin, PublicNoKeyVerification, ReaderOptions,
+    RegularFileSource, RestorePolicy, RootAuthSigningRequest, RootAuthVerification,
+    RootAuthWriterConfig, SafeExtractionOptions, SequentialRootAuthStatus, SourceEntryKind,
+    StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind, WriterOptions,
+    WriterTimings, WrittenArchiveSummary,
 };
+#[cfg(test)]
+use tzap_core::{write_archive_with_kdf, RegularFile};
 #[cfg(test)]
 use tzap_core::{MetadataDiagnosticStatus, MetadataOperation};
 #[cfg(any(target_os = "macos", windows))]
@@ -1044,7 +1044,7 @@ fn run(cli: Cli) -> Result<()> {
                             force,
                         )?;
                         let summary_text = format!(
-                            "created {} file(s), {} tar bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
+                            "created {} member(s), {} tar bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
                             summary.input_member_count,
                             summary.input_tar_bytes,
                             summary.archive.archive_bytes,
@@ -1071,7 +1071,7 @@ fn run(cli: Cli) -> Result<()> {
                             force,
                         )?;
                         let summary_text = format!(
-                            "created 1 file(s), {} raw bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
+                            "created 1 member(s), {} raw bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
                             summary.input_bytes,
                             summary.archive.archive_bytes,
                             summary.archive.volume_count,
@@ -1104,7 +1104,7 @@ fn run(cli: Cli) -> Result<()> {
                             force,
                         )?;
                         let summary_text = format!(
-                            "created 1 file(s), {} spooled raw bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
+                            "created 1 member(s), {} spooled raw bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
                             summary.input_bytes,
                             summary.archive.archive_bytes,
                             summary.archive.volume_count,
@@ -1235,7 +1235,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 let write_outputs = write_outputs_started.elapsed();
                 let summary = format!(
-                    "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
+                    "created {} member(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
                     input_specs.len(),
                     input_bytes,
                     archive.archive_bytes,
@@ -1324,7 +1324,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 let write_outputs = write_outputs_started.elapsed();
                 let summary = format!(
-                    "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
+                    "created {} member(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
                     input_specs.len(),
                     input_bytes,
                     archive.archive_bytes,
@@ -1358,88 +1358,39 @@ fn run(cli: Cli) -> Result<()> {
             let read_inputs_started = Instant::now();
             let inputs = collect_input_files(&input_specs)?;
             let read_inputs = read_inputs_started.elapsed();
-            let regular_files = inputs
-                .iter()
-                .map(|file| RegularFile {
-                    path: file.archive_path.as_str(),
-                    contents: &file.contents,
-                    mode: file.mode,
-                    mtime: file.mtime,
-                    portable_metadata: file.portable_metadata.clone(),
-                })
-                .collect::<Vec<_>>();
             let core_writer_started = Instant::now();
-            let archive = match (
-                &dictionary_bytes,
-                &key.kdf_params,
-                root_auth,
-                root_auth_profile.as_ref(),
-            ) {
-                (Some(dictionary), KdfParams::Raw, Some(root_auth), Some(profile)) => {
-                    write_archive_with_dictionary_and_root_auth(
-                        &regular_files,
+            let mut archive_sink = MemoryArchiveSink::default();
+            let archive =
+                if let (Some(root_auth), Some(profile)) = (root_auth, root_auth_profile.as_ref()) {
+                    let mut authenticator = |request: &RootAuthSigningRequest| {
+                        root_auth_authenticator_value(profile, request)
+                    };
+                    write_archive_sources_to_sink(
+                        &inputs,
                         &key.master_key,
                         options,
-                        dictionary,
-                        root_auth,
-                        |request| root_auth_authenticator_value(profile, request),
+                        dictionary_bytes.as_deref(),
+                        &key.kdf_params,
+                        Some(root_auth),
+                        Some(&mut authenticator),
+                        &mut archive_sink,
                     )
-                }
-                (Some(dictionary), kdf_params, Some(root_auth), Some(profile)) => {
-                    write_archive_with_dictionary_kdf_and_root_auth(
-                        &regular_files,
+                } else {
+                    write_archive_sources_to_sink(
+                        &inputs,
                         &key.master_key,
                         options,
-                        dictionary,
-                        kdf_params,
-                        root_auth,
-                        |request| root_auth_authenticator_value(profile, request),
+                        dictionary_bytes.as_deref(),
+                        &key.kdf_params,
+                        None,
+                        None,
+                        &mut archive_sink,
                     )
                 }
-                (None, KdfParams::Raw, Some(root_auth), Some(profile)) => {
-                    write_archive_with_root_auth(
-                        &regular_files,
-                        &key.master_key,
-                        options,
-                        root_auth,
-                        |request| root_auth_authenticator_value(profile, request),
-                    )
-                }
-                (None, kdf_params, Some(root_auth), Some(profile)) => {
-                    write_archive_with_root_auth_and_kdf(
-                        &regular_files,
-                        &key.master_key,
-                        options,
-                        kdf_params,
-                        root_auth,
-                        |request| root_auth_authenticator_value(profile, request),
-                    )
-                }
-                (Some(dictionary), KdfParams::Raw, None, _) => write_archive_with_dictionary(
-                    &regular_files,
-                    &key.master_key,
-                    options,
-                    dictionary,
-                ),
-                (Some(dictionary), kdf_params, None, _) => write_archive_with_dictionary_and_kdf(
-                    &regular_files,
-                    &key.master_key,
-                    options,
-                    dictionary,
-                    kdf_params,
-                ),
-                (None, KdfParams::Raw, None, _) => {
-                    write_archive(&regular_files, &key.master_key, options)
-                }
-                (None, kdf_params, None, _) => {
-                    write_archive_with_kdf(&regular_files, &key.master_key, options, kdf_params)
-                }
-                (_, _, Some(_), None) => unreachable!("root auth requires signing profile"),
-            }
-            .context("failed to create archive")?;
+                .context("failed to create archive")?;
             let core_writer = core_writer_started.elapsed();
 
-            let output_paths = create_output_paths(&output, archive.volumes.len());
+            let output_paths = create_output_paths(&output, archive_sink.volumes.len());
             if !force {
                 check_archive_paths_free_for_write(&output_paths)?;
             }
@@ -1452,18 +1403,18 @@ fn run(cli: Cli) -> Result<()> {
             let write_outputs_started = Instant::now();
             write_archive_outputs_with_optional_bootstrap(
                 &output,
-                &archive.volumes,
+                &archive_sink.volumes,
                 bootstrap_out.as_deref(),
-                &archive.bootstrap_sidecar,
+                &archive_sink.bootstrap_sidecar,
                 force,
             )?;
             let write_outputs = write_outputs_started.elapsed();
             let summary = format!(
-                "created {} file(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
-                regular_files.len(),
+                "created {} member(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
+                inputs.len(),
                 input_bytes,
-                archive.volumes.iter().map(|volume| volume.len() as u64).sum::<u64>(),
-                archive.volumes.len(),
+                archive_sink.volumes.iter().map(|volume| volume.len() as u64).sum::<u64>(),
+                archive_sink.volumes.len(),
                 resolved_volume_loss_tolerance,
                 bit_rot_buffer_pct
             );
@@ -3015,16 +2966,54 @@ fn unsupported_revision_error_json(err: &anyhow::Error, action: &'static str) ->
 #[derive(Debug)]
 struct InputFile {
     archive_path: String,
+    entry_kind: SourceEntryKind,
+    link_target: Option<Vec<u8>>,
     contents: Vec<u8>,
     mode: u32,
     mtime: ArchiveTimestamp,
     portable_metadata: PortableFileMetadata,
 }
 
+impl RegularFileSource for InputFile {
+    fn archive_path(&self) -> &str {
+        &self.archive_path
+    }
+
+    fn entry_kind(&self) -> SourceEntryKind {
+        self.entry_kind
+    }
+
+    fn link_target(&self) -> Option<&[u8]> {
+        self.link_target.as_deref()
+    }
+
+    fn file_data_size(&self) -> u64 {
+        self.contents.len() as u64
+    }
+
+    fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    fn mtime(&self) -> ArchiveTimestamp {
+        self.mtime
+    }
+
+    fn portable_metadata(&self) -> PortableFileMetadata {
+        self.portable_metadata.clone()
+    }
+
+    fn open(&self) -> std::result::Result<Box<dyn Read + '_>, ArchiveWriteError> {
+        Ok(Box::new(io::Cursor::new(self.contents.as_slice())))
+    }
+}
+
 #[derive(Debug)]
 struct InputSpec {
     source: PathBuf,
     archive_path: String,
+    entry_kind: SourceEntryKind,
+    link_target: Option<Vec<u8>>,
     mode: u32,
     mtime: ArchiveTimestamp,
     portable_metadata: PortableFileMetadata,
@@ -3035,6 +3024,14 @@ struct InputSpec {
 impl RegularFileSource for InputSpec {
     fn archive_path(&self) -> &str {
         &self.archive_path
+    }
+
+    fn entry_kind(&self) -> SourceEntryKind {
+        self.entry_kind
+    }
+
+    fn link_target(&self) -> Option<&[u8]> {
+        self.link_target.as_deref()
     }
 
     fn file_data_size(&self) -> u64 {
@@ -3054,6 +3051,41 @@ impl RegularFileSource for InputSpec {
     }
 
     fn open(&self) -> std::result::Result<Box<dyn Read + '_>, ArchiveWriteError> {
+        if self.entry_kind != SourceEntryKind::Regular {
+            let metadata = fs::symlink_metadata(&self.source).map_err(ArchiveWriteError::Io)?;
+            let actual = input_identity(&metadata).map_err(ArchiveWriteError::Io)?;
+            #[cfg(windows)]
+            let actual = {
+                let mut actual = actual;
+                if self.entry_kind == SourceEntryKind::Directory {
+                    let file = open_windows_metadata_handle(&self.source)
+                        .map_err(ArchiveWriteError::Io)?;
+                    augment_windows_input_identity(&mut actual, &file)
+                        .map_err(ArchiveWriteError::Io)?;
+                }
+                actual
+            };
+            let kind_matches = match self.entry_kind {
+                SourceEntryKind::Directory => metadata.is_dir(),
+                SourceEntryKind::Symlink => metadata.file_type().is_symlink(),
+                SourceEntryKind::Regular => false,
+            };
+            let target_matches = if self.entry_kind == SourceEntryKind::Symlink {
+                symlink_target_bytes(&self.source)
+                    .is_ok_and(|target| Some(target.as_slice()) == self.link_target.as_deref())
+            } else {
+                true
+            };
+            if !kind_matches
+                || !target_matches
+                || !input_identity_matches_after_read(self.identity, actual)
+            {
+                return Err(ArchiveWriteError::Io(io::Error::other(
+                    "non-regular input changed after scan",
+                )));
+            }
+            return Ok(Box::new(io::empty()));
+        }
         let file = File::open(&self.source).map_err(ArchiveWriteError::Io)?;
         validate_opened_input_identity(&file, self.identity).map_err(ArchiveWriteError::Io)?;
         Ok(Box::new(IdentityCheckedInputReader {
@@ -3253,7 +3285,7 @@ fn collect_input_specs(paths: &[String]) -> Result<Vec<InputSpec>> {
 fn reject_unrepresentable_selected_hardlinks(specs: &[InputSpec]) -> Result<()> {
     let mut selected_objects = BTreeMap::<(u64, u64), &str>::new();
     for spec in specs {
-        if spec.identity.link_count < 2 {
+        if spec.entry_kind == SourceEntryKind::Directory || spec.identity.link_count < 2 {
             continue;
         }
         #[cfg(unix)]
@@ -3295,6 +3327,8 @@ fn collect_input_files(specs: &[InputSpec]) -> Result<Vec<InputFile>> {
         }
         out.push(InputFile {
             archive_path: spec.archive_path.clone(),
+            entry_kind: spec.entry_kind,
+            link_target: spec.link_target.clone(),
             contents,
             mode: spec.mode,
             mtime: spec.mtime,
@@ -3312,9 +3346,50 @@ fn collect_one_input_spec(
     let metadata = fs::symlink_metadata(input)
         .with_context(|| format!("failed to inspect input {}", input.display()))?;
     if metadata.file_type().is_symlink() {
-        bail!("refusing to archive symlink input {}", input.display());
+        let archive_path = archive_path_to_string(archive_path)?;
+        let identity = input_identity(&metadata)
+            .with_context(|| format!("failed to identify symlink {}", input.display()))?;
+        let link_target = symlink_target_bytes(input)
+            .with_context(|| format!("failed to read symlink {}", input.display()))?;
+        out.push(InputSpec {
+            source: input.to_owned(),
+            archive_path,
+            entry_kind: SourceEntryKind::Symlink,
+            link_target: Some(link_target),
+            mode: readonly_mode(&metadata),
+            mtime: identity.mtime,
+            portable_metadata: portable_symlink_metadata(identity),
+            size: 0,
+            identity,
+        });
+        return Ok(());
     }
     if metadata.is_dir() {
+        let archive_path_string = archive_path_to_string(archive_path)?;
+        let identity = input_identity(&metadata)
+            .with_context(|| format!("failed to identify input {}", input.display()))?;
+        #[cfg(windows)]
+        let identity = {
+            let mut identity = identity;
+            let file = open_windows_metadata_handle(input)
+                .with_context(|| format!("failed to open Windows directory {}", input.display()))?;
+            augment_windows_input_identity(&mut identity, &file).with_context(|| {
+                format!("failed to identify Windows directory {}", input.display())
+            })?;
+            identity
+        };
+        let portable_metadata = portable_input_metadata(identity, input)?;
+        out.push(InputSpec {
+            source: input.to_owned(),
+            archive_path: archive_path_string,
+            entry_kind: SourceEntryKind::Directory,
+            link_target: None,
+            mode: readonly_mode(&metadata),
+            mtime: identity.mtime,
+            portable_metadata,
+            size: 0,
+            identity,
+        });
         let mut entries = fs::read_dir(input)
             .with_context(|| format!("failed to read directory {}", input.display()))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -3349,6 +3424,8 @@ fn collect_one_input_spec(
     out.push(InputSpec {
         source: input.to_owned(),
         archive_path,
+        entry_kind: SourceEntryKind::Regular,
+        link_target: None,
         mode: readonly_mode(&metadata),
         mtime: identity.mtime,
         portable_metadata,
@@ -3504,6 +3581,17 @@ fn augment_windows_input_identity(identity: &mut InputIdentity, file: &File) -> 
     identity.file_index =
         (u64::from(by_handle.nFileIndexHigh) << 32) | u64::from(by_handle.nFileIndexLow);
     Ok(())
+}
+
+#[cfg(windows)]
+fn open_windows_metadata_handle(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
 }
 
 struct IdentityCheckedInputReader {
@@ -3680,6 +3768,43 @@ fn portable_input_metadata(identity: InputIdentity, input: &Path) -> Result<Port
         attributes: identity.attributes,
         native: capture_native_file_metadata(input, identity)?,
     })
+}
+
+fn portable_symlink_metadata(identity: InputIdentity) -> PortableFileMetadata {
+    PortableFileMetadata {
+        source_os: source_os_label().into(),
+        source_filesystem: "unknown".into(),
+        mode_origin: if cfg!(unix) {
+            PortableModeOrigin::Native
+        } else {
+            PortableModeOrigin::Projected
+        },
+        #[cfg(unix)]
+        posix_owner: Some(PortablePosixOwner {
+            uid: identity.uid,
+            gid: identity.gid,
+            uname: None,
+            gname: None,
+        }),
+        #[cfg(not(unix))]
+        posix_owner: None,
+        attributes: identity.attributes,
+        native: NativeFileMetadata::default(),
+    }
+}
+
+#[cfg(unix)]
+fn symlink_target_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(fs::read_link(path)?.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn symlink_target_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    fs::read_link(path)?
+        .to_str()
+        .map(|target| target.as_bytes().to_vec())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "symlink target is not UTF-8"))
 }
 
 #[cfg(target_os = "linux")]
@@ -3992,7 +4117,7 @@ fn capture_native_file_metadata(
     input: &Path,
     identity: InputIdentity,
 ) -> Result<NativeFileMetadata> {
-    let file = File::open(input).with_context(|| {
+    let file = open_windows_metadata_handle(input).with_context(|| {
         format!(
             "failed to open {} for Windows metadata capture",
             input.display()
@@ -4025,10 +4150,13 @@ fn capture_native_file_metadata(
         .auxiliary_records
         .push(capture_windows_security_descriptor(&file)?);
     let (data_stream_attributes, mut streams) = capture_windows_backup_streams(&file)?;
-    native.primary_pax_records.insert(
-        "TZAP.windows.data-stream-attributes".into(),
-        format!("{data_stream_attributes:08x}").into_bytes(),
-    );
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    if identity.file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        native.primary_pax_records.insert(
+            "TZAP.windows.data-stream-attributes".into(),
+            format!("{data_stream_attributes:08x}").into_bytes(),
+        );
+    }
     native.auxiliary_records.append(&mut streams);
     native.auxiliary_records.sort_by(|left, right| {
         left.kind

@@ -147,7 +147,9 @@ Notes:
   writer and publish the output file only after terminal metadata and optional
   RootAuth signing finish.
 - No append-only sink or multipart-upload create mode is exposed by the CLI.
-- Create emits regular-file tar member groups only. Long or non-ASCII archive
+- Create emits explicit directory, symbolic-link, and regular-file tar member
+  groups. Empty directories, directory metadata, safe relative link targets,
+  and symbolic-link mtimes are preserved. Long or non-ASCII archive
   paths use local path-specific PAX metadata; global PAX/GNU state and tar EOF
   zero blocks are not emitted into the encrypted tar stream.
 - Multi-volume recovery is available only within the `--volume-loss-tolerance`

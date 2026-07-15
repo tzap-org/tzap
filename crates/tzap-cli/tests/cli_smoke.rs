@@ -1349,7 +1349,7 @@ fn cli_create_tar_stdin_round_trips_list_verify_and_extract() {
         ]))
         .assert()
         .success()
-        .stderr(predicate::str::contains("created 2 file(s)"));
+        .stderr(predicate::str::contains("created 2 member(s)"));
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -1432,7 +1432,7 @@ fn cli_create_tar_stdin_multi_volume_round_trips_list_verify_and_extract() {
         ]))
         .assert()
         .success()
-        .stderr(predicate::str::contains("created 2 file(s)"))
+        .stderr(predicate::str::contains("created 2 member(s)"))
         .stderr(predicate::str::contains("3 volume(s)"));
 
     assert!(volume_0.exists());
@@ -1618,7 +1618,7 @@ fn cli_create_tar_stdin_late_reject_removes_output_path() {
     fs::write(&keyfile, KEY_HEX).unwrap();
     let mut input = tar_stream(&[("ok.txt", b"ok".as_slice())]);
     input.truncate(input.len() - 1024);
-    input.extend_from_slice(&tar_header(b"link", b'2', 0));
+    input.extend_from_slice(&tar_header(b"hardlink", b'1', 0));
     input.extend_from_slice(&[0u8; 1024]);
 
     Command::cargo_bin("tzap")
@@ -1636,7 +1636,7 @@ fn cli_create_tar_stdin_late_reject_removes_output_path() {
         .assert()
         .code(16)
         .stderr(predicate::str::contains(
-            "streaming tar stdin supports regular files and directory entries only",
+            "streaming tar stdin supports regular files, directories, and symlinks only",
         ));
 
     assert!(!output.exists());
@@ -1653,7 +1653,7 @@ fn cli_create_tar_stdin_multi_volume_late_reject_removes_output_paths() {
     fs::write(&keyfile, KEY_HEX).unwrap();
     let mut input = tar_stream(&[("ok.txt", b"ok".as_slice())]);
     input.truncate(input.len() - 1024);
-    input.extend_from_slice(&tar_header(b"link", b'2', 0));
+    input.extend_from_slice(&tar_header(b"hardlink", b'1', 0));
     input.extend_from_slice(&[0u8; 1024]);
 
     Command::cargo_bin("tzap")
@@ -1673,7 +1673,7 @@ fn cli_create_tar_stdin_multi_volume_late_reject_removes_output_paths() {
         .assert()
         .code(16)
         .stderr(predicate::str::contains(
-            "streaming tar stdin supports regular files and directory entries only",
+            "streaming tar stdin supports regular files, directories, and symlinks only",
         ));
 
     assert!(!output_base.exists());
@@ -1710,7 +1710,7 @@ fn cli_create_raw_stdin_known_size_round_trips_list_verify_and_extract() {
         .write_stdin(payload.clone())
         .assert()
         .success()
-        .stderr(predicate::str::contains("created 1 file(s)"))
+        .stderr(predicate::str::contains("created 1 member(s)"))
         .stderr(predicate::str::contains("raw bytes in"));
 
     Command::cargo_bin("tzap")
@@ -1785,7 +1785,7 @@ fn cli_create_raw_stdin_known_size_multi_volume_round_trips_list_verify_and_extr
         .write_stdin(payload.clone())
         .assert()
         .success()
-        .stderr(predicate::str::contains("created 1 file(s)"))
+        .stderr(predicate::str::contains("created 1 member(s)"))
         .stderr(predicate::str::contains("3 volume(s)"));
 
     assert!(volume_0.exists());
@@ -3816,7 +3816,9 @@ fn cli_create_list_verify_and_extract_with_keyfile() {
         ])
         .assert()
         .success()
-        .stderr(predicate::str::contains("created 1 file(s), 16 bytes in, "))
+        .stderr(predicate::str::contains(
+            "created 1 member(s), 16 bytes in, ",
+        ))
         .stderr(predicate::str::contains(
             "1 volume(s), volume-loss tolerance 0, bit-rot buffer 5%",
         ));
@@ -5186,13 +5188,14 @@ fn cli_create_directory_tree_is_deterministic_and_includes_nested_files() {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap();
-    let expected = format!("{base}/a.txt\n{base}/b.txt\n{base}/zeta/a.txt\n{base}/zeta/c.txt\n");
-    let expected = format!("{base}/.hidden\n{expected}");
+    let expected = format!(
+        "{base}\n{base}/.hidden\n{base}/a.txt\n{base}/b.txt\n{base}/zeta\n{base}/zeta/a.txt\n{base}/zeta/c.txt\n"
+    );
     assert_eq!(listing, expected);
 }
 
 #[test]
-fn cli_create_omits_empty_directories_by_default() {
+fn cli_create_preserves_empty_directories() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
     let input_root = temp.path().join("input");
@@ -5231,7 +5234,118 @@ fn cli_create_omits_empty_directories_by_default() {
 
     assert_eq!(
         String::from_utf8_lossy(&output),
-        format!("input/keep.txt\n"),
+        "input\ninput/empty\ninput/keep.txt\n",
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_directory_metadata_round_trips_after_children() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input_root = temp.path().join("tree");
+    let nested = input_root.join("nested");
+    let archive = temp.path().join("directory-metadata.tzap");
+    let extract_dir = temp.path().join("extract");
+    let stream_extract_dir = temp.path().join("stream-extract");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("child.txt"), b"child").unwrap();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    let mut permissions = fs::metadata(&nested).unwrap().permissions();
+    permissions.set_mode(0o751);
+    fs::set_permissions(&nested, permissions).unwrap();
+    let expected_time = UNIX_EPOCH + Duration::new(1_700_000_123, 456_789_000);
+    fs::File::open(&nested)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(expected_time))
+        .unwrap();
+    xattr::set(&nested, "user.tzap-directory-test", b"directory-xattr").unwrap();
+    let source = fs::metadata(&nested).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input_root.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--restore",
+            "same-os",
+            "--allow-degraded",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let restored = fs::metadata(extract_dir.join("tree/nested")).unwrap();
+    assert_eq!(restored.mode() & 0o7777, 0o751);
+    assert_eq!(restored.mtime(), source.mtime());
+    assert_eq!(restored.mtime_nsec(), source.mtime_nsec());
+    assert_eq!(restored.uid(), source.uid());
+    assert_eq!(restored.gid(), source.gid());
+    assert_eq!(
+        xattr::get(extract_dir.join("tree/nested"), "user.tzap-directory-test")
+            .unwrap()
+            .as_deref(),
+        Some(b"directory-xattr".as_slice())
+    );
+    assert_eq!(
+        fs::read(extract_dir.join("tree/nested/child.txt")).unwrap(),
+        b"child"
+    );
+
+    fs::create_dir_all(stream_extract_dir.join("tree/nested")).unwrap();
+    let mut wrong_permissions = fs::metadata(stream_extract_dir.join("tree/nested"))
+        .unwrap()
+        .permissions();
+    wrong_permissions.set_mode(0o700);
+    fs::set_permissions(stream_extract_dir.join("tree/nested"), wrong_permissions).unwrap();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--restore",
+            "same-os",
+            "--allow-degraded",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            stream_extract_dir.to_str().unwrap(),
+            "-",
+        ])
+        .write_stdin(fs::read(&archive).unwrap())
+        .assert()
+        .success();
+    let stream_restored = fs::metadata(stream_extract_dir.join("tree/nested")).unwrap();
+    assert_eq!(stream_restored.mode() & 0o7777, 0o751);
+    assert_eq!(stream_restored.mtime(), source.mtime());
+    assert_eq!(stream_restored.mtime_nsec(), source.mtime_nsec());
+    assert_eq!(
+        xattr::get(
+            stream_extract_dir.join("tree/nested"),
+            "user.tzap-directory-test"
+        )
+        .unwrap()
+        .as_deref(),
+        Some(b"directory-xattr".as_slice())
     );
 }
 
@@ -5818,16 +5932,46 @@ fn cli_create_rejects_char_device_input_type() {
 
 #[cfg(unix)]
 #[test]
-fn cli_create_rejects_symlink_input() {
+fn cli_symlink_target_and_mtime_round_trip_without_following_target() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
     let output = temp.path().join("symlink.tzap");
-    let target = temp.path().join("target.txt");
     let link = temp.path().join("link.txt");
+    let extract_dir = temp.path().join("extract");
+    let restored_target = extract_dir.join("target.txt");
 
     fs::write(&keyfile, KEY_HEX).unwrap();
-    fs::write(&target, b"target\n").unwrap();
-    std::os::unix::fs::symlink(&target, &link).unwrap();
+    std::os::unix::fs::symlink("target.txt", &link).unwrap();
+    let link_path = CString::new(link.as_os_str().as_bytes()).unwrap();
+    let expected_seconds = 1_700_000_321;
+    let expected_nanoseconds = 654_321_000;
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: expected_seconds,
+            tv_nsec: expected_nanoseconds,
+        },
+    ];
+    // SAFETY: the path and timespec array remain live for this call, and the
+    // no-follow flag applies the timestamp to the link itself.
+    assert_eq!(
+        unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                link_path.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        },
+        0
+    );
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -5840,10 +5984,38 @@ fn cli_create_rejects_symlink_input() {
             link.to_str().unwrap(),
         ])
         .assert()
-        .code(1)
-        .stderr(predicate::str::contains(
-            "refusing to archive symlink input",
-        ));
+        .success();
+
+    fs::create_dir(&extract_dir).unwrap();
+    fs::write(&restored_target, b"must not be touched").unwrap();
+    let target_before = fs::symlink_metadata(&restored_target).unwrap();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--restore",
+            "portable",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let restored_link = extract_dir.join("link.txt");
+    assert_eq!(
+        fs::read_link(&restored_link).unwrap(),
+        Path::new("target.txt")
+    );
+    let restored = fs::symlink_metadata(restored_link).unwrap();
+    assert_eq!(restored.mtime(), expected_seconds);
+    assert_eq!(restored.mtime_nsec(), expected_nanoseconds);
+    let target_after = fs::symlink_metadata(restored_target).unwrap();
+    assert_eq!(target_after.mtime(), target_before.mtime());
+    assert_eq!(target_after.mtime_nsec(), target_before.mtime_nsec());
+    assert_eq!(target_after.len(), target_before.len());
 }
 
 #[cfg(windows)]
@@ -6829,11 +7001,9 @@ fn cli_list_with_long_output_preserves_unix_mode_bits() {
     permissions.set_mode(0o700);
     fs::set_permissions(&input, permissions).unwrap();
     let source_metadata = fs::metadata(&input).unwrap();
-    let expected_mtime = format!(
-        "{}.{:09}",
-        source_metadata.mtime(),
-        source_metadata.mtime_nsec()
-    );
+    let expected_mtime =
+        ArchiveTimestamp::new(source_metadata.mtime(), source_metadata.mtime_nsec() as u32)
+            .to_string();
 
     Command::cargo_bin("tzap")
         .unwrap()
@@ -6936,7 +7106,7 @@ fn cli_list_outputs_stable_json() {
 }
 
 #[test]
-fn cli_list_supports_empty_archive() {
+fn cli_list_supports_directory_only_archive() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
     let input_root = temp.path().join("empty-root");
@@ -6968,7 +7138,9 @@ fn cli_list_supports_empty_archive() {
         ])
         .assert()
         .success()
-        .stdout(predicate::eq(""));
+        .stdout(predicate::eq(
+            "empty-root\nempty-root/nested\nempty-root/nested/directories\n",
+        ));
 }
 
 #[test]
