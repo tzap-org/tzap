@@ -6984,6 +6984,11 @@ fn native_metadata_requires_system_restore(native: &NativeFileMetadata, source_o
                     .ok()
                     .and_then(|value| u64::from_str_radix(value, 16).ok())
                     .is_some_and(|flags| flags & 0x30 != 0))
+            || (key == "TZAP.macos.st-flags"
+                && std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|value| u64::from_str_radix(value, 16).ok())
+                    .is_some_and(|flags| flags & 0x0006_0006 != 0))
     })
 }
 

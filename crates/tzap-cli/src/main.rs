@@ -26,7 +26,7 @@ use tzap_core::reader::{ArchiveEntry, ArchiveIndexEntry, RecipientWrapRecordCont
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
 #[cfg(unix)]
 use tzap_core::PortablePosixOwner;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use tzap_core::{canonical_base64_encode, encode_percent_name};
 use tzap_core::{
     extract_non_seekable_stream_to_dir, extract_non_seekable_stream_to_dir_with_bootstrap_sidecar,
@@ -64,7 +64,7 @@ use tzap_core::{
 };
 #[cfg(test)]
 use tzap_core::{MetadataDiagnosticStatus, MetadataOperation};
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", windows))]
 use tzap_core::{NativeAuxiliaryMetadata, NativeAuxiliaryNameEncoding, RestoreClass};
 use tzap_plugin_keywrap::{
     dispatch_key_wrap_record, wrap_master_key_for_recipient,
@@ -3774,6 +3774,213 @@ fn capture_native_file_metadata(
     Ok(native)
 }
 
+#[cfg(target_os = "macos")]
+fn capture_native_file_metadata(
+    input: &Path,
+    identity: InputIdentity,
+) -> Result<NativeFileMetadata> {
+    use std::os::macos::fs::MetadataExt;
+    use std::os::unix::ffi::OsStrExt;
+    use xattr::FileExt as _;
+
+    // Leave ample room below the 64 MiB local-PAX cap for declarations and
+    // caller-owned native records. Xattrs beyond this aggregate budget use
+    // the format's hashed auxiliary representation instead.
+    const INLINE_XATTR_BUDGET: usize = 32 * 1024 * 1024;
+
+    let file = File::open(input)
+        .with_context(|| format!("failed to open {} for metadata capture", input.display()))?;
+    let mut native = NativeFileMetadata::default();
+    let mut inline_xattr_bytes = 0usize;
+    native.primary_pax_records.insert(
+        "TZAP.macos.st-flags".into(),
+        format!("{:016x}", file.metadata()?.st_flags()).into_bytes(),
+    );
+    native.primary_pax_records.insert(
+        "TZAP.unix.ctime-observed".into(),
+        ArchiveTimestamp::new(
+            identity.change_time_seconds,
+            identity.change_time_nanoseconds as u32,
+        )
+        .canonical_pax_value()
+        .map_err(|error| anyhow!(error))?,
+    );
+    if let Some(creation_time) = identity.creation_time {
+        native.primary_pax_records.insert(
+            "LIBARCHIVE.creationtime".into(),
+            creation_time
+                .canonical_pax_value()
+                .map_err(|error| anyhow!(error))?,
+        );
+    }
+
+    for name in file
+        .list_xattr()
+        .with_context(|| format!("failed to list xattrs for {}", input.display()))?
+    {
+        let name_bytes = name.as_bytes();
+        let Some(value) = file
+            .get_xattr(&name)
+            .with_context(|| format!("failed to read xattr on {}", input.display()))?
+        else {
+            bail!("xattr changed while scanning {}", input.display());
+        };
+        match name_bytes {
+            b"com.apple.ResourceFork" => {
+                native.auxiliary_records.push(NativeAuxiliaryMetadata::new(
+                    "macos.resource-fork",
+                    "macos-backup-v1",
+                    RestoreClass::SameOs,
+                    value,
+                ))
+            }
+            b"com.apple.FinderInfo" => {
+                if value.len() != 32 {
+                    bail!("FinderInfo on {} is not exactly 32 bytes", input.display());
+                }
+                native.auxiliary_records.push(NativeAuxiliaryMetadata::new(
+                    "macos.finder-info",
+                    "macos-backup-v1",
+                    RestoreClass::SameOs,
+                    value,
+                ));
+            }
+            _ if inline_xattr_bytes
+                .saturating_add(name_bytes.len())
+                .saturating_add(value.len().saturating_mul(4).div_ceil(3))
+                > INLINE_XATTR_BUDGET =>
+            {
+                let profile = if name_bytes.starts_with(b"com.apple.") {
+                    "macos-backup-v1"
+                } else {
+                    "posix-backup-v1"
+                };
+                let mut record = NativeAuxiliaryMetadata::new(
+                    "generic.xattr",
+                    profile,
+                    if macos_system_xattr(name_bytes) {
+                        RestoreClass::System
+                    } else {
+                        RestoreClass::SameOs
+                    },
+                    value,
+                );
+                record.name_encoding = NativeAuxiliaryNameEncoding::Bytes;
+                record.name = name_bytes.to_vec();
+                native.auxiliary_records.push(record);
+            }
+            _ => {
+                let encoded_name =
+                    encode_percent_name(name_bytes).map_err(|error| anyhow!(error))?;
+                native.primary_pax_records.insert(
+                    format!("LIBARCHIVE.xattr.{encoded_name}"),
+                    canonical_base64_encode(&value),
+                );
+                inline_xattr_bytes = inline_xattr_bytes
+                    .saturating_add(encoded_name.len())
+                    .saturating_add(value.len().saturating_mul(4).div_ceil(3));
+            }
+        }
+    }
+
+    if let Some(acl) = capture_macos_acl(&file)
+        .with_context(|| format!("failed to capture ACL for {}", input.display()))?
+    {
+        let mut record = NativeAuxiliaryMetadata::new(
+            "macos.acl-native",
+            "macos-backup-v1",
+            RestoreClass::SameOs,
+            acl,
+        );
+        record.meta.insert(
+            "TZAP.aux.meta.acl-format".into(),
+            b"darwin-acl-external-v1".to_vec(),
+        );
+        native.auxiliary_records.push(record);
+        native
+            .primary_pax_records
+            .insert("TZAP.acl.projection".into(), b"none".to_vec());
+    }
+
+    native.auxiliary_records.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    native.required_profiles.push("macos-backup-v1".into());
+    native.required_profiles.push("posix-backup-v1".into());
+    native.required_profiles.sort();
+    Ok(native)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_system_xattr(name: &[u8]) -> bool {
+    name.starts_with(b"security.") || name.starts_with(b"trusted.") || name.starts_with(b"system.")
+}
+
+#[cfg(target_os = "macos")]
+fn capture_macos_acl(file: &File) -> io::Result<Option<Vec<u8>>> {
+    use std::os::fd::AsRawFd;
+    use std::ptr;
+
+    type Acl = *mut libc::c_void;
+    type AclEntry = *mut libc::c_void;
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+
+    extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> Acl;
+        fn acl_get_entry(acl: Acl, entry_id: libc::c_int, entry: *mut AclEntry) -> libc::c_int;
+        fn acl_size(acl: Acl) -> libc::ssize_t;
+        fn acl_copy_ext(buffer: *mut libc::c_void, acl: Acl, size: libc::ssize_t) -> libc::ssize_t;
+        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+    }
+
+    // SAFETY: `file` owns a live descriptor and the returned ACL is released on every path.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    let result = (|| {
+        let mut first: AclEntry = ptr::null_mut();
+        // SAFETY: `acl` is valid and `first` points to writable storage for one entry pointer.
+        match unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut first) } {
+            1 => return Ok(None),
+            0 => {}
+            _ => return Err(io::Error::last_os_error()),
+        }
+        // SAFETY: `acl` remains valid for the duration of this scope.
+        let size = unsafe { acl_size(acl) };
+        if size < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut external = vec![
+            0u8;
+            usize::try_from(size).map_err(|_| {
+                io::Error::other("macOS ACL external form exceeds platform limits")
+            })?
+        ];
+        // SAFETY: the destination has exactly `size` writable bytes and `acl` is valid.
+        let copied = unsafe { acl_copy_ext(external.as_mut_ptr().cast(), acl, size) };
+        if copied < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        external
+            .truncate(usize::try_from(copied).map_err(|_| {
+                io::Error::other("macOS ACL external form exceeds platform limits")
+            })?);
+        Ok(Some(external))
+    })();
+    // SAFETY: `acl` was returned by `acl_get_fd_np` and has not yet been freed.
+    unsafe { acl_free(acl) };
+    result
+}
+
 #[cfg(windows)]
 fn capture_native_file_metadata(
     input: &Path,
@@ -4264,7 +4471,7 @@ fn capture_windows_backup_streams(file: &File) -> Result<(u32, Vec<NativeAuxilia
     Ok((data_stream_attributes, auxiliary))
 }
 
-#[cfg(all(not(target_os = "linux"), not(windows)))]
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(windows)))]
 fn capture_native_file_metadata(
     _input: &Path,
     _identity: InputIdentity,
@@ -4299,11 +4506,6 @@ fn capture_linux_inode_flags(file: &File, native: &mut NativeFileMetadata) -> io
         "TZAP.linux.fsflags".into(),
         format!("{:016x}", flags as u64).into_bytes(),
     );
-    Ok(())
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn capture_linux_inode_flags(_file: &File, _native: &mut NativeFileMetadata) -> io::Result<()> {
     Ok(())
 }
 
@@ -8243,6 +8445,120 @@ mod tests {
         assert!(native
             .primary_pax_records
             .contains_key("TZAP.unix.ctime-observed"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn filesystem_scan_captures_macos_native_metadata_and_writes_valid_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("native.txt");
+        fs::write(&path, b"payload").unwrap();
+        xattr::set(&path, "com.tzap.test", b"metadata").unwrap();
+        xattr::set(&path, "com.apple.FinderInfo", &[0x5a; 32]).unwrap();
+        xattr::set(&path, "com.apple.ResourceFork", b"resource fork").unwrap();
+        let acl_status = std::process::Command::new("chmod")
+            .arg("+a")
+            .arg("everyone deny delete")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(acl_status.success());
+        let identity = input_identity(&fs::metadata(&path).unwrap()).unwrap();
+
+        let native = capture_native_file_metadata(&path, identity).unwrap();
+
+        assert_eq!(
+            native.required_profiles,
+            vec!["macos-backup-v1", "posix-backup-v1"]
+        );
+        assert_eq!(
+            native
+                .primary_pax_records
+                .get("LIBARCHIVE.xattr.com.tzap.test")
+                .map(Vec::as_slice),
+            Some(b"bWV0YWRhdGE".as_slice())
+        );
+        for key in [
+            "LIBARCHIVE.creationtime",
+            "TZAP.unix.ctime-observed",
+            "TZAP.macos.st-flags",
+            "TZAP.acl.projection",
+        ] {
+            assert!(native.primary_pax_records.contains_key(key), "{key}");
+        }
+        let finder_info = native
+            .auxiliary_records
+            .iter()
+            .find(|record| record.kind == "macos.finder-info")
+            .unwrap();
+        assert_eq!(finder_info.payload, [0x5a; 32]);
+        let resource_fork = native
+            .auxiliary_records
+            .iter()
+            .find(|record| record.kind == "macos.resource-fork")
+            .unwrap();
+        assert_eq!(resource_fork.payload, b"resource fork");
+        let acl = native
+            .auxiliary_records
+            .iter()
+            .find(|record| record.kind == "macos.acl-native")
+            .unwrap();
+        assert!(!acl.payload.is_empty());
+        assert_eq!(
+            acl.meta.get("TZAP.aux.meta.acl-format").map(Vec::as_slice),
+            Some(b"darwin-acl-external-v1".as_slice())
+        );
+
+        let archive = write_archive(
+            &[RegularFile {
+                path: "native.txt",
+                contents: b"payload",
+                mode: identity.mode,
+                mtime: identity.mtime,
+                portable_metadata: PortableFileMetadata {
+                    source_os: "macos".into(),
+                    source_filesystem: "unknown".into(),
+                    mode_origin: PortableModeOrigin::Native,
+                    posix_owner: Some(PortablePosixOwner {
+                        uid: identity.uid,
+                        gid: identity.gid,
+                        uname: None,
+                        gname: None,
+                    }),
+                    attributes: None,
+                    native,
+                },
+            }],
+            &MasterKey::from_raw_key(&[7u8; 32]).unwrap(),
+            WriterOptions {
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+        )
+        .unwrap();
+        let opened = tzap_core::open_archive(
+            &archive.bytes,
+            &MasterKey::from_raw_key(&[7u8; 32]).unwrap(),
+        )
+        .unwrap();
+        opened.verify().unwrap();
+        let verification = opened.verify_content().unwrap();
+        let report = verification.metadata_report().unwrap();
+        assert_eq!(
+            report.profiles_present,
+            vec!["macos-backup-v1", "portable-v1", "posix-backup-v1"]
+        );
+        assert!(report
+            .auxiliary_kinds_present
+            .contains(&"macos.acl-native".to_string()));
+        assert!(report
+            .auxiliary_kinds_present
+            .contains(&"macos.finder-info".to_string()));
+        assert!(report
+            .auxiliary_kinds_present
+            .contains(&"macos.resource-fork".to_string()));
     }
 
     #[cfg(windows)]

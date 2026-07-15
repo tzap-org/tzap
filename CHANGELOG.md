@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Captures macOS regular-file metadata, including Darwin flags, xattrs, native
+  ACLs, FinderInfo, resource forks, creation time, and observed ctime.
 - Replaces logical-source-only create progress with phase-native writer progress.
 - Reports planning and emission source bytes separately for multi-pass writers.
 - Exposes planning-payload, planning-metadata, emitting-payload, and

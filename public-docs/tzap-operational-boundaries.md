@@ -569,7 +569,8 @@ boundaries:
 |---|---|---|
 | Linux | Numeric ownership, readable xattrs, canonical POSIX.1e ACLs, observed ctime, available creation time, and exact Linux inode flags. | Standalone directories, symlinks, special objects, selected hardlink aliases, and xattrs that make the bounded primary PAX record unrepresentable. |
 | Windows | Creation, access, write, and change times at 100-ns precision, including pre-1970 values; exact file and default-data-stream attributes; owner/group/DACL self-relative security descriptor plus SACL when `SeSecurityPrivilege` is available; alternate data streams; EA data; property data; and object IDs returned by the documented backup-stream API. | Reparse points, sparse files/streams, raw EFS, offline/cloud placeholders, hardlink streams or selected aliases, transactional/unknown backup streams, standalone directories, and symlinks. These cases fail creation instead of weakening `capture-status=complete`. |
-| macOS and other POSIX hosts | Portable regular-file fields only. | Source-native profile capture is not yet implemented. |
+| macOS | Numeric ownership, readable xattrs, exact Darwin flags, observed ctime, available creation time, native ACL external form, FinderInfo, and resource forks. Large xattrs use bounded auxiliary records. | Standalone directories, symlinks, special objects, selected hardlink aliases, APFS clone hints, and metadata that cannot be read consistently during the scan. |
+| Other POSIX hosts | Portable regular-file fields only. | Source-native profile capture is not yet implemented. |
 
 Linux POSIX ACL backing xattrs are converted to canonical `SCHILY.acl.*`
 records rather than duplicated as generic xattrs. Windows auxiliary payloads
@@ -691,8 +692,9 @@ surface tar metadata fidelity should use `list_files`, `extract_member`,
   captured/applied as described above. Windows ordinary regular-file metadata
   and supported backup streams are captured, authenticated, parsed, and
   preserved, but native Windows metadata application is not yet implemented.
-  macOS dedicated auxiliary capture and remaining non-regular-file capture are
-  still parser/validator-only.
+  macOS ordinary regular-file flags, xattrs, ACLs, FinderInfo, resource forks,
+  and timestamps are captured and validated, but native auxiliary application
+  and remaining non-regular-file capture are not yet implemented.
 
 ### Remaining native-platform implementation plan
 
@@ -703,8 +705,8 @@ policy-gated application of security descriptors, streams, attributes, and
 times. Each class needs an on-host capture/restore corpus before the full
 Windows backup reader/writer class can be advertised.
 
-The macOS writer needs Darwin flags, native ACL external form, FinderInfo,
-resource forks, birth time, quarantine/provenance xattrs, and APFS clone hints.
+The remaining macOS work is native application of captured ACLs, FinderInfo,
+resource forks, birth time, and flags, plus APFS clone hints.
 The remaining POSIX/BSD writer work includes directories, symlinks, devices,
 FIFOs, hardlink topology, NFSv4 ACL implementations, native BSD flags, and
 large-xattr auxiliary fallback. Those implementations require their matching

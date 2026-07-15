@@ -12358,7 +12358,12 @@ mod tests {
         "linux"
     }
 
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    fn source_os_for_test() -> &'static str {
+        "macos"
+    }
+
+    #[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
     fn source_os_for_test() -> &'static str {
         "other-unix"
     }
