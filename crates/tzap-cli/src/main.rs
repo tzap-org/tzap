@@ -4492,14 +4492,7 @@ fn capture_linux_inode_flags(file: &File, native: &mut NativeFileMetadata) -> io
     let mut flags: libc::c_long = 0;
     // SAFETY: the request writes one c_long to a valid pointer and observes a
     // live file descriptor owned by `file`.
-    if unsafe {
-        libc::ioctl(
-            file.as_raw_fd(),
-            linux_raw_sys::ioctl::FS_IOC_GETFLAGS as libc::c_ulong,
-            &mut flags,
-        )
-    } != 0
-    {
+    if unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) } != 0 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::ENOTTY)
             || error.raw_os_error() == Some(libc::EOPNOTSUPP)
