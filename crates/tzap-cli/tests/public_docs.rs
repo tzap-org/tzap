@@ -488,6 +488,13 @@ fn public_docs_pin_tar_metadata_profile() {
     assert!(boundaries.contains("auxiliary hashes"));
     assert!(boundaries.contains("Global PAX/GNU state"));
     assert!(boundaries.contains("Published revision-45 conformance classes"));
+    assert!(boundaries.contains("Native regular-file capture"));
+    assert!(boundaries.contains("Windows auxiliary payloads"));
+    assert!(boundaries.contains("Windows comparison with 7-Zip 26.01"));
+    assert!(boundaries.contains("Capture parity"));
+    assert!(boundaries.contains("SACL when `SeSecurityPrivilege`"));
+    assert!(boundaries.contains("raw EFS"));
+    assert!(boundaries.contains("native Windows metadata application is not yet implemented"));
     assert!(reference.contains("--restore {content,portable,same-os,system}"));
     assert!(reference.contains("Verification reports authenticated partial-capture"));
 }

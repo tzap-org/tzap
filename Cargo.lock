@@ -1672,6 +1672,7 @@ dependencies = [
  "tzap-core",
  "tzap-plugin-keywrap",
  "tzap-plugin-signing",
+ "windows-sys 0.61.2",
  "xattr",
 ]
 

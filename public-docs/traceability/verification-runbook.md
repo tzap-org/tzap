@@ -1,6 +1,6 @@
 # Verification runbook and record
 
-Review date: 2026-07-14
+Review date: 2026-07-15
 
 This runbook defines the reproducible gate for the traceability matrices in
 this folder.
@@ -54,15 +54,15 @@ cargo install cargo-audit --locked
 
 ## Current record
 
-This record is updated by the 2026-07-14 revision-45 implementation review.
+This record is updated by the 2026-07-15 revision-45 Windows metadata review.
 
 | Gate | Command | Result |
 |---|---|---|
 | Format | `cargo fmt --check` | Passed |
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| Workspace tests | `cargo test --workspace --all-features` | Passed: 705 tests across workspace suites; doc tests also passed |
+| Workspace tests | `cargo test --workspace --all-features --locked` | Passed: 711 tests across workspace suites; doc tests also passed |
 | Deterministic fuzz smoke | `cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked` | Passed: 39 deterministic seeds |
-| Dependency audit | `cargo audit` | Passed: 1160 advisories loaded, 231 locked dependencies scanned, no vulnerabilities or warnings reported after updating `anyhow` and `memmap2` |
+| Dependency audit | `cargo audit` | The 2026-07-14 audit passed with no vulnerabilities or warnings. The 2026-07-15 managed Windows rerun was host-blocked (`Access is denied` executing the installed `cargo-audit.exe`); the lockfile adds no package, only the already-locked `windows-sys 0.61.2` as a direct Windows dependency. |
 | Bounded libFuzzer extension | `cargo +nightly fuzz run --features libfuzzer <target> -- -max_total_time=60` | Host-limited in this review: Windows ARM64 lacks AddressSanitizer support; the emulated Windows x64 target compiled through the fuzz crates but could not link because `clang_rt.asan_dynamic_runtime_thunk-x86_64.lib` is not installed. The earlier 2026-06-20 results predate the current v45 metadata changes and are not treated as current evidence. |
 
 Tools installed during this local pass:

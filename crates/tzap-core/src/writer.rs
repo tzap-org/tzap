@@ -17,9 +17,10 @@ use crate::crypto::{
     Subkeys,
 };
 use crate::entry_metadata::{
-    encode_canonical_pax, is_source_os, parse_primary_metadata, portable_primary_pax,
-    valid_filesystem_token, ArchiveTimestamp, EXTENDED_METADATA_V1, HAS_NATIVE_METADATA,
-    REQUIRES_SYSTEM_RESTORE,
+    canonical_base64_encode, encode_canonical_pax, is_source_os, parse_auxiliary_record,
+    parse_primary_metadata, portable_primary_pax, valid_filesystem_token, validate_group_metadata,
+    ArchiveTimestamp, RestoreClass, EXTENDED_METADATA_V1, HAS_AUXILIARY_STREAMS,
+    HAS_NATIVE_METADATA, REQUIRES_SYSTEM_RESTORE,
 };
 use crate::fec::encode_parity_gf16;
 use crate::format::{
@@ -333,11 +334,58 @@ pub struct PortablePosixOwner {
 /// The writer validates the complete record set using the same parser as the
 /// reader. Callers supply only profile-owned native keys; portable identity,
 /// timestamps, paths, and the metadata declaration remain writer-owned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeAuxiliaryNameEncoding {
+    None,
+    Utf8,
+    Utf16Le,
+    Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeAuxiliaryMetadata {
+    pub kind: String,
+    pub profile: String,
+    pub restore_class: RestoreClass,
+    pub native: bool,
+    pub name_encoding: NativeAuxiliaryNameEncoding,
+    /// Exact decoded name bytes. UTF-16 names are little-endian code units.
+    pub name: Vec<u8>,
+    pub flags: u64,
+    pub logical_size: u64,
+    pub payload: Vec<u8>,
+    pub meta: BTreeMap<String, Vec<u8>>,
+}
+
+impl NativeAuxiliaryMetadata {
+    pub fn new(
+        kind: impl Into<String>,
+        profile: impl Into<String>,
+        restore_class: RestoreClass,
+        payload: Vec<u8>,
+    ) -> Self {
+        let logical_size = payload.len() as u64;
+        Self {
+            kind: kind.into(),
+            profile: profile.into(),
+            restore_class,
+            native: true,
+            name_encoding: NativeAuxiliaryNameEncoding::None,
+            name: Vec::new(),
+            flags: 0,
+            logical_size,
+            payload,
+            meta: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NativeFileMetadata {
     pub required_profiles: Vec<String>,
     pub optional_profiles: Vec<String>,
     pub primary_pax_records: BTreeMap<String, Vec<u8>>,
+    pub auxiliary_records: Vec<NativeAuxiliaryMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6585,8 +6633,25 @@ fn build_regular_file_member_prefix(
         pax_records.insert("mtime".into(), mtime.canonical_pax_value()?);
         0
     };
-    parse_primary_metadata(&pax_records).map_err(|_| {
+    let primary_metadata = parse_primary_metadata(&pax_records).map_err(|_| {
         FormatError::WriterUnsupported("native primary metadata is not a valid v45 declaration")
+    })?;
+    let mut parsed_auxiliary = Vec::with_capacity(portable_metadata.native.auxiliary_records.len());
+    for (ordinal, record) in portable_metadata
+        .native
+        .auxiliary_records
+        .iter()
+        .enumerate()
+    {
+        let ordinal = u32::try_from(ordinal).map_err(|_| {
+            FormatError::WriterUnsupported("auxiliary record count exceeds revision-45 range")
+        })?;
+        let (member, parsed) = build_native_auxiliary_member(ordinal, record)?;
+        out.extend_from_slice(&member);
+        parsed_auxiliary.push(parsed);
+    }
+    validate_group_metadata(&primary_metadata, &parsed_auxiliary).map_err(|_| {
+        FormatError::WriterUnsupported("native auxiliary metadata is not a valid v45 declaration")
     })?;
     let pax_payload = encode_canonical_pax(&pax_records)?;
     let pax_header = build_ustar_header(b"TZAP-PAX/PRIMARY", pax_payload.len() as u64, 0, 0, b'x')?;
@@ -6606,6 +6671,97 @@ fn build_regular_file_member_prefix(
     Ok(out)
 }
 
+fn build_native_auxiliary_member(
+    ordinal: u32,
+    record: &NativeAuxiliaryMetadata,
+) -> Result<(Vec<u8>, crate::entry_metadata::AuxiliaryRecord), FormatError> {
+    let mut pax_records = BTreeMap::new();
+    pax_records.insert("TZAP.aux.version".into(), b"1".to_vec());
+    pax_records.insert("TZAP.aux.kind".into(), record.kind.as_bytes().to_vec());
+    pax_records.insert(
+        "TZAP.aux.profile".into(),
+        record.profile.as_bytes().to_vec(),
+    );
+    pax_records.insert(
+        "TZAP.aux.restore-class".into(),
+        match record.restore_class {
+            RestoreClass::None => b"none".to_vec(),
+            RestoreClass::Portable => b"portable".to_vec(),
+            RestoreClass::SameOs => b"same-os".to_vec(),
+            RestoreClass::System => b"system".to_vec(),
+        },
+    );
+    pax_records.insert(
+        "TZAP.aux.native".into(),
+        if record.native { b"1" } else { b"0" }.to_vec(),
+    );
+    let (name_encoding, encoded_name) = match record.name_encoding {
+        NativeAuxiliaryNameEncoding::None => ("none", record.name.clone()),
+        NativeAuxiliaryNameEncoding::Utf8 => ("utf8", record.name.clone()),
+        NativeAuxiliaryNameEncoding::Utf16Le => {
+            ("utf16le-base64", canonical_base64_encode(&record.name))
+        }
+        NativeAuxiliaryNameEncoding::Bytes => {
+            ("bytes-base64", canonical_base64_encode(&record.name))
+        }
+    };
+    pax_records.insert(
+        "TZAP.aux.name-encoding".into(),
+        name_encoding.as_bytes().to_vec(),
+    );
+    pax_records.insert("TZAP.aux.name".into(), encoded_name);
+    pax_records.insert(
+        "TZAP.aux.flags".into(),
+        format!("{:016x}", record.flags).into_bytes(),
+    );
+    pax_records.insert(
+        "TZAP.aux.logical-size".into(),
+        record.logical_size.to_string().into_bytes(),
+    );
+    let digest = Sha256::digest(&record.payload);
+    pax_records.insert(
+        "TZAP.aux.sha256".into(),
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+            .into_bytes(),
+    );
+    for (key, value) in &record.meta {
+        if pax_records.insert(key.clone(), value.clone()).is_some() {
+            return Err(FormatError::WriterUnsupported(
+                "auxiliary metadata collides with a writer-owned key",
+            ));
+        }
+    }
+
+    let stored_size = record.payload.len() as u64;
+    let header_size = if tar_octal_fits(12, stored_size) {
+        stored_size
+    } else {
+        pax_records.insert("size".into(), stored_size.to_string().into_bytes());
+        0
+    };
+    let parsed = parse_auxiliary_record(&pax_records, ordinal, stored_size, &record.payload)
+        .map_err(|_| {
+            FormatError::WriterUnsupported("native auxiliary metadata is not canonical")
+        })?;
+    let pax_payload = encode_canonical_pax(&pax_records)?;
+    let pax_label = format!("TZAP-PAX/AUX/{ordinal:08x}");
+    let pax_header =
+        build_ustar_header(pax_label.as_bytes(), pax_payload.len() as u64, 0, 0, b'x')?;
+    let auxiliary_label = format!("TZAP-AUX/{ordinal:08x}");
+    let auxiliary_header = build_ustar_header(auxiliary_label.as_bytes(), header_size, 0, 0, b'Z')?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&pax_header);
+    out.extend_from_slice(&pax_payload);
+    out.resize(out.len() + padding_to_512(pax_payload.len()), 0);
+    out.extend_from_slice(&auxiliary_header);
+    out.extend_from_slice(&record.payload);
+    out.resize(out.len() + padding_to_512(record.payload.len()), 0);
+    Ok((out, parsed))
+}
+
 fn merge_native_primary_metadata(
     pax_records: &mut crate::entry_metadata::PaxRecords,
     native: &NativeFileMetadata,
@@ -6613,6 +6769,7 @@ fn merge_native_primary_metadata(
     if native.required_profiles.is_empty()
         && native.optional_profiles.is_empty()
         && native.primary_pax_records.is_empty()
+        && native.auxiliary_records.is_empty()
     {
         return Ok(());
     }
@@ -6775,9 +6932,19 @@ fn path_requires_pax(path: &[u8]) -> bool {
 
 fn v45_portable_file_entry_flags(mode: u32, metadata: &PortableFileMetadata) -> u32 {
     EXTENDED_METADATA_V1
+        | if metadata.native.auxiliary_records.is_empty() {
+            0
+        } else {
+            HAS_AUXILIARY_STREAMS
+        }
         | if !metadata.native.required_profiles.is_empty()
             || !metadata.native.optional_profiles.is_empty()
             || !metadata.native.primary_pax_records.is_empty()
+            || metadata
+                .native
+                .auxiliary_records
+                .iter()
+                .any(|record| record.native)
         {
             HAS_NATIVE_METADATA
         } else {
@@ -6786,6 +6953,11 @@ fn v45_portable_file_entry_flags(mode: u32, metadata: &PortableFileMetadata) -> 
         | if mode & 0o6000 != 0
             || metadata.posix_owner.is_some()
             || native_metadata_requires_system_restore(&metadata.native, &metadata.source_os)
+            || metadata
+                .native
+                .auxiliary_records
+                .iter()
+                .any(|record| record.restore_class == RestoreClass::System)
         {
             REQUIRES_SYSTEM_RESTORE
         } else {
@@ -7579,6 +7751,46 @@ mod tests {
         );
         assert_ne!(
             parsed.v45_metadata.file_entry_flags & HAS_NATIVE_METADATA,
+            0
+        );
+    }
+
+    #[test]
+    fn regular_file_writer_emits_valid_native_auxiliary_metadata() {
+        let mut native = NativeFileMetadata {
+            required_profiles: vec!["posix-backup-v1".into()],
+            ..NativeFileMetadata::default()
+        };
+        let mut auxiliary = NativeAuxiliaryMetadata::new(
+            "generic.xattr",
+            "posix-backup-v1",
+            RestoreClass::SameOs,
+            b"large xattr value".to_vec(),
+        );
+        auxiliary.name_encoding = NativeAuxiliaryNameEncoding::Bytes;
+        auxiliary.name = b"user.large".to_vec();
+        native.auxiliary_records.push(auxiliary);
+        let metadata = PortableFileMetadata {
+            source_os: "linux".into(),
+            native,
+            ..PortableFileMetadata::default()
+        };
+
+        let group = build_regular_file_member_group(
+            b"native-aux.txt",
+            b"contents",
+            0o640,
+            ArchiveTimestamp::from_seconds(12),
+            &metadata,
+        )
+        .unwrap();
+        let parsed = parse_tar_member_group(&group, 4096).unwrap();
+
+        assert_eq!(parsed.v45_metadata.auxiliary.len(), 1);
+        assert_eq!(parsed.v45_metadata.auxiliary[0].kind, "generic.xattr");
+        assert_eq!(parsed.v45_metadata.auxiliary[0].decoded_name, b"user.large");
+        assert_ne!(
+            parsed.v45_metadata.file_entry_flags & HAS_AUXILIARY_STREAMS,
             0
         );
     }

@@ -64,6 +64,8 @@ use tzap_core::{
 };
 #[cfg(test)]
 use tzap_core::{MetadataDiagnosticStatus, MetadataOperation};
+#[cfg(windows)]
+use tzap_core::{NativeAuxiliaryMetadata, NativeAuxiliaryNameEncoding, RestoreClass};
 use tzap_plugin_keywrap::{
     dispatch_key_wrap_record, wrap_master_key_for_recipient,
     ArchiveIdentity as KeyWrapArchiveIdentity, KeyWrapOutcome, KeyWrapSuite, PrivateKeyLookup,
@@ -3089,6 +3091,18 @@ struct InputIdentity {
     ino: u64,
     #[cfg(windows)]
     creation_time_100ns: u64,
+    #[cfg(windows)]
+    last_access_time_100ns: u64,
+    #[cfg(windows)]
+    change_time_100ns: u64,
+    #[cfg(windows)]
+    file_attributes: u32,
+    #[cfg(windows)]
+    link_count: u64,
+    #[cfg(windows)]
+    volume_serial: u64,
+    #[cfg(windows)]
+    file_index: u64,
 }
 
 #[derive(Debug)]
@@ -3230,19 +3244,22 @@ fn collect_input_specs(paths: &[String]) -> Result<Vec<InputSpec>> {
             .with_context(|| format!("failed to collect input {path}"))?;
     }
     out.sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     reject_unrepresentable_selected_hardlinks(&out)?;
     Ok(out)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn reject_unrepresentable_selected_hardlinks(specs: &[InputSpec]) -> Result<()> {
     let mut selected_objects = BTreeMap::<(u64, u64), &str>::new();
     for spec in specs {
         if spec.identity.link_count < 2 {
             continue;
         }
+        #[cfg(unix)]
         let identity = (spec.identity.dev, spec.identity.ino);
+        #[cfg(windows)]
+        let identity = (spec.identity.volume_serial, spec.identity.file_index);
         if let Some(previous) = selected_objects.insert(identity, &spec.archive_path) {
             if previous != spec.archive_path {
                 bail!(
@@ -3314,9 +3331,18 @@ fn collect_one_input_spec(
     if !metadata.is_file() {
         bail!("unsupported input type {}", input.display());
     }
+    #[cfg(windows)]
+    reject_unsupported_windows_regular_file(&metadata, input)?;
     let archive_path = archive_path_to_string(archive_path)?;
-    let identity = input_identity(&metadata)
+    let mut identity = input_identity(&metadata)
         .with_context(|| format!("failed to identify input {}", input.display()))?;
+    #[cfg(windows)]
+    {
+        let file = File::open(input)
+            .with_context(|| format!("failed to open {} for identity capture", input.display()))?;
+        augment_windows_input_identity(&mut identity, &file)
+            .with_context(|| format!("failed to identify Windows input {}", input.display()))?;
+    }
     let portable_metadata = portable_input_metadata(identity, input)?;
     out.push(InputSpec {
         source: input.to_owned(),
@@ -3386,15 +3412,91 @@ fn input_identity(metadata: &fs::Metadata) -> io::Result<InputIdentity> {
             use std::os::windows::fs::MetadataExt;
             metadata.creation_time()
         },
+        #[cfg(windows)]
+        last_access_time_100ns: {
+            use std::os::windows::fs::MetadataExt;
+            metadata.last_access_time()
+        },
+        #[cfg(windows)]
+        change_time_100ns: 0,
+        #[cfg(windows)]
+        file_attributes: {
+            use std::os::windows::fs::MetadataExt;
+            metadata.file_attributes()
+        },
+        #[cfg(windows)]
+        link_count: 0,
+        #[cfg(windows)]
+        volume_serial: 0,
+        #[cfg(windows)]
+        file_index: 0,
     })
 }
 
 fn validate_opened_input_identity(file: &File, expected: InputIdentity) -> io::Result<()> {
     let actual_metadata = file.metadata()?;
-    let actual = input_identity(&actual_metadata)?;
-    if actual != expected {
+    let mut actual = input_identity(&actual_metadata)?;
+    #[cfg(windows)]
+    augment_windows_input_identity(&mut actual, file)?;
+    if !input_identity_matches_after_read(expected, actual) {
         return Err(io::Error::other("input changed after scan"));
     }
+    Ok(())
+}
+
+fn input_identity_matches_after_read(expected: InputIdentity, actual: InputIdentity) -> bool {
+    #[cfg(windows)]
+    {
+        let mut expected = expected;
+        let mut actual = actual;
+        // Opening and reading the file may update LastAccessTime. Preserve the pre-read value in
+        // the archive, but exclude this self-induced field from the final source identity check.
+        expected.last_access_time_100ns = 0;
+        actual.last_access_time_100ns = 0;
+        expected == actual
+    }
+    #[cfg(not(windows))]
+    {
+        expected == actual
+    }
+}
+
+#[cfg(windows)]
+fn augment_windows_input_identity(identity: &mut InputIdentity, file: &File) -> io::Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO,
+    };
+
+    let handle = file.as_raw_handle().cast();
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: `handle` is live and both output pointers reference correctly sized structures.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut by_handle = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is live and `by_handle` is a valid writable output structure.
+    if unsafe { GetFileInformationByHandle(handle, &mut by_handle) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    identity.creation_time_100ns = basic.CreationTime as u64;
+    identity.last_access_time_100ns = basic.LastAccessTime as u64;
+    identity.change_time_100ns = basic.ChangeTime as u64;
+    identity.file_attributes = basic.FileAttributes;
+    identity.link_count = u64::from(by_handle.nNumberOfLinks);
+    identity.volume_serial = u64::from(by_handle.dwVolumeSerialNumber);
+    identity.file_index =
+        (u64::from(by_handle.nFileIndexHigh) << 32) | u64::from(by_handle.nFileIndexLow);
     Ok(())
 }
 
@@ -3442,14 +3544,17 @@ fn archive_timestamp(time: SystemTime) -> io::Result<ArchiveTimestamp> {
         )),
         Err(error) => {
             let duration = error.duration();
-            if duration.as_secs() == 0 && duration.subsec_nanos() != 0 {
-                return Err(io::Error::other(
-                    "input mtime between -1 and 0 cannot use canonical revision-45 encoding",
-                ));
-            }
-            let seconds = i64::try_from(-i128::from(duration.as_secs()))
+            let (seconds, nanoseconds) = if duration.subsec_nanos() == 0 {
+                (-i128::from(duration.as_secs()), 0)
+            } else {
+                (
+                    -i128::from(duration.as_secs()) - 1,
+                    1_000_000_000 - duration.subsec_nanos(),
+                )
+            };
+            let seconds = i64::try_from(seconds)
                 .map_err(|_| io::Error::other("input mtime exceeds revision-45 i64 range"))?;
-            Ok(ArchiveTimestamp::new(seconds, duration.subsec_nanos()))
+            Ok(ArchiveTimestamp::new(seconds, nanoseconds))
         }
     }
 }
@@ -3489,6 +3594,48 @@ fn archive_path_to_string(path: &Path) -> Result<String> {
         bail!("empty archive path");
     }
     Ok(parts.join("/"))
+}
+
+#[cfg(windows)]
+fn reject_unsupported_windows_regular_file(metadata: &fs::Metadata, input: &Path) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
+
+    let attributes = metadata.file_attributes();
+    if let Some(reason) = unsupported_windows_file_attribute_reason(attributes) {
+        bail!(
+            "Windows metadata capture does not support {}: {reason}",
+            input.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn unsupported_windows_file_attribute_reason(attributes: u32) -> Option<&'static str> {
+    const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
+    const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x0000_4000;
+    [
+        (
+            FILE_ATTRIBUTE_REPARSE_POINT,
+            "reparse points require exact reparse-data capture",
+        ),
+        (
+            FILE_ATTRIBUTE_SPARSE_FILE,
+            "sparse files require exact allocated-range framing",
+        ),
+        (
+            FILE_ATTRIBUTE_ENCRYPTED,
+            "EFS files require raw EFS callback capture",
+        ),
+        (
+            FILE_ATTRIBUTE_OFFLINE,
+            "offline/cloud placeholders require an explicit hydration policy",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(flag, reason)| (attributes & flag != 0).then_some(reason))
 }
 
 #[cfg(unix)]
@@ -3627,7 +3774,497 @@ fn capture_native_file_metadata(
     Ok(native)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn capture_native_file_metadata(
+    input: &Path,
+    identity: InputIdentity,
+) -> Result<NativeFileMetadata> {
+    let file = File::open(input).with_context(|| {
+        format!(
+            "failed to open {} for Windows metadata capture",
+            input.display()
+        )
+    })?;
+    let mut native = NativeFileMetadata::default();
+    native.primary_pax_records.insert(
+        "TZAP.windows.file-attributes".into(),
+        format!("{:08x}", identity.file_attributes).into_bytes(),
+    );
+    native.primary_pax_records.insert(
+        "atime".into(),
+        windows_filetime_timestamp(identity.last_access_time_100ns)?
+            .canonical_pax_value()
+            .map_err(|error| anyhow!(error))?,
+    );
+    native.primary_pax_records.insert(
+        "LIBARCHIVE.creationtime".into(),
+        windows_filetime_timestamp(identity.creation_time_100ns)?
+            .canonical_pax_value()
+            .map_err(|error| anyhow!(error))?,
+    );
+    native.primary_pax_records.insert(
+        "TZAP.windows.change-time".into(),
+        windows_filetime_timestamp(identity.change_time_100ns)?
+            .canonical_pax_value()
+            .map_err(|error| anyhow!(error))?,
+    );
+    native
+        .auxiliary_records
+        .push(capture_windows_security_descriptor(&file)?);
+    let (data_stream_attributes, mut streams) = capture_windows_backup_streams(&file)?;
+    native.primary_pax_records.insert(
+        "TZAP.windows.data-stream-attributes".into(),
+        format!("{data_stream_attributes:08x}").into_bytes(),
+    );
+    native.auxiliary_records.append(&mut streams);
+    native.auxiliary_records.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    native.required_profiles.push("windows-backup-v1".into());
+    Ok(native)
+}
+
+#[cfg(windows)]
+fn windows_filetime_timestamp(value_100ns: u64) -> Result<ArchiveTimestamp> {
+    const WINDOWS_TO_UNIX_EPOCH_100NS: i128 = 116_444_736_000_000_000;
+    const TICKS_PER_SECOND: i128 = 10_000_000;
+    let unix_100ns = i128::from(value_100ns) - WINDOWS_TO_UNIX_EPOCH_100NS;
+    let seconds = i64::try_from(unix_100ns.div_euclid(TICKS_PER_SECOND))
+        .map_err(|_| anyhow!("Windows timestamp exceeds revision-45 i64 range"))?;
+    let nanoseconds = (unix_100ns.rem_euclid(TICKS_PER_SECOND) * 100) as u32;
+    Ok(ArchiveTimestamp::new(seconds, nanoseconds))
+}
+
+#[cfg(windows)]
+fn windows_sacl_capture_enabled() -> bool {
+    use std::ptr;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, SE_SECURITY_NAME,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let mut token = ptr::null_mut();
+        // SAFETY: `token` is a valid output pointer and the pseudo process handle is always live.
+        if unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+                &mut token,
+            )
+        } == 0
+        {
+            return false;
+        }
+        let enabled = {
+            let mut privileges = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                ..Default::default()
+            };
+            // SAFETY: the one-element privilege array provides a valid LUID output slot.
+            if unsafe {
+                LookupPrivilegeValueW(
+                    ptr::null(),
+                    SE_SECURITY_NAME,
+                    &mut privileges.Privileges[0].Luid,
+                )
+            } == 0
+            {
+                false
+            } else {
+                privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                // AdjustTokenPrivileges can report success while setting ERROR_NOT_ALL_ASSIGNED;
+                // clearing and checking last-error is the documented capability test used here.
+                unsafe { SetLastError(ERROR_SUCCESS) };
+                // SAFETY: `token` is live and `privileges` is a valid one-entry input structure.
+                unsafe {
+                    AdjustTokenPrivileges(
+                        token,
+                        0,
+                        &privileges,
+                        0,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                    ) != 0
+                        && GetLastError() == ERROR_SUCCESS
+                }
+            }
+        };
+        // SAFETY: `token` was returned by OpenProcessToken and is closed exactly once.
+        unsafe { CloseHandle(token) };
+        enabled
+    })
+}
+
+#[cfg(windows)]
+fn capture_windows_security_descriptor(file: &File) -> Result<NativeAuxiliaryMetadata> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, LocalFree, ERROR_SUCCESS, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorLength, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, SACL_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        ReOpenFile, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+    };
+    use windows_sys::Win32::System::SystemServices::ACCESS_SYSTEM_SECURITY;
+
+    const BASE_SECURITY_INFORMATION: u32 =
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let original_handle = file.as_raw_handle().cast();
+    let sacl_handle = if windows_sacl_capture_enabled() {
+        // The handle returned by File::open has READ_CONTROL but not ACCESS_SYSTEM_SECURITY.
+        // ReOpenFile preserves object identity while requesting the access needed for SACLs.
+        // SAFETY: `original_handle` is live and all flags are valid for a regular file.
+        let handle = unsafe {
+            ReOpenFile(
+                original_handle,
+                READ_CONTROL | ACCESS_SYSTEM_SECURITY,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+            )
+        };
+        (handle != INVALID_HANDLE_VALUE).then_some(handle)
+    } else {
+        None
+    };
+    let security_information = if sacl_handle.is_some() {
+        BASE_SECURITY_INFORMATION | SACL_SECURITY_INFORMATION
+    } else {
+        BASE_SECURITY_INFORMATION
+    };
+    let security_handle = sacl_handle.unwrap_or(original_handle);
+    let mut descriptor = ptr::null_mut();
+    // SAFETY: the file handle is live, optional component outputs are null, and the returned
+    // descriptor is released with LocalFree below as required by GetSecurityInfo.
+    let status = unsafe {
+        GetSecurityInfo(
+            security_handle,
+            SE_FILE_OBJECT,
+            security_information,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if let Some(handle) = sacl_handle {
+        // SAFETY: `handle` was returned by ReOpenFile and is closed exactly once.
+        unsafe { CloseHandle(handle) };
+    }
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status as i32).into());
+    }
+    if descriptor.is_null() {
+        bail!("GetSecurityInfo returned an empty security descriptor");
+    }
+    // SAFETY: GetSecurityInfo returned a valid self-relative security descriptor.
+    let length = unsafe { GetSecurityDescriptorLength(descriptor) } as usize;
+    // SAFETY: `descriptor` references `length` readable bytes until LocalFree.
+    let payload = unsafe { std::slice::from_raw_parts(descriptor.cast::<u8>(), length) }.to_vec();
+    // SAFETY: `descriptor` was allocated by GetSecurityInfo and has not been freed.
+    let free_result = unsafe { LocalFree(descriptor) };
+    if !free_result.is_null() {
+        bail!("failed to release Windows security descriptor");
+    }
+    if payload.len() < 20 {
+        bail!("GetSecurityInfo returned a truncated self-relative descriptor");
+    }
+    let control = u16::from_le_bytes(payload[2..4].try_into().unwrap());
+    let owner_offset = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+    let group_offset = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+    let mut captured_security_information = 0u32;
+    if owner_offset != 0 {
+        captured_security_information |= OWNER_SECURITY_INFORMATION;
+    }
+    if group_offset != 0 {
+        captured_security_information |= GROUP_SECURITY_INFORMATION;
+    }
+    if control & 0x0004 != 0 {
+        captured_security_information |= DACL_SECURITY_INFORMATION;
+    }
+    if control & 0x0010 != 0 {
+        captured_security_information |= SACL_SECURITY_INFORMATION;
+    }
+    let required_identity = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION;
+    if captured_security_information & required_identity != required_identity {
+        bail!("Windows security descriptor lacks requested owner or group metadata");
+    }
+    let mut auxiliary = NativeAuxiliaryMetadata::new(
+        "windows.security-descriptor",
+        "windows-backup-v1",
+        RestoreClass::System,
+        payload,
+    );
+    auxiliary.meta.insert(
+        "TZAP.aux.meta.security-information".into(),
+        format!("{captured_security_information:08x}").into_bytes(),
+    );
+    Ok(auxiliary)
+}
+
+#[cfg(windows)]
+struct WindowsBackupReader {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    context: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+impl WindowsBackupReader {
+    fn new(file: &File) -> Self {
+        use std::os::windows::io::AsRawHandle;
+        Self {
+            handle: file.as_raw_handle().cast(),
+            context: std::ptr::null_mut(),
+        }
+    }
+
+    fn read_optional_exact(&mut self, out: &mut [u8]) -> io::Result<bool> {
+        use windows_sys::Win32::Storage::FileSystem::BackupRead;
+
+        let mut offset = 0usize;
+        while offset < out.len() {
+            let mut read = 0u32;
+            // SAFETY: the handle is live, the output slice is writable, and `context` is owned
+            // by this reader until its Drop implementation aborts the backup operation.
+            if unsafe {
+                BackupRead(
+                    self.handle,
+                    out[offset..].as_mut_ptr(),
+                    u32::try_from(out.len() - offset)
+                        .map_err(|_| io::Error::other("BackupRead request exceeds u32"))?,
+                    &mut read,
+                    0,
+                    0,
+                    &mut self.context,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if read == 0 {
+                if offset == 0 {
+                    return Ok(false);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Windows backup stream ended mid-record",
+                ));
+            }
+            offset += read as usize;
+        }
+        Ok(true)
+    }
+
+    fn read_vec(&mut self, size: u64) -> io::Result<Vec<u8>> {
+        let size = usize::try_from(size)
+            .map_err(|_| io::Error::other("Windows backup stream exceeds address space"))?;
+        let mut payload = vec![0u8; size];
+        if size != 0 && !self.read_optional_exact(&mut payload)? {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Windows backup stream payload is missing",
+            ));
+        }
+        Ok(payload)
+    }
+
+    fn skip(&mut self, size: u64) -> io::Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::BackupSeek;
+
+        let mut low = 0u32;
+        let mut high = 0u32;
+        // SAFETY: the handle and context belong to this backup operation and output counters
+        // are valid writable pointers.
+        if unsafe {
+            BackupSeek(
+                self.handle,
+                size as u32,
+                (size >> 32) as u32,
+                &mut low,
+                &mut high,
+                &mut self.context,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let skipped = (u64::from(high) << 32) | u64::from(low);
+        if skipped != size {
+            return Err(io::Error::other(
+                "Windows backup stream could not be skipped completely",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsBackupReader {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Storage::FileSystem::BackupRead;
+
+        let mut ignored = 0u32;
+        // SAFETY: aborting with a null zero-length buffer releases the context owned here.
+        unsafe {
+            BackupRead(
+                self.handle,
+                std::ptr::null_mut(),
+                0,
+                &mut ignored,
+                1,
+                0,
+                &mut self.context,
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+fn capture_windows_backup_streams(file: &File) -> Result<(u32, Vec<NativeAuxiliaryMetadata>)> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        BACKUP_ALTERNATE_DATA, BACKUP_DATA, BACKUP_EA_DATA, BACKUP_LINK, BACKUP_OBJECT_ID,
+        BACKUP_PROPERTY_DATA, BACKUP_REPARSE_DATA, BACKUP_SECURITY_DATA, BACKUP_SPARSE_BLOCK,
+        BACKUP_TXFS_DATA,
+    };
+
+    const FIXED_STREAM_HEADER_LEN: usize = 20;
+    let mut reader = WindowsBackupReader::new(file);
+    let mut data_stream_attributes = None;
+    let mut auxiliary = Vec::new();
+    loop {
+        let mut header = [0u8; FIXED_STREAM_HEADER_LEN];
+        if !reader.read_optional_exact(&mut header)? {
+            break;
+        }
+        let stream_id = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        let attributes = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let signed_size = i64::from_le_bytes(header[8..16].try_into().unwrap());
+        if signed_size < 0 {
+            bail!("Windows BackupRead returned a negative stream size");
+        }
+        let size = signed_size as u64;
+        let name_size = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        if name_size % 2 != 0 {
+            bail!("Windows BackupRead returned an odd UTF-16 stream-name length");
+        }
+        let name = reader.read_vec(name_size as u64)?;
+        match stream_id {
+            BACKUP_DATA => {
+                if data_stream_attributes.replace(attributes).is_some() {
+                    bail!("Windows BackupRead returned duplicate default data streams");
+                }
+                if !name.is_empty() {
+                    bail!("Windows default data stream unexpectedly has a name");
+                }
+                reader.skip(size)?;
+            }
+            BACKUP_SECURITY_DATA => reader.skip(size)?,
+            BACKUP_ALTERNATE_DATA => {
+                let payload = reader.read_vec(size)?;
+                let mut record = NativeAuxiliaryMetadata::new(
+                    "windows.alternate-data",
+                    "windows-backup-v1",
+                    if attributes & 0x0000_0002 != 0 {
+                        RestoreClass::System
+                    } else {
+                        RestoreClass::SameOs
+                    },
+                    payload,
+                );
+                record.name_encoding = NativeAuxiliaryNameEncoding::Utf16Le;
+                record.name = name;
+                record
+                    .meta
+                    .insert("TZAP.aux.meta.stream-type".into(), b"00000004".to_vec());
+                record.meta.insert(
+                    "TZAP.aux.meta.stream-attributes".into(),
+                    format!("{attributes:08x}").into_bytes(),
+                );
+                if attributes & 0x0000_0008 != 0 {
+                    bail!("sparse Windows alternate streams are not yet supported");
+                }
+                auxiliary.push(record);
+            }
+            BACKUP_EA_DATA | BACKUP_PROPERTY_DATA | BACKUP_OBJECT_ID => {
+                if !name.is_empty() {
+                    bail!("unnamed Windows backup stream unexpectedly has a name");
+                }
+                let payload = reader.read_vec(size)?;
+                let (kind, stream_type, restore_class) = match stream_id {
+                    BACKUP_EA_DATA => (
+                        "windows.ea-data",
+                        "00000002",
+                        if attributes & 0x0000_0002 != 0 {
+                            RestoreClass::System
+                        } else {
+                            RestoreClass::SameOs
+                        },
+                    ),
+                    BACKUP_PROPERTY_DATA => (
+                        "windows.property-data",
+                        "00000006",
+                        if attributes & 0x0000_0002 != 0 {
+                            RestoreClass::System
+                        } else {
+                            RestoreClass::SameOs
+                        },
+                    ),
+                    _ => ("windows.object-id", "00000007", RestoreClass::System),
+                };
+                let mut record =
+                    NativeAuxiliaryMetadata::new(kind, "windows-backup-v1", restore_class, payload);
+                record.meta.insert(
+                    "TZAP.aux.meta.stream-type".into(),
+                    stream_type.as_bytes().to_vec(),
+                );
+                record.meta.insert(
+                    "TZAP.aux.meta.stream-attributes".into(),
+                    format!("{attributes:08x}").into_bytes(),
+                );
+                if attributes & 0x0000_0008 != 0 {
+                    bail!("sparse Windows metadata streams are not yet supported");
+                }
+                auxiliary.push(record);
+            }
+            BACKUP_REPARSE_DATA => {
+                bail!("Windows reparse streams require reparse-point writer support")
+            }
+            BACKUP_SPARSE_BLOCK => {
+                bail!("Windows sparse streams require sparse writer support")
+            }
+            BACKUP_LINK => bail!("Windows hardlink streams require hardlink writer support"),
+            BACKUP_TXFS_DATA => {
+                bail!("Windows transactional backup streams are not representable in v45")
+            }
+            _ => bail!("Windows BackupRead returned unsupported stream id {stream_id}"),
+        }
+    }
+    let data_stream_attributes = match data_stream_attributes {
+        Some(attributes) => attributes,
+        // BackupRead may omit BACKUP_DATA entirely for a zero-length unnamed stream. Successful
+        // enumeration still proves there are no stream attributes to preserve in that case.
+        None if file.metadata()?.len() == 0 => 0,
+        None => bail!("Windows BackupRead did not return the default data stream"),
+    };
+    if data_stream_attributes & 0x0000_0008 != 0 {
+        bail!("sparse Windows default streams require sparse writer support");
+    }
+    Ok((data_stream_attributes, auxiliary))
+}
+
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 fn capture_native_file_metadata(
     _input: &Path,
     _identity: InputIdentity,
@@ -7212,7 +7849,7 @@ mod tests {
         assert_eq!(layout.block_size, 64 * 1024);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn create_rejects_selected_hardlinks_when_topology_cannot_be_emitted() {
         let temp = tempfile::tempdir().unwrap();
@@ -7606,5 +8243,135 @@ mod tests {
         assert!(native
             .primary_pax_records
             .contains_key("TZAP.unix.ctime-observed"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capture_rejects_metadata_classes_that_are_not_exactly_supported() {
+        for attributes in [0x0000_0200, 0x0000_0400, 0x0000_1000, 0x0000_4000] {
+            assert!(unsupported_windows_file_attribute_reason(attributes).is_some());
+        }
+        assert_eq!(unsupported_windows_file_attribute_reason(0x20), None);
+    }
+
+    #[test]
+    fn archive_timestamp_canonicalizes_fractional_pre_epoch_times() {
+        assert_eq!(
+            archive_timestamp(UNIX_EPOCH - Duration::new(0, 100)).unwrap(),
+            ArchiveTimestamp::new(-1, 999_999_900)
+        );
+        assert_eq!(
+            archive_timestamp(UNIX_EPOCH - Duration::new(1, 500_000_000)).unwrap(),
+            ArchiveTimestamp::new(-2, 500_000_000)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_filetime_conversion_preserves_100ns_precision() {
+        const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
+        assert_eq!(
+            windows_filetime_timestamp(UNIX_EPOCH_FILETIME + 12_345_678).unwrap(),
+            ArchiveTimestamp::new(1, 234_567_800)
+        );
+        assert_eq!(
+            windows_filetime_timestamp(UNIX_EPOCH_FILETIME - 1).unwrap(),
+            ArchiveTimestamp::new(-1, 999_999_900)
+        );
+        assert_eq!(
+            windows_filetime_timestamp(0).unwrap(),
+            ArchiveTimestamp::new(-11_644_473_600, 0)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn filesystem_scan_captures_windows_scalars_security_and_alternate_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("native.txt");
+        fs::write(&path, b"payload").unwrap();
+        let alternate_path = PathBuf::from(format!("{}:tzap-test", path.display()));
+        fs::write(&alternate_path, b"alternate metadata").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let mut identity = input_identity(&metadata).unwrap();
+        let file = File::open(&path).unwrap();
+        augment_windows_input_identity(&mut identity, &file).unwrap();
+
+        let native = capture_native_file_metadata(&path, identity).unwrap();
+
+        assert_eq!(native.required_profiles, vec!["windows-backup-v1"]);
+        for key in [
+            "atime",
+            "LIBARCHIVE.creationtime",
+            "TZAP.windows.change-time",
+            "TZAP.windows.file-attributes",
+            "TZAP.windows.data-stream-attributes",
+        ] {
+            assert!(native.primary_pax_records.contains_key(key), "{key}");
+        }
+        let security = native
+            .auxiliary_records
+            .iter()
+            .find(|record| record.kind == "windows.security-descriptor")
+            .unwrap();
+        let security_mask = u32::from_str_radix(
+            std::str::from_utf8(&security.meta["TZAP.aux.meta.security-information"]).unwrap(),
+            16,
+        )
+        .unwrap();
+        assert_eq!(security_mask & 0x3, 0x3);
+        assert_eq!(security_mask & !0xf, 0);
+        let alternate = native
+            .auxiliary_records
+            .iter()
+            .find(|record| record.kind == "windows.alternate-data")
+            .unwrap();
+        assert_eq!(alternate.payload, b"alternate metadata");
+        assert_eq!(
+            alternate.name,
+            ":tzap-test:$DATA"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+
+        let specs = collect_input_specs(&[path.to_string_lossy().into_owned()]).unwrap();
+        let mut checked_reader = specs[0].open().unwrap();
+        let mut checked_payload = Vec::new();
+        checked_reader.read_to_end(&mut checked_payload).unwrap();
+        assert_eq!(checked_payload, b"payload");
+
+        let portable_metadata = PortableFileMetadata {
+            source_os: "windows".into(),
+            source_filesystem: "unknown".into(),
+            mode_origin: PortableModeOrigin::Projected,
+            posix_owner: None,
+            attributes: identity.attributes,
+            native,
+        };
+        let archive = write_archive(
+            &[RegularFile {
+                path: "native.txt",
+                contents: b"payload",
+                mode: identity.mode,
+                mtime: identity.mtime,
+                portable_metadata,
+            }],
+            &MasterKey::from_raw_key(&[7u8; 32]).unwrap(),
+            WriterOptions {
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+        )
+        .unwrap();
+        tzap_core::open_archive(
+            &archive.bytes,
+            &MasterKey::from_raw_key(&[7u8; 32]).unwrap(),
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
     }
 }

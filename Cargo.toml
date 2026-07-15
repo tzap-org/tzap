@@ -47,6 +47,7 @@ unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4"] }
 xattr = "1.6"
 x509-parser = "0.18"
+windows-sys = "0.61.2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 zstd = { version = "0.13", features = ["zstdmt"] }
 zstd-safe = "7"

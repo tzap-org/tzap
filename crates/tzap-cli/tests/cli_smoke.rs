@@ -3105,8 +3105,8 @@ fn cli_verify_json_success_reports_machine_readable_summary() {
     assert!(metadata.get("capture_complete").unwrap().as_bool().unwrap());
     let expected_profiles = if cfg!(target_os = "linux") {
         serde_json::json!(["linux-backup-v1", "portable-v1", "posix-backup-v1"])
-    } else if cfg!(unix) {
-        serde_json::json!(["portable-v1", "posix-backup-v1"])
+    } else if cfg!(windows) {
+        serde_json::json!(["portable-v1", "windows-backup-v1"])
     } else {
         serde_json::json!(["portable-v1"])
     };

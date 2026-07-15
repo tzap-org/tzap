@@ -553,26 +553,73 @@ What to do:
 ## Tar metadata profile
 
 The v0.45 CLI create path emits complete `portable-v1` regular-file member
-groups. Every group starts with the mandatory canonical
-`TZAP-PAX/PRIMARY` record, followed by the primary ustar entry. Archive paths
+groups. After zero or more auxiliary member pairs, every group ends with the
+mandatory canonical `TZAP-PAX/PRIMARY` record followed by the primary ustar
+entry. Archive paths
 are normalized safe relative NFC UTF-8 paths using `/` separators. The writer
 captures source mtimes as signed Unix seconds plus nanoseconds, uses canonical
 PAX `mtime` whenever the value is pre-epoch, too large for ustar, or has a
 fraction, and rechecks size, mode, and mtime after the final source read.
 Filesystem inputs also preserve native-vs-projected mode origin, POSIX numeric
 UID/GID where applicable, and the Windows readonly/hidden/system/archive
-portable projection. Linux regular-file creation additionally captures readable
-extended attributes, observed ctime, available creation time, and source-native
-profiles. It captures the exact inode-flag scalar and converts
-Linux POSIX ACL xattrs to canonical `SCHILY.acl.*` records rather than
-duplicating filesystem-internal ACL xattrs. These values participate in the
-same final identity recheck. Library writers expose native primary-PAX records
-through `NativeFileMetadata` and timestamps through `ArchiveTimestamp`. The
-writer does not emit global PAX state, GNU long-name
+portable projection. Native regular-file capture currently has these platform
+boundaries:
+
+| Capture host | Captured for accepted regular files | Rejected or not captured |
+|---|---|---|
+| Linux | Numeric ownership, readable xattrs, canonical POSIX.1e ACLs, observed ctime, available creation time, and exact Linux inode flags. | Standalone directories, symlinks, special objects, selected hardlink aliases, and xattrs that make the bounded primary PAX record unrepresentable. |
+| Windows | Creation, access, write, and change times at 100-ns precision, including pre-1970 values; exact file and default-data-stream attributes; owner/group/DACL self-relative security descriptor plus SACL when `SeSecurityPrivilege` is available; alternate data streams; EA data; property data; and object IDs returned by the documented backup-stream API. | Reparse points, sparse files/streams, raw EFS, offline/cloud placeholders, hardlink streams or selected aliases, transactional/unknown backup streams, standalone directories, and symlinks. These cases fail creation instead of weakening `capture-status=complete`. |
+| macOS and other POSIX hosts | Portable regular-file fields only. | Source-native profile capture is not yet implemented. |
+
+Linux POSIX ACL backing xattrs are converted to canonical `SCHILY.acl.*`
+records rather than duplicated as generic xattrs. Windows auxiliary payloads
+are emitted as revision-45 `Z` members and hashed exactly; security descriptors
+always use the captured `OWNER_SECURITY_INFORMATION`,
+`GROUP_SECURITY_INFORMATION`, and `DACL_SECURITY_INFORMATION` mask and add
+`SACL_SECURITY_INFORMATION` when the process can enable `SeSecurityPrivilege`
+and reopen the same file object with `ACCESS_SYSTEM_SECURITY`.
+Windows `LastAccessTime` is preserved
+from the pre-content-read scan but is excluded from the final identity
+comparison because the writer's own read may update it. Stable Windows identity
+fields, including change time, attributes, file ID, link count, and volume
+identity, are rechecked after the source read.
+
+Library writers expose native primary-PAX and auxiliary records through
+`NativeFileMetadata`, `NativeAuxiliaryMetadata`, and timestamps through
+`ArchiveTimestamp`. The writer does not emit global PAX state, GNU long-name
 records, legacy sparse formats, or the tar two-zero-block end marker.
-On Unix, create rejects two selected paths that resolve to the same hardlinked
+On Unix and Windows, create rejects two selected paths that resolve to the same hardlinked
 filesystem object because this regular-file-only writer cannot yet emit their
 topology without weakening the complete-capture declaration.
+
+### Windows comparison with 7-Zip 26.01
+
+The locally available 7-Zip 26.01 source is the reproducible Windows metadata
+baseline for this review. The comparison follows its update scanner and
+callbacks (`EnumDirItems`, `UpdateCallback`, `FileFind`, and
+`ArchiveExtractCallback`) and its optional `-sns`, `-sni`, `-snh`, and `-snl`
+paths. WinRAR is proprietary and no inspectable WinRAR source or test corpus was
+provided, so this document does not claim an internal WinRAR equivalence.
+
+| Windows capability | tzap create capture | 7-Zip 26.01 source baseline | Assessment |
+|---|---|---|---|
+| Regular-file times and attributes | Creation, access, write, and change times plus exact file and data-stream attributes | Creation, access, write times and Windows attributes | Meets or exceeds for accepted regular files; tzap additionally records change time and default-stream attributes. |
+| NT security | Owner, group, and DACL; SACL when `SeSecurityPrivilege` can be enabled | Owner, group, and DACL with `-sni`; SACL under the same privilege condition | Capture parity. tzap native application on restore is not implemented. |
+| Alternate data streams | Exact UTF-16 stream name, bytes, and stream attributes | Named streams with `-sns` | Capture parity or better for stream attributes. |
+| Other backup streams | EA, property, and object-ID streams returned by `BackupRead` | No corresponding capture path identified in the reviewed scanner | Additional tzap capture for accepted regular files. |
+| Hard-link topology | Detects and rejects selected aliases and `BACKUP_LINK` | Preserves topology with `-snh`, keyed by volume and file ID | Gap: needs multi-entry writer topology and restore support. |
+| Reparse points and symlinks | Detects and rejects them | Stores exact reparse data with `-snl` | Gap: needs non-regular member emission, safe path-graph policy, and restore support. |
+| Standalone directories | Scanner omits them | Stores directory entries and their metadata | Gap: needs directory member emission and post-order metadata finalization. |
+| Sparse files, EFS, and offline/cloud placeholders | Detects and rejects them | Not used as a parity claim here | Deliberately unsupported until exact sparse/raw-EFS semantics and on-host restore tests exist. |
+
+Consequently, tzap now reaches the reviewed 7-Zip metadata capture level for an
+accepted ordinary Windows regular file, and captures some extra `BackupRead`
+stream classes. It does **not** yet reach 7-Zip's end-to-end filesystem-object
+support because directory, hard-link, reparse/symlink, and native Windows
+restore paths remain absent. Auxiliary payloads are currently buffered in
+memory by the writer API, so a file with very large alternate or metadata
+streams can require memory proportional to those streams; streaming auxiliary
+member emission is planned with the broader writer-object work.
 
 The core reader implements the revision-45 member-group grammar for regular
 files, directories, symlinks, hardlinks, character devices, block devices, and
@@ -632,17 +679,36 @@ surface tar metadata fidelity should use `list_files`, `extract_member`,
 - `tzap-core`: revision-45 Core reader and physical archive reader/writer for
   the documented archive workflows.
 - CLI/core writer: complete `portable-v1` regular-file emission plus declared
-  Linux regular-file native records. It does not claim the full Portable,
-  POSIX backup, or Linux backup reader/writer class because directory/link
-  capture and auxiliary native streams are not exposed by the current writer.
+  Linux regular-file native records and Windows regular-file primary/auxiliary
+  records listed above. It does not claim the full Portable, POSIX, Linux, or
+  Windows backup reader/writer class because directory/link/special capture,
+  several OS metadata classes, and full native restoration remain incomplete.
 - `tzap-plugin-keywrap`: `x509-hpke-recipient-v1` for revision 45.
 - `tzap-plugin-signing`: `ed25519-archiveroot-v1` and the revision-45 X.509
   RootAuth profile.
 - POSIX, Linux, macOS, and Windows backup reader/writer classes are not
   advertised. Linux regular-file ownership, xattrs, ACLs, and flags are
-  captured/applied as described above; macOS dedicated auxiliary records,
-  Windows backup streams/security metadata, and remaining non-regular-file
-  capture are still parser/validator-only.
+  captured/applied as described above. Windows ordinary regular-file metadata
+  and supported backup streams are captured, authenticated, parsed, and
+  preserved, but native Windows metadata application is not yet implemented.
+  macOS dedicated auxiliary capture and remaining non-regular-file capture are
+  still parser/validator-only.
+
+### Remaining native-platform implementation plan
+
+The next Windows work is exact reparse buffers/placeholders, sparse primary and
+named-stream ranges, raw EFS callbacks, directory case-sensitive state,
+standalone directory/link topology, streaming auxiliary payload emission, and
+policy-gated application of security descriptors, streams, attributes, and
+times. Each class needs an on-host capture/restore corpus before the full
+Windows backup reader/writer class can be advertised.
+
+The macOS writer needs Darwin flags, native ACL external form, FinderInfo,
+resource forks, birth time, quarantine/provenance xattrs, and APFS clone hints.
+The remaining POSIX/BSD writer work includes directories, symlinks, devices,
+FIFOs, hardlink topology, NFSv4 ACL implementations, native BSD flags, and
+large-xattr auxiliary fallback. Those implementations require their matching
+host CI or fixtures; Windows-only tests cannot establish their API fidelity.
 
 ## Cloud directory-prefix optimization
 
