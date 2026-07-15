@@ -4139,26 +4139,13 @@ fn apply_linux_inode_flags(
     let mut current: libc::c_long = 0;
     // SAFETY: these ioctls read/write one c_long through valid pointers and
     // operate on the live descriptor owned by `file`.
-    let get_result = unsafe {
-        libc::ioctl(
-            file.as_raw_fd(),
-            linux_raw_sys::ioctl::FS_IOC_GETFLAGS as libc::c_ulong,
-            &mut current,
-        )
-    };
+    let get_result = unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut current) };
     if get_result == 0 {
         let modifiable = u64::from(linux_raw_sys::general::FS_FL_USER_MODIFIABLE);
         let mut restored =
             ((current as u64 & !modifiable) | (desired & modifiable)) as libc::c_long;
         // SAFETY: as above, SETFLAGS reads the initialized c_long value.
-        if unsafe {
-            libc::ioctl(
-                file.as_raw_fd(),
-                linux_raw_sys::ioctl::FS_IOC_SETFLAGS as libc::c_ulong,
-                &mut restored,
-            )
-        } == 0
-        {
+        if unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &mut restored) } == 0 {
             return Ok(());
         }
     }
@@ -5215,7 +5202,7 @@ mod tests {
 
     #[test]
     fn rejects_global_gnu_headers() {
-        for typeflag in [b'V', b'M', b'N'] {
+        for typeflag in *b"VMN" {
             let bytes = member(b"global", typeflag, b"archive-label", b"");
 
             assert_eq!(

@@ -12411,13 +12411,7 @@ mod tests {
         let mut flags: libc::c_long = 0;
         // SAFETY: GETFLAGS writes one c_long to a valid pointer.
         assert_eq!(
-            unsafe {
-                libc::ioctl(
-                    file.as_raw_fd(),
-                    linux_raw_sys::ioctl::FS_IOC_GETFLAGS as libc::c_ulong,
-                    &mut flags,
-                )
-            },
+            unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags,) },
             0
         );
         assert_ne!(flags as u64 & 0x40, 0);
