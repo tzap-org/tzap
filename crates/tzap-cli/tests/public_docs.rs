@@ -501,6 +501,20 @@ fn public_docs_pin_tar_metadata_profile() {
 }
 
 #[test]
+fn cli_reference_explains_degraded_metadata_diagnostics() {
+    let reference = read_workspace_file("public-docs/tzap-cli-reference.md");
+    let boundaries = read_workspace_file("public-docs/tzap-operational-boundaries.md");
+
+    assert!(reference.contains("### Reading degraded-metadata diagnostics"));
+    assert!(reference.contains("PATH: PROFILE: CLASS: OPERATION/STATUS"));
+    assert!(reference.contains("Restore phases are:"));
+    assert!(reference.contains("| `1` | Regular files |"));
+    assert!(reference.contains("birth time or `btime`"));
+    assert!(reference.contains("it does not suppress command"));
+    assert!(boundaries.contains("#reading-degraded-metadata-diagnostics"));
+}
+
+#[test]
 fn traceability_materials_live_under_requested_folder_and_cover_claim_gates() {
     let root = workspace_root().join("public-docs").join("traceability");
     assert!(root.is_dir());

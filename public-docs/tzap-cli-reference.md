@@ -8,7 +8,8 @@ This document is a compact command reference for `tzap` operators and automation
 
 ## Global options
 
-- `--quiet`: suppress success summaries and standard success output
+- `--quiet`: suppress routine success output and non-fatal diagnostics;
+  command failures are still reported
 - `--verbose`: emit verbose diagnostics
 - `--help`: usage for current context
 
@@ -178,6 +179,8 @@ Useful flags:
   metadata restore policy; defaults to `portable`
 - `--allow-degraded`: explicitly permit requested but unsupported metadata or
   storage-layout fidelity to be skipped/materialized with diagnostics
+- `--quiet`: suppress routine success output and per-entry non-fatal metadata
+  diagnostics; extraction failures are still reported
 - `--bootstrap`: bootstrap sidecar path
 - `--recipient-key`: open a v45 RecipientWrap archive with a local recipient
   private key
@@ -219,6 +222,93 @@ Notes:
   records, and mode/mtime application failures are reported to stderr as
   `tzap: degraded-metadata: ...`. Global PAX/GNU state and unregistered local
   keys are rejected.
+
+### Reading degraded-metadata diagnostics
+
+With `--allow-degraded`, extraction continues when a requested metadata or
+storage-layout feature cannot be restored exactly. Each affected archive member
+normally produces a diagnostic on stderr in this form:
+
+```text
+tzap: degraded-metadata: PATH: PROFILE: CLASS: OPERATION/STATUS: MESSAGE [policy=POLICY phase=N]
+```
+
+For example:
+
+```text
+tzap: degraded-metadata: app/LICENSE.txt: linux-backup-v1: native-metadata: Plan/Skipped: requested native metadata was skipped under explicit degraded restore [policy=System phase=1]
+```
+
+The fields mean:
+
+- `PATH`: path of the affected member inside the archive.
+- `PROFILE`: metadata profile that owns the affected information. For example,
+  `linux-backup-v1` identifies Linux-native backup metadata; it is not an error
+  code or a Linux version requirement.
+- `CLASS`: kind of metadata or layout fidelity affected. `native-metadata` is a
+  broad class and may cover creation time, a native attribute, or another
+  platform-specific field.
+- `OPERATION`: stage that produced the diagnostic: `Capture`, `Parse`,
+  `Verify`, `Plan`, or `Restore`. `Plan` means the decision was made during
+  extraction preflight, before applying that item of metadata.
+- `STATUS`: result for the affected item: `Partial`, `Unsupported`, `Skipped`,
+  `Materialized`, or `Failed`. `Skipped` means tzap deliberately did not apply
+  that item under the selected policy; it does not mean the member's file
+  contents were skipped.
+- `MESSAGE`: human-readable reason.
+- `policy`: requested restore policy (`Content`, `Portable`, `SameOs`, or
+  `System`).
+- `phase`: safe extraction-order group, not severity, percentage complete, or
+  an error number.
+
+Restore phases are:
+
+| Phase | Members handled in that phase |
+| --- | --- |
+| `1` | Regular files |
+| `2` | Symlinks, character/block devices, and FIFOs |
+| `3` | Hardlinks and native reparse placeholders |
+| `4` | Directories, finalized after their descendants |
+
+Optional suffixes provide more context when available: `native-error` contains
+the host operating-system error, while `staged` and `committed` report byte
+counts for provisional streaming work.
+
+A degraded diagnostic concerns the named metadata or layout item only.
+Supported work still proceeds: file contents and supported ownership, modes,
+ACLs, xattrs, timestamps, and flags requested by the policy are restored. The
+final extraction summary counts the diagnostics separately from extracted
+members.
+
+#### Why Linux creation time commonly causes repeated warnings
+
+Creation time, also called birth time or `btime`, records when a filesystem
+inode was created. It is distinct from modification time (`mtime`), metadata
+change time (`ctime`), and access time (`atime`). Linux filesystems such as ext4
+may report creation time, so tzap records it for provenance, verification, and
+future or filesystem-specific restoration.
+
+The normal Linux filesystem interfaces do not let an extractor assign an
+arbitrary creation time to a newly created inode, even when the extractor runs
+as root. The restored inode therefore receives the extraction time as its new
+creation time. A `System` restore requests exact native metadata, so this or any
+other unsupported required native field is a hard error unless
+`--allow-degraded` explicitly permits the mismatch.
+
+Native metadata is recorded per archive member. An archive containing many
+files with an unsupported native field can therefore print the same warning
+once per file. The generic `native-metadata` class can also represent native
+fields other than creation time, so not every such warning should be assumed to
+be a creation-time warning.
+
+Use `--quiet` when these expected per-member diagnostics are too noisy:
+
+```sh
+tzap extract --restore system --allow-degraded --quiet -C restored backup.tzap
+```
+
+`--quiet` also suppresses the success summary, but it does not suppress command
+failures.
 
 ## Command: list
 

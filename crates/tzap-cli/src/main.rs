@@ -116,7 +116,11 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    #[arg(long = "quiet", global = true, help = "Suppress success summaries.")]
+    #[arg(
+        long = "quiet",
+        global = true,
+        help = "Suppress routine success output and non-fatal diagnostics; failures are still reported."
+    )]
     quiet: bool,
 
     #[arg(long = "verbose", global = true, help = "Enable verbose diagnostics.")]

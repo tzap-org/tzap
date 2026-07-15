@@ -657,6 +657,9 @@ restores before destination changes; sequential restores remain provisional
 until terminal verification and commit. `--restore system` requires explicit
 authorization, while unsupported native application remains a hard error unless
 `--allow-degraded` is explicitly selected.
+The CLI diagnostic fields, restore-phase numbers, repeated per-member warning
+behavior, and the common Linux creation-time limitation are explained in
+[`tzap-cli-reference.md`](tzap-cli-reference.md#reading-degraded-metadata-diagnostics).
 
 Authenticated metadata outside the chosen policy is enumerated through
 structured diagnostics. A partial capture, unsupported required extension
