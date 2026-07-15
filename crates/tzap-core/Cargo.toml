@@ -42,6 +42,13 @@ xattr.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-raw-sys.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+
 [dev-dependencies]
 hex.workspace = true
 tempfile.workspace = true

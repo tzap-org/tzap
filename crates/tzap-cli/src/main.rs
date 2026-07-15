@@ -57,11 +57,11 @@ use tzap_core::{
     PortableFileMetadata, PortableModeOrigin, PublicNoKeyVerification, ReaderOptions,
     RegularFileSource, RestorePolicy, RootAuthSigningRequest, RootAuthVerification,
     RootAuthWriterConfig, SafeExtractionOptions, SequentialRootAuthStatus, SourceEntryKind,
-    StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind, WriterOptions,
-    WriterTimings, WrittenArchiveSummary,
+    SparseExtent, StreamingRawWriterSummary, StreamingTarWriterSummary, TarEntryKind,
+    WriterOptions, WriterTimings, WrittenArchiveSummary,
 };
 #[cfg(test)]
-use tzap_core::{write_archive_with_kdf, RegularFile};
+use tzap_core::{write_archive, write_archive_with_kdf, RegularFile};
 #[cfg(test)]
 use tzap_core::{MetadataDiagnosticStatus, MetadataOperation};
 #[cfg(any(target_os = "macos", windows))]
@@ -2973,6 +2973,8 @@ struct InputFile {
     entry_kind: SourceEntryKind,
     link_target: Option<Vec<u8>>,
     contents: Vec<u8>,
+    size: u64,
+    sparse_extents: Option<Vec<SparseExtent>>,
     mode: u32,
     mtime: ArchiveTimestamp,
     portable_metadata: PortableFileMetadata,
@@ -2992,7 +2994,11 @@ impl RegularFileSource for InputFile {
     }
 
     fn file_data_size(&self) -> u64 {
-        self.contents.len() as u64
+        self.size
+    }
+
+    fn sparse_extents(&self) -> Option<&[SparseExtent]> {
+        self.sparse_extents.as_deref()
     }
 
     fn mode(&self) -> u32 {
@@ -3022,6 +3028,7 @@ struct InputSpec {
     mtime: ArchiveTimestamp,
     portable_metadata: PortableFileMetadata,
     size: u64,
+    sparse_extents: Option<Vec<SparseExtent>>,
     identity: InputIdentity,
 }
 
@@ -3040,6 +3047,10 @@ impl RegularFileSource for InputSpec {
 
     fn file_data_size(&self) -> u64 {
         self.size
+    }
+
+    fn sparse_extents(&self) -> Option<&[SparseExtent]> {
+        self.sparse_extents.as_deref()
     }
 
     fn mode(&self) -> u32 {
@@ -3092,6 +3103,16 @@ impl RegularFileSource for InputSpec {
         }
         let file = File::open(&self.source).map_err(ArchiveWriteError::Io)?;
         validate_opened_input_identity(&file, self.identity).map_err(ArchiveWriteError::Io)?;
+        if let Some(extents) = self.sparse_extents.as_deref() {
+            return Ok(Box::new(SparseExtentInputReader {
+                file,
+                expected: self.identity,
+                expected_extents: extents,
+                extent_index: 0,
+                extent_remaining: 0,
+                validated: false,
+            }) as Box<dyn Read + '_>);
+        }
         Ok(Box::new(IdentityCheckedInputReader {
             file,
             expected: self.identity,
@@ -3334,6 +3355,8 @@ fn collect_input_files(specs: &[InputSpec]) -> Result<Vec<InputFile>> {
             entry_kind: spec.entry_kind,
             link_target: spec.link_target.clone(),
             contents,
+            size: spec.size,
+            sparse_extents: spec.sparse_extents.clone(),
             mode: spec.mode,
             mtime: spec.mtime,
             portable_metadata: spec.portable_metadata.clone(),
@@ -3349,6 +3372,10 @@ fn collect_one_input_spec(
 ) -> Result<()> {
     let metadata = fs::symlink_metadata(input)
         .with_context(|| format!("failed to inspect input {}", input.display()))?;
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x0000_0400 != 0 {
+        return collect_windows_known_reparse_input(input, archive_path, metadata, out);
+    }
     if metadata.file_type().is_symlink() {
         let archive_path = archive_path_to_string(archive_path)?;
         let identity = input_identity(&metadata)
@@ -3364,6 +3391,7 @@ fn collect_one_input_spec(
             mtime: identity.mtime,
             portable_metadata: portable_symlink_metadata(identity),
             size: 0,
+            sparse_extents: None,
             identity,
         });
         return Ok(());
@@ -3392,6 +3420,7 @@ fn collect_one_input_spec(
             mtime: identity.mtime,
             portable_metadata,
             size: 0,
+            sparse_extents: None,
             identity,
         });
         let mut entries = fs::read_dir(input)
@@ -3416,14 +3445,29 @@ fn collect_one_input_spec(
     let identity = input_identity(&metadata)
         .with_context(|| format!("failed to identify input {}", input.display()))?;
     #[cfg(windows)]
-    let identity = {
+    let (identity, sparse_extents) = {
         let mut identity = identity;
         let file = File::open(input)
             .with_context(|| format!("failed to open {} for identity capture", input.display()))?;
         augment_windows_input_identity(&mut identity, &file)
             .with_context(|| format!("failed to identify Windows input {}", input.display()))?;
-        identity
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
+        let sparse_extents = if identity.file_attributes & FILE_ATTRIBUTE_SPARSE_FILE != 0 {
+            Some(
+                query_windows_allocated_ranges(&file, identity.len).with_context(|| {
+                    format!(
+                        "failed to query sparse ranges for Windows input {}",
+                        input.display()
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        (identity, sparse_extents)
     };
+    #[cfg(not(windows))]
+    let sparse_extents = None;
     let portable_metadata = portable_input_metadata(identity, input)?;
     out.push(InputSpec {
         source: input.to_owned(),
@@ -3434,9 +3478,205 @@ fn collect_one_input_spec(
         mtime: identity.mtime,
         portable_metadata,
         size: metadata.len(),
+        sparse_extents,
         identity,
     });
     Ok(())
+}
+
+#[cfg(windows)]
+fn collect_windows_known_reparse_input(
+    input: &Path,
+    archive_path: &Path,
+    metadata: fs::Metadata,
+    out: &mut Vec<InputSpec>,
+) -> Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let file = open_windows_metadata_handle(input)
+        .with_context(|| format!("failed to open Windows reparse point {}", input.display()))?;
+    let mut identity = input_identity(&metadata)
+        .with_context(|| format!("failed to identify reparse point {}", input.display()))?;
+    augment_windows_input_identity(&mut identity, &file)
+        .with_context(|| format!("failed to identify reparse point {}", input.display()))?;
+    let reparse_data = query_windows_reparse_data(&file)
+        .with_context(|| format!("failed to query reparse point {}", input.display()))?;
+    let known = validate_windows_known_reparse_data(&reparse_data)
+        .with_context(|| format!("unsupported Windows reparse point {}", input.display()))?;
+    let archive_path = archive_path_to_string(archive_path)?;
+    let mut portable_metadata = portable_input_metadata(identity, input)?;
+    match known {
+        WindowsKnownReparse::RelativeSymlink { portable_target } => {
+            out.push(InputSpec {
+                source: input.to_owned(),
+                archive_path,
+                entry_kind: SourceEntryKind::Symlink,
+                link_target: Some(portable_target),
+                mode: readonly_mode(&metadata),
+                mtime: identity.mtime,
+                portable_metadata,
+                size: 0,
+                sparse_extents: None,
+                identity,
+            });
+        }
+        WindowsKnownReparse::Junction => {
+            portable_metadata.native.primary_pax_records.insert(
+                "TZAP.windows.reparse-placeholder".into(),
+                b"1".to_vec(),
+            );
+            out.push(InputSpec {
+                source: input.to_owned(),
+                archive_path,
+                entry_kind: SourceEntryKind::ReparseDirectory,
+                link_target: None,
+                mode: readonly_mode(&metadata),
+                mtime: identity.mtime,
+                portable_metadata,
+                size: 0,
+                sparse_extents: None,
+                identity,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WindowsKnownReparse {
+    RelativeSymlink { portable_target: Vec<u8> },
+    Junction,
+}
+
+#[cfg(windows)]
+fn query_windows_reparse_data(file: &File) -> io::Result<Vec<u8>> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+
+    const MAX_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
+    let mut buffer = vec![0u8; MAX_REPARSE_DATA_BUFFER_SIZE];
+    let mut bytes_returned = 0u32;
+    // SAFETY: the handle is live and the fixed output allocation remains valid for this
+    // synchronous call. FSCTL_GET_REPARSE_POINT has no input buffer.
+    if unsafe {
+        DeviceIoControl(
+            file.as_raw_handle().cast(),
+            FSCTL_GET_REPARSE_POINT,
+            ptr::null(),
+            0,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+            &mut bytes_returned,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    buffer.truncate(bytes_returned as usize);
+    if buffer.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reparse buffer is truncated",
+        ));
+    }
+    let declared = usize::from(u16::from_le_bytes([buffer[4], buffer[5]]));
+    if declared + 8 != buffer.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reparse buffer length is inconsistent",
+        ));
+    }
+    Ok(buffer)
+}
+
+#[cfg(windows)]
+fn validate_windows_known_reparse_data(data: &[u8]) -> io::Result<WindowsKnownReparse> {
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+    const SYMLINK_FLAG_RELATIVE: u32 = 1;
+
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+    if data.len() < 8 {
+        return Err(invalid("reparse buffer is truncated"));
+    }
+    let tag = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let payload_len = usize::from(u16::from_le_bytes(data[4..6].try_into().unwrap()));
+    if payload_len + 8 != data.len() {
+        return Err(invalid("reparse buffer length is inconsistent"));
+    }
+    let (fixed_len, flags) = match tag {
+        IO_REPARSE_TAG_SYMLINK => {
+            if payload_len < 12 {
+                return Err(invalid("symbolic-link reparse payload is truncated"));
+            }
+            (12usize, u32::from_le_bytes(data[16..20].try_into().unwrap()))
+        }
+        IO_REPARSE_TAG_MOUNT_POINT => {
+            if payload_len < 8 {
+                return Err(invalid("mount-point reparse payload is truncated"));
+            }
+            (8usize, 0)
+        }
+        _ => return Err(invalid("reparse tag is not an Essential supported tag")),
+    };
+    let substitute_offset = usize::from(u16::from_le_bytes(data[8..10].try_into().unwrap()));
+    let substitute_len = usize::from(u16::from_le_bytes(data[10..12].try_into().unwrap()));
+    let print_offset = usize::from(u16::from_le_bytes(data[12..14].try_into().unwrap()));
+    let print_len = usize::from(u16::from_le_bytes(data[14..16].try_into().unwrap()));
+    if substitute_offset % 2 != 0
+        || substitute_len % 2 != 0
+        || print_offset % 2 != 0
+        || print_len % 2 != 0
+    {
+        return Err(invalid("reparse path fields are not UTF-16 aligned"));
+    }
+    let path_buffer = &data[8 + fixed_len..];
+    let decode_name = |offset: usize, len: usize| -> io::Result<String> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| invalid("reparse path range overflows"))?;
+        let bytes = path_buffer
+            .get(offset..end)
+            .ok_or_else(|| invalid("reparse path range exceeds the payload"))?;
+        let units = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        let text = String::from_utf16(&units)
+            .map_err(|_| invalid("reparse path is not valid UTF-16"))?;
+        if text.contains('\0') {
+            return Err(invalid("reparse path contains NUL"));
+        }
+        Ok(text)
+    };
+    let substitute = decode_name(substitute_offset, substitute_len)?;
+    let print = decode_name(print_offset, print_len)?;
+    if substitute.is_empty() {
+        return Err(invalid("reparse substitute name is empty"));
+    }
+
+    if tag == IO_REPARSE_TAG_SYMLINK {
+        if flags != SYMLINK_FLAG_RELATIVE {
+            return Err(invalid("only relative Windows symbolic links are supported"));
+        }
+        let target = if print.is_empty() { substitute } else { print };
+        let target = target.replace('\\', "/").into_bytes();
+        if target.is_empty() || target[0] == b'/' || target.contains(&b':') {
+            return Err(invalid("Windows symbolic-link target is absolute"));
+        }
+        Ok(WindowsKnownReparse::RelativeSymlink {
+            portable_target: target,
+        })
+    } else {
+        if !substitute.starts_with("\\??\\") || print.is_empty() {
+            return Err(invalid("junction path fields are not canonical"));
+        }
+        Ok(WindowsKnownReparse::Junction)
+    }
 }
 
 fn input_identity(metadata: &fs::Metadata) -> io::Result<InputIdentity> {
@@ -3588,13 +3828,125 @@ fn augment_windows_input_identity(identity: &mut InputIdentity, file: &File) -> 
 }
 
 #[cfg(windows)]
+fn query_windows_allocated_ranges(file: &File, logical_size: u64) -> io::Result<Vec<SparseExtent>> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
+    use windows_sys::Win32::System::Ioctl::{
+        FILE_ALLOCATED_RANGE_BUFFER, FSCTL_QUERY_ALLOCATED_RANGES,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const QUERY_BATCH: usize = 1024;
+    const MAX_EXTENTS: usize = 1_048_576;
+    if logical_size == 0 {
+        return Ok(Vec::new());
+    }
+    let logical_size_i64 = i64::try_from(logical_size)
+        .map_err(|_| io::Error::other("sparse logical size exceeds Windows range API"))?;
+    let mut query_start = 0u64;
+    let mut extents = Vec::<SparseExtent>::new();
+    while query_start < logical_size {
+        let mut query = FILE_ALLOCATED_RANGE_BUFFER {
+            FileOffset: i64::try_from(query_start)
+                .map_err(|_| io::Error::other("sparse query offset exceeds Windows range API"))?,
+            Length: logical_size_i64 - query_start as i64,
+        };
+        let mut output = [FILE_ALLOCATED_RANGE_BUFFER::default(); QUERY_BATCH];
+        let mut bytes_returned = 0u32;
+        // SAFETY: the live file handle and fixed-size input/output buffers remain valid for the
+        // synchronous DeviceIoControl call, and the byte lengths exactly match those buffers.
+        let success = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle().cast(),
+                FSCTL_QUERY_ALLOCATED_RANGES,
+                (&mut query as *mut FILE_ALLOCATED_RANGE_BUFFER).cast(),
+                size_of::<FILE_ALLOCATED_RANGE_BUFFER>() as u32,
+                output.as_mut_ptr().cast(),
+                size_of::<[FILE_ALLOCATED_RANGE_BUFFER; QUERY_BATCH]>() as u32,
+                &mut bytes_returned,
+                ptr::null_mut(),
+            )
+        };
+        let error = io::Error::last_os_error();
+        if success == 0 && error.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
+            return Err(error);
+        }
+        if bytes_returned as usize % size_of::<FILE_ALLOCATED_RANGE_BUFFER>() != 0 {
+            return Err(io::Error::other(
+                "Windows returned a truncated allocated-range row",
+            ));
+        }
+        let count = bytes_returned as usize / size_of::<FILE_ALLOCATED_RANGE_BUFFER>();
+        if count > QUERY_BATCH || (success == 0 && count == 0) {
+            return Err(io::Error::other(
+                "Windows allocated-range query made no progress",
+            ));
+        }
+        let mut next_query_start = query_start;
+        for range in &output[..count] {
+            if range.FileOffset < 0 || range.Length <= 0 {
+                return Err(io::Error::other(
+                    "Windows returned an invalid allocated range",
+                ));
+            }
+            let offset = range.FileOffset as u64;
+            let end = offset
+                .checked_add(range.Length as u64)
+                .ok_or_else(|| io::Error::other("Windows allocated range overflow"))?
+                .min(logical_size);
+            if offset >= logical_size || end <= offset {
+                return Err(io::Error::other(
+                    "Windows returned an out-of-bounds allocated range",
+                ));
+            }
+            if let Some(previous) = extents.last_mut() {
+                let previous_end = previous.offset + previous.length;
+                if offset <= previous_end {
+                    previous.length = previous_end.max(end) - previous.offset;
+                } else {
+                    extents.push(SparseExtent {
+                        offset,
+                        length: end - offset,
+                    });
+                }
+            } else {
+                extents.push(SparseExtent {
+                    offset,
+                    length: end - offset,
+                });
+            }
+            if extents.len() > MAX_EXTENTS {
+                return Err(io::Error::other(
+                    "sparse extent count exceeds revision-45 limit",
+                ));
+            }
+            next_query_start = next_query_start.max(end);
+        }
+        if success != 0 {
+            break;
+        }
+        if next_query_start <= query_start {
+            return Err(io::Error::other(
+                "Windows allocated-range query did not advance",
+            ));
+        }
+        query_start = next_query_start;
+    }
+    Ok(extents)
+}
+
+#[cfg(windows)]
 fn open_windows_metadata_handle(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
 
     fs::OpenOptions::new()
         .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
 }
 
@@ -3603,6 +3955,69 @@ struct IdentityCheckedInputReader {
     expected: InputIdentity,
     remaining: u64,
     validated: bool,
+}
+
+struct SparseExtentInputReader<'a> {
+    file: File,
+    expected: InputIdentity,
+    expected_extents: &'a [SparseExtent],
+    extent_index: usize,
+    extent_remaining: u64,
+    validated: bool,
+}
+
+impl SparseExtentInputReader<'_> {
+    fn validate_finished(&mut self) -> io::Result<()> {
+        if self.validated {
+            return Ok(());
+        }
+        validate_opened_input_identity(&self.file, self.expected)?;
+        #[cfg(windows)]
+        if query_windows_allocated_ranges(&self.file, self.expected.len)? != self.expected_extents {
+            return Err(io::Error::other(
+                "sparse allocated ranges changed after scan",
+            ));
+        }
+        self.validated = true;
+        Ok(())
+    }
+}
+
+impl Read for SparseExtentInputReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        while written < out.len() {
+            if self.extent_remaining == 0 {
+                let Some(extent) = self.expected_extents.get(self.extent_index) else {
+                    self.validate_finished()?;
+                    break;
+                };
+                self.file.seek(SeekFrom::Start(extent.offset))?;
+                self.extent_remaining = extent.length;
+            }
+            let count = (out.len() - written)
+                .min(usize::try_from(self.extent_remaining).unwrap_or(usize::MAX));
+            let read = self.file.read(&mut out[written..written + count])?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "sparse extent ended before its scanned size",
+                ));
+            }
+            written += read;
+            self.extent_remaining -= read as u64;
+            if self.extent_remaining == 0 {
+                self.extent_index += 1;
+            }
+        }
+        if self.extent_index == self.expected_extents.len() && self.extent_remaining == 0 {
+            self.validate_finished()?;
+        }
+        Ok(written)
+    }
 }
 
 impl Read for IdentityCheckedInputReader {
@@ -3710,7 +4125,6 @@ fn reject_unsupported_windows_regular_file(metadata: &fs::Metadata, input: &Path
 
 #[cfg(windows)]
 fn unsupported_windows_file_attribute_reason(attributes: u32) -> Option<&'static str> {
-    const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
     const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x0000_4000;
@@ -3718,10 +4132,6 @@ fn unsupported_windows_file_attribute_reason(attributes: u32) -> Option<&'static
         (
             FILE_ATTRIBUTE_REPARSE_POINT,
             "reparse points require exact reparse-data capture",
-        ),
-        (
-            FILE_ATTRIBUTE_SPARSE_FILE,
-            "sparse files require exact allocated-range framing",
         ),
         (
             FILE_ATTRIBUTE_ENCRYPTED,
@@ -4150,10 +4560,45 @@ fn capture_native_file_metadata(
             .canonical_pax_value()
             .map_err(|error| anyhow!(error))?,
     );
+    let reparse_data = if identity.file_attributes & 0x0000_0400 != 0 {
+        let data = query_windows_reparse_data(&file).with_context(|| {
+            format!("failed to read Windows reparse data for {}", input.display())
+        })?;
+        validate_windows_known_reparse_data(&data).with_context(|| {
+            format!("failed to validate Windows reparse data for {}", input.display())
+        })?;
+        let tag = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let mut record = NativeAuxiliaryMetadata::new(
+            "windows.reparse-data",
+            "windows-backup-v1",
+            RestoreClass::System,
+            data.clone(),
+        );
+        record.meta.insert(
+            "TZAP.aux.meta.reparse-tag".into(),
+            format!("{tag:08x}").into_bytes(),
+        );
+        native.auxiliary_records.push(record);
+        Some(data)
+    } else {
+        None
+    };
     native
         .auxiliary_records
-        .push(capture_windows_security_descriptor(&file)?);
-    let (data_stream_attributes, mut streams) = capture_windows_backup_streams(&file)?;
+        .push(capture_windows_security_descriptor(&file).with_context(|| {
+            format!(
+                "failed to capture Windows security descriptor for {}",
+                input.display()
+            )
+        })?);
+    let (data_stream_attributes, mut streams) =
+        capture_windows_backup_streams(&file, reparse_data.as_deref())
+        .with_context(|| {
+            format!(
+                "failed to enumerate Windows streams for {}",
+                input.display()
+            )
+        })?;
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
     if identity.file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
         native.primary_pax_records.insert(
@@ -4453,6 +4898,21 @@ impl WindowsBackupReader {
         }
         Ok(())
     }
+
+    fn discard(&mut self, mut size: u64) -> io::Result<()> {
+        let mut buffer = [0u8; 64 * 1024];
+        while size > 0 {
+            let take = size.min(buffer.len() as u64) as usize;
+            if !self.read_optional_exact(&mut buffer[..take])? {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Windows backup stream payload is missing",
+                ));
+            }
+            size -= take as u64;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -4477,7 +4937,10 @@ impl Drop for WindowsBackupReader {
 }
 
 #[cfg(windows)]
-fn capture_windows_backup_streams(file: &File) -> Result<(u32, Vec<NativeAuxiliaryMetadata>)> {
+fn capture_windows_backup_streams(
+    file: &File,
+    expected_reparse_data: Option<&[u8]>,
+) -> Result<(u32, Vec<NativeAuxiliaryMetadata>)> {
     use windows_sys::Win32::Storage::FileSystem::{
         BACKUP_ALTERNATE_DATA, BACKUP_DATA, BACKUP_EA_DATA, BACKUP_LINK, BACKUP_OBJECT_ID,
         BACKUP_PROPERTY_DATA, BACKUP_REPARSE_DATA, BACKUP_SECURITY_DATA, BACKUP_SPARSE_BLOCK,
@@ -4513,9 +4976,13 @@ fn capture_windows_backup_streams(file: &File) -> Result<(u32, Vec<NativeAuxilia
                 if !name.is_empty() {
                     bail!("Windows default data stream unexpectedly has a name");
                 }
-                reader.skip(size)?;
+                reader.skip(size).with_context(|| {
+                    format!("failed to skip Windows default data stream ({size} bytes)")
+                })?;
             }
-            BACKUP_SECURITY_DATA => reader.skip(size)?,
+            BACKUP_SECURITY_DATA => reader.skip(size).with_context(|| {
+                format!("failed to skip Windows security stream ({size} bytes)")
+            })?,
             BACKUP_ALTERNATE_DATA => {
                 let payload = reader.read_vec(size)?;
                 let mut record = NativeAuxiliaryMetadata::new(
@@ -4584,10 +5051,21 @@ fn capture_windows_backup_streams(file: &File) -> Result<(u32, Vec<NativeAuxilia
                 auxiliary.push(record);
             }
             BACKUP_REPARSE_DATA => {
-                bail!("Windows reparse streams require reparse-point writer support")
+                if !name.is_empty() {
+                    bail!("Windows reparse stream unexpectedly has a name");
+                }
+                let payload = reader.read_vec(size)?;
+                if expected_reparse_data != Some(payload.as_slice()) {
+                    bail!("Windows reparse stream disagrees with FSCTL_GET_REPARSE_POINT");
+                }
             }
             BACKUP_SPARSE_BLOCK => {
-                bail!("Windows sparse streams require sparse writer support")
+                if !name.is_empty() {
+                    bail!("Windows sparse-block stream unexpectedly has a name");
+                }
+                reader.discard(size).with_context(|| {
+                    format!("failed to discard Windows sparse-block stream ({size} bytes)")
+                })?;
             }
             BACKUP_LINK => bail!("Windows hardlink streams require hardlink writer support"),
             BACKUP_TXFS_DATA => {
@@ -4603,9 +5081,6 @@ fn capture_windows_backup_streams(file: &File) -> Result<(u32, Vec<NativeAuxilia
         None if file.metadata()?.len() == 0 => 0,
         None => bail!("Windows BackupRead did not return the default data stream"),
     };
-    if data_stream_attributes & 0x0000_0008 != 0 {
-        bail!("sparse Windows default streams require sparse writer support");
-    }
     Ok((data_stream_attributes, auxiliary))
 }
 
@@ -8782,7 +9257,8 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        let specs = collect_input_specs(&[path.to_string_lossy().into_owned()]).unwrap();
+        let specs = collect_input_specs(&[path.to_string_lossy().into_owned()])
+            .unwrap_or_else(|error| panic!("{error:#}"));
         let mut checked_reader = specs[0].open().unwrap();
         let mut checked_payload = Vec::new();
         checked_reader.read_to_end(&mut checked_payload).unwrap();
@@ -8820,5 +9296,203 @@ mod tests {
         .unwrap()
         .verify()
         .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sparse_file_round_trips_logical_bytes_and_allocated_ranges() {
+        use std::os::windows::io::AsRawHandle;
+        use std::ptr;
+        use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sparse.bin");
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let mut bytes_returned = 0u32;
+        // SAFETY: the file handle is live and FSCTL_SET_SPARSE accepts empty synchronous buffers.
+        assert_ne!(
+            unsafe {
+                DeviceIoControl(
+                    file.as_raw_handle().cast(),
+                    FSCTL_SET_SPARSE,
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut bytes_returned,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let logical_size = 1024 * 1024u64;
+        file.set_len(logical_size).unwrap();
+        file.seek(SeekFrom::Start(64 * 1024)).unwrap();
+        file.write_all(b"leading extent").unwrap();
+        file.seek(SeekFrom::Start(logical_size - 4096)).unwrap();
+        file.write_all(b"trailing extent").unwrap();
+        file.flush().unwrap();
+        let source_ranges = query_windows_allocated_ranges(&file, logical_size).unwrap();
+        assert!(!source_ranges.is_empty());
+        drop(file);
+
+        let specs = collect_input_specs(&[path.to_string_lossy().into_owned()])
+            .unwrap_or_else(|error| panic!("{error:#}"));
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].sparse_extents.as_deref(),
+            Some(source_ranges.as_slice())
+        );
+        let master_key = MasterKey::from_raw_key(&[9u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+        write_archive_sources_to_sink(
+            &specs,
+            &master_key,
+            WriterOptions {
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+            None,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+        let opened = tzap_core::open_archive(&sink.volumes[0], &master_key).unwrap();
+        opened.verify().unwrap();
+        let index = opened.lookup_index_entry("sparse.bin").unwrap().unwrap();
+        assert_eq!(index.file_data_size, logical_size);
+
+        let output = temp.path().join("output");
+        fs::create_dir(&output).unwrap();
+        opened
+            .extract_all_to(&output, SafeExtractionOptions::default())
+            .unwrap();
+        let restored_path = output.join("sparse.bin");
+        let restored = File::open(&restored_path).unwrap();
+        assert_eq!(restored.metadata().unwrap().len(), logical_size);
+        assert_eq!(
+            query_windows_allocated_ranges(&restored, logical_size).unwrap(),
+            source_ranges
+        );
+        let logical = fs::read(restored_path).unwrap();
+        assert_eq!(&logical[64 * 1024..64 * 1024 + 14], b"leading extent");
+        assert_eq!(
+            &logical[logical_size as usize - 4096..logical_size as usize - 4096 + 15],
+            b"trailing extent"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_basic_attributes_and_all_four_times_round_trip() {
+        use std::mem::size_of;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileBasicInfo, GetFileInformationByHandleEx, SetFileInformationByHandle,
+            FILE_BASIC_INFO,
+        };
+
+        const READONLY: u32 = 0x0000_0001;
+        const HIDDEN: u32 = 0x0000_0002;
+        const SYSTEM: u32 = 0x0000_0004;
+        const ARCHIVE: u32 = 0x0000_0020;
+        const MUTABLE_MASK: u32 = READONLY | HIDDEN | SYSTEM | ARCHIVE | 0x100 | 0x2000;
+        const WINDOWS_EPOCH_OFFSET: i64 = 116_444_736_000_000_000;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("basic.bin");
+        fs::write(&source, b"windows basic metadata").unwrap();
+        let source_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&source)
+            .unwrap();
+        let expected = FILE_BASIC_INFO {
+            CreationTime: WINDOWS_EPOCH_OFFSET - 12_345_678_000_000,
+            LastAccessTime: WINDOWS_EPOCH_OFFSET - 11_111_111_000_000,
+            LastWriteTime: WINDOWS_EPOCH_OFFSET - 9_876_543_000_000,
+            ChangeTime: WINDOWS_EPOCH_OFFSET - 8_765_432_000_000,
+            FileAttributes: HIDDEN | SYSTEM | ARCHIVE,
+        };
+        // SAFETY: the handle is live and `expected` is a correctly sized initialized structure.
+        assert_ne!(
+            unsafe {
+                SetFileInformationByHandle(
+                    source_file.as_raw_handle().cast(),
+                    FileBasicInfo,
+                    (&expected as *const FILE_BASIC_INFO).cast(),
+                    size_of::<FILE_BASIC_INFO>() as u32,
+                )
+            },
+            0
+        );
+        drop(source_file);
+
+        let specs = collect_input_specs(&[source.to_string_lossy().into_owned()]).unwrap();
+        let master_key = MasterKey::from_raw_key(&[10u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+        write_archive_sources_to_sink(
+            &specs,
+            &master_key,
+            WriterOptions {
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+            None,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+        let opened = tzap_core::open_archive(&sink.volumes[0], &master_key).unwrap();
+        opened.verify().unwrap();
+        let output = temp.path().join("basic-output");
+        fs::create_dir(&output).unwrap();
+        opened
+            .extract_all_to(
+                &output,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::SameOs,
+                    allow_degraded: true,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+
+        let restored = File::open(output.join("basic.bin")).unwrap();
+        let mut actual = FILE_BASIC_INFO::default();
+        // SAFETY: the handle is live and `actual` is a correctly sized writable structure.
+        assert_ne!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    restored.as_raw_handle().cast(),
+                    FileBasicInfo,
+                    (&mut actual as *mut FILE_BASIC_INFO).cast(),
+                    size_of::<FILE_BASIC_INFO>() as u32,
+                )
+            },
+            0
+        );
+        assert_eq!(actual.CreationTime, expected.CreationTime);
+        assert_eq!(actual.LastAccessTime, expected.LastAccessTime);
+        assert_eq!(actual.LastWriteTime, expected.LastWriteTime);
+        assert_eq!(actual.ChangeTime, expected.ChangeTime);
+        assert_eq!(
+            actual.FileAttributes & MUTABLE_MASK,
+            expected.FileAttributes & MUTABLE_MASK
+        );
     }
 }

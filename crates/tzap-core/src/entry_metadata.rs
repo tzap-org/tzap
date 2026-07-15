@@ -2510,7 +2510,7 @@ pub fn schily_posix_acl_to_linux_xattr(value: &[u8]) -> Result<Vec<u8>, FormatEr
     Ok(out)
 }
 
-fn parse_timestamp(value: &[u8]) -> Result<(i64, u32), FormatError> {
+pub(crate) fn parse_timestamp(value: &[u8]) -> Result<(i64, u32), FormatError> {
     let text = std::str::from_utf8(value)
         .map_err(|_| FormatError::InvalidArchive("timestamp is not ASCII"))?;
     if text.is_empty() || text.starts_with('+') {

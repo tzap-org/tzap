@@ -19,8 +19,9 @@ use crate::crypto::{
 use crate::entry_metadata::{
     canonical_base64_encode, encode_canonical_pax, is_source_os, parse_auxiliary_record,
     parse_primary_metadata, portable_primary_pax, valid_filesystem_token, validate_group_metadata,
-    ArchiveTimestamp, RestoreClass, EXTENDED_METADATA_V1, HAS_AUXILIARY_STREAMS,
-    HAS_NATIVE_METADATA, HAS_SPARSE_EXTENTS, PORTABLE_PROFILE, REQUIRES_SYSTEM_RESTORE,
+    ArchiveTimestamp, RestoreClass, SparseExtent, EXTENDED_METADATA_V1, HAS_AUXILIARY_STREAMS,
+    HAS_NATIVE_METADATA, HAS_SPARSE_EXTENTS, MAX_SPARSE_EXTENTS, PORTABLE_PROFILE,
+    REQUIRES_SYSTEM_RESTORE,
 };
 use crate::fec::encode_parity_gf16;
 use crate::format::{
@@ -409,6 +410,9 @@ pub enum SourceEntryKind {
     Regular,
     Directory,
     Symlink,
+    /// Zero-data directory primary whose native metadata contains an exact,
+    /// validated Windows mount-point reparse payload.
+    ReparseDirectory,
 }
 
 impl Default for PortableFileMetadata {
@@ -460,6 +464,14 @@ pub trait RegularFileSource {
         None
     }
     fn file_data_size(&self) -> u64;
+    /// Canonical allocated extents for a sparse regular file.
+    ///
+    /// `file_data_size` remains the logical size. When this returns `Some`,
+    /// `open` must yield exactly the concatenated extent bytes in ascending map
+    /// order. `Some(&[])` represents an all-hole sparse file.
+    fn sparse_extents(&self) -> Option<&[SparseExtent]> {
+        None
+    }
     fn mode(&self) -> u32;
     fn mtime(&self) -> ArchiveTimestamp;
     fn portable_metadata(&self) -> PortableFileMetadata {
@@ -583,6 +595,10 @@ impl<S: RegularFileSource> RegularFileSource for ProgressRegularFileSource<'_, S
 
     fn file_data_size(&self) -> u64 {
         self.inner.file_data_size()
+    }
+
+    fn sparse_extents(&self) -> Option<&[SparseExtent]> {
+        self.inner.sparse_extents()
     }
 
     fn mode(&self) -> u32 {
@@ -736,6 +752,7 @@ struct TarMember {
     tar_member_group_start: u64,
     tar_member_group_size: u64,
     file_data_size: u64,
+    sparse_extents: Option<Vec<SparseExtent>>,
     mode: u32,
     mtime: ArchiveTimestamp,
     portable_metadata: PortableFileMetadata,
@@ -972,6 +989,7 @@ pub(crate) struct StreamingRegularMember {
     pub entry_kind: SourceEntryKind,
     pub link_target: Option<Vec<u8>>,
     pub file_data_size: u64,
+    pub sparse_extents: Option<Vec<SparseExtent>>,
     pub mode: u32,
     pub mtime: ArchiveTimestamp,
     pub portable_metadata: PortableFileMetadata,
@@ -1353,6 +1371,7 @@ where
                         entry_kind: file.entry_kind(),
                         link_target: file.link_target().map(<[u8]>::to_vec),
                         file_data_size: file.file_data_size(),
+                        sparse_extents: file.sparse_extents().map(<[SparseExtent]>::to_vec),
                         mode: file.mode(),
                         mtime: file.mtime(),
                         portable_metadata: file.portable_metadata(),
@@ -1401,6 +1420,7 @@ where
                         entry_kind: file.entry_kind(),
                         link_target: file.link_target().map(<[u8]>::to_vec),
                         file_data_size: file.file_data_size(),
+                        sparse_extents: file.sparse_extents().map(<[SparseExtent]>::to_vec),
                         mode: file.mode(),
                         mtime: file.mtime(),
                         portable_metadata: file.portable_metadata(),
@@ -1449,6 +1469,7 @@ where
                         entry_kind: file.entry_kind(),
                         link_target: file.link_target().map(<[u8]>::to_vec),
                         file_data_size: file.file_data_size(),
+                        sparse_extents: file.sparse_extents().map(<[SparseExtent]>::to_vec),
                         mode: file.mode(),
                         mtime: file.mtime(),
                         portable_metadata: file.portable_metadata(),
@@ -2017,12 +2038,19 @@ fn plan_payload_stream<S: RegularFileSource>(
             .into());
         }
         let link_target = file.link_target().map(<[u8]>::to_vec);
+        let sparse_extents = file.sparse_extents().map(<[SparseExtent]>::to_vec);
+        let source_payload_size = sparse_extents
+            .as_deref()
+            .map(|extents| sparse_extent_bytes(extents, file.file_data_size()))
+            .transpose()?
+            .unwrap_or(file.file_data_size());
         let portable_metadata = file.portable_metadata();
         let prefix = build_primary_member_prefix(
             &path,
             entry_kind,
             link_target.as_deref(),
             file.file_data_size(),
+            sparse_extents.as_deref(),
             file.mode(),
             file.mtime(),
             &portable_metadata,
@@ -2031,8 +2059,8 @@ fn plan_payload_stream<S: RegularFileSource>(
         let member_group_size = checked_u64_add(
             prefix.len() as u64,
             checked_u64_add(
-                file.file_data_size(),
-                padding_to_512_u64(file.file_data_size()),
+                source_payload_size,
+                padding_to_512_u64(source_payload_size),
                 "tar member",
             )?,
             "tar member",
@@ -2044,11 +2072,12 @@ fn plan_payload_stream<S: RegularFileSource>(
             tar_member_group_start: member_start,
             tar_member_group_size: member_group_size,
             file_data_size: file.file_data_size(),
+            sparse_extents,
             mode: file.mode(),
             mtime: file.mtime(),
             portable_metadata,
         });
-        let mut reader = StreamingMemberReader::new(file.open()?, prefix, file.file_data_size());
+        let mut reader = StreamingMemberReader::new(file.open()?, prefix, source_payload_size);
         let mut member_offset = 0u64;
         while member_offset < member_group_size {
             let remaining = member_group_size - member_offset;
@@ -2343,6 +2372,7 @@ where
                         entry_kind: file.entry_kind(),
                         link_target: file.link_target().map(<[u8]>::to_vec),
                         file_data_size: file.file_data_size(),
+                        sparse_extents: file.sparse_extents().map(<[SparseExtent]>::to_vec),
                         mode: file.mode(),
                         mtime: file.mtime(),
                         portable_metadata: file.portable_metadata(),
@@ -2631,11 +2661,18 @@ impl<O: ArchiveWriteSink> OrderedParallelArchiveWriter<'_, O> {
             )
             .into());
         }
+        let source_payload_size = member
+            .sparse_extents
+            .as_deref()
+            .map(|extents| sparse_extent_bytes(extents, member.file_data_size))
+            .transpose()?
+            .unwrap_or(member.file_data_size);
         let prefix = build_primary_member_prefix(
             &path,
             member.entry_kind,
             member.link_target.as_deref(),
             member.file_data_size,
+            member.sparse_extents.as_deref(),
             member.mode,
             member.mtime,
             &member.portable_metadata,
@@ -2644,8 +2681,8 @@ impl<O: ArchiveWriteSink> OrderedParallelArchiveWriter<'_, O> {
         let member_group_size = checked_u64_add(
             prefix.len() as u64,
             checked_u64_add(
-                member.file_data_size,
-                padding_to_512_u64(member.file_data_size),
+                source_payload_size,
+                padding_to_512_u64(source_payload_size),
                 "tar member",
             )?,
             "tar member",
@@ -2658,13 +2695,13 @@ impl<O: ArchiveWriteSink> OrderedParallelArchiveWriter<'_, O> {
             tar_member_group_start: member_start,
             tar_member_group_size: member_group_size,
             file_data_size: member.file_data_size,
+            sparse_extents: member.sparse_extents,
             mode: member.mode,
             mtime: member.mtime,
             portable_metadata: member.portable_metadata.clone(),
         });
 
-        let mut reader =
-            StreamingMemberReader::new(Box::new(payload), prefix, member.file_data_size);
+        let mut reader = StreamingMemberReader::new(Box::new(payload), prefix, source_payload_size);
         let mut member_offset = 0u64;
         while member_offset < member_group_size {
             let remaining = member_group_size - member_offset;
@@ -3229,11 +3266,18 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
             )
             .into());
         }
+        let source_payload_size = member
+            .sparse_extents
+            .as_deref()
+            .map(|extents| sparse_extent_bytes(extents, member.file_data_size))
+            .transpose()?
+            .unwrap_or(member.file_data_size);
         let prefix = build_primary_member_prefix(
             &path,
             member.entry_kind,
             member.link_target.as_deref(),
             member.file_data_size,
+            member.sparse_extents.as_deref(),
             member.mode,
             member.mtime,
             &member.portable_metadata,
@@ -3242,8 +3286,8 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
         let member_group_size = checked_u64_add(
             prefix.len() as u64,
             checked_u64_add(
-                member.file_data_size,
-                padding_to_512_u64(member.file_data_size),
+                source_payload_size,
+                padding_to_512_u64(source_payload_size),
                 "tar member",
             )?,
             "tar member",
@@ -3256,13 +3300,13 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
             tar_member_group_start: member_start,
             tar_member_group_size: member_group_size,
             file_data_size: member.file_data_size,
+            sparse_extents: member.sparse_extents,
             mode: member.mode,
             mtime: member.mtime,
             portable_metadata: member.portable_metadata.clone(),
         });
 
-        let mut reader =
-            StreamingMemberReader::new(Box::new(payload), prefix, member.file_data_size);
+        let mut reader = StreamingMemberReader::new(Box::new(payload), prefix, source_payload_size);
         let mut member_offset = 0u64;
         while member_offset < member_group_size {
             let remaining = member_group_size - member_offset;
@@ -4232,6 +4276,7 @@ where
             || file.entry_kind() != member.entry_kind
             || file.link_target() != member.link_target.as_deref()
             || file.file_data_size() != member.file_data_size
+            || file.sparse_extents() != member.sparse_extents.as_deref()
             || file.mode() != member.mode
             || file.mtime() != member.mtime
             || file.portable_metadata() != member.portable_metadata
@@ -4246,11 +4291,18 @@ where
             member.entry_kind,
             member.link_target.as_deref(),
             member.file_data_size,
+            member.sparse_extents.as_deref(),
             member.mode,
             member.mtime,
             &member.portable_metadata,
         )?;
-        let mut reader = StreamingMemberReader::new(file.open()?, prefix, member.file_data_size);
+        let source_payload_size = member
+            .sparse_extents
+            .as_deref()
+            .map(|extents| sparse_extent_bytes(extents, member.file_data_size))
+            .transpose()?
+            .unwrap_or(member.file_data_size);
+        let mut reader = StreamingMemberReader::new(file.open()?, prefix, source_payload_size);
         let mut member_offset = 0u64;
         while member_offset < member.tar_member_group_size {
             let remaining = member.tar_member_group_size - member_offset;
@@ -4692,33 +4744,60 @@ fn serialize_kdf_params(params: &KdfParams) -> Result<Vec<u8>, FormatError> {
 }
 
 #[cfg(test)]
-fn build_tar_stream(
-    files: &[RegularFile<'_>],
+fn build_tar_stream<S: RegularFileSource>(
+    files: &[S],
     max_path_length: u32,
 ) -> Result<(Vec<u8>, Vec<TarMember>), FormatError> {
     let mut stream = Vec::new();
     let mut members = Vec::with_capacity(files.len());
     for file in files {
-        let path = normalize_lookup_file_path(file.path, max_path_length)?;
+        let path = normalize_lookup_file_path(file.archive_path(), max_path_length)?;
         let start = stream.len() as u64;
-        let member_group = build_regular_file_member_group(
+        let sparse_extents = file.sparse_extents().map(<[SparseExtent]>::to_vec);
+        let source_payload_size = sparse_extents
+            .as_deref()
+            .map(|extents| sparse_extent_bytes(extents, file.file_data_size()))
+            .transpose()?
+            .unwrap_or(file.file_data_size());
+        let mut member_group = build_primary_member_prefix(
             &path,
-            file.contents,
-            file.mode,
-            file.mtime,
-            &file.portable_metadata,
+            file.entry_kind(),
+            file.link_target(),
+            file.file_data_size(),
+            sparse_extents.as_deref(),
+            file.mode(),
+            file.mtime(),
+            &file.portable_metadata(),
         )?;
+        let mut reader = file
+            .open()
+            .map_err(|_| FormatError::WriterInvariant("test source failed to open"))?;
+        let mut payload = Vec::new();
+        reader
+            .read_to_end(&mut payload)
+            .map_err(|_| FormatError::WriterInvariant("test source failed to read"))?;
+        if payload.len() as u64 != source_payload_size {
+            return Err(FormatError::WriterInvariant(
+                "test source payload size mismatch",
+            ));
+        }
+        member_group.extend_from_slice(&payload);
+        member_group.resize(
+            member_group.len() + padding_to_512(source_payload_size as usize),
+            0,
+        );
         stream.extend_from_slice(&member_group);
         members.push(TarMember {
             path,
-            entry_kind: SourceEntryKind::Regular,
-            link_target: None,
+            entry_kind: file.entry_kind(),
+            link_target: file.link_target().map(<[u8]>::to_vec),
             tar_member_group_start: start,
             tar_member_group_size: member_group.len() as u64,
-            file_data_size: file.contents.len() as u64,
-            mode: file.mode,
-            mtime: file.mtime,
-            portable_metadata: file.portable_metadata.clone(),
+            file_data_size: file.file_data_size(),
+            sparse_extents,
+            mode: file.mode(),
+            mtime: file.mtime(),
+            portable_metadata: file.portable_metadata(),
         });
     }
     Ok((stream, members))
@@ -4992,7 +5071,11 @@ fn build_index_shard_plaintext(
             offset_in_first_frame_plaintext: 0,
             tar_member_group_size: row.member.tar_member_group_size,
             file_data_size: row.member.file_data_size,
-            flags: v45_portable_file_entry_flags(row.member.mode, &row.member.portable_metadata),
+            flags: v45_portable_file_entry_flags(
+                row.member.mode,
+                row.member.sparse_extents.is_some(),
+                &row.member.portable_metadata,
+            ),
         });
     }
 
@@ -6586,6 +6669,7 @@ struct StreamingMemberReader<'a> {
     prefix: Cursor<Vec<u8>>,
     file: Box<dyn Read + 'a>,
     remaining_file_bytes: u64,
+    source_eof_checked: bool,
     remaining_padding_bytes: usize,
     pushback: Vec<u8>,
 }
@@ -6596,6 +6680,7 @@ impl<'a> StreamingMemberReader<'a> {
             prefix: Cursor::new(prefix),
             file,
             remaining_file_bytes: file_size,
+            source_eof_checked: false,
             remaining_padding_bytes: padding_to_512_u64(file_size) as usize,
             pushback: Vec::new(),
         }
@@ -6658,6 +6743,17 @@ impl Read for StreamingMemberReader<'_> {
             }
         }
 
+        if !self.source_eof_checked {
+            let mut extra = [0u8; 1];
+            if self.file.read(&mut extra)? != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "file source exceeded declared stored size",
+                ));
+            }
+            self.source_eof_checked = true;
+        }
+
         if self.remaining_padding_bytes > 0 {
             let count = (out.len() - written).min(self.remaining_padding_bytes);
             out[written..written + count].fill(0);
@@ -6682,6 +6778,7 @@ fn build_regular_file_member_prefix(
         SourceEntryKind::Regular,
         None,
         file_size,
+        None,
         mode,
         mtime,
         portable_metadata,
@@ -6693,11 +6790,12 @@ fn build_primary_member_prefix(
     entry_kind: SourceEntryKind,
     link_target: Option<&[u8]>,
     file_size: u64,
+    sparse_extents: Option<&[SparseExtent]>,
     mode: u32,
     mtime: ArchiveTimestamp,
     portable_metadata: &PortableFileMetadata,
 ) -> Result<Vec<u8>, FormatError> {
-    if entry_kind != SourceEntryKind::Regular && file_size != 0 {
+    if entry_kind != SourceEntryKind::Regular && (file_size != 0 || sparse_extents.is_some()) {
         return Err(FormatError::WriterInvariant(
             "non-regular member has non-zero file data size",
         ));
@@ -6718,9 +6816,30 @@ fn build_primary_member_prefix(
         }
         (_, None) => {}
     }
+    let sparse_map = sparse_extents
+        .map(|extents| encode_sparse_map(extents, file_size))
+        .transpose()?;
+    let stored_extent_bytes = sparse_extents
+        .map(|extents| sparse_extent_bytes(extents, file_size))
+        .transpose()?
+        .unwrap_or(file_size);
+    let stored_size = checked_u64_add(
+        sparse_map.as_ref().map_or(0, |map| map.len() as u64),
+        stored_extent_bytes,
+        "sparse primary stored size",
+    )?;
     let mut out = Vec::new();
-    let use_path_override = path_requires_pax(path);
+    let use_path_override = sparse_map.is_none() && path_requires_pax(path);
     validate_portable_file_metadata(portable_metadata)?;
+    let reparse_placeholder = portable_metadata
+        .native
+        .primary_pax_records
+        .contains_key("TZAP.windows.reparse-placeholder");
+    if (entry_kind == SourceEntryKind::ReparseDirectory) != reparse_placeholder {
+        return Err(FormatError::WriterInvariant(
+            "Windows reparse directory kind and placeholder metadata disagree",
+        ));
+    }
     let mut pax_records =
         portable_primary_pax(path, mode, &portable_metadata.source_os, use_path_override)?;
     pax_records.insert(
@@ -6738,6 +6857,15 @@ fn build_primary_member_prefix(
         pax_records.insert(
             "TZAP.portable.attributes".into(),
             format!("{attributes:08x}").into_bytes(),
+        );
+    }
+    if sparse_map.is_some() {
+        pax_records.insert("GNU.sparse.major".into(), b"1".to_vec());
+        pax_records.insert("GNU.sparse.minor".into(), b"0".to_vec());
+        pax_records.insert("GNU.sparse.name".into(), path.to_vec());
+        pax_records.insert(
+            "GNU.sparse.realsize".into(),
+            file_size.to_string().into_bytes(),
         );
     }
     merge_native_primary_metadata(&mut pax_records, &portable_metadata.native)?;
@@ -6759,6 +6887,12 @@ fn build_primary_member_prefix(
         }
     } else {
         pax_records.insert("mtime".into(), mtime.canonical_pax_value()?);
+        0
+    };
+    let header_size = if tar_octal_fits(12, stored_size) {
+        stored_size
+    } else {
+        pax_records.insert("size".into(), stored_size.to_string().into_bytes());
         0
     };
     let primary_metadata = parse_primary_metadata(&pax_records).map_err(|_| {
@@ -6787,7 +6921,9 @@ fn build_primary_member_prefix(
     out.extend_from_slice(&pax_payload);
     out.resize(out.len() + padding_to_512(pax_payload.len()), 0);
 
-    let header_path = if use_path_override {
+    let header_path = if sparse_map.is_some() {
+        b"GNUSparseFile.0/TZAP".to_vec()
+    } else if use_path_override {
         b"TZAP-PRIMARY".to_vec()
     } else {
         path.to_vec()
@@ -6795,17 +6931,80 @@ fn build_primary_member_prefix(
 
     let typeflag = match entry_kind {
         SourceEntryKind::Regular => b'0',
-        SourceEntryKind::Directory => b'5',
+        SourceEntryKind::Directory | SourceEntryKind::ReparseDirectory => b'5',
         SourceEntryKind::Symlink => b'2',
     };
-    let mut header = build_ustar_header(&header_path, file_size, mode, header_mtime, typeflag)?;
+    let mut header = build_ustar_header(&header_path, header_size, mode, header_mtime, typeflag)?;
     if let Some(target) = link_target.filter(|_| !use_linkpath_override) {
         header[157..157 + target.len()].copy_from_slice(target);
         finalize_tar_checksum(&mut header)?;
     }
     apply_primary_tar_identity(&mut header, &primary_identity)?;
     out.extend_from_slice(&header);
+    if let Some(sparse_map) = sparse_map {
+        out.extend_from_slice(&sparse_map);
+    }
     Ok(out)
+}
+
+fn sparse_extent_bytes(extents: &[SparseExtent], logical_size: u64) -> Result<u64, FormatError> {
+    if extents.len() > MAX_SPARSE_EXTENTS {
+        return Err(FormatError::WriterUnsupported(
+            "sparse extent count exceeds revision-45 limit",
+        ));
+    }
+    let mut previous_end = 0u64;
+    let mut stored_size = 0u64;
+    for (index, extent) in extents.iter().enumerate() {
+        if extent.length == 0 || extent.offset < previous_end {
+            return Err(FormatError::WriterUnsupported(
+                "sparse extents overlap or have zero length",
+            ));
+        }
+        if index != 0 && extent.offset == previous_end {
+            return Err(FormatError::WriterUnsupported(
+                "adjacent sparse extents must be merged",
+            ));
+        }
+        let end = extent
+            .offset
+            .checked_add(extent.length)
+            .ok_or(FormatError::WriterUnsupported("sparse extent overflow"))?;
+        if end > logical_size {
+            return Err(FormatError::WriterUnsupported(
+                "sparse extent exceeds logical size",
+            ));
+        }
+        stored_size =
+            stored_size
+                .checked_add(extent.length)
+                .ok_or(FormatError::WriterUnsupported(
+                    "sparse stored size overflow",
+                ))?;
+        previous_end = end;
+    }
+    Ok(stored_size)
+}
+
+fn encode_sparse_map(extents: &[SparseExtent], logical_size: u64) -> Result<Vec<u8>, FormatError> {
+    sparse_extent_bytes(extents, logical_size)?;
+    let mut map = Vec::new();
+    map.extend_from_slice(extents.len().to_string().as_bytes());
+    map.push(b'\n');
+    for extent in extents {
+        map.extend_from_slice(extent.offset.to_string().as_bytes());
+        map.push(b'\n');
+        map.extend_from_slice(extent.length.to_string().as_bytes());
+        map.push(b'\n');
+    }
+    let padding = padding_to_512(map.len());
+    map.resize(
+        map.len()
+            .checked_add(padding)
+            .ok_or(FormatError::WriterUnsupported("sparse map size overflow"))?,
+        0,
+    );
+    Ok(map)
 }
 
 fn build_native_auxiliary_member(
@@ -7067,7 +7266,11 @@ fn path_requires_pax(path: &[u8]) -> bool {
     path.len() > 100
 }
 
-fn v45_portable_file_entry_flags(mode: u32, metadata: &PortableFileMetadata) -> u32 {
+fn v45_portable_file_entry_flags(
+    mode: u32,
+    primary_sparse: bool,
+    metadata: &PortableFileMetadata,
+) -> u32 {
     EXTENDED_METADATA_V1
         | if metadata.native.auxiliary_records.is_empty() {
             0
@@ -7091,11 +7294,12 @@ fn v45_portable_file_entry_flags(mode: u32, metadata: &PortableFileMetadata) -> 
         } else {
             0
         }
-        | if metadata
-            .native
-            .auxiliary_records
-            .iter()
-            .any(|record| record.flags & 1 != 0)
+        | if primary_sparse
+            || metadata
+                .native
+                .auxiliary_records
+                .iter()
+                .any(|record| record.flags & 1 != 0)
         {
             HAS_SPARSE_EXTENTS
         } else {
@@ -7579,6 +7783,7 @@ mod tests {
                 tar_member_group_start: idx as u64 * 512,
                 tar_member_group_size: 512,
                 file_data_size: 0,
+                sparse_extents: None,
                 mode: 0o644,
                 mtime: ArchiveTimestamp::UNIX_EPOCH,
                 portable_metadata: PortableFileMetadata::default(),
@@ -7637,6 +7842,7 @@ mod tests {
                     tar_member_group_start: 0,
                     tar_member_group_size: 512,
                     file_data_size: 0,
+                    sparse_extents: None,
                     mode: 0o644,
                     mtime: ArchiveTimestamp::UNIX_EPOCH,
                     portable_metadata: PortableFileMetadata::default(),
@@ -7653,6 +7859,7 @@ mod tests {
                     tar_member_group_start: 512,
                     tar_member_group_size: 512,
                     file_data_size: 0,
+                    sparse_extents: None,
                     mode: 0o644,
                     mtime: ArchiveTimestamp::UNIX_EPOCH,
                     portable_metadata: PortableFileMetadata::default(),
@@ -7754,6 +7961,149 @@ mod tests {
             let end = start + member.tar_member_group_size as usize;
             assert_path_specific_member_group(&tar_stream[start..end]);
         }
+    }
+
+    struct SparseTestSource {
+        logical_size: u64,
+        extents: Vec<SparseExtent>,
+        extent_bytes: Vec<u8>,
+    }
+
+    impl RegularFileSource for SparseTestSource {
+        fn archive_path(&self) -> &str {
+            "sparse.bin"
+        }
+
+        fn file_data_size(&self) -> u64 {
+            self.logical_size
+        }
+
+        fn sparse_extents(&self) -> Option<&[SparseExtent]> {
+            Some(&self.extents)
+        }
+
+        fn mode(&self) -> u32 {
+            0o644
+        }
+
+        fn mtime(&self) -> ArchiveTimestamp {
+            ArchiveTimestamp::UNIX_EPOCH
+        }
+
+        fn open(&self) -> Result<Box<dyn Read + '_>, ArchiveWriteError> {
+            Ok(Box::new(Cursor::new(self.extent_bytes.as_slice())))
+        }
+    }
+
+    #[test]
+    fn sparse_writer_emits_canonical_gnu_sparse_primary_and_all_hole_file() {
+        for source in [
+            SparseTestSource {
+                logical_size: 32,
+                extents: vec![
+                    SparseExtent {
+                        offset: 4,
+                        length: 3,
+                    },
+                    SparseExtent {
+                        offset: 16,
+                        length: 2,
+                    },
+                    SparseExtent {
+                        offset: 30,
+                        length: 2,
+                    },
+                ],
+                extent_bytes: b"abcdeyz".to_vec(),
+            },
+            SparseTestSource {
+                logical_size: 1 << 20,
+                extents: Vec::new(),
+                extent_bytes: Vec::new(),
+            },
+        ] {
+            let expected_map_prefix = format!("{}\n", source.extents.len());
+            let (tar_stream, members) = build_tar_stream(&[source], 4096).unwrap();
+            let parsed = parse_tar_member_group(&tar_stream, 4096).unwrap();
+            assert_eq!(parsed.path, b"sparse.bin");
+            assert_eq!(parsed.logical_size, members[0].file_data_size);
+            let layout = parsed.v45_metadata.sparse_layout.unwrap();
+            assert_eq!(layout.logical_size, members[0].file_data_size);
+            assert_eq!(layout.extents, members[0].sparse_extents.clone().unwrap());
+            assert!(parsed.data.starts_with(expected_map_prefix.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn sparse_writer_rejects_noncanonical_extent_maps() {
+        for extents in [
+            vec![SparseExtent {
+                offset: 0,
+                length: 0,
+            }],
+            vec![
+                SparseExtent {
+                    offset: 0,
+                    length: 2,
+                },
+                SparseExtent {
+                    offset: 2,
+                    length: 2,
+                },
+            ],
+            vec![SparseExtent {
+                offset: 9,
+                length: 2,
+            }],
+        ] {
+            let source = SparseTestSource {
+                logical_size: 10,
+                extents,
+                extent_bytes: Vec::new(),
+            };
+            assert!(build_tar_stream(&[source], 4096).is_err());
+        }
+    }
+
+    #[test]
+    fn sparse_writer_indexes_logical_size_and_streams_expanded_content() {
+        let source = SparseTestSource {
+            logical_size: 12,
+            extents: vec![
+                SparseExtent {
+                    offset: 2,
+                    length: 3,
+                },
+                SparseExtent {
+                    offset: 9,
+                    length: 2,
+                },
+            ],
+            extent_bytes: b"abcxy".to_vec(),
+        };
+        let master_key = MasterKey::from_raw_key(&[7u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+        write_archive_sources_to_sink(
+            &[source],
+            &master_key,
+            single_volume_metadata_test_options(),
+            None,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+
+        let opened = open_archive(&sink.volumes[0], &master_key).unwrap();
+        opened.verify().unwrap();
+        let entry = opened.lookup_index_entry("sparse.bin").unwrap().unwrap();
+        assert_eq!(entry.file_data_size, 12);
+        assert_ne!(entry.flags & HAS_SPARSE_EXTENTS, 0);
+        assert_eq!(
+            opened.extract_file("sparse.bin").unwrap().unwrap(),
+            b"\0\0abc\0\0\0\0xy\0"
+        );
     }
 
     #[test]
@@ -7874,6 +8224,7 @@ mod tests {
             SourceEntryKind::Directory,
             None,
             0,
+            None,
             0o2750,
             ArchiveTimestamp::new(1_700_000_000, 123_456_789),
             &portable_metadata,
@@ -7900,6 +8251,7 @@ mod tests {
             SourceEntryKind::Symlink,
             Some(b"../target.txt"),
             0,
+            None,
             0o777,
             mtime,
             &PortableFileMetadata::default(),
@@ -9543,6 +9895,7 @@ mod tests {
                 tar_member_group_start: idx as u64 * 512,
                 tar_member_group_size: 512,
                 file_data_size: 0,
+                sparse_extents: None,
                 mode: 0o644,
                 mtime: ArchiveTimestamp::UNIX_EPOCH,
                 portable_metadata: PortableFileMetadata::default(),

@@ -12,18 +12,28 @@ use unicode_normalization::UnicodeNormalization;
 use crate::entry_metadata::canonical_base64_decode;
 #[cfg(target_os = "linux")]
 use crate::entry_metadata::schily_posix_acl_to_linux_xattr;
+#[cfg(windows)]
+use cap_std::fs::OpenOptionsExt as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FileBasicInfo, GetFileInformationByHandleEx, SetFileInformationByHandle, DELETE,
+    FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+};
 
 use crate::entry_metadata::{
     decode_percent_name, parse_auxiliary_record, parse_canonical_pax, parse_primary_metadata,
-    parse_sparse_payload, validate_group_metadata, ArchiveTimestamp, AuxiliaryRecord,
-    AuxiliaryStreamValidator, CaptureReportRow, CaptureStatus, MemberMetadata, PaxRecords,
-    PortableMetadataMirror, PrimaryMetadata, RestoreClass, RestorePolicy, SparseStreamValidator,
-    CAPTURE_REPORT_KIND, HAS_NATIVE_METADATA, HAS_SPARSE_EXTENTS, MAX_AGGREGATE_PAX_PAYLOAD,
-    MAX_LOCAL_PAX_PAYLOAD, REQUIRES_SYSTEM_RESTORE,
+    parse_sparse_payload, parse_timestamp, validate_group_metadata, ArchiveTimestamp,
+    AuxiliaryRecord, AuxiliaryStreamValidator, CaptureReportRow, CaptureStatus, MemberMetadata,
+    PaxRecords, PortableMetadataMirror, PrimaryMetadata, RestoreClass, RestorePolicy, SparseExtent,
+    SparseStreamValidator, CAPTURE_REPORT_KIND, HAS_NATIVE_METADATA, HAS_SPARSE_EXTENTS,
+    MAX_AGGREGATE_PAX_PAYLOAD, MAX_LOCAL_PAX_PAYLOAD, REQUIRES_SYSTEM_RESTORE,
 };
 use crate::format::{ExtractError, FormatError};
 use crate::metadata::validate_file_path_bytes;
@@ -308,6 +318,19 @@ pub(crate) trait TarMemberGroupReader {
 trait TarMemberStreamHandler {
     fn on_member(&mut self, member: &StreamedTarMemberMetadata) -> Result<(), ExtractError>;
     fn write_regular_payload(&mut self, bytes: &[u8]) -> Result<(), ExtractError>;
+    fn begin_sparse_payload(
+        &mut self,
+        _logical_size: u64,
+        _extents: &[SparseExtent],
+    ) -> Result<bool, ExtractError> {
+        Ok(false)
+    }
+    fn write_sparse_extent(&mut self, _offset: u64, _bytes: &[u8]) -> Result<(), ExtractError> {
+        Err(FormatError::InvalidArchive("sparse output was not initialized").into())
+    }
+    fn finish_sparse_payload(&mut self) -> Result<(), ExtractError> {
+        Ok(())
+    }
 }
 
 pub(crate) trait TarStreamObserver {
@@ -316,6 +339,24 @@ pub(crate) trait TarStreamObserver {
     }
 
     fn on_regular_payload(&mut self, _bytes: &[u8]) -> Result<(), FormatError> {
+        Ok(())
+    }
+
+    fn on_sparse_layout(
+        &mut self,
+        _logical_size: u64,
+        _extents: &[SparseExtent],
+    ) -> Result<bool, FormatError> {
+        Ok(false)
+    }
+
+    fn on_sparse_extent(&mut self, _offset: u64, _bytes: &[u8]) -> Result<(), FormatError> {
+        Err(FormatError::InvalidArchive(
+            "sparse observer output was not initialized",
+        ))
+    }
+
+    fn on_sparse_complete(&mut self) -> Result<(), FormatError> {
         Ok(())
     }
 
@@ -360,6 +401,28 @@ impl TarStreamObserver for TarStreamFilesystemRestoreObserver<'_> {
             .map_err(format_error_from_extract_error)
     }
 
+    fn on_sparse_layout(
+        &mut self,
+        logical_size: u64,
+        extents: &[SparseExtent],
+    ) -> Result<bool, FormatError> {
+        self.handler
+            .begin_sparse_payload(logical_size, extents)
+            .map_err(format_error_from_extract_error)
+    }
+
+    fn on_sparse_extent(&mut self, offset: u64, bytes: &[u8]) -> Result<(), FormatError> {
+        self.handler
+            .write_sparse_extent(offset, bytes)
+            .map_err(format_error_from_extract_error)
+    }
+
+    fn on_sparse_complete(&mut self) -> Result<(), FormatError> {
+        self.handler
+            .finish_sparse_payload()
+            .map_err(format_error_from_extract_error)
+    }
+
     fn on_member_complete(
         &mut self,
         member: &StreamedTarMemberMetadata,
@@ -393,6 +456,7 @@ struct StreamingSparsePrimary {
     extent_index: usize,
     extent_consumed: u64,
     logical_cursor: u64,
+    native_output: Option<bool>,
 }
 
 impl StreamingSparsePrimary {
@@ -403,6 +467,7 @@ impl StreamingSparsePrimary {
             extent_index: 0,
             extent_consumed: 0,
             logical_cursor: 0,
+            native_output: None,
         }
     }
 
@@ -418,6 +483,15 @@ impl StreamingSparsePrimary {
         }
         let Some(layout) = &self.layout else {
             return Ok(());
+        };
+        let native_output = match self.native_output {
+            Some(native_output) => native_output,
+            None => {
+                let native_output =
+                    observer.on_sparse_layout(layout.logical_size, &layout.extents)?;
+                self.native_output = Some(native_output);
+                native_output
+            }
         };
         let padded = layout.map_and_padding_size as u64;
         let data_offset = if before >= padded {
@@ -436,12 +510,18 @@ impl StreamingSparsePrimary {
                         "sparse primary has trailing extent bytes",
                     ))?;
             if self.extent_consumed == 0 {
-                observer_write_zeros(observer, extent.offset - self.logical_cursor)?;
+                if !native_output {
+                    observer_write_zeros(observer, extent.offset - self.logical_cursor)?;
+                }
             }
             let available = extent.length - self.extent_consumed;
             let take = usize::try_from(available.min(data.len() as u64))
                 .map_err(|_| FormatError::InvalidArchive("sparse extent exceeds usize"))?;
-            observer.on_regular_payload(&data[..take])?;
+            if native_output {
+                observer.on_sparse_extent(extent.offset + self.extent_consumed, &data[..take])?;
+            } else {
+                observer.on_regular_payload(&data[..take])?;
+            }
             self.extent_consumed += take as u64;
             data = &data[take..];
             if self.extent_consumed == extent.length {
@@ -460,7 +540,15 @@ impl StreamingSparsePrimary {
                 "sparse primary extent data is incomplete",
             ));
         }
-        observer_write_zeros(observer, layout.logical_size - self.logical_cursor)
+        let native_output = match self.native_output {
+            Some(native_output) => native_output,
+            None => observer.on_sparse_layout(layout.logical_size, &layout.extents)?,
+        };
+        if native_output {
+            observer.on_sparse_complete()
+        } else {
+            observer_write_zeros(observer, layout.logical_size - self.logical_cursor)
+        }
     }
 }
 
@@ -1177,8 +1265,24 @@ fn validate_v45_primary_cross_fields(
 }
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0000_0004;
+const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0000_0100;
+const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x0000_2000;
 const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x0000_4000;
+const WINDOWS_ESSENTIAL_SETTABLE_ATTRIBUTES: u32 = FILE_ATTRIBUTE_READONLY
+    | FILE_ATTRIBUTE_HIDDEN
+    | FILE_ATTRIBUTE_SYSTEM
+    | FILE_ATTRIBUTE_ARCHIVE
+    | FILE_ATTRIBUTE_TEMPORARY
+    | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+const WINDOWS_ESSENTIAL_INTRINSIC_ATTRIBUTES: u32 =
+    FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_SPARSE_FILE | FILE_ATTRIBUTE_REPARSE_POINT;
 const STREAM_CONTAINS_SECURITY: u32 = 0x0000_0002;
 const STREAM_SPARSE_ATTRIBUTE: u32 = 0x0000_0008;
 
@@ -2827,26 +2931,32 @@ fn plan_restore(
         );
     }
     if metadata.file_entry_flags & HAS_SPARSE_EXTENTS != 0 {
-        if options.restore_policy != RestorePolicy::Content && !options.allow_degraded {
+        let native_sparse_supported = cfg!(windows);
+        if options.restore_policy != RestorePolicy::Content
+            && !native_sparse_supported
+            && !options.allow_degraded
+        {
             return Err(FormatError::ReaderUnsupported(
                 "sparse layout materialization needs explicit degraded restore",
             ));
         }
-        diagnostics.push(
-            MetadataDiagnostic::new(
-                path,
-                "portable-v1",
-                "sparse-layout",
-                MetadataOperation::Plan,
-                MetadataDiagnosticStatus::Materialized,
-                if options.restore_policy == RestorePolicy::Content {
-                    "sparse layout is outside content policy; logical bytes will be materialized"
-                } else {
-                    "sparse layout will be materialized as logical zero bytes"
-                },
-            )
-            .for_restore(options.restore_policy, 1),
-        );
+        if options.restore_policy == RestorePolicy::Content || !native_sparse_supported {
+            diagnostics.push(
+                MetadataDiagnostic::new(
+                    path,
+                    "portable-v1",
+                    "sparse-layout",
+                    MetadataOperation::Plan,
+                    MetadataDiagnosticStatus::Materialized,
+                    if options.restore_policy == RestorePolicy::Content {
+                        "sparse layout is outside content policy; logical bytes will be materialized"
+                    } else {
+                        "sparse layout will be materialized as logical zero bytes"
+                    },
+                )
+                .for_restore(options.restore_policy, 1),
+            );
+        }
     }
 
     if options.restore_policy != RestorePolicy::Content
@@ -3175,6 +3285,28 @@ fn native_primary_restore_unsupported(metadata: &MemberMetadata, include_system:
         if key == "TZAP.linux.fsflags" {
             return !cfg!(target_os = "linux");
         }
+        if key == "TZAP.windows.file-attributes" {
+            if !cfg!(windows) || metadata.declaration.source_os != "windows" {
+                return true;
+            }
+            return metadata
+                .primary_records
+                .get(key)
+                .and_then(|value| parse_lower_hex_u32(value, "Windows file attributes").ok())
+                .is_none_or(|attributes| {
+                    attributes
+                        & !(WINDOWS_ESSENTIAL_SETTABLE_ATTRIBUTES
+                            | WINDOWS_ESSENTIAL_INTRINSIC_ATTRIBUTES
+                            | FILE_ATTRIBUTE_NORMAL)
+                        != 0
+                });
+        }
+        if key == "TZAP.windows.change-time" {
+            return !cfg!(windows) || metadata.declaration.source_os != "windows";
+        }
+        if key == "LIBARCHIVE.creationtime" && metadata.declaration.source_os == "windows" {
+            return !cfg!(windows);
+        }
         if key.starts_with("SCHILY.acl.") || key.starts_with("TZAP.acl.") {
             return !cfg!(target_os = "linux");
         }
@@ -3410,6 +3542,9 @@ struct FilesystemRestoreHandler<'a> {
     skipped_reparse_placeholder: bool,
     skipped_by_policy: bool,
     materialized_hardlink: bool,
+    native_sparse_active: bool,
+    sparse_logical_size: u64,
+    sparse_extents: Vec<SparseExtent>,
     planned_diagnostics: Vec<MetadataDiagnostic>,
     defer_hardlinks: bool,
     deferred_hardlinks: Vec<(Vec<u8>, Vec<u8>)>,
@@ -3428,6 +3563,9 @@ impl<'a> FilesystemRestoreHandler<'a> {
             skipped_reparse_placeholder: false,
             skipped_by_policy: false,
             materialized_hardlink: false,
+            native_sparse_active: false,
+            sparse_logical_size: 0,
+            sparse_extents: Vec::new(),
             planned_diagnostics: Vec::new(),
             defer_hardlinks: false,
             deferred_hardlinks: Vec::new(),
@@ -3583,6 +3721,9 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
         self.skipped_reparse_placeholder = false;
         self.skipped_by_policy = false;
         self.materialized_hardlink = false;
+        self.native_sparse_active = false;
+        self.sparse_logical_size = 0;
+        self.sparse_extents.clear();
         self.planned_diagnostics.clear();
         self.planned_diagnostics = plan_restore(
             &member.path,
@@ -3707,6 +3848,77 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
         ))?;
         file.write_all(bytes)
             .map_err(|_| FormatError::FilesystemExtractionFailed("failed to write regular file"))?;
+        Ok(())
+    }
+
+    fn begin_sparse_payload(
+        &mut self,
+        logical_size: u64,
+        extents: &[SparseExtent],
+    ) -> Result<bool, ExtractError> {
+        #[cfg(windows)]
+        {
+            if self.options.restore_policy == RestorePolicy::Content {
+                return Ok(false);
+            }
+            let file = self.file.as_mut().ok_or(FormatError::InvalidArchive(
+                "regular file output is missing",
+            ))?;
+            prepare_windows_sparse_file(file, logical_size)?;
+            self.native_sparse_active = true;
+            self.sparse_logical_size = logical_size;
+            self.sparse_extents = extents.to_vec();
+            return Ok(true);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (logical_size, extents);
+            Ok(false)
+        }
+    }
+
+    fn write_sparse_extent(&mut self, offset: u64, bytes: &[u8]) -> Result<(), ExtractError> {
+        if !self.native_sparse_active {
+            return Err(FormatError::InvalidArchive("sparse output was not initialized").into());
+        }
+        let file = self.file.as_mut().ok_or(FormatError::InvalidArchive(
+            "regular file output is missing",
+        ))?;
+        file.seek(SeekFrom::Start(offset)).map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to seek sparse output extent")
+        })?;
+        file.write_all(bytes).map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to write sparse output extent")
+        })?;
+        Ok(())
+    }
+
+    fn finish_sparse_payload(&mut self) -> Result<(), ExtractError> {
+        if !self.native_sparse_active {
+            return Ok(());
+        }
+        let file = self.file.as_mut().ok_or(FormatError::InvalidArchive(
+            "regular file output is missing",
+        ))?;
+        file.flush().map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to flush sparse output")
+        })?;
+        if file
+            .metadata()
+            .map_err(|_| {
+                FormatError::FilesystemExtractionFailed("failed to inspect sparse output")
+            })?
+            .len()
+            != self.sparse_logical_size
+        {
+            return Err(FormatError::FilesystemExtractionFailed(
+                "sparse output logical size does not match archive",
+            )
+            .into());
+        }
+        #[cfg(windows)]
+        verify_windows_sparse_file(file, self.sparse_logical_size, &self.sparse_extents)?;
+        self.native_sparse_active = false;
         Ok(())
     }
 }
@@ -3856,22 +4068,35 @@ where
         .into());
     }
 
+    let native_output = handler.begin_sparse_payload(logical_size, &layout.extents)?;
     let zeros = [0u8; 64 * 1024];
     let mut logical_cursor = 0u64;
     let mut buf = [0u8; 64 * 1024];
     for extent in &layout.extents {
-        write_zero_run(handler, &zeros, extent.offset - logical_cursor)?;
+        if !native_output {
+            write_zero_run(handler, &zeros, extent.offset - logical_cursor)?;
+        }
         let mut extent_remaining = extent.length;
+        let mut extent_consumed = 0u64;
         while extent_remaining > 0 {
             let chunk_len = extent_remaining.min(buf.len() as u64) as usize;
             read_member_bytes(reader, &mut buf[..chunk_len], remaining)?;
             validator.observe(&buf[..chunk_len])?;
-            handler.write_regular_payload(&buf[..chunk_len])?;
+            if native_output {
+                handler.write_sparse_extent(extent.offset + extent_consumed, &buf[..chunk_len])?;
+            } else {
+                handler.write_regular_payload(&buf[..chunk_len])?;
+            }
             extent_remaining -= chunk_len as u64;
+            extent_consumed += chunk_len as u64;
         }
         logical_cursor = extent.offset + extent.length;
     }
-    write_zero_run(handler, &zeros, logical_size - logical_cursor)?;
+    if native_output {
+        handler.finish_sparse_payload()?;
+    } else {
+        write_zero_run(handler, &zeros, logical_size - logical_cursor)?;
+    }
     validator.finish()?;
     Ok(())
 }
@@ -4162,8 +4387,246 @@ fn apply_restored_regular_file_metadata_parts(
     apply_regular_file_mtime(file, path, mtime, options, diagnostics)?;
     apply_regular_file_attributes(file, path, attributes, options, diagnostics)?;
     if let Some(member_metadata) = member_metadata {
+        apply_windows_basic_metadata(file, path, member_metadata, options, diagnostics)?;
         apply_linux_inode_flags(file, path, member_metadata, options, diagnostics)?;
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn pax_timestamp_to_windows_filetime(timestamp: (i64, u32)) -> Result<i64, FormatError> {
+    const WINDOWS_TO_UNIX_EPOCH_100NS: i128 = 116_444_736_000_000_000;
+    let (seconds, nanoseconds) = timestamp;
+    if nanoseconds % 100 != 0 {
+        return Err(FormatError::FilesystemExtractionFailed(
+            "Windows timestamp is not representable at 100-nanosecond precision",
+        ));
+    }
+    let ticks = i128::from(seconds)
+        .checked_mul(10_000_000)
+        .and_then(|value| value.checked_add(i128::from(nanoseconds / 100)))
+        .and_then(|value| value.checked_add(WINDOWS_TO_UNIX_EPOCH_100NS))
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(FormatError::FilesystemExtractionFailed(
+            "Windows timestamp is outside the FILETIME range",
+        ))?;
+    if ticks < 0 {
+        return Err(FormatError::FilesystemExtractionFailed(
+            "Windows timestamp predates the FILETIME epoch",
+        ));
+    }
+    Ok(ticks)
+}
+
+#[cfg(windows)]
+fn apply_windows_basic_metadata(
+    file: &fs::File,
+    path: &[u8],
+    metadata: &MemberMetadata,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    if metadata.declaration.source_os != "windows"
+        || !matches!(
+            options.restore_policy,
+            RestorePolicy::SameOs | RestorePolicy::System
+        )
+    {
+        return Ok(());
+    }
+
+    let desired_attributes = metadata
+        .primary_records
+        .get("TZAP.windows.file-attributes")
+        .map(|value| parse_lower_hex_u32(value, "Windows file attributes"))
+        .transpose()?;
+    let parse_optional_timestamp = |key: &str| {
+        metadata
+            .primary_records
+            .get(key)
+            .map(|value| parse_timestamp(value).and_then(pax_timestamp_to_windows_filetime))
+            .transpose()
+    };
+    let creation_time = parse_optional_timestamp("LIBARCHIVE.creationtime")?;
+    let access_time = parse_optional_timestamp("atime")?;
+    let write_time = Some(pax_timestamp_to_windows_filetime(
+        metadata.portable_mirror.mtime,
+    )?);
+    let change_time = parse_optional_timestamp("TZAP.windows.change-time")?;
+
+    let mut current = FILE_BASIC_INFO::default();
+    let handle = file.as_raw_handle().cast();
+    // SAFETY: `handle` is live and `current` is a correctly sized writable structure.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            (&mut current as *mut FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                "basic-metadata",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to inspect Windows basic metadata",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "failed to inspect Windows basic metadata",
+        );
+    }
+
+    let mut restored = current;
+    if let Some(value) = creation_time {
+        restored.CreationTime = value;
+    }
+    if let Some(value) = access_time {
+        restored.LastAccessTime = value;
+    }
+    if let Some(value) = write_time {
+        restored.LastWriteTime = value;
+    }
+    if let Some(value) = change_time {
+        restored.ChangeTime = value;
+    }
+    if let Some(desired) = desired_attributes {
+        let unsupported = desired
+            & !(WINDOWS_ESSENTIAL_SETTABLE_ATTRIBUTES
+                | WINDOWS_ESSENTIAL_INTRINSIC_ATTRIBUTES
+                | FILE_ATTRIBUTE_NORMAL);
+        if unsupported != 0 {
+            let diagnostic = MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                "file-attributes",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Unsupported,
+                format!("unsupported Windows attribute bits were not applied: {unsupported:08x}"),
+            )
+            .for_restore(options.restore_policy, 4);
+            if options.allow_degraded {
+                diagnostics.push(diagnostic);
+            } else {
+                return Err(FormatError::ReaderUnsupported(
+                    "Windows file attributes contain unsupported bits",
+                ));
+            }
+        }
+        let intrinsic_mismatch =
+            (current.FileAttributes ^ desired) & WINDOWS_ESSENTIAL_INTRINSIC_ATTRIBUTES;
+        if intrinsic_mismatch != 0 {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    "windows-backup-v1",
+                    "file-attributes",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    format!(
+                        "restored Windows object has mismatched intrinsic attributes: {intrinsic_mismatch:08x}"
+                    ),
+                )
+                .for_restore(options.restore_policy, 4),
+                options,
+                "restored Windows object has mismatched intrinsic attributes",
+            )?;
+        }
+        restored.FileAttributes = (current.FileAttributes & !WINDOWS_ESSENTIAL_SETTABLE_ATTRIBUTES)
+            | (desired & WINDOWS_ESSENTIAL_SETTABLE_ATTRIBUTES);
+        if restored.FileAttributes
+            & (WINDOWS_ESSENTIAL_SETTABLE_ATTRIBUTES | WINDOWS_ESSENTIAL_INTRINSIC_ATTRIBUTES)
+            == 0
+        {
+            restored.FileAttributes |= FILE_ATTRIBUTE_NORMAL;
+        } else {
+            restored.FileAttributes &= !FILE_ATTRIBUTE_NORMAL;
+        }
+    }
+
+    // SAFETY: `handle` is live and `restored` is a correctly sized initialized structure.
+    if unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileBasicInfo,
+            (&restored as *const FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                "basic-metadata",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to apply Windows basic metadata",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "failed to apply Windows basic metadata",
+        );
+    }
+
+    let mut actual = FILE_BASIC_INFO::default();
+    // SAFETY: `handle` is live and `actual` is a correctly sized writable structure.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            (&mut actual as *mut FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+        || actual.CreationTime != restored.CreationTime
+        || actual.LastAccessTime != restored.LastAccessTime
+        || actual.LastWriteTime != restored.LastWriteTime
+        || actual.ChangeTime != restored.ChangeTime
+        || actual.FileAttributes
+            & (WINDOWS_ESSENTIAL_SETTABLE_ATTRIBUTES | WINDOWS_ESSENTIAL_INTRINSIC_ATTRIBUTES)
+            != restored.FileAttributes
+                & (WINDOWS_ESSENTIAL_SETTABLE_ATTRIBUTES | WINDOWS_ESSENTIAL_INTRINSIC_ATTRIBUTES)
+    {
+        let error = std::io::Error::last_os_error();
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                "basic-metadata",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "Windows basic metadata did not verify after restoration",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "Windows basic metadata did not verify after restoration",
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn apply_windows_basic_metadata(
+    _file: &fs::File,
+    _path: &[u8],
+    _metadata: &MemberMetadata,
+    _options: SafeExtractionOptions,
+    _diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
     Ok(())
 }
 
@@ -4820,6 +5283,8 @@ fn create_new_file_options() -> CapOpenOptions {
         .write(true)
         .create_new(true)
         .follow(FollowSymlinks::No);
+    #[cfg(windows)]
+    options.access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE);
     options
 }
 
@@ -4838,6 +5303,35 @@ fn open_existing_regular_file(target: &PreparedDestination) -> Result<fs::File, 
 }
 
 fn open_existing_directory(target: &PreparedDestination) -> Result<fs::File, FormatError> {
+    #[cfg(windows)]
+    {
+        let mut options = CapOpenOptions::new();
+        options
+            .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .follow(FollowSymlinks::No);
+        let directory = target
+            .parent
+            .open_with(&target.leaf, &options)
+            .map(cap_std::fs::File::into_std)
+            .map_err(|_| {
+                FormatError::FilesystemExtractionFailed(
+                    "failed to open directory for metadata restoration",
+                )
+            })?;
+        let metadata = directory.metadata().map_err(|_| {
+            FormatError::FilesystemExtractionFailed(
+                "failed to inspect directory for metadata restoration",
+            )
+        })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(FormatError::UnsafeArchivePath);
+        }
+        return Ok(directory);
+    }
+
+    #[cfg(not(windows))]
     let directory = target.parent.open_dir_nofollow(&target.leaf).map_err(|_| {
         FormatError::FilesystemExtractionFailed("failed to open directory for metadata restoration")
     })?;
@@ -4852,7 +5346,7 @@ fn open_existing_directory(target: &PreparedDestination) -> Result<fs::File, For
                 )
             })
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     {
         Ok(directory.into_std_file())
     }
@@ -4998,6 +5492,289 @@ fn create_temp_regular_file(
     ))
 }
 
+#[cfg(windows)]
+fn prepare_windows_sparse_file(file: &fs::File, logical_size: u64) -> Result<(), FormatError> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let mut bytes_returned = 0u32;
+    // SAFETY: the file handle is live; FSCTL_SET_SPARSE accepts null input and output buffers for
+    // the default "set sparse" operation, and the call is synchronous.
+    if unsafe {
+        DeviceIoControl(
+            file.as_raw_handle().cast(),
+            FSCTL_SET_SPARSE,
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(FormatError::FilesystemExtractionFailed(
+            "destination filesystem cannot mark sparse output",
+        ));
+    }
+    file.set_len(logical_size)
+        .map_err(|_| FormatError::FilesystemExtractionFailed("failed to size sparse output"))
+}
+
+#[cfg(windows)]
+fn query_windows_sparse_ranges(
+    file: &fs::File,
+    logical_size: u64,
+) -> Result<Vec<SparseExtent>, FormatError> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
+    use windows_sys::Win32::System::Ioctl::{
+        FILE_ALLOCATED_RANGE_BUFFER, FSCTL_QUERY_ALLOCATED_RANGES,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const QUERY_BATCH: usize = 1024;
+    if logical_size == 0 {
+        return Ok(Vec::new());
+    }
+    let logical_size_i64 = i64::try_from(logical_size).map_err(|_| {
+        FormatError::FilesystemExtractionFailed("sparse logical size exceeds Windows range API")
+    })?;
+    let mut query_start = 0u64;
+    let mut extents = Vec::<SparseExtent>::new();
+    while query_start < logical_size {
+        let mut query = FILE_ALLOCATED_RANGE_BUFFER {
+            FileOffset: query_start as i64,
+            Length: logical_size_i64 - query_start as i64,
+        };
+        let mut output = [FILE_ALLOCATED_RANGE_BUFFER::default(); QUERY_BATCH];
+        let mut bytes_returned = 0u32;
+        // SAFETY: the live handle and fixed-size buffers remain valid for this synchronous call.
+        let success = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle().cast(),
+                FSCTL_QUERY_ALLOCATED_RANGES,
+                (&mut query as *mut FILE_ALLOCATED_RANGE_BUFFER).cast(),
+                size_of::<FILE_ALLOCATED_RANGE_BUFFER>() as u32,
+                output.as_mut_ptr().cast(),
+                size_of::<[FILE_ALLOCATED_RANGE_BUFFER; QUERY_BATCH]>() as u32,
+                &mut bytes_returned,
+                ptr::null_mut(),
+            )
+        };
+        let error = std::io::Error::last_os_error();
+        if success == 0 && error.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
+            return Err(FormatError::FilesystemExtractionFailed(
+                "failed to query restored sparse ranges",
+            ));
+        }
+        if bytes_returned as usize % size_of::<FILE_ALLOCATED_RANGE_BUFFER>() != 0 {
+            return Err(FormatError::FilesystemExtractionFailed(
+                "Windows returned a truncated restored sparse range",
+            ));
+        }
+        let count = bytes_returned as usize / size_of::<FILE_ALLOCATED_RANGE_BUFFER>();
+        if count > QUERY_BATCH || (success == 0 && count == 0) {
+            return Err(FormatError::FilesystemExtractionFailed(
+                "restored sparse range query made no progress",
+            ));
+        }
+        let mut next_query_start = query_start;
+        for range in &output[..count] {
+            if range.FileOffset < 0 || range.Length <= 0 {
+                return Err(FormatError::FilesystemExtractionFailed(
+                    "Windows returned an invalid restored sparse range",
+                ));
+            }
+            let offset = range.FileOffset as u64;
+            let end = offset
+                .checked_add(range.Length as u64)
+                .ok_or(FormatError::FilesystemExtractionFailed(
+                    "restored sparse range overflow",
+                ))?
+                .min(logical_size);
+            if offset >= logical_size || end <= offset {
+                return Err(FormatError::FilesystemExtractionFailed(
+                    "Windows returned an out-of-bounds restored sparse range",
+                ));
+            }
+            if let Some(previous) = extents.last_mut() {
+                let previous_end = previous.offset + previous.length;
+                if offset <= previous_end {
+                    previous.length = previous_end.max(end) - previous.offset;
+                } else {
+                    extents.push(SparseExtent {
+                        offset,
+                        length: end - offset,
+                    });
+                }
+            } else {
+                extents.push(SparseExtent {
+                    offset,
+                    length: end - offset,
+                });
+            }
+            next_query_start = next_query_start.max(end);
+        }
+        if success != 0 {
+            break;
+        }
+        if next_query_start <= query_start {
+            return Err(FormatError::FilesystemExtractionFailed(
+                "restored sparse range query did not advance",
+            ));
+        }
+        query_start = next_query_start;
+    }
+    Ok(extents)
+}
+
+#[cfg(windows)]
+fn verify_windows_sparse_file(
+    file: &fs::File,
+    logical_size: u64,
+    expected_extents: &[SparseExtent],
+) -> Result<(), FormatError> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+    };
+
+    const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: the handle is live and the output points to a correctly sized FILE_BASIC_INFO.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+        || basic.FileAttributes & FILE_ATTRIBUTE_SPARSE_FILE == 0
+    {
+        return Err(FormatError::FilesystemExtractionFailed(
+            "restored file is not marked sparse",
+        ));
+    }
+    if query_windows_sparse_ranges(file, logical_size)? != expected_extents {
+        return Err(FormatError::FilesystemExtractionFailed(
+            "restored sparse ranges do not match archive",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn rename_open_file_noreplace(
+    file: &fs::File,
+    destination_parent: &CapDir,
+    destination_leaf: &Path,
+) -> Result<(), FormatError> {
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfo, GetFinalPathNameByHandleW, SetFileInformationByHandle,
+        FILE_NAME_NORMALIZED, FILE_RENAME_INFO, VOLUME_NAME_DOS,
+    };
+
+    let leaf = destination_leaf
+        .as_os_str()
+        .encode_wide()
+        .collect::<Vec<_>>();
+    if leaf.is_empty() || leaf.iter().any(|unit| *unit == 0) {
+        return Err(FormatError::UnsafeArchivePath);
+    }
+    let mut capacity = 512usize;
+    let mut name = loop {
+        let mut buffer = vec![0u16; capacity];
+        // SAFETY: the directory handle is live and `buffer` is writable for its declared length.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                destination_parent.as_raw_handle().cast(),
+                buffer.as_mut_ptr(),
+                u32::try_from(buffer.len()).map_err(|_| {
+                    FormatError::FilesystemExtractionFailed(
+                        "destination path buffer exceeds Windows limit",
+                    )
+                })?,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if length == 0 {
+            return Err(FormatError::FilesystemExtractionFailed(
+                "failed to resolve destination directory handle",
+            ));
+        }
+        if length < buffer.len() {
+            buffer.truncate(length);
+            break buffer;
+        }
+        capacity = length
+            .checked_add(1)
+            .ok_or(FormatError::FilesystemExtractionFailed(
+                "destination path length overflow",
+            ))?;
+    };
+    if !name.ends_with(&[b'\\' as u16]) {
+        name.push(b'\\' as u16);
+    }
+    name.extend_from_slice(&leaf);
+    let byte_len = offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(name.len().checked_mul(size_of::<u16>()).ok_or(
+            FormatError::FilesystemExtractionFailed(
+                "destination file name is too large to publish",
+            ),
+        )?)
+        .ok_or(FormatError::FilesystemExtractionFailed(
+            "destination rename buffer overflow",
+        ))?;
+    let storage_len = byte_len.div_ceil(size_of::<usize>());
+    let mut storage = vec![0usize; storage_len];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: `storage` is pointer-aligned and large enough for the fixed structure plus every
+    // UTF-16 filename unit. ReplaceIfExists=false gives the required no-clobber publication.
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = std::ptr::null_mut();
+        (*info).FileNameLength = u32::try_from(name.len() * size_of::<u16>()).map_err(|_| {
+            FormatError::FilesystemExtractionFailed("destination filename exceeds Windows limit")
+        })?;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
+        if SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            FileRenameInfo,
+            info.cast(),
+            u32::try_from(byte_len).map_err(|_| {
+                FormatError::FilesystemExtractionFailed(
+                    "destination rename buffer exceeds Windows limit",
+                )
+            })?,
+        ) == 0
+        {
+            let error = std::io::Error::last_os_error();
+            return if matches!(error.raw_os_error(), Some(80 | 183)) {
+                Err(FormatError::UnsafeOverwrite)
+            } else {
+                Err(FormatError::FilesystemExtractionFailed(
+                    "failed to publish allocation-preserving output",
+                ))
+            };
+        }
+    }
+    Ok(())
+}
+
 fn publish_regular_file(
     destination: &PreparedDestination,
     temp_leaf: &Path,
@@ -5008,6 +5785,21 @@ fn publish_regular_file(
         remove_existing_leaf_if_needed(destination)?;
     }
 
+    #[cfg(windows)]
+    {
+        temp_file
+            .flush()
+            .map_err(|_| FormatError::FilesystemExtractionFailed("failed to flush regular file"))?;
+        if let Err(error) =
+            rename_open_file_noreplace(&temp_file, &destination.parent, &destination.leaf)
+        {
+            let _ = destination.parent.remove_file_or_symlink(temp_leaf);
+            return Err(error);
+        }
+        return Ok(temp_file);
+    }
+
+    #[cfg(not(windows))]
     let mut output = match destination
         .parent
         .open_with(&destination.leaf, &create_new_file_options())
@@ -5025,11 +5817,13 @@ fn publish_regular_file(
         }
     };
 
+    #[cfg(not(windows))]
     let copy_result = temp_file
         .seek(SeekFrom::Start(0))
         .and_then(|_| std::io::copy(&mut temp_file, &mut output))
         .and_then(|_| output.flush());
 
+    #[cfg(not(windows))]
     if copy_result.is_err() {
         let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
         let _ = destination.parent.remove_file_or_symlink(temp_leaf);
@@ -5038,8 +5832,11 @@ fn publish_regular_file(
         ));
     }
 
-    let _ = destination.parent.remove_file_or_symlink(temp_leaf);
-    Ok(output)
+    #[cfg(not(windows))]
+    {
+        let _ = destination.parent.remove_file_or_symlink(temp_leaf);
+        Ok(output)
+    }
 }
 
 fn remove_existing_leaf_if_needed(destination: &PreparedDestination) -> Result<(), FormatError> {
