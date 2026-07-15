@@ -15,6 +15,8 @@ use openssl::x509::X509;
 use rand::RngCore;
 use serde_json::json;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+#[cfg(windows)]
+use tzap_core::encode_v45_sparse_map;
 use tzap_core::format::{
     FormatError, CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION, READER_MAX_ARGON2ID_M_COST_KIB,
     READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST,
@@ -24,6 +26,8 @@ use tzap_core::format::{
 use tzap_core::linux_posix_acl_xattr_to_schily;
 use tzap_core::reader::{ArchiveEntry, ArchiveIndexEntry, RecipientWrapRecordContext};
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
+#[cfg(all(test, target_os = "macos"))]
+use tzap_core::write_archive;
 #[cfg(unix)]
 use tzap_core::PortablePosixOwner;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -61,7 +65,7 @@ use tzap_core::{
     WriterOptions, WriterTimings, WrittenArchiveSummary,
 };
 #[cfg(test)]
-use tzap_core::{write_archive, write_archive_with_kdf, RegularFile};
+use tzap_core::{write_archive_with_kdf, RegularFile};
 #[cfg(test)]
 use tzap_core::{MetadataDiagnosticStatus, MetadataOperation};
 #[cfg(any(target_os = "macos", windows))]
@@ -1359,9 +1363,7 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
 
-            let read_inputs_started = Instant::now();
-            let inputs = collect_input_files(&input_specs)?;
-            let read_inputs = read_inputs_started.elapsed();
+            let read_inputs = Duration::default();
             let core_writer_started = Instant::now();
             let mut archive_sink = MemoryArchiveSink::default();
             let archive =
@@ -1370,7 +1372,7 @@ fn run(cli: Cli) -> Result<()> {
                         root_auth_authenticator_value(profile, request)
                     };
                     write_archive_sources_to_sink(
-                        &inputs,
+                        &input_specs,
                         &key.master_key,
                         options,
                         dictionary_bytes.as_deref(),
@@ -1381,7 +1383,7 @@ fn run(cli: Cli) -> Result<()> {
                     )
                 } else {
                     write_archive_sources_to_sink(
-                        &inputs,
+                        &input_specs,
                         &key.master_key,
                         options,
                         dictionary_bytes.as_deref(),
@@ -1415,7 +1417,7 @@ fn run(cli: Cli) -> Result<()> {
             let write_outputs = write_outputs_started.elapsed();
             let summary = format!(
                 "created {} member(s), {} bytes in, {} archive bytes, {} volume(s), volume-loss tolerance {}, bit-rot buffer {}%",
-                inputs.len(),
+                input_specs.len(),
                 input_bytes,
                 archive_sink.volumes.iter().map(|volume| volume.len() as u64).sum::<u64>(),
                 archive_sink.volumes.len(),
@@ -2968,57 +2970,6 @@ fn unsupported_revision_error_json(err: &anyhow::Error, action: &'static str) ->
 }
 
 #[derive(Debug)]
-struct InputFile {
-    archive_path: String,
-    entry_kind: SourceEntryKind,
-    link_target: Option<Vec<u8>>,
-    contents: Vec<u8>,
-    size: u64,
-    sparse_extents: Option<Vec<SparseExtent>>,
-    mode: u32,
-    mtime: ArchiveTimestamp,
-    portable_metadata: PortableFileMetadata,
-}
-
-impl RegularFileSource for InputFile {
-    fn archive_path(&self) -> &str {
-        &self.archive_path
-    }
-
-    fn entry_kind(&self) -> SourceEntryKind {
-        self.entry_kind
-    }
-
-    fn link_target(&self) -> Option<&[u8]> {
-        self.link_target.as_deref()
-    }
-
-    fn file_data_size(&self) -> u64 {
-        self.size
-    }
-
-    fn sparse_extents(&self) -> Option<&[SparseExtent]> {
-        self.sparse_extents.as_deref()
-    }
-
-    fn mode(&self) -> u32 {
-        self.mode
-    }
-
-    fn mtime(&self) -> ArchiveTimestamp {
-        self.mtime
-    }
-
-    fn portable_metadata(&self) -> PortableFileMetadata {
-        self.portable_metadata.clone()
-    }
-
-    fn open(&self) -> std::result::Result<Box<dyn Read + '_>, ArchiveWriteError> {
-        Ok(Box::new(io::Cursor::new(self.contents.as_slice())))
-    }
-}
-
-#[derive(Debug)]
 struct InputSpec {
     source: PathBuf,
     archive_path: String,
@@ -3072,22 +3023,40 @@ impl RegularFileSource for InputSpec {
             #[cfg(windows)]
             let actual = {
                 let mut actual = actual;
-                if self.entry_kind == SourceEntryKind::Directory {
-                    let file = open_windows_metadata_handle(&self.source)
-                        .map_err(ArchiveWriteError::Io)?;
-                    augment_windows_input_identity(&mut actual, &file)
-                        .map_err(ArchiveWriteError::Io)?;
-                }
+                let file =
+                    open_windows_metadata_handle(&self.source).map_err(ArchiveWriteError::Io)?;
+                augment_windows_input_identity(&mut actual, &file)
+                    .map_err(ArchiveWriteError::Io)?;
                 actual
             };
             let kind_matches = match self.entry_kind {
                 SourceEntryKind::Directory => metadata.is_dir(),
                 SourceEntryKind::Symlink => metadata.file_type().is_symlink(),
+                SourceEntryKind::Hardlink => metadata.is_file(),
+                #[cfg(windows)]
+                SourceEntryKind::ReparseDirectory => open_windows_metadata_handle(&self.source)
+                    .and_then(|file| query_windows_reparse_data(&file))
+                    .and_then(|data| validate_windows_known_reparse_data(&data))
+                    .is_ok_and(|kind| kind == WindowsKnownReparse::Junction),
+                #[cfg(not(windows))]
+                SourceEntryKind::ReparseDirectory => false,
                 SourceEntryKind::Regular => false,
             };
             let target_matches = if self.entry_kind == SourceEntryKind::Symlink {
-                symlink_target_bytes(&self.source)
-                    .is_ok_and(|target| Some(target.as_slice()) == self.link_target.as_deref())
+                #[cfg(windows)]
+                let actual_target = open_windows_metadata_handle(&self.source)
+                    .and_then(|file| query_windows_reparse_data(&file))
+                    .and_then(|data| validate_windows_known_reparse_data(&data))
+                    .ok()
+                    .and_then(|kind| match kind {
+                        WindowsKnownReparse::RelativeSymlink { portable_target } => {
+                            Some(portable_target)
+                        }
+                        WindowsKnownReparse::Junction => None,
+                    });
+                #[cfg(not(windows))]
+                let actual_target = symlink_target_bytes(&self.source).ok();
+                actual_target.as_deref() == self.link_target.as_deref()
             } else {
                 true
             };
@@ -3119,6 +3088,71 @@ impl RegularFileSource for InputSpec {
             remaining: self.size,
             validated: false,
         }) as Box<dyn Read + '_>)
+    }
+
+    fn open_auxiliary(
+        &self,
+        ordinal: usize,
+    ) -> std::result::Result<Box<dyn Read + '_>, ArchiveWriteError> {
+        let record = self
+            .portable_metadata
+            .native
+            .auxiliary_records
+            .get(ordinal)
+            .ok_or(FormatError::WriterInvariant(
+                "auxiliary source ordinal is missing",
+            ))?;
+        if !record.is_streamed() {
+            return Ok(Box::new(io::Cursor::new(record.payload.as_slice())));
+        }
+        #[cfg(windows)]
+        {
+            if record.kind != "windows.alternate-data"
+                || record.name_encoding != NativeAuxiliaryNameEncoding::Utf16Le
+                || record.name.len() % 2 != 0
+            {
+                return Err(FormatError::WriterUnsupported(
+                    "unsupported streamed Windows auxiliary source",
+                )
+                .into());
+            }
+            let metadata = fs::symlink_metadata(&self.source).map_err(ArchiveWriteError::Io)?;
+            let mut actual = input_identity(&metadata).map_err(ArchiveWriteError::Io)?;
+            let base = open_windows_metadata_handle(&self.source).map_err(ArchiveWriteError::Io)?;
+            augment_windows_input_identity(&mut actual, &base).map_err(ArchiveWriteError::Io)?;
+            if !input_identity_matches_after_read(self.identity, actual) {
+                return Err(ArchiveWriteError::Io(io::Error::other(
+                    "Windows input changed before alternate-stream read",
+                )));
+            }
+            let stream_path = windows_alternate_stream_path(&self.source, &record.name)
+                .map_err(ArchiveWriteError::Io)?;
+            let stream = File::open(stream_path).map_err(ArchiveWriteError::Io)?;
+            if stream.metadata().map_err(ArchiveWriteError::Io)?.len() != record.logical_size {
+                return Err(ArchiveWriteError::Io(io::Error::other(
+                    "Windows alternate stream changed after scan",
+                )));
+            }
+            if let Some(extents) = record.streamed_sparse_extents() {
+                let map = encode_v45_sparse_map(extents, record.logical_size)?;
+                return Ok(Box::new(io::Cursor::new(map).chain(
+                    WindowsSparseAlternateStreamReader {
+                        file: stream,
+                        logical_size: record.logical_size,
+                        expected_extents: extents.to_vec(),
+                        extent_index: 0,
+                        extent_remaining: 0,
+                        validated: false,
+                    },
+                )));
+            }
+            Ok(Box::new(stream))
+        }
+        #[cfg(not(windows))]
+        Err(
+            FormatError::WriterUnsupported("streamed Windows auxiliary sources require Windows")
+                .into(),
+        )
     }
 }
 
@@ -3302,28 +3336,44 @@ fn collect_input_specs(paths: &[String]) -> Result<Vec<InputSpec>> {
     }
     out.sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
     #[cfg(any(unix, windows))]
-    reject_unrepresentable_selected_hardlinks(&out)?;
+    apply_selected_hardlink_topology(&mut out)?;
     Ok(out)
 }
 
 #[cfg(any(unix, windows))]
-fn reject_unrepresentable_selected_hardlinks(specs: &[InputSpec]) -> Result<()> {
-    let mut selected_objects = BTreeMap::<(u64, u64), &str>::new();
-    for spec in specs {
-        if spec.entry_kind == SourceEntryKind::Directory || spec.identity.link_count < 2 {
+fn apply_selected_hardlink_topology(specs: &mut [InputSpec]) -> Result<()> {
+    let mut selected_objects = BTreeMap::<(u64, u64), usize>::new();
+    for index in 0..specs.len() {
+        let spec = &specs[index];
+        if spec.entry_kind != SourceEntryKind::Regular || spec.identity.link_count < 2 {
             continue;
         }
         #[cfg(unix)]
         let identity = (spec.identity.dev, spec.identity.ino);
         #[cfg(windows)]
         let identity = (spec.identity.volume_serial, spec.identity.file_index);
-        if let Some(previous) = selected_objects.insert(identity, &spec.archive_path) {
-            if previous != spec.archive_path {
-                bail!(
-                    "selected hardlink topology is unsupported by the current v45 writer: {previous} and {} name the same filesystem object",
-                    spec.archive_path
-                );
+        if let Some(&canonical_index) = selected_objects.get(&identity) {
+            let canonical = &specs[canonical_index];
+            if canonical.identity != spec.identity {
+                bail!("selected hardlink identity changed while grouping inputs");
             }
+            let (canonical_target, mode, mtime, mut portable_metadata) = (
+                canonical.archive_path.as_bytes().to_vec(),
+                canonical.mode,
+                canonical.mtime,
+                canonical.portable_metadata.clone(),
+            );
+            portable_metadata.native = NativeFileMetadata::default();
+            let alias = &mut specs[index];
+            alias.entry_kind = SourceEntryKind::Hardlink;
+            alias.link_target = Some(canonical_target);
+            alias.mode = mode;
+            alias.mtime = mtime;
+            alias.portable_metadata = portable_metadata;
+            alias.size = 0;
+            alias.sparse_extents = None;
+        } else {
+            selected_objects.insert(identity, index);
         }
     }
     Ok(())
@@ -3336,40 +3386,14 @@ fn input_specs_total_size(specs: &[InputSpec]) -> Result<u64> {
     })
 }
 
-fn collect_input_files(specs: &[InputSpec]) -> Result<Vec<InputFile>> {
-    let mut out = Vec::new();
-    for spec in specs {
-        let mut reader = spec
-            .open()
-            .map_err(|err| anyhow!(err))
-            .with_context(|| format!("failed to read input {}", spec.source.display()))?;
-        let mut contents = Vec::new();
-        reader
-            .read_to_end(&mut contents)
-            .with_context(|| format!("failed to read input {}", spec.source.display()))?;
-        if contents.len() as u64 != spec.size {
-            bail!("input changed while reading {}", spec.source.display());
-        }
-        out.push(InputFile {
-            archive_path: spec.archive_path.clone(),
-            entry_kind: spec.entry_kind,
-            link_target: spec.link_target.clone(),
-            contents,
-            size: spec.size,
-            sparse_extents: spec.sparse_extents.clone(),
-            mode: spec.mode,
-            mtime: spec.mtime,
-            portable_metadata: spec.portable_metadata.clone(),
-        });
-    }
-    Ok(out)
-}
-
 fn collect_one_input_spec(
     input: &Path,
     archive_path: &Path,
     out: &mut Vec<InputSpec>,
 ) -> Result<()> {
+    #[cfg(windows)]
+    use std::os::windows::fs::MetadataExt as _;
+
     let metadata = fs::symlink_metadata(input)
         .with_context(|| format!("failed to inspect input {}", input.display()))?;
     #[cfg(windows)]
@@ -3491,8 +3515,6 @@ fn collect_windows_known_reparse_input(
     metadata: fs::Metadata,
     out: &mut Vec<InputSpec>,
 ) -> Result<()> {
-    use std::os::windows::fs::MetadataExt as _;
-
     let file = open_windows_metadata_handle(input)
         .with_context(|| format!("failed to open Windows reparse point {}", input.display()))?;
     let mut identity = input_identity(&metadata)
@@ -3521,10 +3543,10 @@ fn collect_windows_known_reparse_input(
             });
         }
         WindowsKnownReparse::Junction => {
-            portable_metadata.native.primary_pax_records.insert(
-                "TZAP.windows.reparse-placeholder".into(),
-                b"1".to_vec(),
-            );
+            portable_metadata
+                .native
+                .primary_pax_records
+                .insert("TZAP.windows.reparse-placeholder".into(), b"1".to_vec());
             out.push(InputSpec {
                 source: input.to_owned(),
                 archive_path,
@@ -3553,8 +3575,8 @@ enum WindowsKnownReparse {
 fn query_windows_reparse_data(file: &File) -> io::Result<Vec<u8>> {
     use std::os::windows::io::AsRawHandle;
     use std::ptr;
-    use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
 
     const MAX_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
     let mut buffer = vec![0u8; MAX_REPARSE_DATA_BUFFER_SIZE];
@@ -3613,7 +3635,10 @@ fn validate_windows_known_reparse_data(data: &[u8]) -> io::Result<WindowsKnownRe
             if payload_len < 12 {
                 return Err(invalid("symbolic-link reparse payload is truncated"));
             }
-            (12usize, u32::from_le_bytes(data[16..20].try_into().unwrap()))
+            (
+                12usize,
+                u32::from_le_bytes(data[16..20].try_into().unwrap()),
+            )
         }
         IO_REPARSE_TAG_MOUNT_POINT => {
             if payload_len < 8 {
@@ -3646,8 +3671,8 @@ fn validate_windows_known_reparse_data(data: &[u8]) -> io::Result<WindowsKnownRe
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect::<Vec<_>>();
-        let text = String::from_utf16(&units)
-            .map_err(|_| invalid("reparse path is not valid UTF-16"))?;
+        let text =
+            String::from_utf16(&units).map_err(|_| invalid("reparse path is not valid UTF-16"))?;
         if text.contains('\0') {
             return Err(invalid("reparse path contains NUL"));
         }
@@ -3661,7 +3686,9 @@ fn validate_windows_known_reparse_data(data: &[u8]) -> io::Result<WindowsKnownRe
 
     if tag == IO_REPARSE_TAG_SYMLINK {
         if flags != SYMLINK_FLAG_RELATIVE {
-            return Err(invalid("only relative Windows symbolic links are supported"));
+            return Err(invalid(
+                "only relative Windows symbolic links are supported",
+            ));
         }
         let target = if print.is_empty() { substitute } else { print };
         let target = target.replace('\\', "/").into_bytes();
@@ -3964,6 +3991,91 @@ struct SparseExtentInputReader<'a> {
     extent_index: usize,
     extent_remaining: u64,
     validated: bool,
+}
+
+#[cfg(windows)]
+fn windows_alternate_stream_path(base: &Path, name: &[u8]) -> io::Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    if name.len() % 2 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows alternate stream name is not UTF-16LE",
+        ));
+    }
+    let mut stream_path = base.as_os_str().encode_wide().collect::<Vec<_>>();
+    stream_path.extend(
+        name.chunks_exact(2)
+            .map(|unit| u16::from_le_bytes([unit[0], unit[1]])),
+    );
+    Ok(PathBuf::from(OsString::from_wide(&stream_path)))
+}
+
+#[cfg(windows)]
+struct WindowsSparseAlternateStreamReader {
+    file: File,
+    logical_size: u64,
+    expected_extents: Vec<SparseExtent>,
+    extent_index: usize,
+    extent_remaining: u64,
+    validated: bool,
+}
+
+#[cfg(windows)]
+impl WindowsSparseAlternateStreamReader {
+    fn validate_finished(&mut self) -> io::Result<()> {
+        if !self.validated {
+            if self.file.metadata()?.len() != self.logical_size
+                || query_windows_allocated_ranges(&self.file, self.logical_size)?
+                    != self.expected_extents
+            {
+                return Err(io::Error::other(
+                    "sparse Windows alternate stream changed after scan",
+                ));
+            }
+            self.validated = true;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Read for WindowsSparseAlternateStreamReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        while written < out.len() {
+            if self.extent_remaining == 0 {
+                let Some(extent) = self.expected_extents.get(self.extent_index) else {
+                    self.validate_finished()?;
+                    break;
+                };
+                self.file.seek(SeekFrom::Start(extent.offset))?;
+                self.extent_remaining = extent.length;
+            }
+            let count = (out.len() - written)
+                .min(usize::try_from(self.extent_remaining).unwrap_or(usize::MAX));
+            let read = self.file.read(&mut out[written..written + count])?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "sparse Windows alternate extent ended before its scanned size",
+                ));
+            }
+            written += read;
+            self.extent_remaining -= read as u64;
+            if self.extent_remaining == 0 {
+                self.extent_index += 1;
+            }
+        }
+        if self.extent_index == self.expected_extents.len() && self.extent_remaining == 0 {
+            self.validate_finished()?;
+        }
+        Ok(written)
+    }
 }
 
 impl SparseExtentInputReader<'_> {
@@ -4562,10 +4674,16 @@ fn capture_native_file_metadata(
     );
     let reparse_data = if identity.file_attributes & 0x0000_0400 != 0 {
         let data = query_windows_reparse_data(&file).with_context(|| {
-            format!("failed to read Windows reparse data for {}", input.display())
+            format!(
+                "failed to read Windows reparse data for {}",
+                input.display()
+            )
         })?;
         validate_windows_known_reparse_data(&data).with_context(|| {
-            format!("failed to validate Windows reparse data for {}", input.display())
+            format!(
+                "failed to validate Windows reparse data for {}",
+                input.display()
+            )
         })?;
         let tag = u32::from_le_bytes(data[0..4].try_into().unwrap());
         let mut record = NativeAuxiliaryMetadata::new(
@@ -4592,15 +4710,17 @@ fn capture_native_file_metadata(
             )
         })?);
     let (data_stream_attributes, mut streams) =
-        capture_windows_backup_streams(&file, reparse_data.as_deref())
-        .with_context(|| {
-            format!(
-                "failed to enumerate Windows streams for {}",
-                input.display()
-            )
-        })?;
+        capture_windows_backup_streams(input, &file, reparse_data.as_deref()).with_context(
+            || {
+                format!(
+                    "failed to enumerate Windows streams for {}",
+                    input.display()
+                )
+            },
+        )?;
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
-    if identity.file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    if identity.file_attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0 {
         native.primary_pax_records.insert(
             "TZAP.windows.data-stream-attributes".into(),
             format!("{data_stream_attributes:08x}").into_bytes(),
@@ -4870,6 +4990,27 @@ impl WindowsBackupReader {
         Ok(payload)
     }
 
+    fn read_sha256(&mut self, mut size: u64) -> io::Result<[u8; 32]> {
+        use sha2::{Digest as _, Sha256};
+
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        while size > 0 {
+            let count = buffer
+                .len()
+                .min(usize::try_from(size).unwrap_or(usize::MAX));
+            if !self.read_optional_exact(&mut buffer[..count])? {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Windows backup stream payload is missing",
+                ));
+            }
+            hasher.update(&buffer[..count]);
+            size -= count as u64;
+        }
+        Ok(hasher.finalize().into())
+    }
+
     fn skip(&mut self, size: u64) -> io::Result<()> {
         use windows_sys::Win32::Storage::FileSystem::BackupSeek;
 
@@ -4938,6 +5079,7 @@ impl Drop for WindowsBackupReader {
 
 #[cfg(windows)]
 fn capture_windows_backup_streams(
+    input: &Path,
     file: &File,
     expected_reparse_data: Option<&[u8]>,
 ) -> Result<(u32, Vec<NativeAuxiliaryMetadata>)> {
@@ -4951,6 +5093,7 @@ fn capture_windows_backup_streams(
     let mut reader = WindowsBackupReader::new(file);
     let mut data_stream_attributes = None;
     let mut auxiliary = Vec::new();
+    let mut sparse_alternate = Vec::new();
     loop {
         let mut header = [0u8; FIXED_STREAM_HEADER_LEN];
         if !reader.read_optional_exact(&mut header)? {
@@ -4984,16 +5127,25 @@ fn capture_windows_backup_streams(
                 format!("failed to skip Windows security stream ({size} bytes)")
             })?,
             BACKUP_ALTERNATE_DATA => {
-                let payload = reader.read_vec(size)?;
-                let mut record = NativeAuxiliaryMetadata::new(
+                let restore_class = if attributes & 0x0000_0002 != 0 {
+                    RestoreClass::System
+                } else {
+                    RestoreClass::SameOs
+                };
+                if attributes & 0x0000_0008 != 0 {
+                    reader.skip(size).with_context(|| {
+                        format!("failed to skip sparse Windows alternate stream ({size} bytes)")
+                    })?;
+                    sparse_alternate.push((name, attributes, restore_class));
+                    continue;
+                }
+                let sha256 = reader.read_sha256(size)?;
+                let mut record = NativeAuxiliaryMetadata::new_streamed(
                     "windows.alternate-data",
                     "windows-backup-v1",
-                    if attributes & 0x0000_0002 != 0 {
-                        RestoreClass::System
-                    } else {
-                        RestoreClass::SameOs
-                    },
-                    payload,
+                    restore_class,
+                    size,
+                    sha256,
                 );
                 record.name_encoding = NativeAuxiliaryNameEncoding::Utf16Le;
                 record.name = name;
@@ -5004,9 +5156,6 @@ fn capture_windows_backup_streams(
                     "TZAP.aux.meta.stream-attributes".into(),
                     format!("{attributes:08x}").into_bytes(),
                 );
-                if attributes & 0x0000_0008 != 0 {
-                    bail!("sparse Windows alternate streams are not yet supported");
-                }
                 auxiliary.push(record);
             }
             BACKUP_EA_DATA | BACKUP_PROPERTY_DATA | BACKUP_OBJECT_ID => {
@@ -5067,7 +5216,14 @@ fn capture_windows_backup_streams(
                     format!("failed to discard Windows sparse-block stream ({size} bytes)")
                 })?;
             }
-            BACKUP_LINK => bail!("Windows hardlink streams require hardlink writer support"),
+            BACKUP_LINK => {
+                if !name.is_empty() {
+                    bail!("Windows hardlink stream unexpectedly has a name");
+                }
+                reader.discard(size).with_context(|| {
+                    format!("failed to discard Windows hardlink topology stream ({size} bytes)")
+                })?;
+            }
             BACKUP_TXFS_DATA => {
                 bail!("Windows transactional backup streams are not representable in v45")
             }
@@ -5081,7 +5237,68 @@ fn capture_windows_backup_streams(
         None if file.metadata()?.len() == 0 => 0,
         None => bail!("Windows BackupRead did not return the default data stream"),
     };
+    drop(reader);
+    for (name, attributes, restore_class) in sparse_alternate {
+        let stream_path = windows_alternate_stream_path(input, &name)?;
+        let mut stream = File::open(stream_path)?;
+        let logical_size = stream.metadata()?.len();
+        let extents = query_windows_allocated_ranges(&stream, logical_size)?;
+        let map = encode_v45_sparse_map(&extents, logical_size).map_err(|error| anyhow!(error))?;
+        let sha256 =
+            hash_windows_sparse_alternate_stream(&mut stream, &map, &extents, logical_size)?;
+        let mut record = NativeAuxiliaryMetadata::new_streamed_sparse(
+            "windows.alternate-data",
+            "windows-backup-v1",
+            restore_class,
+            logical_size,
+            extents,
+            sha256,
+        )
+        .map_err(|error| anyhow!(error))?;
+        record.name_encoding = NativeAuxiliaryNameEncoding::Utf16Le;
+        record.name = name;
+        record
+            .meta
+            .insert("TZAP.aux.meta.stream-type".into(), b"00000004".to_vec());
+        record.meta.insert(
+            "TZAP.aux.meta.stream-attributes".into(),
+            format!("{attributes:08x}").into_bytes(),
+        );
+        auxiliary.push(record);
+    }
     Ok((data_stream_attributes, auxiliary))
+}
+
+#[cfg(windows)]
+fn hash_windows_sparse_alternate_stream(
+    stream: &mut File,
+    map: &[u8],
+    extents: &[SparseExtent],
+    logical_size: u64,
+) -> Result<[u8; 32]> {
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(map);
+    let mut buffer = [0u8; 64 * 1024];
+    for extent in extents {
+        stream.seek(SeekFrom::Start(extent.offset))?;
+        let mut remaining = extent.length;
+        while remaining > 0 {
+            let count = buffer
+                .len()
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            stream.read_exact(&mut buffer[..count])?;
+            hasher.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+    }
+    if stream.metadata()?.len() != logical_size
+        || query_windows_allocated_ranges(stream, logical_size)? != extents
+    {
+        bail!("Windows sparse alternate stream changed while hashing");
+    }
+    Ok(hasher.finalize().into())
 }
 
 #[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(windows)))]
@@ -8659,22 +8876,31 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn create_rejects_selected_hardlinks_when_topology_cannot_be_emitted() {
+    fn create_groups_selected_hardlinks_under_deterministic_canonical_target() {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.txt");
         let second = temp.path().join("second.txt");
         fs::write(&first, b"shared").unwrap();
         fs::hard_link(&first, &second).unwrap();
 
-        let error = collect_input_specs(&[
+        let specs = collect_input_specs(&[
             first.to_string_lossy().into_owned(),
             second.to_string_lossy().into_owned(),
         ])
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error
-            .to_string()
-            .contains("selected hardlink topology is unsupported"));
+        assert_eq!(specs[0].entry_kind, SourceEntryKind::Regular);
+        assert_eq!(specs[1].entry_kind, SourceEntryKind::Hardlink);
+        assert_eq!(
+            specs[1].link_target.as_deref(),
+            Some(b"first.txt".as_slice())
+        );
+        assert_eq!(specs[1].size, 0);
+        assert!(specs[1]
+            .portable_metadata
+            .native
+            .auxiliary_records
+            .is_empty());
     }
 
     #[test]
@@ -9170,9 +9396,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_capture_rejects_metadata_classes_that_are_not_exactly_supported() {
-        for attributes in [0x0000_0200, 0x0000_0400, 0x0000_1000, 0x0000_4000] {
+        for attributes in [0x0000_0400, 0x0000_1000, 0x0000_4000] {
             assert!(unsupported_windows_file_attribute_reason(attributes).is_some());
         }
+        assert_eq!(unsupported_windows_file_attribute_reason(0x0000_0200), None);
         assert_eq!(unsupported_windows_file_attribute_reason(0x20), None);
     }
 
@@ -9214,6 +9441,8 @@ mod tests {
         fs::write(&path, b"payload").unwrap();
         let alternate_path = PathBuf::from(format!("{}:tzap-test", path.display()));
         fs::write(&alternate_path, b"alternate metadata").unwrap();
+        let unicode_alternate_path = PathBuf::from(format!("{}:元数据", path.display()));
+        fs::write(&unicode_alternate_path, b"unicode alternate metadata").unwrap();
         let metadata = fs::metadata(&path).unwrap();
         let mut identity = input_identity(&metadata).unwrap();
         let file = File::open(&path).unwrap();
@@ -9246,9 +9475,21 @@ mod tests {
         let alternate = native
             .auxiliary_records
             .iter()
-            .find(|record| record.kind == "windows.alternate-data")
+            .find(|record| {
+                record.kind == "windows.alternate-data"
+                    && record.name
+                        == ":tzap-test:$DATA"
+                            .encode_utf16()
+                            .flat_map(u16::to_le_bytes)
+                            .collect::<Vec<_>>()
+            })
             .unwrap();
-        assert_eq!(alternate.payload, b"alternate metadata");
+        assert!(alternate.payload.is_empty());
+        assert!(alternate.is_streamed());
+        assert_eq!(
+            alternate.stored_payload_size(),
+            b"alternate metadata".len() as u64
+        );
         assert_eq!(
             alternate.name,
             ":tzap-test:$DATA"
@@ -9264,38 +9505,232 @@ mod tests {
         checked_reader.read_to_end(&mut checked_payload).unwrap();
         assert_eq!(checked_payload, b"payload");
 
-        let portable_metadata = PortableFileMetadata {
-            source_os: "windows".into(),
-            source_filesystem: "unknown".into(),
-            mode_origin: PortableModeOrigin::Projected,
-            posix_owner: None,
-            attributes: identity.attributes,
-            native,
-        };
-        let archive = write_archive(
-            &[RegularFile {
-                path: "native.txt",
-                contents: b"payload",
-                mode: identity.mode,
-                mtime: identity.mtime,
-                portable_metadata,
-            }],
-            &MasterKey::from_raw_key(&[7u8; 32]).unwrap(),
+        let master_key = MasterKey::from_raw_key(&[7u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+        write_archive_sources_to_sink_ordered_parallel(
+            &specs,
+            &master_key,
             WriterOptions {
                 stripe_width: 1,
                 volume_loss_tolerance: 0,
                 bit_rot_buffer_pct: 0,
                 ..WriterOptions::default()
             },
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
         )
         .unwrap();
-        tzap_core::open_archive(
-            &archive.bytes,
-            &MasterKey::from_raw_key(&[7u8; 32]).unwrap(),
+        let opened = tzap_core::open_archive(&sink.volumes[0], &master_key).unwrap();
+        opened.verify().unwrap();
+        let output = temp.path().join("native-output");
+        fs::create_dir(&output).unwrap();
+        let restore_report = opened
+            .extract_all_to(
+                &output,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::SameOs,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fs::read(output.join("native.txt")).unwrap(), b"payload");
+        assert_eq!(
+            fs::read(PathBuf::from(format!(
+                "{}:tzap-test",
+                output.join("native.txt").display()
+            )))
+            .unwrap_or_else(|error| panic!("{error}; report={restore_report:#?}")),
+            b"alternate metadata"
+        );
+        assert_eq!(
+            fs::read(PathBuf::from(format!(
+                "{}:元数据",
+                output.join("native.txt").display()
+            )))
+            .unwrap(),
+            b"unicode alternate metadata"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn standalone_windows_directory_alternate_data_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("native-directory");
+        fs::create_dir(&source).unwrap();
+        fs::write(
+            PathBuf::from(format!("{}:tzap-directory", source.display())),
+            b"directory alternate metadata",
         )
-        .unwrap()
-        .verify()
         .unwrap();
+
+        let specs = collect_input_specs(&[source.to_string_lossy().into_owned()])
+            .unwrap_or_else(|error| panic!("{error:#}"));
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].entry_kind, SourceEntryKind::Directory);
+        assert!(specs[0]
+            .portable_metadata
+            .native
+            .auxiliary_records
+            .iter()
+            .any(|record| record.kind == "windows.alternate-data"));
+
+        let master_key = MasterKey::from_raw_key(&[11u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+        write_archive_sources_to_sink_ordered_parallel(
+            &specs,
+            &master_key,
+            WriterOptions {
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+        let opened = tzap_core::open_archive(&sink.volumes[0], &master_key).unwrap();
+        opened.verify().unwrap();
+        let output = temp.path().join("directory-output");
+        fs::create_dir(&output).unwrap();
+        opened
+            .extract_all_to(
+                &output,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::SameOs,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+        let restored = output.join("native-directory");
+        assert!(restored.is_dir());
+        assert_eq!(
+            fs::read(PathBuf::from(format!(
+                "{}:tzap-directory",
+                restored.display()
+            )))
+            .unwrap(),
+            b"directory alternate metadata"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sparse_windows_alternate_data_round_trips_ranges_and_content() {
+        use std::os::windows::io::AsRawHandle;
+        use std::ptr;
+        use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("sparse-ads.bin");
+        fs::write(&source, b"base payload").unwrap();
+        let stream_path = PathBuf::from(format!("{}:sparse-test", source.display()));
+        let mut stream = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&stream_path)
+            .unwrap();
+        let mut bytes_returned = 0u32;
+        // SAFETY: the stream handle is live and FSCTL_SET_SPARSE accepts empty buffers.
+        assert_ne!(
+            unsafe {
+                DeviceIoControl(
+                    stream.as_raw_handle().cast(),
+                    FSCTL_SET_SPARSE,
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut bytes_returned,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let logical_size = 1024 * 1024u64;
+        stream.set_len(logical_size).unwrap();
+        stream.seek(SeekFrom::Start(64 * 1024)).unwrap();
+        stream.write_all(b"sparse ADS leading extent").unwrap();
+        stream.seek(SeekFrom::Start(logical_size - 4096)).unwrap();
+        stream.write_all(b"sparse ADS trailing extent").unwrap();
+        stream.flush().unwrap();
+        let source_ranges = query_windows_allocated_ranges(&stream, logical_size).unwrap();
+        assert!(!source_ranges.is_empty());
+        drop(stream);
+
+        let specs = collect_input_specs(&[source.to_string_lossy().into_owned()])
+            .unwrap_or_else(|error| panic!("{error:#}"));
+        let sparse_record = specs[0]
+            .portable_metadata
+            .native
+            .auxiliary_records
+            .iter()
+            .find(|record| record.kind == "windows.alternate-data")
+            .unwrap();
+        assert!(sparse_record.is_streamed());
+        assert_eq!(sparse_record.flags, 1);
+        assert_eq!(sparse_record.logical_size, logical_size);
+        assert_eq!(
+            sparse_record.streamed_sparse_extents(),
+            Some(source_ranges.as_slice())
+        );
+
+        let key = MasterKey::from_raw_key(&[19u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+        write_archive_sources_to_sink_ordered_parallel(
+            &specs,
+            &key,
+            WriterOptions {
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+        let opened = tzap_core::open_archive(&sink.volumes[0], &key).unwrap();
+        opened.verify().unwrap();
+        let output = temp.path().join("sparse-ads-output");
+        fs::create_dir(&output).unwrap();
+        opened
+            .extract_all_to(
+                &output,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::SameOs,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+        let restored_stream_path = PathBuf::from(format!(
+            "{}:sparse-test",
+            output.join("sparse-ads.bin").display()
+        ));
+        let restored_stream = File::open(&restored_stream_path).unwrap();
+        assert_eq!(restored_stream.metadata().unwrap().len(), logical_size);
+        assert_eq!(
+            query_windows_allocated_ranges(&restored_stream, logical_size).unwrap(),
+            source_ranges
+        );
+        let logical = fs::read(restored_stream_path).unwrap();
+        assert_eq!(
+            &logical[64 * 1024..64 * 1024 + 25],
+            b"sparse ADS leading extent"
+        );
+        assert_eq!(
+            &logical[logical_size as usize - 4096..logical_size as usize - 4096 + 26],
+            b"sparse ADS trailing extent"
+        );
     }
 
     #[cfg(windows)]
@@ -9494,5 +9929,286 @@ mod tests {
             actual.FileAttributes & MUTABLE_MASK,
             expected.FileAttributes & MUTABLE_MASK
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_relative_symlink_round_trips_portable_and_exact_reparse_data() {
+        use std::os::windows::fs::symlink_file;
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("target.txt"), b"target").unwrap();
+        let source = temp.path().join("link.txt");
+        symlink_file("target.txt", &source).unwrap();
+        let source_handle = open_windows_metadata_handle(&source).unwrap();
+        let expected_reparse = query_windows_reparse_data(&source_handle).unwrap();
+        assert!(matches!(
+            validate_windows_known_reparse_data(&expected_reparse).unwrap(),
+            WindowsKnownReparse::RelativeSymlink { .. }
+        ));
+
+        let specs = collect_input_specs(&[source.to_string_lossy().into_owned()])
+            .unwrap_or_else(|error| panic!("{error:#}"));
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].entry_kind, SourceEntryKind::Symlink);
+        assert!(specs[0]
+            .portable_metadata
+            .native
+            .auxiliary_records
+            .iter()
+            .any(|record| record.kind == "windows.reparse-data"
+                && record.payload == expected_reparse));
+
+        let master_key = MasterKey::from_raw_key(&[11u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+        write_archive_sources_to_sink(
+            &specs,
+            &master_key,
+            WriterOptions {
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+            None,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+        let opened = tzap_core::open_archive(&sink.volumes[0], &master_key).unwrap();
+        opened.verify().unwrap();
+
+        let portable_output = temp.path().join("portable-links");
+        fs::create_dir(&portable_output).unwrap();
+        opened
+            .extract_all_to(&portable_output, SafeExtractionOptions::default())
+            .unwrap();
+        assert_eq!(
+            fs::read_link(portable_output.join("link.txt")).unwrap(),
+            PathBuf::from("target.txt")
+        );
+
+        let exact_output = temp.path().join("exact-links");
+        fs::create_dir(&exact_output).unwrap();
+        opened
+            .extract_all_to(
+                &exact_output,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::System,
+                    allow_degraded: true,
+                    system_authorized: true,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+        let exact_handle = open_windows_metadata_handle(&exact_output.join("link.txt")).unwrap();
+        assert_eq!(
+            query_windows_reparse_data(&exact_handle).unwrap(),
+            expected_reparse
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_junction_round_trips_as_skipped_placeholder_and_exact_reparse_data() {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::os::windows::io::AsRawHandle as _;
+        use std::ptr;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+            FILE_GENERIC_WRITE,
+        };
+        use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("junction-target");
+        fs::create_dir(&target).unwrap();
+        let junction = temp.path().join("junction");
+        fs::create_dir(&junction).unwrap();
+
+        let print = target.as_os_str().encode_wide().collect::<Vec<_>>();
+        let mut substitute = "\\??\\".encode_utf16().collect::<Vec<_>>();
+        substitute.extend_from_slice(&print);
+        let substitute_bytes = substitute.len() * 2;
+        let print_offset = substitute_bytes + 2;
+        let mut path_units = substitute.clone();
+        path_units.push(0);
+        path_units.extend_from_slice(&print);
+        path_units.push(0);
+        let payload_len = 8 + path_units.len() * 2;
+        let mut reparse = Vec::with_capacity(8 + payload_len);
+        reparse.extend_from_slice(&0xA000_0003u32.to_le_bytes());
+        reparse.extend_from_slice(&(payload_len as u16).to_le_bytes());
+        reparse.extend_from_slice(&0u16.to_le_bytes());
+        reparse.extend_from_slice(&0u16.to_le_bytes());
+        reparse.extend_from_slice(&(substitute_bytes as u16).to_le_bytes());
+        reparse.extend_from_slice(&(print_offset as u16).to_le_bytes());
+        reparse.extend_from_slice(&((print.len() * 2) as u16).to_le_bytes());
+        for unit in path_units {
+            reparse.extend_from_slice(&unit.to_le_bytes());
+        }
+        let junction_handle = fs::OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&junction)
+            .unwrap();
+        let mut returned = 0u32;
+        // SAFETY: the handle and canonical mount-point payload remain live for the call.
+        assert_ne!(
+            unsafe {
+                DeviceIoControl(
+                    junction_handle.as_raw_handle().cast(),
+                    FSCTL_SET_REPARSE_POINT,
+                    reparse.as_ptr().cast(),
+                    reparse.len() as u32,
+                    ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        drop(junction_handle);
+        let source_handle = open_windows_metadata_handle(&junction).unwrap();
+        let expected_reparse = query_windows_reparse_data(&source_handle).unwrap();
+        assert_eq!(expected_reparse, reparse);
+
+        let specs = collect_input_specs(&[junction.to_string_lossy().into_owned()])
+            .unwrap_or_else(|error| panic!("{error:#}"));
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].entry_kind, SourceEntryKind::ReparseDirectory);
+        let master_key = MasterKey::from_raw_key(&[12u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+        write_archive_sources_to_sink(
+            &specs,
+            &master_key,
+            WriterOptions {
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+            None,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+        let opened = tzap_core::open_archive(&sink.volumes[0], &master_key).unwrap();
+        opened.verify().unwrap();
+
+        let portable_output = temp.path().join("portable-junction");
+        fs::create_dir(&portable_output).unwrap();
+        opened
+            .extract_all_to(&portable_output, SafeExtractionOptions::default())
+            .unwrap();
+        assert!(!portable_output.join("junction").exists());
+
+        let exact_output = temp.path().join("exact-junction");
+        fs::create_dir(&exact_output).unwrap();
+        let exact_report = opened
+            .extract_all_to(
+                &exact_output,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::System,
+                    allow_degraded: true,
+                    system_authorized: true,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+        let exact_handle = open_windows_metadata_handle(&exact_output.join("junction"))
+            .unwrap_or_else(|error| panic!("{error}; report={exact_report:#?}"));
+        assert_eq!(
+            query_windows_reparse_data(&exact_handle).unwrap(),
+            expected_reparse
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_selected_hardlinks_store_data_once_and_restore_shared_file_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let alpha = temp.path().join("alpha.bin");
+        let beta = temp.path().join("beta.bin");
+        fs::write(&alpha, b"one physical file").unwrap();
+        fs::hard_link(&alpha, &beta).unwrap();
+
+        let specs = collect_input_specs(&[
+            beta.to_string_lossy().into_owned(),
+            alpha.to_string_lossy().into_owned(),
+        ])
+        .unwrap_or_else(|error| panic!("{error:#}"));
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].archive_path, "alpha.bin");
+        assert_eq!(specs[0].entry_kind, SourceEntryKind::Regular);
+        assert_eq!(specs[1].entry_kind, SourceEntryKind::Hardlink);
+        assert_eq!(
+            specs[1].link_target.as_deref(),
+            Some(b"alpha.bin".as_slice())
+        );
+
+        let master_key = MasterKey::from_raw_key(&[13u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+        write_archive_sources_to_sink(
+            &specs,
+            &master_key,
+            WriterOptions {
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+            None,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+        let opened = tzap_core::open_archive(&sink.volumes[0], &master_key).unwrap();
+        opened.verify().unwrap();
+        assert_eq!(
+            opened
+                .lookup_index_entry("alpha.bin")
+                .unwrap()
+                .unwrap()
+                .file_data_size,
+            b"one physical file".len() as u64
+        );
+        assert_eq!(
+            opened
+                .lookup_index_entry("beta.bin")
+                .unwrap()
+                .unwrap()
+                .file_data_size,
+            0
+        );
+
+        let output = temp.path().join("hardlink-output");
+        fs::create_dir(&output).unwrap();
+        opened
+            .extract_all_to(&output, SafeExtractionOptions::default())
+            .unwrap();
+        assert_eq!(
+            fs::read(output.join("beta.bin")).unwrap(),
+            b"one physical file"
+        );
+        let alpha_file = File::open(output.join("alpha.bin")).unwrap();
+        let beta_file = File::open(output.join("beta.bin")).unwrap();
+        let mut alpha_identity = input_identity(&alpha_file.metadata().unwrap()).unwrap();
+        let mut beta_identity = input_identity(&beta_file.metadata().unwrap()).unwrap();
+        augment_windows_input_identity(&mut alpha_identity, &alpha_file).unwrap();
+        augment_windows_input_identity(&mut beta_identity, &beta_file).unwrap();
+        assert_eq!(alpha_identity.volume_serial, beta_identity.volume_serial);
+        assert_eq!(alpha_identity.file_index, beta_identity.file_index);
+        assert_eq!(alpha_identity.link_count, 2);
+        assert_eq!(beta_identity.link_count, 2);
     }
 }

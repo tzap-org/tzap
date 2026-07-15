@@ -74,7 +74,8 @@ pub use tar_model::{
     MetadataVerificationReport, RestorePolicyCapability, SafeExtractionOptions, TarEntryKind,
 };
 pub use writer::{
-    write_archive, write_archive_sources_to_sink, write_archive_sources_to_sink_ordered_parallel,
+    encode_v45_sparse_map, write_archive, write_archive_sources_to_sink,
+    write_archive_sources_to_sink_ordered_parallel,
     write_archive_sources_to_sink_ordered_parallel_with_progress,
     write_archive_sources_to_sink_ordered_parallel_with_recipient_wrap_records,
     write_archive_sources_to_sink_ordered_parallel_with_recipient_wrap_records_and_progress,

@@ -1667,6 +1667,7 @@ dependencies = [
  "rand",
  "rpassword",
  "serde_json",
+ "sha2",
  "tempfile",
  "time",
  "tzap-core",

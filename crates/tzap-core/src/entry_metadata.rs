@@ -275,6 +275,10 @@ impl AuxiliaryStreamValidator {
         Ok(())
     }
 
+    pub(crate) fn declaration(&self) -> &AuxiliaryRecord {
+        &self.record
+    }
+
     pub fn finish(mut self) -> Result<AuxiliaryRecord, FormatError> {
         if self.received != self.record.stored_size {
             return invalid("AuxiliaryMetadata", "auxiliary payload length mismatch");
@@ -283,9 +287,10 @@ impl AuxiliaryStreamValidator {
             return invalid("AuxiliaryMetadata", "auxiliary payload SHA-256 mismatch");
         }
         self.record.sparse_layout = self.sparse.map(SparseStreamValidator::finish).transpose()?;
-        if self.record.kind == CAPTURE_REPORT_KIND {
-            self.record.capture_report_payload = self.retained.clone();
-        }
+        // Retain only the bounded structured kinds selected by
+        // `retained_auxiliary_cap`. The historical field name predates native
+        // reparse restoration; consumers still gate interpretation by kind.
+        self.record.capture_report_payload = self.retained.clone();
         validate_builtin_auxiliary_payload(&self.record, self.retained.as_deref())?;
         Ok(self.record)
     }
@@ -894,6 +899,14 @@ fn parse_auxiliary_declaration(
     };
     validate_builtin_auxiliary(&record)?;
     Ok(record)
+}
+
+pub(crate) fn parse_auxiliary_declaration_for_writer(
+    records: &PaxRecords,
+    ordinal: u32,
+    stored_size: u64,
+) -> Result<AuxiliaryRecord, FormatError> {
+    parse_auxiliary_declaration(records, ordinal, stored_size)
 }
 
 pub fn validate_group_metadata(
@@ -1983,6 +1996,12 @@ fn validate_builtin_auxiliary_payload(
 }
 
 fn validate_windows_stream_name(name: &[u8]) -> Result<(), FormatError> {
+    if name.len() % 2 != 0 {
+        return invalid(
+            "AuxiliaryMetadata",
+            "Windows alternate-data name is not UTF-16LE",
+        );
+    }
     let units = name
         .chunks_exact(2)
         .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))

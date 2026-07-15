@@ -1,7 +1,7 @@
 use std::io::{self, ErrorKind, Read};
 
 use crate::crypto::{KdfParams, MasterKey};
-use crate::entry_metadata::ArchiveTimestamp;
+use crate::entry_metadata::{ArchiveTimestamp, SparseExtent, MAX_SPARSE_EXTENTS};
 use crate::format::{ArchiveWriteError, FormatError};
 use crate::metadata::{
     normalize_lookup_file_path, validate_directory_path_bytes, validate_file_path_bytes,
@@ -45,6 +45,7 @@ struct TarStdinRegularMember {
     mode: u32,
     mtime: ArchiveTimestamp,
     logical_size: u64,
+    sparse_extents: Option<Vec<SparseExtent>>,
     portable_metadata: PortableFileMetadata,
 }
 
@@ -62,6 +63,10 @@ struct LocalTarMetadata {
     pax_gname: Option<Vec<u8>>,
     gnu_long_name: Option<Vec<u8>>,
     gnu_long_link: Option<Vec<u8>>,
+    gnu_sparse_major: Option<u64>,
+    gnu_sparse_minor: Option<u64>,
+    gnu_sparse_name: Option<Vec<u8>>,
+    gnu_sparse_realsize: Option<u64>,
 }
 
 impl LocalTarMetadata {
@@ -78,6 +83,10 @@ impl LocalTarMetadata {
             || self.pax_gname.is_some()
             || self.gnu_long_name.is_some()
             || self.gnu_long_link.is_some()
+            || self.gnu_sparse_major.is_some()
+            || self.gnu_sparse_minor.is_some()
+            || self.gnu_sparse_name.is_some()
+            || self.gnu_sparse_realsize.is_some()
     }
 }
 
@@ -226,7 +235,7 @@ where
                             entry_kind: member.entry_kind,
                             link_target: member.link_target,
                             file_data_size: member.logical_size,
-                            sparse_extents: None,
+                            sparse_extents: member.sparse_extents,
                             mode: member.mode,
                             mtime: member.mtime,
                             portable_metadata: member.portable_metadata,
@@ -445,24 +454,55 @@ where
                     attributes: None,
                     native: Default::default(),
                 };
+                let has_sparse_declaration = metadata.gnu_sparse_major.is_some()
+                    || metadata.gnu_sparse_minor.is_some()
+                    || metadata.gnu_sparse_name.is_some()
+                    || metadata.gnu_sparse_realsize.is_some();
+                let sparse_logical_size = if has_sparse_declaration {
+                    if typeflag != 0 && typeflag != b'0' {
+                        return Err(FormatError::InvalidArchive(
+                            "GNU sparse metadata is attached to a non-regular entry",
+                        )
+                        .into());
+                    }
+                    if metadata.gnu_sparse_major != Some(1)
+                        || metadata.gnu_sparse_minor != Some(0)
+                        || metadata.gnu_sparse_name.is_none()
+                        || metadata.gnu_sparse_realsize.is_none()
+                    {
+                        return Err(FormatError::ReaderUnsupported(
+                            "tar stdin supports only complete GNU sparse PAX 1.0 declarations",
+                        )
+                        .into());
+                    }
+                    metadata.gnu_sparse_realsize
+                } else {
+                    None
+                };
                 metadata = LocalTarMetadata::default();
 
                 match typeflag {
                     0 | b'0' => {
-                        let member = TarStdinRegularMember {
-                            path,
-                            entry_kind: SourceEntryKind::Regular,
-                            link_target: None,
-                            mode,
-                            mtime,
-                            logical_size: effective_size,
-                            portable_metadata,
-                        };
                         {
                             let mut payload = LimitedTarPayloadReader {
                                 reader,
                                 remaining: effective_size,
                                 input_tar_bytes: &mut summary.input_tar_bytes,
+                            };
+                            let sparse_extents = sparse_logical_size
+                                .map(|logical_size| {
+                                    read_gnu_sparse_1_0_map(&mut payload, logical_size)
+                                })
+                                .transpose()?;
+                            let member = TarStdinRegularMember {
+                                path,
+                                entry_kind: SourceEntryKind::Regular,
+                                link_target: None,
+                                mode,
+                                mtime,
+                                logical_size: sparse_logical_size.unwrap_or(effective_size),
+                                sparse_extents,
+                                portable_metadata,
                             };
                             on_regular(member, Some(&mut payload))?;
                             if payload.remaining != 0 {
@@ -497,6 +537,7 @@ where
                             mode,
                             mtime,
                             logical_size: 0,
+                            sparse_extents: None,
                             portable_metadata,
                         };
                         on_regular(member, None)?;
@@ -517,6 +558,7 @@ where
                             mode,
                             mtime,
                             logical_size: 0,
+                            sparse_extents: None,
                             portable_metadata,
                         };
                         on_regular(member, None)?;
@@ -566,6 +608,112 @@ impl<R: Read> Read for LimitedTarPayloadReader<'_, R> {
             Err(error) => Err(error),
         }
     }
+}
+
+fn read_gnu_sparse_1_0_map<R: Read>(
+    payload: &mut LimitedTarPayloadReader<'_, R>,
+    logical_size: u64,
+) -> Result<Vec<SparseExtent>, ArchiveWriteError> {
+    fn read_line<R: Read>(
+        payload: &mut LimitedTarPayloadReader<'_, R>,
+        consumed: &mut u64,
+    ) -> Result<u64, ArchiveWriteError> {
+        let mut digits = Vec::with_capacity(20);
+        loop {
+            let mut byte = [0u8; 1];
+            payload
+                .read_exact(&mut byte)
+                .map_err(ArchiveWriteError::Io)?;
+            *consumed = consumed
+                .checked_add(1)
+                .ok_or(FormatError::InvalidArchive("GNU sparse map size overflow"))?;
+            if byte[0] == b'\n' {
+                break;
+            }
+            if !byte[0].is_ascii_digit() || digits.len() == 20 {
+                return Err(FormatError::InvalidArchive(
+                    "GNU sparse map value is not canonical decimal",
+                )
+                .into());
+            }
+            digits.push(byte[0]);
+        }
+        if digits.is_empty() || (digits.len() > 1 && digits[0] == b'0') {
+            return Err(
+                FormatError::InvalidArchive("GNU sparse map value is not minimal decimal").into(),
+            );
+        }
+        Ok(parse_decimal_u64(&digits)?)
+    }
+
+    let mut map_bytes = 0u64;
+    let count_u64 = read_line(payload, &mut map_bytes)?;
+    let count =
+        usize::try_from(count_u64).map_err(|_| FormatError::ReaderResourceLimitExceeded {
+            field: "sparse extent count",
+            cap: MAX_SPARSE_EXTENTS as u64,
+            actual: count_u64,
+        })?;
+    if count > MAX_SPARSE_EXTENTS {
+        return Err(FormatError::ReaderResourceLimitExceeded {
+            field: "sparse extent count",
+            cap: MAX_SPARSE_EXTENTS as u64,
+            actual: count_u64,
+        }
+        .into());
+    }
+    let mut extents = Vec::with_capacity(count);
+    let mut previous_end = 0u64;
+    let mut extent_bytes = 0u64;
+    for index in 0..count {
+        let offset = read_line(payload, &mut map_bytes)?;
+        let length = read_line(payload, &mut map_bytes)?;
+        let end = offset
+            .checked_add(length)
+            .ok_or(FormatError::InvalidArchive("GNU sparse extent overflow"))?;
+        if length == 0 || offset < previous_end || (index != 0 && offset == previous_end) {
+            return Err(FormatError::InvalidArchive(
+                "GNU sparse extents overlap, are empty, or are not merged",
+            )
+            .into());
+        }
+        if end > logical_size {
+            return Err(
+                FormatError::InvalidArchive("GNU sparse extent exceeds logical size").into(),
+            );
+        }
+        extent_bytes = extent_bytes
+            .checked_add(length)
+            .ok_or(FormatError::InvalidArchive(
+                "GNU sparse extent byte count overflow",
+            ))?;
+        extents.push(SparseExtent { offset, length });
+        previous_end = end;
+    }
+    let padded_map_size = map_bytes
+        .checked_add(511)
+        .ok_or(FormatError::InvalidArchive("GNU sparse map size overflow"))?
+        / 512
+        * 512;
+    let mut padding = padded_map_size - map_bytes;
+    let mut zeros = [0u8; 512];
+    while padding != 0 {
+        let take = usize::try_from(padding.min(zeros.len() as u64)).unwrap();
+        payload
+            .read_exact(&mut zeros[..take])
+            .map_err(ArchiveWriteError::Io)?;
+        if zeros[..take].iter().any(|byte| *byte != 0) {
+            return Err(FormatError::InvalidArchive("GNU sparse map padding is non-zero").into());
+        }
+        padding -= take as u64;
+    }
+    if payload.remaining != extent_bytes {
+        return Err(FormatError::InvalidArchive(
+            "GNU sparse stored size does not match the canonical map",
+        )
+        .into());
+    }
+    Ok(extents)
 }
 
 fn read_tar_block<R: Read>(
@@ -679,8 +827,9 @@ fn canonical_main_path(
     max_path_length: u32,
 ) -> Result<Vec<u8>, FormatError> {
     let mut path = metadata
-        .pax_path
+        .gnu_sparse_name
         .clone()
+        .or_else(|| metadata.pax_path.clone())
         .or_else(|| metadata.gnu_long_name.clone())
         .unwrap_or_else(|| ustar_path(header));
     while path.starts_with(b"./") {
@@ -756,10 +905,14 @@ fn parse_pax_records(payload: &[u8], metadata: &mut LocalTarMetadata) -> Result<
             "gid" => metadata.pax_gid = Some(parse_decimal_u64(value)?),
             "uname" => metadata.pax_uname = Some(value.to_vec()),
             "gname" => metadata.pax_gname = Some(value.to_vec()),
+            "GNU.sparse.major" => metadata.gnu_sparse_major = Some(parse_decimal_u64(value)?),
+            "GNU.sparse.minor" => metadata.gnu_sparse_minor = Some(parse_decimal_u64(value)?),
+            "GNU.sparse.name" => metadata.gnu_sparse_name = Some(value.to_vec()),
+            "GNU.sparse.realsize" => metadata.gnu_sparse_realsize = Some(parse_decimal_u64(value)?),
             key if key.starts_with("GNU.sparse.") => {
                 return Err(FormatError::ReaderUnsupported(
-                    "unsupported GNU sparse tar entry",
-                ))
+                    "unsupported GNU sparse PAX key",
+                ));
             }
             _ => {}
         }
@@ -1029,6 +1182,48 @@ mod tests {
         out
     }
 
+    fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
+        let body_len = key.len() + 1 + value.len() + 1;
+        let mut total = body_len + 2;
+        loop {
+            let next = body_len + total.to_string().len() + 1;
+            if next == total {
+                break;
+            }
+            total = next;
+        }
+        let mut out = format!("{total} {key}=").into_bytes();
+        out.extend_from_slice(value);
+        out.push(b'\n');
+        out
+    }
+
+    fn gnu_sparse_1_0_tar(path: &str, logical_size: u64, map: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut sparse_payload = map.to_vec();
+        sparse_payload.resize(sparse_payload.len().div_ceil(512) * 512, 0);
+        sparse_payload.extend_from_slice(data);
+        let stored_size = sparse_payload.len() as u64;
+        let mut pax = Vec::new();
+        for (key, value) in [
+            ("GNU.sparse.major", b"1".as_slice()),
+            ("GNU.sparse.minor", b"0".as_slice()),
+            ("GNU.sparse.name", path.as_bytes()),
+            ("GNU.sparse.realsize", logical_size.to_string().as_bytes()),
+            ("size", stored_size.to_string().as_bytes()),
+        ] {
+            pax.extend_from_slice(&pax_record(key, value));
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&tar_header(b"PaxHeaders/sparse", b'x', pax.len() as u64));
+        out.extend_from_slice(&pax);
+        out.resize(out.len() + padding_to_512(pax.len()), 0);
+        out.extend_from_slice(&tar_header(b"GNUSparseFile.0/input", b'0', stored_size));
+        out.extend_from_slice(&sparse_payload);
+        out.resize(out.len() + padding_to_512(sparse_payload.len()), 0);
+        out.extend_from_slice(&[0u8; TAR_BLOCK_LEN * 2]);
+        out
+    }
+
     fn tar_header(path: &[u8], kind: u8, size: u64) -> [u8; TAR_BLOCK_LEN] {
         let mut header = [0u8; TAR_BLOCK_LEN];
         header[..path.len()].copy_from_slice(path);
@@ -1170,6 +1365,40 @@ mod tests {
             opened.extract_file("dir/beta.txt").unwrap(),
             Some(b"beta payload".to_vec())
         );
+    }
+
+    #[test]
+    fn tar_stdin_canonicalizes_gnu_sparse_1_0_without_materializing_holes() {
+        let input = gnu_sparse_1_0_tar(
+            "sparse.bin",
+            16 * 1024,
+            b"2\n1024\n3\n8192\n4\n",
+            b"abcWXYZ",
+        );
+        let archive = write_tar_stream_archive(input.as_slice(), &master_key(), options()).unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        opened.verify().unwrap();
+        let listed = opened.list_files().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, "sparse.bin");
+        assert_eq!(listed[0].file_data_size, 16 * 1024);
+        let logical = opened.extract_file("sparse.bin").unwrap().unwrap();
+        assert_eq!(logical.len(), 16 * 1024);
+        assert_eq!(&logical[1024..1027], b"abc");
+        assert_eq!(&logical[8192..8196], b"WXYZ");
+        assert!(logical[..1024].iter().all(|byte| *byte == 0));
+        assert!(logical[8196..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn tar_stdin_canonicalizes_all_hole_gnu_sparse_1_0() {
+        let input = gnu_sparse_1_0_tar("hole.bin", 1 << 20, b"0\n", b"");
+        let archive = write_tar_stream_archive(input.as_slice(), &master_key(), options()).unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        opened.verify().unwrap();
+        let logical = opened.extract_file("hole.bin").unwrap().unwrap();
+        assert_eq!(logical.len(), 1 << 20);
+        assert!(logical.iter().all(|byte| *byte == 0));
     }
 
     #[test]

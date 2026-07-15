@@ -3,7 +3,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use unicode_normalization::UnicodeNormalization;
@@ -23,8 +23,9 @@ use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     FileBasicInfo, GetFileInformationByHandleEx, SetFileInformationByHandle, DELETE,
-    FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+    FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_WRITE_ATTRIBUTES,
 };
 
 use crate::entry_metadata::{
@@ -318,6 +319,15 @@ pub(crate) trait TarMemberGroupReader {
 trait TarMemberStreamHandler {
     fn on_member(&mut self, member: &StreamedTarMemberMetadata) -> Result<(), ExtractError>;
     fn write_regular_payload(&mut self, bytes: &[u8]) -> Result<(), ExtractError>;
+    fn begin_auxiliary_payload(&mut self, _record: &AuxiliaryRecord) -> Result<bool, ExtractError> {
+        Ok(false)
+    }
+    fn write_auxiliary_payload(&mut self, _bytes: &[u8]) -> Result<(), ExtractError> {
+        Ok(())
+    }
+    fn finish_auxiliary_payload(&mut self, _record: &AuxiliaryRecord) -> Result<(), ExtractError> {
+        Ok(())
+    }
     fn begin_sparse_payload(
         &mut self,
         _logical_size: u64,
@@ -339,6 +349,18 @@ pub(crate) trait TarStreamObserver {
     }
 
     fn on_regular_payload(&mut self, _bytes: &[u8]) -> Result<(), FormatError> {
+        Ok(())
+    }
+
+    fn on_auxiliary_start(&mut self, _record: &AuxiliaryRecord) -> Result<bool, FormatError> {
+        Ok(false)
+    }
+
+    fn on_auxiliary_payload(&mut self, _bytes: &[u8]) -> Result<(), FormatError> {
+        Ok(())
+    }
+
+    fn on_auxiliary_complete(&mut self, _record: &AuxiliaryRecord) -> Result<(), FormatError> {
         Ok(())
     }
 
@@ -389,6 +411,24 @@ impl<'a> TarStreamFilesystemRestoreObserver<'a> {
 }
 
 impl TarStreamObserver for TarStreamFilesystemRestoreObserver<'_> {
+    fn on_auxiliary_start(&mut self, record: &AuxiliaryRecord) -> Result<bool, FormatError> {
+        self.handler
+            .begin_auxiliary_payload(record)
+            .map_err(format_error_from_extract_error)
+    }
+
+    fn on_auxiliary_payload(&mut self, bytes: &[u8]) -> Result<(), FormatError> {
+        self.handler
+            .write_auxiliary_payload(bytes)
+            .map_err(format_error_from_extract_error)
+    }
+
+    fn on_auxiliary_complete(&mut self, record: &AuxiliaryRecord) -> Result<(), FormatError> {
+        self.handler
+            .finish_auxiliary_payload(record)
+            .map_err(format_error_from_extract_error)
+    }
+
     fn on_member_start(&mut self, member: &StreamedTarMemberMetadata) -> Result<(), FormatError> {
         self.handler
             .on_member(member)
@@ -509,10 +549,8 @@ impl StreamingSparsePrimary {
                     .ok_or(FormatError::InvalidArchive(
                         "sparse primary has trailing extent bytes",
                     ))?;
-            if self.extent_consumed == 0 {
-                if !native_output {
-                    observer_write_zeros(observer, extent.offset - self.logical_cursor)?;
-                }
+            if self.extent_consumed == 0 && !native_output {
+                observer_write_zeros(observer, extent.offset - self.logical_cursor)?;
             }
             let available = extent.length - self.extent_consumed;
             let take = usize::try_from(available.min(data.len() as u64))
@@ -1286,6 +1324,96 @@ const WINDOWS_ESSENTIAL_INTRINSIC_ATTRIBUTES: u32 =
 const STREAM_CONTAINS_SECURITY: u32 = 0x0000_0002;
 const STREAM_SPARSE_ATTRIBUTE: u32 = 0x0000_0008;
 
+fn validate_windows_essential_reparse_data(data: &[u8]) -> Result<u32, FormatError> {
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+    if data.len() < 8 {
+        return Err(FormatError::InvalidArchive("reparse buffer is truncated"));
+    }
+    let tag = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let payload_len = usize::from(u16::from_le_bytes(data[4..6].try_into().unwrap()));
+    if payload_len + 8 != data.len() {
+        return Err(FormatError::InvalidArchive(
+            "reparse buffer length is inconsistent",
+        ));
+    }
+    let fixed_len = match tag {
+        IO_REPARSE_TAG_SYMLINK if payload_len >= 12 => {
+            if u32::from_le_bytes(data[16..20].try_into().unwrap()) != 1 {
+                return Err(FormatError::InvalidArchive(
+                    "only relative Windows symbolic links are supported",
+                ));
+            }
+            12
+        }
+        IO_REPARSE_TAG_MOUNT_POINT if payload_len >= 8 => 8,
+        IO_REPARSE_TAG_SYMLINK | IO_REPARSE_TAG_MOUNT_POINT => {
+            return Err(FormatError::InvalidArchive("reparse payload is truncated"));
+        }
+        _ => {
+            return Err(FormatError::ReaderUnsupported(
+                "reparse tag is not supported by Windows Essential",
+            ));
+        }
+    };
+    let substitute_offset = usize::from(u16::from_le_bytes(data[8..10].try_into().unwrap()));
+    let substitute_len = usize::from(u16::from_le_bytes(data[10..12].try_into().unwrap()));
+    let print_offset = usize::from(u16::from_le_bytes(data[12..14].try_into().unwrap()));
+    let print_len = usize::from(u16::from_le_bytes(data[14..16].try_into().unwrap()));
+    if [substitute_offset, substitute_len, print_offset, print_len]
+        .iter()
+        .any(|value| value % 2 != 0)
+    {
+        return Err(FormatError::InvalidArchive(
+            "reparse path fields are not UTF-16 aligned",
+        ));
+    }
+    let path_buffer = &data[8 + fixed_len..];
+    let decode = |offset: usize, len: usize| -> Result<String, FormatError> {
+        let end = offset
+            .checked_add(len)
+            .ok_or(FormatError::InvalidArchive("reparse path range overflows"))?;
+        let bytes = path_buffer
+            .get(offset..end)
+            .ok_or(FormatError::InvalidArchive(
+                "reparse path range exceeds payload",
+            ))?;
+        let units = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        let text = String::from_utf16(&units)
+            .map_err(|_| FormatError::InvalidArchive("reparse path is not valid UTF-16"))?;
+        if text.contains('\0') {
+            return Err(FormatError::InvalidArchive("reparse path contains NUL"));
+        }
+        Ok(text)
+    };
+    let substitute = decode(substitute_offset, substitute_len)?;
+    let print = decode(print_offset, print_len)?;
+    if substitute.is_empty() {
+        return Err(FormatError::InvalidArchive(
+            "reparse substitute name is empty",
+        ));
+    }
+    if tag == IO_REPARSE_TAG_SYMLINK {
+        let target = if print.is_empty() {
+            &substitute
+        } else {
+            &print
+        };
+        let target = target.replace('\\', "/");
+        if target.is_empty() || target.starts_with('/') || target.contains(':') {
+            return Err(FormatError::UnsafeArchivePath);
+        }
+    } else if !substitute.starts_with("\\??\\") || print.is_empty() {
+        return Err(FormatError::InvalidArchive(
+            "junction path fields are not canonical",
+        ));
+    }
+    Ok(tag)
+}
+
 fn validate_windows_cross_fields(
     kind: TarEntryKind,
     records: &PaxRecords,
@@ -1351,7 +1479,9 @@ fn validate_windows_cross_fields(
     }
     if let Some(attributes) = file_attributes {
         let is_directory = kind == TarEntryKind::Directory;
-        if (attributes & FILE_ATTRIBUTE_DIRECTORY != 0) != is_directory {
+        if kind != TarEntryKind::Symlink
+            && (attributes & FILE_ATTRIBUTE_DIRECTORY != 0) != is_directory
+        {
             return Err(FormatError::InvalidArchive(
                 "Windows directory attribute disagrees with primary type",
             ));
@@ -1668,8 +1798,14 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
                         }
                         payload.extend_from_slice(&input[..take]);
                     }
-                    PendingTarEntry::Auxiliary { validator } => {
+                    PendingTarEntry::Auxiliary {
+                        validator,
+                        stream_to_observer,
+                    } => {
                         validator.observe(&input[..take])?;
+                        if *stream_to_observer {
+                            self.observer.on_auxiliary_payload(&input[..take])?;
+                        }
                     }
                     PendingTarEntry::Main { member, sparse, .. }
                         if take > 0 && member.kind == TarEntryKind::Regular =>
@@ -1884,8 +2020,12 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
                     ));
                 };
                 validate_v45_auxiliary_header(&header, ordinal, header_size, effective_size)?;
+                let validator = AuxiliaryStreamValidator::new(&records, ordinal, effective_size)?;
+                let stream_to_observer =
+                    self.observer.on_auxiliary_start(validator.declaration())?;
                 PendingTarEntry::Auxiliary {
-                    validator: AuxiliaryStreamValidator::new(&records, ordinal, effective_size)?,
+                    validator,
+                    stream_to_observer,
                 }
             }
             b'g' | b'L' | b'K' | b'V' | b'M' | b'N' | b'S' => {
@@ -2039,8 +2179,15 @@ impl<O: TarStreamObserver> TarStreamSummaryValidator<O> {
                     header: Vec::new(),
                 })
             }
-            PendingTarEntry::Auxiliary { validator } => {
-                metadata.auxiliary.push(validator.finish()?);
+            PendingTarEntry::Auxiliary {
+                validator,
+                stream_to_observer,
+            } => {
+                let record = validator.finish()?;
+                if stream_to_observer {
+                    self.observer.on_auxiliary_complete(&record)?;
+                }
+                metadata.auxiliary.push(record);
                 Ok(StreamingTarState::Header {
                     metadata,
                     group_start,
@@ -2286,6 +2433,7 @@ enum PendingTarEntry {
     },
     Auxiliary {
         validator: AuxiliaryStreamValidator,
+        stream_to_observer: bool,
     },
     Main {
         member: StreamedTarMemberMetadata,
@@ -2593,9 +2741,20 @@ where
                 validate_v45_auxiliary_header(&header, ordinal, header_size, effective_size)?;
                 let mut validator =
                     AuxiliaryStreamValidator::new(&records, ordinal, effective_size)?;
-                stream_auxiliary_payload(reader, effective_size, &mut remaining, &mut validator)?;
+                let stream_to_handler = handler.begin_auxiliary_payload(validator.declaration())?;
+                stream_auxiliary_payload(
+                    reader,
+                    effective_size,
+                    &mut remaining,
+                    &mut validator,
+                    stream_to_handler.then_some(handler),
+                )?;
                 read_zero_padding(reader, padding_len, &mut remaining)?;
-                auxiliary.push(validator.finish()?);
+                let record = validator.finish()?;
+                if stream_to_handler {
+                    handler.finish_auxiliary_payload(&record)?;
+                }
+                auxiliary.push(record);
             }
             b'g' | b'L' | b'K' | b'V' | b'M' | b'N' | b'S' => {
                 return Err(FormatError::InvalidArchive(
@@ -2893,7 +3052,11 @@ fn plan_restore(
             .for_restore(options.restore_policy, 2),
         );
     }
-    if reparse_placeholder {
+    if reparse_placeholder
+        && !(cfg!(windows)
+            && options.restore_policy == RestorePolicy::System
+            && windows_reparse_metadata_supported(metadata))
+    {
         diagnostics.push(
             MetadataDiagnostic::new(
                 path,
@@ -3036,8 +3199,11 @@ fn plan_restore(
                 portable_bits != 0 && (!cfg!(windows) || portable_bits & !1 != 0)
             }
             RestorePolicy::SameOs | RestorePolicy::System => {
-                (portable_bits != 0 && (!cfg!(windows) || portable_bits & !1 != 0))
-                    || same_os_bits != 0
+                (portable_bits != 0
+                    && !(cfg!(windows) && metadata.declaration.source_os == "windows")
+                    && (!cfg!(windows) || portable_bits & !1 != 0))
+                    || (same_os_bits != 0
+                        && !(cfg!(windows) && metadata.declaration.source_os == "windows"))
             }
         };
         if unsupported_requested && !options.allow_degraded {
@@ -3147,16 +3313,20 @@ fn plan_restore(
     let unsupported_primary_same_os = native_primary_restore_unsupported(metadata, false);
     let unsupported_primary_system = native_primary_restore_unsupported(metadata, true);
     let unsupported_same_os = metadata.auxiliary.iter().any(|record| {
-        record.restore_class == RestoreClass::SameOs && profile_is_required(&record.profile)
+        record.restore_class == RestoreClass::SameOs
+            && profile_is_required(&record.profile)
+            && !native_auxiliary_restore_supported(record, false)
     }) || (required_native_scalar && unsupported_primary_same_os)
         || (required_native_profile && !native_source_matches_host);
     let unsupported_system = metadata.auxiliary.iter().any(|record| {
-        record.restore_class == RestoreClass::System && profile_is_required(&record.profile)
+        record.restore_class == RestoreClass::System
+            && profile_is_required(&record.profile)
+            && !native_auxiliary_restore_supported(record, true)
     }) || (metadata.declaration.owner_kind_posix
         && !numeric_ownership_supported(metadata))
         || (metadata.declaration.portable_mode & 0o6000 != 0 && !cfg!(unix))
         || (required_native_scalar && unsupported_primary_system)
-        || reparse_placeholder
+        || (reparse_placeholder && !windows_reparse_metadata_supported(metadata))
         || matches!(
             kind,
             TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
@@ -3267,6 +3437,101 @@ fn plan_restore(
     Ok(diagnostics)
 }
 
+fn native_auxiliary_restore_supported(record: &AuxiliaryRecord, include_system: bool) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    if record.kind == "windows.alternate-data" {
+        return record.restore_class == RestoreClass::SameOs
+            && record
+                .meta
+                .get("TZAP.aux.meta.stream-attributes")
+                .is_some_and(|value| {
+                    value == b"00000000" && record.flags == 0
+                        || value == b"00000008" && record.flags == 1
+                });
+    }
+    if !include_system {
+        return false;
+    }
+    if record.kind == "windows.reparse-data" {
+        return record
+            .capture_report_payload
+            .as_deref()
+            .is_some_and(|payload| validate_windows_essential_reparse_data(payload).is_ok());
+    }
+    if record.kind == "windows.security-descriptor" {
+        return record.capture_report_payload.is_some()
+            && record
+                .meta
+                .get("TZAP.aux.meta.security-information")
+                .and_then(|value| parse_lower_hex_u32(value, "Windows security information").ok())
+                .is_some_and(windows_security_restore_privileges_available);
+    }
+    false
+}
+
+#[cfg(windows)]
+fn windows_security_restore_privileges_available(security_information: u32) -> bool {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME,
+        SE_SECURITY_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = ptr::null_mut();
+    // SAFETY: `token` is a valid output slot and the process pseudo-handle is live.
+    if unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+            &mut token,
+        )
+    } == 0
+    {
+        return false;
+    }
+    let enable = |name| {
+        let mut privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            ..Default::default()
+        };
+        // SAFETY: the one-element privilege array provides valid input/output storage.
+        if unsafe { LookupPrivilegeValueW(ptr::null(), name, &mut privileges.Privileges[0].Luid) }
+            == 0
+        {
+            return false;
+        }
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        unsafe { SetLastError(ERROR_SUCCESS) };
+        // SAFETY: `token` is live and the initialized one-entry structure is readable.
+        unsafe {
+            AdjustTokenPrivileges(token, 0, &privileges, 0, ptr::null_mut(), ptr::null_mut()) != 0
+                && GetLastError() == ERROR_SUCCESS
+        }
+    };
+    let available = enable(SE_RESTORE_NAME)
+        && (security_information & 0x0000_0008 == 0 || enable(SE_SECURITY_NAME));
+    // SAFETY: `token` was returned by OpenProcessToken and is closed once.
+    unsafe { CloseHandle(token) };
+    available
+}
+
+#[cfg(not(windows))]
+fn windows_security_restore_privileges_available(_security_information: u32) -> bool {
+    false
+}
+
+fn windows_reparse_metadata_supported(metadata: &MemberMetadata) -> bool {
+    metadata.declaration.source_os == "windows"
+        && metadata
+            .auxiliary
+            .iter()
+            .any(|record| native_auxiliary_restore_supported(record, true))
+}
+
 fn native_primary_restore_unsupported(metadata: &MemberMetadata, include_system: bool) -> bool {
     metadata.primary_records.keys().any(|key| {
         let native = key.starts_with("TZAP.linux.")
@@ -3303,6 +3568,19 @@ fn native_primary_restore_unsupported(metadata: &MemberMetadata, include_system:
         }
         if key == "TZAP.windows.change-time" {
             return !cfg!(windows) || metadata.declaration.source_os != "windows";
+        }
+        if key == "TZAP.windows.data-stream-attributes" {
+            return !cfg!(windows)
+                || metadata.declaration.source_os != "windows"
+                || metadata
+                    .primary_records
+                    .get(key)
+                    .is_none_or(|value| value != b"00000000" && value != b"00000008");
+        }
+        if key == "TZAP.windows.reparse-placeholder" {
+            return !cfg!(windows)
+                || !include_system
+                || !windows_reparse_metadata_supported(metadata);
         }
         if key == "LIBARCHIVE.creationtime" && metadata.declaration.source_os == "windows" {
             return !cfg!(windows);
@@ -3550,6 +3828,13 @@ struct FilesystemRestoreHandler<'a> {
     deferred_hardlinks: Vec<(Vec<u8>, Vec<u8>)>,
     defer_directories: bool,
     deferred_directories: Vec<(Vec<u8>, MemberMetadata)>,
+    active_auxiliary: Option<StagedAuxiliary>,
+    staged_auxiliary: Vec<StagedAuxiliary>,
+}
+
+struct StagedAuxiliary {
+    record: AuxiliaryRecord,
+    file: fs::File,
 }
 
 impl<'a> FilesystemRestoreHandler<'a> {
@@ -3571,6 +3856,8 @@ impl<'a> FilesystemRestoreHandler<'a> {
             deferred_hardlinks: Vec::new(),
             defer_directories: false,
             deferred_directories: Vec::new(),
+            active_auxiliary: None,
+            staged_auxiliary: Vec::new(),
         }
     }
 
@@ -3582,6 +3869,11 @@ impl<'a> FilesystemRestoreHandler<'a> {
     }
 
     fn finish_archive(&mut self) -> Result<Vec<MetadataDiagnostic>, FormatError> {
+        if self.active_auxiliary.is_some() || !self.staged_auxiliary.is_empty() {
+            return Err(FormatError::InvalidArchive(
+                "native auxiliary payload was not attached to an archive member",
+            ));
+        }
         let mut diagnostics = Vec::new();
         for (path, target) in std::mem::take(&mut self.deferred_hardlinks) {
             let destination =
@@ -3647,10 +3939,19 @@ impl<'a> FilesystemRestoreHandler<'a> {
             }
         }
         diagnostics.append(&mut self.planned_diagnostics);
+        if member.kind != TarEntryKind::Regular && !self.staged_auxiliary.is_empty() {
+            return Err(FormatError::InvalidArchive(
+                "native auxiliary payload was not restored for its archive member",
+            )
+            .into());
+        }
         if self.skipped_reparse_placeholder {
             return Ok(diagnostics);
         }
         if self.skipped_by_policy {
+            return Ok(diagnostics);
+        }
+        if member.reparse_placeholder {
             return Ok(diagnostics);
         }
         if member.kind == TarEntryKind::Directory {
@@ -3683,6 +3984,17 @@ impl<'a> FilesystemRestoreHandler<'a> {
         ))?;
         let file = publish_regular_file(&destination, &temp_leaf, file, self.options)?;
         if self.options.restore_policy != RestorePolicy::Content {
+            if let Err(error) = apply_windows_alternate_streams(
+                &file,
+                &member.path,
+                &mut self.staged_auxiliary,
+                self.options,
+                &mut diagnostics,
+            ) {
+                drop(file);
+                let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
+                return Err(error.into());
+            }
             if let Err(error) = apply_restored_regular_file_metadata_parts(
                 &file,
                 &member.path,
@@ -3711,8 +4023,81 @@ impl Drop for FilesystemRestoreHandler<'_> {
 }
 
 impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
+    fn begin_auxiliary_payload(&mut self, record: &AuxiliaryRecord) -> Result<bool, ExtractError> {
+        if self.active_auxiliary.is_some() {
+            return Err(FormatError::InvalidArchive(
+                "previous auxiliary payload was not finalized",
+            )
+            .into());
+        }
+        let requested = match self.options.restore_policy {
+            RestorePolicy::Content | RestorePolicy::Portable => false,
+            RestorePolicy::SameOs => record.restore_class <= RestoreClass::SameOs,
+            RestorePolicy::System => true,
+        };
+        if !requested
+            || !native_auxiliary_restore_supported(
+                record,
+                self.options.restore_policy == RestorePolicy::System,
+            )
+            || record.kind != "windows.alternate-data"
+        {
+            return Ok(false);
+        }
+        let file = tempfile::tempfile().map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to stage native auxiliary payload")
+        })?;
+        self.active_auxiliary = Some(StagedAuxiliary {
+            record: record.clone(),
+            file,
+        });
+        Ok(true)
+    }
+
+    fn write_auxiliary_payload(&mut self, bytes: &[u8]) -> Result<(), ExtractError> {
+        self.active_auxiliary
+            .as_mut()
+            .ok_or(FormatError::InvalidArchive(
+                "auxiliary staging output is missing",
+            ))?
+            .file
+            .write_all(bytes)
+            .map_err(|_| {
+                FormatError::FilesystemExtractionFailed("failed to stage native auxiliary payload")
+                    .into()
+            })
+    }
+
+    fn finish_auxiliary_payload(&mut self, record: &AuxiliaryRecord) -> Result<(), ExtractError> {
+        let mut staged = self
+            .active_auxiliary
+            .take()
+            .ok_or(FormatError::InvalidArchive(
+                "auxiliary staging output is missing",
+            ))?;
+        if staged.record.ordinal != record.ordinal || staged.record.kind != record.kind {
+            return Err(FormatError::InvalidArchive(
+                "staged auxiliary declaration changed during validation",
+            )
+            .into());
+        }
+        staged.file.flush().map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to flush native auxiliary staging")
+        })?;
+        staged.file.seek(SeekFrom::Start(0)).map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to rewind native auxiliary staging")
+        })?;
+        staged.record = record.clone();
+        self.staged_auxiliary.push(staged);
+        Ok(())
+    }
+
     fn on_member(&mut self, member: &StreamedTarMemberMetadata) -> Result<(), ExtractError> {
-        if self.destination.is_some() || self.temp_leaf.is_some() || self.file.is_some() {
+        if self.destination.is_some()
+            || self.temp_leaf.is_some()
+            || self.file.is_some()
+            || self.active_auxiliary.is_some()
+        {
             return Err(FormatError::InvalidArchive(
                 "previous streamed restore member was not finalized",
             )
@@ -3732,7 +4117,11 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
             member.reparse_placeholder,
             self.options,
         )?;
-        if member.reparse_placeholder {
+        let restore_exact_windows_reparse = cfg!(windows)
+            && self.options.restore_policy == RestorePolicy::System
+            && self.options.system_authorized
+            && windows_reparse_metadata_supported(&member.v45_metadata);
+        if member.reparse_placeholder && !restore_exact_windows_reparse {
             self.skipped_reparse_placeholder = true;
             return Ok(());
         }
@@ -3758,10 +4147,42 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                 self.file = Some(file);
             }
             TarEntryKind::Directory => {
-                create_directory(&destination)?;
-                if self.defer_directories {
-                    self.deferred_directories
-                        .push((member.path.clone(), member.v45_metadata.clone()));
+                if member.reparse_placeholder {
+                    #[cfg(windows)]
+                    create_windows_reparse_object(
+                        &destination,
+                        &member.path,
+                        member.kind,
+                        &member.v45_metadata,
+                        &mut self.staged_auxiliary,
+                        self.options,
+                        &mut self.planned_diagnostics,
+                    )?;
+                    #[cfg(not(windows))]
+                    unreachable!("exact Windows reparse restore is Windows-only");
+                } else {
+                    create_directory(&destination)?;
+                    if self.defer_directories {
+                        self.deferred_directories
+                            .push((member.path.clone(), member.v45_metadata.clone()));
+                    }
+                }
+                if !self.staged_auxiliary.is_empty() {
+                    #[cfg(windows)]
+                    let directory = if member.reparse_placeholder {
+                        open_existing_windows_reparse(&destination)?
+                    } else {
+                        open_existing_directory(&destination)?
+                    };
+                    #[cfg(not(windows))]
+                    let directory = open_existing_directory(&destination)?;
+                    apply_windows_alternate_streams(
+                        &directory,
+                        &member.path,
+                        &mut self.staged_auxiliary,
+                        self.options,
+                        &mut self.planned_diagnostics,
+                    )?;
                 }
             }
             TarEntryKind::Symlink => {
@@ -3770,15 +4191,68 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                     .as_deref()
                     .ok_or(FormatError::InvalidArchive("symlink target is missing"))?;
                 validate_symlink_target(&member.path, target)?;
-                create_symlink(&destination, target, self.options)?;
-                if self.options.restore_policy != RestorePolicy::Content {
-                    apply_restored_symlink_mtime(
+                if restore_exact_windows_reparse {
+                    #[cfg(windows)]
+                    create_windows_reparse_object(
                         &destination,
                         &member.path,
-                        member.v45_metadata.portable_mirror.mtime,
+                        member.kind,
+                        &member.v45_metadata,
+                        &mut self.staged_auxiliary,
                         self.options,
                         &mut self.planned_diagnostics,
                     )?;
+                    #[cfg(not(windows))]
+                    unreachable!("exact Windows reparse restore is Windows-only");
+                } else {
+                    create_symlink(&destination, target, self.options)?;
+                    let result = (|| {
+                        if !self.staged_auxiliary.is_empty() {
+                            #[cfg(windows)]
+                            {
+                                let reparse = open_existing_windows_reparse(&destination)?;
+                                apply_windows_alternate_streams(
+                                    &reparse,
+                                    &member.path,
+                                    &mut self.staged_auxiliary,
+                                    self.options,
+                                    &mut self.planned_diagnostics,
+                                )?;
+                            }
+                            #[cfg(not(windows))]
+                            self.staged_auxiliary.clear();
+                        }
+                        if self.options.restore_policy != RestorePolicy::Content {
+                            apply_restored_symlink_mtime(
+                                &destination,
+                                &member.path,
+                                member.v45_metadata.portable_mirror.mtime,
+                                self.options,
+                                &mut self.planned_diagnostics,
+                            )?;
+                        }
+                        #[cfg(windows)]
+                        if member.v45_metadata.declaration.source_os == "windows"
+                            && matches!(
+                                self.options.restore_policy,
+                                RestorePolicy::SameOs | RestorePolicy::System
+                            )
+                        {
+                            let reparse = open_existing_windows_reparse(&destination)?;
+                            apply_windows_basic_metadata(
+                                &reparse,
+                                &member.path,
+                                &member.v45_metadata,
+                                self.options,
+                                &mut self.planned_diagnostics,
+                            )?;
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
+                        return Err(error);
+                    }
                 }
             }
             TarEntryKind::Hardlink => {
@@ -3868,7 +4342,7 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
             self.native_sparse_active = true;
             self.sparse_logical_size = logical_size;
             self.sparse_extents = extents.to_vec();
-            return Ok(true);
+            Ok(true)
         }
         #[cfg(not(windows))]
         {
@@ -3998,11 +4472,12 @@ where
     Ok(())
 }
 
-fn stream_auxiliary_payload<R: TarMemberGroupReader>(
+fn stream_auxiliary_payload<R: TarMemberGroupReader, H: TarMemberStreamHandler>(
     reader: &mut R,
     len: u64,
     remaining: &mut u64,
     validator: &mut AuxiliaryStreamValidator,
+    mut handler: Option<&mut H>,
 ) -> Result<(), ExtractError> {
     let mut pending = len;
     let mut buf = [0u8; 64 * 1024];
@@ -4015,6 +4490,9 @@ fn stream_auxiliary_payload<R: TarMemberGroupReader>(
         *remaining -= read as u64;
         pending -= read as u64;
         validator.observe(&buf[..read])?;
+        if let Some(handler) = handler.as_deref_mut() {
+            handler.write_auxiliary_payload(&buf[..read])?;
+        }
     }
     Ok(())
 }
@@ -4387,9 +4865,505 @@ fn apply_restored_regular_file_metadata_parts(
     apply_regular_file_mtime(file, path, mtime, options, diagnostics)?;
     apply_regular_file_attributes(file, path, attributes, options, diagnostics)?;
     if let Some(member_metadata) = member_metadata {
+        apply_windows_security_descriptor(file, path, member_metadata, options, diagnostics)?;
         apply_windows_basic_metadata(file, path, member_metadata, options, diagnostics)?;
         apply_linux_inode_flags(file, path, member_metadata, options, diagnostics)?;
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsAlternateStreamRollback {
+    paths: Vec<Vec<u16>>,
+    committed: bool,
+}
+
+#[cfg(windows)]
+impl Drop for WindowsAlternateStreamRollback {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        use windows_sys::Win32::Storage::FileSystem::DeleteFileW;
+        for path in self.paths.iter().rev() {
+            // SAFETY: every path is retained as a NUL-terminated UTF-16 buffer until this call.
+            unsafe {
+                DeleteFileW(path.as_ptr());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn apply_windows_alternate_streams(
+    base_file: &fs::File,
+    path: &[u8],
+    staged: &mut Vec<StagedAuxiliary>,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFinalPathNameByHandleW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+        FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+
+    if staged.is_empty() {
+        return Ok(());
+    }
+    if !matches!(
+        options.restore_policy,
+        RestorePolicy::SameOs | RestorePolicy::System
+    ) {
+        staged.clear();
+        return Ok(());
+    }
+    let handle = base_file.as_raw_handle().cast();
+    // SAFETY: the handle is live; the zero-length query returns the required UTF-16 count.
+    let required = unsafe {
+        GetFinalPathNameByHandleW(
+            handle,
+            std::ptr::null_mut(),
+            0,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if required == 0 {
+        return Err(FormatError::FilesystemExtractionFailed(
+            "failed to resolve restored object for alternate-stream creation",
+        ));
+    }
+    let mut base_path = vec![0u16; required as usize + 1];
+    // SAFETY: `base_path` provides the queried capacity and remains writable for the call.
+    let written = unsafe {
+        GetFinalPathNameByHandleW(
+            handle,
+            base_path.as_mut_ptr(),
+            base_path.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if written == 0 || written as usize >= base_path.len() {
+        return Err(FormatError::FilesystemExtractionFailed(
+            "failed to resolve restored object for alternate-stream creation",
+        ));
+    }
+    base_path.truncate(written as usize);
+    let mut rollback = WindowsAlternateStreamRollback {
+        paths: Vec::new(),
+        committed: false,
+    };
+
+    for staged_record in std::mem::take(staged) {
+        let StagedAuxiliary { record, mut file } = staged_record;
+        if record.kind != "windows.alternate-data" {
+            return Err(FormatError::InvalidArchive(
+                "staged Windows alternate stream has unsupported framing",
+            ));
+        }
+        if record.decoded_name.len() % 2 != 0 {
+            return Err(FormatError::InvalidArchive(
+                "Windows alternate stream name is not UTF-16LE",
+            ));
+        }
+        let stream_name = record
+            .decoded_name
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        let mut stream_path = Vec::with_capacity(base_path.len() + stream_name.len() + 1);
+        stream_path.extend_from_slice(&base_path);
+        stream_path.extend_from_slice(&stream_name);
+        stream_path.push(0);
+        // SAFETY: the base path comes from the pinned destination handle and the suffix passed
+        // built-in UTF-16 alternate-stream grammar validation during archive parsing.
+        let stream_handle = unsafe {
+            CreateFileW(
+                stream_path.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if stream_handle.is_null() || stream_handle as isize == -1 {
+            let error = std::io::Error::last_os_error();
+            return record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    "windows-backup-v1",
+                    "alternate-data",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "failed to create Windows alternate data stream",
+                )
+                .for_restore(options.restore_policy, 2)
+                .with_native_error(&error),
+                options,
+                "failed to create Windows alternate data stream",
+            );
+        }
+        // SAFETY: ownership of the newly created handle transfers to `stream` exactly once.
+        let mut stream = unsafe { fs::File::from_raw_handle(stream_handle.cast()) };
+        rollback.paths.push(stream_path);
+        restore_windows_alternate_stream_payload(&mut file, &mut stream, &record)?;
+    }
+    rollback.committed = true;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn restore_windows_alternate_stream_payload(
+    staged: &mut fs::File,
+    stream: &mut fs::File,
+    record: &AuxiliaryRecord,
+) -> Result<(), FormatError> {
+    let sparse_layout = record.sparse_layout.as_ref();
+    let extents = sparse_layout.map(|layout| layout.extents.as_slice());
+    let extent_bytes = extents
+        .unwrap_or_default()
+        .iter()
+        .try_fold(0u64, |sum, extent| sum.checked_add(extent.length))
+        .ok_or(FormatError::InvalidArchive(
+            "sparse Windows alternate stream extent size overflow",
+        ))?;
+    let data_offset = if let Some(extents) = extents {
+        let map_size = sparse_layout
+            .expect("sparse extents require a layout")
+            .map_and_padding_size as u64;
+        if map_size.checked_add(extent_bytes) != Some(record.stored_size) {
+            return Err(FormatError::InvalidArchive(
+                "sparse Windows alternate stream stored size is inconsistent",
+            ));
+        }
+        prepare_windows_sparse_file(stream, record.logical_size)?;
+        staged.seek(SeekFrom::Start(map_size)).map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to seek staged sparse alternate stream")
+        })?;
+        for extent in extents {
+            stream.seek(SeekFrom::Start(extent.offset)).map_err(|_| {
+                FormatError::FilesystemExtractionFailed("failed to seek sparse alternate stream")
+            })?;
+            copy_exact_bytes(
+                staged,
+                stream,
+                extent.length,
+                "Windows sparse alternate stream",
+            )?;
+        }
+        map_size
+    } else {
+        staged.seek(SeekFrom::Start(0)).map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to rewind staged alternate stream")
+        })?;
+        copy_exact_bytes(
+            staged,
+            stream,
+            record.logical_size,
+            "Windows alternate stream",
+        )?;
+        0
+    };
+    stream.flush().map_err(|_| {
+        FormatError::FilesystemExtractionFailed("failed to flush Windows alternate stream")
+    })?;
+    if stream
+        .metadata()
+        .map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to inspect Windows alternate stream")
+        })?
+        .len()
+        != record.logical_size
+    {
+        return Err(FormatError::FilesystemExtractionFailed(
+            "Windows alternate stream logical size did not verify",
+        ));
+    }
+    if let Some(extents) = extents {
+        if query_windows_sparse_ranges(stream, record.logical_size)? != extents {
+            return Err(FormatError::FilesystemExtractionFailed(
+                "Windows sparse alternate stream ranges did not verify",
+            ));
+        }
+    }
+    staged.seek(SeekFrom::Start(data_offset)).map_err(|_| {
+        FormatError::FilesystemExtractionFailed("failed to rewind staged alternate stream data")
+    })?;
+    if let Some(extents) = extents {
+        for extent in extents {
+            stream.seek(SeekFrom::Start(extent.offset)).map_err(|_| {
+                FormatError::FilesystemExtractionFailed(
+                    "failed to seek restored sparse alternate stream",
+                )
+            })?;
+            compare_exact_bytes(
+                staged,
+                stream,
+                extent.length,
+                "Windows sparse alternate stream",
+            )?;
+        }
+    } else {
+        stream.seek(SeekFrom::Start(0)).map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to rewind Windows alternate stream")
+        })?;
+        compare_exact_bytes(
+            staged,
+            stream,
+            record.logical_size,
+            "Windows alternate stream",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_exact_bytes(
+    input: &mut fs::File,
+    output: &mut fs::File,
+    mut remaining: u64,
+    description: &'static str,
+) -> Result<(), FormatError> {
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let count = buffer
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        input.read_exact(&mut buffer[..count]).map_err(|_| {
+            FormatError::FilesystemExtractionFailed("staged auxiliary payload ended early")
+        })?;
+        output
+            .write_all(&buffer[..count])
+            .map_err(|_| FormatError::FilesystemExtractionFailed(description))?;
+        remaining -= count as u64;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn compare_exact_bytes(
+    expected: &mut fs::File,
+    actual: &mut fs::File,
+    mut remaining: u64,
+    description: &'static str,
+) -> Result<(), FormatError> {
+    let mut expected_buffer = [0u8; 64 * 1024];
+    let mut actual_buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let count = expected_buffer
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        expected
+            .read_exact(&mut expected_buffer[..count])
+            .map_err(|_| {
+                FormatError::FilesystemExtractionFailed("failed to read staged auxiliary payload")
+            })?;
+        actual
+            .read_exact(&mut actual_buffer[..count])
+            .map_err(|_| {
+                FormatError::FilesystemExtractionFailed("failed to read restored auxiliary payload")
+            })?;
+        if expected_buffer[..count] != actual_buffer[..count] {
+            return Err(FormatError::FilesystemExtractionFailed(description));
+        }
+        remaining -= count as u64;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn apply_windows_alternate_streams(
+    _base_file: &fs::File,
+    _path: &[u8],
+    staged: &mut Vec<StagedAuxiliary>,
+    _options: SafeExtractionOptions,
+    _diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    staged.clear();
+    Ok(())
+}
+
+#[cfg(windows)]
+fn apply_windows_security_descriptor(
+    file: &fs::File,
+    path: &[u8],
+    metadata: &MemberMetadata,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER};
+    use windows_sys::Win32::Security::{GetKernelObjectSecurity, SetKernelObjectSecurity};
+    use windows_sys::Win32::Storage::FileSystem::{
+        ReOpenFile, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+    };
+    use windows_sys::Win32::System::SystemServices::ACCESS_SYSTEM_SECURITY;
+
+    if metadata.declaration.source_os != "windows"
+        || options.restore_policy != RestorePolicy::System
+        || !options.system_authorized
+    {
+        return Ok(());
+    }
+    let Some(record) = metadata
+        .auxiliary
+        .iter()
+        .find(|record| record.kind == "windows.security-descriptor")
+    else {
+        return Ok(());
+    };
+    let payload = record
+        .capture_report_payload
+        .as_deref()
+        .ok_or(FormatError::InvalidArchive(
+            "Windows security descriptor was not retained",
+        ))?;
+    let security_information = record
+        .meta
+        .get("TZAP.aux.meta.security-information")
+        .map(|value| parse_lower_hex_u32(value, "Windows security information"))
+        .transpose()?
+        .ok_or(FormatError::InvalidArchive(
+            "Windows security descriptor lacks its information mask",
+        ))?;
+    if !windows_security_restore_privileges_available(security_information) {
+        let diagnostic = MetadataDiagnostic::new(
+            path,
+            "windows-backup-v1",
+            "security-descriptor",
+            MetadataOperation::Restore,
+            MetadataDiagnosticStatus::Unsupported,
+            "required Windows restore privilege is unavailable",
+        )
+        .for_restore(options.restore_policy, 4);
+        if options.allow_degraded {
+            diagnostics.push(diagnostic);
+            return Ok(());
+        }
+        return Err(FormatError::ReaderUnsupported(
+            "Windows security restoration requires SeRestorePrivilege and optional SeSecurityPrivilege",
+        ));
+    }
+    let desired_access = READ_CONTROL
+        | WRITE_DAC
+        | WRITE_OWNER
+        | if security_information & 0x0000_0008 != 0 {
+            ACCESS_SYSTEM_SECURITY
+        } else {
+            0
+        };
+    // SAFETY: the original handle is live and flags preserve no-follow access to its object.
+    let security_handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle().cast(),
+            desired_access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if security_handle.is_null() || security_handle as isize == -1 {
+        let error = std::io::Error::last_os_error();
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                "security-descriptor",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to open object for Windows security restoration",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "failed to open object for Windows security restoration",
+        );
+    }
+    // SAFETY: the parser-validated self-relative descriptor remains readable for the call.
+    let set_ok = unsafe {
+        SetKernelObjectSecurity(
+            security_handle,
+            security_information,
+            payload.as_ptr().cast_mut().cast(),
+        )
+    } != 0;
+    let set_error = std::io::Error::last_os_error();
+    if !set_ok {
+        unsafe { CloseHandle(security_handle) };
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                "security-descriptor",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to apply Windows security descriptor",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&set_error),
+            options,
+            "failed to apply Windows security descriptor",
+        );
+    }
+
+    let mut needed = 0u32;
+    // SAFETY: the null-buffer query returns the descriptor size through `needed`.
+    let first = unsafe {
+        GetKernelObjectSecurity(
+            security_handle,
+            security_information,
+            ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    let first_error = std::io::Error::last_os_error();
+    let mut actual = vec![0u8; needed as usize];
+    // SAFETY: `actual` has the queried size and remains writable for the call.
+    let get_ok = first == 0
+        && first_error.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER as i32)
+        && needed != 0
+        && unsafe {
+            GetKernelObjectSecurity(
+                security_handle,
+                security_information,
+                actual.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } != 0;
+    unsafe { CloseHandle(security_handle) };
+    if !get_ok || actual != payload {
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                "security-descriptor",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "Windows security descriptor did not verify after restoration",
+            )
+            .for_restore(options.restore_policy, 4),
+            options,
+            "Windows security descriptor did not verify after restoration",
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn apply_windows_security_descriptor(
+    _file: &fs::File,
+    _path: &[u8],
+    _metadata: &MemberMetadata,
+    _options: SafeExtractionOptions,
+    _diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
     Ok(())
 }
 
@@ -5328,7 +6302,7 @@ fn open_existing_directory(target: &PreparedDestination) -> Result<fs::File, For
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(FormatError::UnsafeArchivePath);
         }
-        return Ok(directory);
+        Ok(directory)
     }
 
     #[cfg(not(windows))]
@@ -5350,6 +6324,40 @@ fn open_existing_directory(target: &PreparedDestination) -> Result<fs::File, For
     {
         Ok(directory.into_std_file())
     }
+}
+
+#[cfg(windows)]
+fn open_existing_windows_reparse(target: &PreparedDestination) -> Result<fs::File, FormatError> {
+    let mut options = CapOpenOptions::new();
+    options
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .follow(FollowSymlinks::No);
+    let reparse = target
+        .parent
+        .open_with(&target.leaf, &options)
+        .map(cap_std::fs::File::into_std)
+        .map_err(|_| {
+            FormatError::FilesystemExtractionFailed(
+                "failed to open Windows reparse object for metadata restoration",
+            )
+        })?;
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: `reparse` owns a live handle and `basic` is a correctly sized writable output.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            reparse.as_raw_handle().cast(),
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+        || basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    {
+        return Err(FormatError::UnsafeArchivePath);
+    }
+    Ok(reparse)
 }
 
 fn apply_restored_directory_metadata(
@@ -5688,7 +6696,7 @@ fn rename_open_file_noreplace(
         .as_os_str()
         .encode_wide()
         .collect::<Vec<_>>();
-    if leaf.is_empty() || leaf.iter().any(|unit| *unit == 0) {
+    if leaf.is_empty() || leaf.contains(&0) {
         return Err(FormatError::UnsafeArchivePath);
     }
     let mut capacity = 512usize;
@@ -5796,7 +6804,7 @@ fn publish_regular_file(
             let _ = destination.parent.remove_file_or_symlink(temp_leaf);
             return Err(error);
         }
-        return Ok(temp_file);
+        Ok(temp_file)
     }
 
     #[cfg(not(windows))]
@@ -5932,6 +6940,183 @@ fn create_symlink(
             "failed to create symlink",
         )),
     }
+}
+
+#[cfg(windows)]
+struct WindowsReparseRollback<'a> {
+    destination: &'a PreparedDestination,
+    directory: bool,
+    armed: bool,
+}
+
+#[cfg(windows)]
+impl Drop for WindowsReparseRollback<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.directory {
+            let _ = self.destination.parent.remove_dir(&self.destination.leaf);
+        } else {
+            let _ = self
+                .destination
+                .parent
+                .remove_file_or_symlink(&self.destination.leaf);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_windows_reparse_object(
+    destination: &PreparedDestination,
+    path: &[u8],
+    kind: TarEntryKind,
+    metadata: &MemberMetadata,
+    staged_auxiliary: &mut Vec<StagedAuxiliary>,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use std::ptr;
+    use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let record = metadata
+        .auxiliary
+        .iter()
+        .find(|record| record.kind == "windows.reparse-data")
+        .ok_or(FormatError::InvalidArchive(
+            "Windows reparse object lacks exact reparse data",
+        ))?;
+    let payload = record
+        .capture_report_payload
+        .as_deref()
+        .ok_or(FormatError::InvalidArchive(
+            "Windows reparse data was not retained",
+        ))?;
+    let tag = validate_windows_essential_reparse_data(payload)?;
+    let expected_tag = if kind == TarEntryKind::Symlink {
+        0xA000_000Cu32
+    } else {
+        0xA000_0003u32
+    };
+    if tag != expected_tag {
+        return Err(FormatError::InvalidArchive(
+            "Windows reparse tag disagrees with primary object kind",
+        ));
+    }
+    let attributes = metadata
+        .primary_records
+        .get("TZAP.windows.file-attributes")
+        .map(|value| parse_lower_hex_u32(value, "Windows file attributes"))
+        .transpose()?
+        .ok_or(FormatError::InvalidArchive(
+            "Windows reparse object lacks file attributes",
+        ))?;
+    let directory_object = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    if kind == TarEntryKind::Directory && !directory_object {
+        return Err(FormatError::InvalidArchive(
+            "Windows junction is not a directory reparse object",
+        ));
+    }
+    if options.overwrite_existing {
+        remove_existing_leaf_if_needed(destination)?;
+    }
+    let mut rollback = WindowsReparseRollback {
+        destination,
+        directory: directory_object,
+        armed: false,
+    };
+
+    let file = if directory_object {
+        destination
+            .parent
+            .create_dir(&destination.leaf)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    FormatError::UnsafeOverwrite
+                } else {
+                    FormatError::FilesystemExtractionFailed(
+                        "failed to create Windows reparse directory",
+                    )
+                }
+            })?;
+        let mut open = CapOpenOptions::new();
+        open.access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .follow(FollowSymlinks::No);
+        destination
+            .parent
+            .open_with(&destination.leaf, &open)
+            .map(cap_std::fs::File::into_std)
+            .map_err(|_| {
+                FormatError::FilesystemExtractionFailed("failed to open Windows reparse directory")
+            })?
+    } else {
+        let mut open = create_new_file_options();
+        open.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        destination
+            .parent
+            .open_with(&destination.leaf, &open)
+            .map(cap_std::fs::File::into_std)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    FormatError::UnsafeOverwrite
+                } else {
+                    FormatError::FilesystemExtractionFailed("failed to create Windows reparse file")
+                }
+            })?
+    };
+    rollback.armed = true;
+
+    let handle = file.as_raw_handle().cast();
+    let mut bytes_returned = 0u32;
+    // SAFETY: the handle is live and the authenticated payload is retained for the synchronous
+    // control call. FSCTL_SET_REPARSE_POINT has no output buffer.
+    if unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_SET_REPARSE_POINT,
+            payload.as_ptr().cast(),
+            payload.len() as u32,
+            ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(FormatError::FilesystemExtractionFailed(
+            "failed to set Windows reparse data",
+        ));
+    }
+
+    let mut actual = vec![0u8; 16 * 1024];
+    // SAFETY: the handle is live and the output allocation remains valid for the synchronous call.
+    if unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_GET_REPARSE_POINT,
+            ptr::null(),
+            0,
+            actual.as_mut_ptr().cast(),
+            actual.len() as u32,
+            &mut bytes_returned,
+            ptr::null_mut(),
+        )
+    } == 0
+        || actual.get(..bytes_returned as usize) != Some(payload)
+    {
+        return Err(FormatError::FilesystemExtractionFailed(
+            "Windows reparse data did not verify after creation",
+        ));
+    }
+    apply_windows_alternate_streams(&file, path, staged_auxiliary, options, diagnostics)?;
+    apply_windows_security_descriptor(&file, path, metadata, options, diagnostics)?;
+    apply_windows_basic_metadata(&file, path, metadata, options, diagnostics)?;
+    rollback.armed = false;
+    Ok(())
 }
 
 fn path_components(path: &[u8]) -> Result<Vec<String>, FormatError> {
@@ -7002,15 +8187,18 @@ mod tests {
         let mut parsed = parse_tar_member_group(&bytes, 4096).unwrap();
         parsed.v45_metadata.file_entry_flags |= HAS_SPARSE_EXTENTS;
 
+        let strict = plan_restore(
+            b"sparse.bin",
+            &parsed.v45_metadata,
+            TarEntryKind::Regular,
+            false,
+            SafeExtractionOptions::default(),
+        );
+        #[cfg(windows)]
+        assert!(strict.unwrap().is_empty());
+        #[cfg(not(windows))]
         assert_eq!(
-            plan_restore(
-                b"sparse.bin",
-                &parsed.v45_metadata,
-                TarEntryKind::Regular,
-                false,
-                SafeExtractionOptions::default(),
-            )
-            .unwrap_err(),
+            strict.unwrap_err(),
             FormatError::ReaderUnsupported(
                 "sparse layout materialization needs explicit degraded restore"
             )
@@ -7027,6 +8215,9 @@ mod tests {
             },
         )
         .unwrap();
+        #[cfg(windows)]
+        assert!(degraded.is_empty());
+        #[cfg(not(windows))]
         assert!(degraded.iter().any(|diagnostic| {
             diagnostic.metadata_class == "sparse-layout"
                 && diagnostic.status == MetadataDiagnosticStatus::Materialized

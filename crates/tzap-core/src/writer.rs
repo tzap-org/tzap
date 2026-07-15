@@ -17,11 +17,11 @@ use crate::crypto::{
     Subkeys,
 };
 use crate::entry_metadata::{
-    canonical_base64_encode, encode_canonical_pax, is_source_os, parse_auxiliary_record,
-    parse_primary_metadata, portable_primary_pax, valid_filesystem_token, validate_group_metadata,
-    ArchiveTimestamp, RestoreClass, SparseExtent, EXTENDED_METADATA_V1, HAS_AUXILIARY_STREAMS,
-    HAS_NATIVE_METADATA, HAS_SPARSE_EXTENTS, MAX_SPARSE_EXTENTS, PORTABLE_PROFILE,
-    REQUIRES_SYSTEM_RESTORE,
+    canonical_base64_encode, encode_canonical_pax, is_source_os,
+    parse_auxiliary_declaration_for_writer, parse_auxiliary_record, parse_primary_metadata,
+    portable_primary_pax, valid_filesystem_token, validate_group_metadata, ArchiveTimestamp,
+    RestoreClass, SparseExtent, EXTENDED_METADATA_V1, HAS_AUXILIARY_STREAMS, HAS_NATIVE_METADATA,
+    HAS_SPARSE_EXTENTS, MAX_SPARSE_EXTENTS, PORTABLE_PROFILE, REQUIRES_SYSTEM_RESTORE,
 };
 use crate::fec::encode_parity_gf16;
 use crate::format::{
@@ -356,6 +356,14 @@ pub struct NativeAuxiliaryMetadata {
     pub logical_size: u64,
     pub payload: Vec<u8>,
     pub meta: BTreeMap<String, Vec<u8>>,
+    streamed_payload: Option<StreamedAuxiliaryPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamedAuxiliaryPayload {
+    stored_size: u64,
+    sha256: [u8; 32],
+    sparse_extents: Option<Vec<SparseExtent>>,
 }
 
 impl NativeAuxiliaryMetadata {
@@ -377,7 +385,89 @@ impl NativeAuxiliaryMetadata {
             logical_size,
             payload,
             meta: BTreeMap::new(),
+            streamed_payload: None,
         }
+    }
+
+    /// Declares a re-openable auxiliary payload supplied by
+    /// [`RegularFileSource::open_auxiliary`].
+    pub fn new_streamed(
+        kind: impl Into<String>,
+        profile: impl Into<String>,
+        restore_class: RestoreClass,
+        stored_size: u64,
+        sha256: [u8; 32],
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            profile: profile.into(),
+            restore_class,
+            native: true,
+            name_encoding: NativeAuxiliaryNameEncoding::None,
+            name: Vec::new(),
+            flags: 0,
+            logical_size: stored_size,
+            payload: Vec::new(),
+            meta: BTreeMap::new(),
+            streamed_payload: Some(StreamedAuxiliaryPayload {
+                stored_size,
+                sha256,
+                sparse_extents: None,
+            }),
+        }
+    }
+
+    pub fn new_streamed_sparse(
+        kind: impl Into<String>,
+        profile: impl Into<String>,
+        restore_class: RestoreClass,
+        logical_size: u64,
+        sparse_extents: Vec<SparseExtent>,
+        sha256: [u8; 32],
+    ) -> Result<Self, FormatError> {
+        let map = encode_v45_sparse_map(&sparse_extents, logical_size)?;
+        let extent_bytes = sparse_extent_bytes(&sparse_extents, logical_size)?;
+        let stored_size = checked_u64_add(map.len() as u64, extent_bytes, "sparse auxiliary")?;
+        Ok(Self {
+            kind: kind.into(),
+            profile: profile.into(),
+            restore_class,
+            native: true,
+            name_encoding: NativeAuxiliaryNameEncoding::None,
+            name: Vec::new(),
+            flags: 1,
+            logical_size,
+            payload: Vec::new(),
+            meta: BTreeMap::new(),
+            streamed_payload: Some(StreamedAuxiliaryPayload {
+                stored_size,
+                sha256,
+                sparse_extents: Some(sparse_extents),
+            }),
+        })
+    }
+
+    pub fn is_streamed(&self) -> bool {
+        self.streamed_payload.is_some()
+    }
+
+    pub fn streamed_sparse_extents(&self) -> Option<&[SparseExtent]> {
+        self.streamed_payload
+            .as_ref()
+            .and_then(|payload| payload.sparse_extents.as_deref())
+    }
+
+    pub fn stored_payload_size(&self) -> u64 {
+        self.streamed_payload
+            .as_ref()
+            .map_or(self.payload.len() as u64, |payload| payload.stored_size)
+    }
+
+    fn sha256(&self) -> [u8; 32] {
+        self.streamed_payload.as_ref().map_or_else(
+            || Sha256::digest(&self.payload).into(),
+            |payload| payload.sha256,
+        )
     }
 }
 
@@ -410,6 +500,7 @@ pub enum SourceEntryKind {
     Regular,
     Directory,
     Symlink,
+    Hardlink,
     /// Zero-data directory primary whose native metadata contains an exact,
     /// validated Windows mount-point reparse payload.
     ReparseDirectory,
@@ -459,7 +550,7 @@ pub trait RegularFileSource {
     fn entry_kind(&self) -> SourceEntryKind {
         SourceEntryKind::Regular
     }
-    /// Link target bytes for a symbolic-link source.
+    /// Link target bytes for a symbolic-link or hardlink source.
     fn link_target(&self) -> Option<&[u8]> {
         None
     }
@@ -478,6 +569,29 @@ pub trait RegularFileSource {
         PortableFileMetadata::default()
     }
     fn open(&self) -> Result<Box<dyn Read + '_>, ArchiveWriteError>;
+    /// Opens a streamed auxiliary payload by its canonical ordinal.
+    ///
+    /// The default serves inline payloads. Sources using
+    /// [`NativeAuxiliaryMetadata::new_streamed`] must override this method and
+    /// return a fresh reader on every call.
+    fn open_auxiliary(&self, ordinal: usize) -> Result<Box<dyn Read + '_>, ArchiveWriteError> {
+        let metadata = self.portable_metadata();
+        let record =
+            metadata
+                .native
+                .auxiliary_records
+                .get(ordinal)
+                .ok_or(FormatError::WriterInvariant(
+                    "auxiliary source ordinal is missing",
+                ))?;
+        if record.is_streamed() {
+            return Err(FormatError::WriterUnsupported(
+                "streamed auxiliary source did not implement open_auxiliary",
+            )
+            .into());
+        }
+        Ok(Box::new(Cursor::new(record.payload.clone())))
+    }
 }
 
 impl RegularFileSource for RegularFile<'_> {
@@ -525,8 +639,8 @@ pub enum ArchiveWritePhase {
 /// Automatic volume-size replanning may start `PlanningPayload` and
 /// `PlanningMetadata` more than once. Each call to
 /// [`ArchiveWriteProgressSink::phase_started`] begins a new phase occurrence;
-/// within that occurrence, one archive member reports at most
-/// [`RegularFileSource::file_data_size`] bytes.
+/// within that occurrence, one archive member reports at most its primary
+/// source bytes plus its declared streamed auxiliary payload bytes.
 pub trait ArchiveWriteProgressSink {
     /// Reports that the writer entered a new creation phase.
     fn phase_started(&mut self, phase: ArchiveWritePhase);
@@ -577,6 +691,7 @@ impl<'a> SourceProgressState<'a> {
 
 struct ProgressRegularFileSource<'a, S> {
     inner: &'a S,
+    source_bytes: u64,
     state: Rc<RefCell<SourceProgressState<'a>>>,
 }
 
@@ -617,7 +732,16 @@ impl<S: RegularFileSource> RegularFileSource for ProgressRegularFileSource<'_, S
         Ok(Box::new(SourceProgressReader {
             inner: self.inner.open()?,
             archive_path: self.inner.archive_path().to_owned(),
-            file_data_size: self.inner.file_data_size(),
+            source_bytes: self.source_bytes,
+            state: Rc::clone(&self.state),
+        }))
+    }
+
+    fn open_auxiliary(&self, ordinal: usize) -> Result<Box<dyn Read + '_>, ArchiveWriteError> {
+        Ok(Box::new(SourceProgressReader {
+            inner: self.inner.open_auxiliary(ordinal)?,
+            archive_path: self.inner.archive_path().to_owned(),
+            source_bytes: self.source_bytes,
             state: Rc::clone(&self.state),
         }))
     }
@@ -626,7 +750,7 @@ impl<S: RegularFileSource> RegularFileSource for ProgressRegularFileSource<'_, S
 struct SourceProgressReader<'a> {
     inner: Box<dyn Read + 'a>,
     archive_path: String,
-    file_data_size: u64,
+    source_bytes: u64,
     state: Rc<RefCell<SourceProgressState<'a>>>,
 }
 
@@ -635,7 +759,7 @@ impl Read for SourceProgressReader<'_> {
         let bytes = self.inner.read(buf)?;
         self.state
             .borrow_mut()
-            .record(&self.archive_path, bytes as u64, self.file_data_size);
+            .record(&self.archive_path, bytes as u64, self.source_bytes);
         Ok(bytes)
     }
 }
@@ -652,9 +776,21 @@ fn progress_sources<'a, S: RegularFileSource>(
     let state = Rc::new(RefCell::new(SourceProgressState::new(sink)));
     let sources = files
         .iter()
-        .map(|inner| ProgressRegularFileSource {
-            inner,
-            state: Rc::clone(&state),
+        .map(|inner| {
+            let source_bytes = inner
+                .portable_metadata()
+                .native
+                .auxiliary_records
+                .iter()
+                .filter(|record| record.is_streamed())
+                .fold(inner.file_data_size(), |total, record| {
+                    total.saturating_add(record.stored_payload_size())
+                });
+            ProgressRegularFileSource {
+                inner,
+                source_bytes,
+                state: Rc::clone(&state),
+            }
         })
         .collect();
     (sources, state)
@@ -1362,22 +1498,7 @@ where
         None,
         |writer| {
             for file in files {
-                let archive_path =
-                    normalize_lookup_file_path(file.archive_path(), options.max_path_length)?;
-                let mut reader = file.open()?;
-                writer.write_regular_member_from_reader(
-                    StreamingRegularMember {
-                        archive_path,
-                        entry_kind: file.entry_kind(),
-                        link_target: file.link_target().map(<[u8]>::to_vec),
-                        file_data_size: file.file_data_size(),
-                        sparse_extents: file.sparse_extents().map(<[SparseExtent]>::to_vec),
-                        mode: file.mode(),
-                        mtime: file.mtime(),
-                        portable_metadata: file.portable_metadata(),
-                    },
-                    reader.as_mut(),
-                )?;
+                writer.write_regular_member_from_source(file)?;
             }
             Ok(())
         },
@@ -1411,22 +1532,7 @@ where
         None,
         |writer| {
             for file in files {
-                let archive_path =
-                    normalize_lookup_file_path(file.archive_path(), options.max_path_length)?;
-                let mut reader = file.open()?;
-                writer.write_regular_member_from_reader(
-                    StreamingRegularMember {
-                        archive_path,
-                        entry_kind: file.entry_kind(),
-                        link_target: file.link_target().map(<[u8]>::to_vec),
-                        file_data_size: file.file_data_size(),
-                        sparse_extents: file.sparse_extents().map(<[SparseExtent]>::to_vec),
-                        mode: file.mode(),
-                        mtime: file.mtime(),
-                        portable_metadata: file.portable_metadata(),
-                    },
-                    reader.as_mut(),
-                )?;
+                writer.write_regular_member_from_source(file)?;
             }
             Ok(())
         },
@@ -1460,22 +1566,7 @@ where
         Some(&progress_state),
         |writer| {
             for file in &progress_files {
-                let archive_path =
-                    normalize_lookup_file_path(file.archive_path(), options.max_path_length)?;
-                let mut reader = file.open()?;
-                writer.write_regular_member_from_reader(
-                    StreamingRegularMember {
-                        archive_path,
-                        entry_kind: file.entry_kind(),
-                        link_target: file.link_target().map(<[u8]>::to_vec),
-                        file_data_size: file.file_data_size(),
-                        sparse_extents: file.sparse_extents().map(<[SparseExtent]>::to_vec),
-                        mode: file.mode(),
-                        mtime: file.mtime(),
-                        portable_metadata: file.portable_metadata(),
-                    },
-                    reader.as_mut(),
-                )?;
+                writer.write_regular_member_from_source(file)?;
             }
             Ok(())
         },
@@ -2045,7 +2136,7 @@ fn plan_payload_stream<S: RegularFileSource>(
             .transpose()?
             .unwrap_or(file.file_data_size());
         let portable_metadata = file.portable_metadata();
-        let prefix = build_primary_member_prefix(
+        let layout = build_primary_member_layout(
             &path,
             entry_kind,
             link_target.as_deref(),
@@ -2056,14 +2147,12 @@ fn plan_payload_stream<S: RegularFileSource>(
             &portable_metadata,
         )?;
         let member_start = tar_total_size;
-        let member_group_size = checked_u64_add(
-            prefix.len() as u64,
-            checked_u64_add(
-                source_payload_size,
-                padding_to_512_u64(source_payload_size),
-                "tar member",
-            )?,
-            "tar member",
+        let member_group_size = primary_member_layout_size(&layout, source_payload_size)?;
+        let mut reader = StreamingMemberReader::from_source(
+            file,
+            &portable_metadata,
+            layout,
+            source_payload_size,
         )?;
         tar_members.push(TarMember {
             path,
@@ -2077,7 +2166,6 @@ fn plan_payload_stream<S: RegularFileSource>(
             mtime: file.mtime(),
             portable_metadata,
         });
-        let mut reader = StreamingMemberReader::new(file.open()?, prefix, source_payload_size);
         let mut member_offset = 0u64;
         while member_offset < member_group_size {
             let remaining = member_group_size - member_offset;
@@ -2363,22 +2451,7 @@ where
         |writer| {
             writer.reserve_member_capacity(files.len());
             for file in files {
-                let archive_path =
-                    normalize_lookup_file_path(file.archive_path(), options.max_path_length)?;
-                let mut reader = file.open()?;
-                writer.write_regular_member_from_reader(
-                    StreamingRegularMember {
-                        archive_path,
-                        entry_kind: file.entry_kind(),
-                        link_target: file.link_target().map(<[u8]>::to_vec),
-                        file_data_size: file.file_data_size(),
-                        sparse_extents: file.sparse_extents().map(<[SparseExtent]>::to_vec),
-                        mode: file.mode(),
-                        mtime: file.mtime(),
-                        portable_metadata: file.portable_metadata(),
-                    },
-                    reader.as_mut(),
-                )?;
+                writer.write_regular_member_from_source(file)?;
             }
             Ok(())
         },
@@ -2653,8 +2726,8 @@ impl<O: ArchiveWriteSink> OrderedParallelArchiveWriter<'_, O> {
         member: StreamingRegularMember,
         payload: &mut dyn Read,
     ) -> Result<(), ArchiveWriteError> {
-        let path = member.archive_path;
-        validate_file_path_bytes(&path, self.options.max_path_length)?;
+        let path = &member.archive_path;
+        validate_file_path_bytes(path, self.options.max_path_length)?;
         if member.entry_kind != SourceEntryKind::Regular && member.file_data_size != 0 {
             return Err(FormatError::WriterInvariant(
                 "non-regular source has non-zero file data size",
@@ -2668,7 +2741,7 @@ impl<O: ArchiveWriteSink> OrderedParallelArchiveWriter<'_, O> {
             .transpose()?
             .unwrap_or(member.file_data_size);
         let prefix = build_primary_member_prefix(
-            &path,
+            path,
             member.entry_kind,
             member.link_target.as_deref(),
             member.file_data_size,
@@ -2677,7 +2750,6 @@ impl<O: ArchiveWriteSink> OrderedParallelArchiveWriter<'_, O> {
             member.mtime,
             &member.portable_metadata,
         )?;
-        let member_start = self.ordered.tar_total_size;
         let member_group_size = checked_u64_add(
             prefix.len() as u64,
             checked_u64_add(
@@ -2687,9 +2759,69 @@ impl<O: ArchiveWriteSink> OrderedParallelArchiveWriter<'_, O> {
             )?,
             "tar member",
         )?;
+        let mut reader = StreamingMemberReader::new(Box::new(payload), prefix, source_payload_size);
+        self.write_prebuilt_member(member, &mut reader, member_group_size)
+    }
+
+    fn write_regular_member_from_source<S: RegularFileSource + ?Sized>(
+        &mut self,
+        source: &S,
+    ) -> Result<(), ArchiveWriteError> {
+        let member = StreamingRegularMember {
+            archive_path: normalize_lookup_file_path(
+                source.archive_path(),
+                self.options.max_path_length,
+            )?,
+            entry_kind: source.entry_kind(),
+            link_target: source.link_target().map(<[u8]>::to_vec),
+            file_data_size: source.file_data_size(),
+            sparse_extents: source.sparse_extents().map(<[SparseExtent]>::to_vec),
+            mode: source.mode(),
+            mtime: source.mtime(),
+            portable_metadata: source.portable_metadata(),
+        };
+        if member.entry_kind != SourceEntryKind::Regular && member.file_data_size != 0 {
+            return Err(FormatError::WriterInvariant(
+                "non-regular source has non-zero file data size",
+            )
+            .into());
+        }
+        let source_payload_size = member
+            .sparse_extents
+            .as_deref()
+            .map(|extents| sparse_extent_bytes(extents, member.file_data_size))
+            .transpose()?
+            .unwrap_or(member.file_data_size);
+        let layout = build_primary_member_layout(
+            &member.archive_path,
+            member.entry_kind,
+            member.link_target.as_deref(),
+            member.file_data_size,
+            member.sparse_extents.as_deref(),
+            member.mode,
+            member.mtime,
+            &member.portable_metadata,
+        )?;
+        let member_group_size = primary_member_layout_size(&layout, source_payload_size)?;
+        let mut reader = StreamingMemberReader::from_source(
+            source,
+            &member.portable_metadata,
+            layout,
+            source_payload_size,
+        )?;
+        self.write_prebuilt_member(member, &mut reader, member_group_size)
+    }
+
+    fn write_prebuilt_member(
+        &mut self,
+        member: StreamingRegularMember,
+        reader: &mut StreamingMemberReader<'_>,
+        member_group_size: u64,
+    ) -> Result<(), ArchiveWriteError> {
+        let member_start = self.ordered.tar_total_size;
         let member_index = self.ordered.tar_members.len();
         self.ordered.tar_members.push(TarMember {
-            path,
+            path: member.archive_path,
             entry_kind: member.entry_kind,
             link_target: member.link_target,
             tar_member_group_start: member_start,
@@ -2698,10 +2830,8 @@ impl<O: ArchiveWriteSink> OrderedParallelArchiveWriter<'_, O> {
             sparse_extents: member.sparse_extents,
             mode: member.mode,
             mtime: member.mtime,
-            portable_metadata: member.portable_metadata.clone(),
+            portable_metadata: member.portable_metadata,
         });
-
-        let mut reader = StreamingMemberReader::new(Box::new(payload), prefix, source_payload_size);
         let mut member_offset = 0u64;
         while member_offset < member_group_size {
             let remaining = member_group_size - member_offset;
@@ -3253,13 +3383,23 @@ fn max_single_pass_index_root_data_shards(options: WriterOptions) -> Result<u16,
 }
 
 impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
-    pub(crate) fn write_regular_member_from_reader(
+    fn write_regular_member_from_source<S: RegularFileSource + ?Sized>(
         &mut self,
-        member: StreamingRegularMember,
-        payload: &mut dyn Read,
+        source: &S,
     ) -> Result<(), ArchiveWriteError> {
-        let path = member.archive_path;
-        validate_file_path_bytes(&path, self.options.max_path_length)?;
+        let member = StreamingRegularMember {
+            archive_path: normalize_lookup_file_path(
+                source.archive_path(),
+                self.options.max_path_length,
+            )?,
+            entry_kind: source.entry_kind(),
+            link_target: source.link_target().map(<[u8]>::to_vec),
+            file_data_size: source.file_data_size(),
+            sparse_extents: source.sparse_extents().map(<[SparseExtent]>::to_vec),
+            mode: source.mode(),
+            mtime: source.mtime(),
+            portable_metadata: source.portable_metadata(),
+        };
         if member.entry_kind != SourceEntryKind::Regular && member.file_data_size != 0 {
             return Err(FormatError::WriterInvariant(
                 "non-regular source has non-zero file data size",
@@ -3272,8 +3412,8 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
             .map(|extents| sparse_extent_bytes(extents, member.file_data_size))
             .transpose()?
             .unwrap_or(member.file_data_size);
-        let prefix = build_primary_member_prefix(
-            &path,
+        let layout = build_primary_member_layout(
+            &member.archive_path,
             member.entry_kind,
             member.link_target.as_deref(),
             member.file_data_size,
@@ -3282,19 +3422,26 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
             member.mtime,
             &member.portable_metadata,
         )?;
-        let member_start = self.tar_total_size;
-        let member_group_size = checked_u64_add(
-            prefix.len() as u64,
-            checked_u64_add(
-                source_payload_size,
-                padding_to_512_u64(source_payload_size),
-                "tar member",
-            )?,
-            "tar member",
+        let member_group_size = primary_member_layout_size(&layout, source_payload_size)?;
+        let mut reader = StreamingMemberReader::from_source(
+            source,
+            &member.portable_metadata,
+            layout,
+            source_payload_size,
         )?;
+        self.write_prebuilt_member(member, &mut reader, member_group_size)
+    }
+
+    fn write_prebuilt_member(
+        &mut self,
+        member: StreamingRegularMember,
+        reader: &mut StreamingMemberReader<'_>,
+        member_group_size: u64,
+    ) -> Result<(), ArchiveWriteError> {
+        let member_start = self.tar_total_size;
         let member_index = self.tar_members.len();
         self.tar_members.push(TarMember {
-            path,
+            path: member.archive_path,
             entry_kind: member.entry_kind,
             link_target: member.link_target,
             tar_member_group_start: member_start,
@@ -3303,10 +3450,8 @@ impl<O: ArchiveWriteSink> StreamingArchiveWriter<'_, O> {
             sparse_extents: member.sparse_extents,
             mode: member.mode,
             mtime: member.mtime,
-            portable_metadata: member.portable_metadata.clone(),
+            portable_metadata: member.portable_metadata,
         });
-
-        let mut reader = StreamingMemberReader::new(Box::new(payload), prefix, source_payload_size);
         let mut member_offset = 0u64;
         while member_offset < member_group_size {
             let remaining = member_group_size - member_offset;
@@ -4286,7 +4431,7 @@ where
             )
             .into());
         }
-        let prefix = build_primary_member_prefix(
+        let layout = build_primary_member_layout(
             &member.path,
             member.entry_kind,
             member.link_target.as_deref(),
@@ -4302,7 +4447,19 @@ where
             .map(|extents| sparse_extent_bytes(extents, member.file_data_size))
             .transpose()?
             .unwrap_or(member.file_data_size);
-        let mut reader = StreamingMemberReader::new(file.open()?, prefix, source_payload_size);
+        let actual_member_group_size = primary_member_layout_size(&layout, source_payload_size)?;
+        if actual_member_group_size != member.tar_member_group_size {
+            return Err(FormatError::WriterInvariant(
+                "streamed auxiliary layout changed between planning and emission",
+            )
+            .into());
+        }
+        let mut reader = StreamingMemberReader::from_source(
+            file,
+            &member.portable_metadata,
+            layout,
+            source_payload_size,
+        )?;
         let mut member_offset = 0u64;
         while member_offset < member.tar_member_group_size {
             let remaining = member.tar_member_group_size - member_offset;
@@ -6666,24 +6823,186 @@ fn build_bootstrap_sidecar(
 }
 
 struct StreamingMemberReader<'a> {
-    prefix: Cursor<Vec<u8>>,
-    file: Box<dyn Read + 'a>,
-    remaining_file_bytes: u64,
-    source_eof_checked: bool,
-    remaining_padding_bytes: usize,
+    sections: Vec<StreamingMemberSection<'a>>,
+    section_index: usize,
     pushback: Vec<u8>,
+}
+
+struct StreamingMemberSection<'a> {
+    reader: Option<Box<dyn Read + 'a>>,
+    opener: Option<SectionOpener<'a>>,
+    remaining: u64,
+    remaining_padding: u64,
+    expected_sha256: Option<[u8; 32]>,
+    hasher: Sha256,
+    source_eof_checked: bool,
+}
+
+type SectionOpener<'a> = Box<dyn FnOnce() -> Result<Box<dyn Read + 'a>, ArchiveWriteError> + 'a>;
+
+impl<'a> StreamingMemberSection<'a> {
+    fn bytes(bytes: Vec<u8>) -> Self {
+        let size = bytes.len() as u64;
+        Self {
+            reader: Some(Box::new(Cursor::new(bytes))),
+            opener: None,
+            remaining: size,
+            remaining_padding: 0,
+            expected_sha256: None,
+            hasher: Sha256::new(),
+            source_eof_checked: false,
+        }
+    }
+
+    fn payload(reader: Box<dyn Read + 'a>, size: u64, expected_sha256: Option<[u8; 32]>) -> Self {
+        Self {
+            reader: Some(reader),
+            opener: None,
+            remaining: size,
+            remaining_padding: padding_to_512_u64(size),
+            expected_sha256,
+            hasher: Sha256::new(),
+            source_eof_checked: false,
+        }
+    }
+
+    fn deferred_payload(
+        opener: SectionOpener<'a>,
+        size: u64,
+        expected_sha256: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            reader: None,
+            opener: Some(opener),
+            remaining: size,
+            remaining_padding: padding_to_512_u64(size),
+            expected_sha256,
+            hasher: Sha256::new(),
+            source_eof_checked: false,
+        }
+    }
+
+    fn reader(&mut self) -> std::io::Result<&mut Box<dyn Read + 'a>> {
+        if self.reader.is_none() {
+            let opener = self
+                .opener
+                .take()
+                .ok_or_else(|| std::io::Error::other("streaming member section has no source"))?;
+            self.reader = Some(opener().map_err(|error| std::io::Error::other(error.to_string()))?);
+        }
+        Ok(self.reader.as_mut().expect("reader was initialized"))
+    }
+}
+
+impl Read for StreamingMemberSection<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining > 0 {
+            let limit = out
+                .len()
+                .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+            let count = self.reader()?.read(&mut out[..limit])?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "member source ended before its declared size",
+                ));
+            }
+            self.remaining -= count as u64;
+            if self.expected_sha256.is_some() {
+                self.hasher.update(&out[..count]);
+            }
+            return Ok(count);
+        }
+        if !self.source_eof_checked {
+            let mut extra = [0u8; 1];
+            if self.reader()?.read(&mut extra)? != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "member source exceeded its declared size",
+                ));
+            }
+            if let Some(expected) = self.expected_sha256 {
+                let actual: [u8; 32] = self.hasher.clone().finalize().into();
+                if actual != expected {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "auxiliary source changed after metadata capture",
+                    ));
+                }
+            }
+            self.source_eof_checked = true;
+            self.reader = None;
+        }
+        if self.remaining_padding > 0 {
+            let count = out
+                .len()
+                .min(usize::try_from(self.remaining_padding).unwrap_or(usize::MAX));
+            out[..count].fill(0);
+            self.remaining_padding -= count as u64;
+            return Ok(count);
+        }
+        Ok(0)
+    }
 }
 
 impl<'a> StreamingMemberReader<'a> {
     fn new(file: Box<dyn Read + 'a>, prefix: Vec<u8>, file_size: u64) -> Self {
         Self {
-            prefix: Cursor::new(prefix),
-            file,
-            remaining_file_bytes: file_size,
-            source_eof_checked: false,
-            remaining_padding_bytes: padding_to_512_u64(file_size) as usize,
+            sections: vec![
+                StreamingMemberSection::bytes(prefix),
+                StreamingMemberSection::payload(file, file_size, None),
+            ],
+            section_index: 0,
             pushback: Vec::new(),
         }
+    }
+
+    fn from_source<S: RegularFileSource + ?Sized>(
+        source: &'a S,
+        metadata: &PortableFileMetadata,
+        layout: PrimaryMemberLayout,
+        primary_size: u64,
+    ) -> Result<Self, ArchiveWriteError> {
+        let mut sections = Vec::with_capacity(layout.auxiliary.len() * 2 + 2);
+        for (ordinal, auxiliary) in layout.auxiliary.into_iter().enumerate() {
+            sections.push(StreamingMemberSection::bytes(auxiliary.bytes));
+            let record = metadata.native.auxiliary_records.get(ordinal).ok_or(
+                FormatError::WriterInvariant("planned auxiliary source ordinal is missing"),
+            )?;
+            if record.is_streamed() {
+                sections.push(StreamingMemberSection::deferred_payload(
+                    Box::new(move || source.open_auxiliary(ordinal)),
+                    auxiliary.stored_size,
+                    Some(auxiliary.sha256),
+                ));
+            } else {
+                sections.push(StreamingMemberSection::payload(
+                    Box::new(Cursor::new(record.payload.clone())),
+                    auxiliary.stored_size,
+                    Some(auxiliary.sha256),
+                ));
+            }
+            if record.stored_payload_size() != auxiliary.stored_size {
+                return Err(FormatError::WriterInvariant(
+                    "auxiliary source declaration changed while opening",
+                )
+                .into());
+            }
+        }
+        sections.push(StreamingMemberSection::bytes(layout.primary));
+        sections.push(StreamingMemberSection::deferred_payload(
+            Box::new(move || source.open()),
+            primary_size,
+            None,
+        ));
+        Ok(Self {
+            sections,
+            section_index: 0,
+            pushback: Vec::new(),
+        })
     }
 
     fn push_back(&mut self, bytes: Vec<u8>) {
@@ -6717,48 +7036,13 @@ impl Read for StreamingMemberReader<'_> {
             }
         }
 
-        let prefix_count = self.prefix.read(&mut out[written..])?;
-        written += prefix_count;
-        if written == out.len() {
-            return Ok(written);
-        }
-
-        if self.remaining_file_bytes > 0 {
-            let max_file_read = (out.len() - written)
-                .min(usize::try_from(self.remaining_file_bytes).unwrap_or(usize::MAX));
-            let count = self.file.read(&mut out[written..written + max_file_read])?;
+        while written < out.len() && self.section_index < self.sections.len() {
+            let count = self.sections[self.section_index].read(&mut out[written..])?;
             if count == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "file source ended before declared size",
-                ));
+                self.section_index += 1;
+            } else {
+                written += count;
             }
-            self.remaining_file_bytes -= count as u64;
-            written += count;
-            if written == out.len() {
-                return Ok(written);
-            }
-            if self.remaining_file_bytes > 0 {
-                return Ok(written);
-            }
-        }
-
-        if !self.source_eof_checked {
-            let mut extra = [0u8; 1];
-            if self.file.read(&mut extra)? != 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "file source exceeded declared stored size",
-                ));
-            }
-            self.source_eof_checked = true;
-        }
-
-        if self.remaining_padding_bytes > 0 {
-            let count = (out.len() - written).min(self.remaining_padding_bytes);
-            out[written..written + count].fill(0);
-            self.remaining_padding_bytes -= count;
-            written += count;
         }
 
         Ok(written)
@@ -6785,6 +7069,7 @@ fn build_regular_file_member_prefix(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_primary_member_prefix(
     path: &[u8],
     entry_kind: SourceEntryKind,
@@ -6795,6 +7080,74 @@ fn build_primary_member_prefix(
     mtime: ArchiveTimestamp,
     portable_metadata: &PortableFileMetadata,
 ) -> Result<Vec<u8>, FormatError> {
+    let layout = build_primary_member_layout(
+        path,
+        entry_kind,
+        link_target,
+        file_size,
+        sparse_extents,
+        mode,
+        mtime,
+        portable_metadata,
+    )?;
+    let mut out = Vec::new();
+    for (ordinal, auxiliary) in layout.auxiliary.iter().enumerate() {
+        let record = &portable_metadata.native.auxiliary_records[ordinal];
+        if record.is_streamed() {
+            return Err(FormatError::WriterUnsupported(
+                "this writer path does not accept streamed auxiliary payloads",
+            ));
+        }
+        out.extend_from_slice(&auxiliary.bytes);
+        out.extend_from_slice(&record.payload);
+        out.resize(
+            out.len() + padding_to_512_u64(auxiliary.stored_size) as usize,
+            0,
+        );
+    }
+    out.extend_from_slice(&layout.primary);
+    Ok(out)
+}
+
+struct PrimaryMemberLayout {
+    auxiliary: Vec<NativeAuxiliaryMemberPrefix>,
+    primary: Vec<u8>,
+}
+
+fn primary_member_layout_size(
+    layout: &PrimaryMemberLayout,
+    primary_payload_size: u64,
+) -> Result<u64, FormatError> {
+    let mut size = 0u64;
+    for auxiliary in &layout.auxiliary {
+        size = checked_u64_add(size, auxiliary.bytes.len() as u64, "auxiliary member")?;
+        size = checked_u64_add(size, auxiliary.stored_size, "auxiliary member")?;
+        size = checked_u64_add(
+            size,
+            padding_to_512_u64(auxiliary.stored_size),
+            "auxiliary member",
+        )?;
+    }
+    size = checked_u64_add(size, layout.primary.len() as u64, "primary member")?;
+    size = checked_u64_add(size, primary_payload_size, "primary member")?;
+    checked_u64_add(
+        size,
+        padding_to_512_u64(primary_payload_size),
+        "primary member",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_primary_member_layout(
+    path: &[u8],
+    entry_kind: SourceEntryKind,
+    link_target: Option<&[u8]>,
+    file_size: u64,
+    sparse_extents: Option<&[SparseExtent]>,
+    mode: u32,
+    mtime: ArchiveTimestamp,
+    portable_metadata: &PortableFileMetadata,
+) -> Result<PrimaryMemberLayout, FormatError> {
     if entry_kind != SourceEntryKind::Regular && (file_size != 0 || sparse_extents.is_some()) {
         return Err(FormatError::WriterInvariant(
             "non-regular member has non-zero file data size",
@@ -6803,6 +7156,17 @@ fn build_primary_member_prefix(
     match (entry_kind, link_target) {
         (SourceEntryKind::Symlink, Some(target)) => {
             crate::tar_model::validate_symlink_target(path, target)?;
+        }
+        (SourceEntryKind::Hardlink, Some(target)) => {
+            validate_file_path_bytes(target, u32::MAX)?;
+            if target == path {
+                return Err(FormatError::WriterInvariant("hardlink aliases itself"));
+            }
+            if portable_metadata.native != NativeFileMetadata::default() {
+                return Err(FormatError::WriterInvariant(
+                    "hardlink alias carries native file-object metadata",
+                ));
+            }
         }
         (SourceEntryKind::Symlink, None) => {
             return Err(FormatError::WriterInvariant(
@@ -6817,7 +7181,7 @@ fn build_primary_member_prefix(
         (_, None) => {}
     }
     let sparse_map = sparse_extents
-        .map(|extents| encode_sparse_map(extents, file_size))
+        .map(|extents| encode_v45_sparse_map(extents, file_size))
         .transpose()?;
     let stored_extent_bytes = sparse_extents
         .map(|extents| sparse_extent_bytes(extents, file_size))
@@ -6828,7 +7192,6 @@ fn build_primary_member_prefix(
         stored_extent_bytes,
         "sparse primary stored size",
     )?;
-    let mut out = Vec::new();
     let use_path_override = sparse_map.is_none() && path_requires_pax(path);
     validate_portable_file_metadata(portable_metadata)?;
     let reparse_placeholder = portable_metadata
@@ -6899,6 +7262,7 @@ fn build_primary_member_prefix(
         FormatError::WriterUnsupported("native primary metadata is not a valid v45 declaration")
     })?;
     let mut parsed_auxiliary = Vec::with_capacity(portable_metadata.native.auxiliary_records.len());
+    let mut auxiliary = Vec::with_capacity(portable_metadata.native.auxiliary_records.len());
     for (ordinal, record) in portable_metadata
         .native
         .auxiliary_records
@@ -6908,18 +7272,19 @@ fn build_primary_member_prefix(
         let ordinal = u32::try_from(ordinal).map_err(|_| {
             FormatError::WriterUnsupported("auxiliary record count exceeds revision-45 range")
         })?;
-        let (member, parsed) = build_native_auxiliary_member(ordinal, record)?;
-        out.extend_from_slice(&member);
-        parsed_auxiliary.push(parsed);
+        let member = build_native_auxiliary_member_prefix(ordinal, record)?;
+        parsed_auxiliary.push(member.parsed.clone());
+        auxiliary.push(member);
     }
     validate_group_metadata(&primary_metadata, &parsed_auxiliary).map_err(|_| {
         FormatError::WriterUnsupported("native auxiliary metadata is not a valid v45 declaration")
     })?;
     let pax_payload = encode_canonical_pax(&pax_records)?;
     let pax_header = build_ustar_header(b"TZAP-PAX/PRIMARY", pax_payload.len() as u64, 0, 0, b'x')?;
-    out.extend_from_slice(&pax_header);
-    out.extend_from_slice(&pax_payload);
-    out.resize(out.len() + padding_to_512(pax_payload.len()), 0);
+    let mut primary = Vec::new();
+    primary.extend_from_slice(&pax_header);
+    primary.extend_from_slice(&pax_payload);
+    primary.resize(primary.len() + padding_to_512(pax_payload.len()), 0);
 
     let header_path = if sparse_map.is_some() {
         b"GNUSparseFile.0/TZAP".to_vec()
@@ -6933,6 +7298,7 @@ fn build_primary_member_prefix(
         SourceEntryKind::Regular => b'0',
         SourceEntryKind::Directory | SourceEntryKind::ReparseDirectory => b'5',
         SourceEntryKind::Symlink => b'2',
+        SourceEntryKind::Hardlink => b'1',
     };
     let mut header = build_ustar_header(&header_path, header_size, mode, header_mtime, typeflag)?;
     if let Some(target) = link_target.filter(|_| !use_linkpath_override) {
@@ -6940,11 +7306,11 @@ fn build_primary_member_prefix(
         finalize_tar_checksum(&mut header)?;
     }
     apply_primary_tar_identity(&mut header, &primary_identity)?;
-    out.extend_from_slice(&header);
+    primary.extend_from_slice(&header);
     if let Some(sparse_map) = sparse_map {
-        out.extend_from_slice(&sparse_map);
+        primary.extend_from_slice(&sparse_map);
     }
-    Ok(out)
+    Ok(PrimaryMemberLayout { auxiliary, primary })
 }
 
 fn sparse_extent_bytes(extents: &[SparseExtent], logical_size: u64) -> Result<u64, FormatError> {
@@ -6986,7 +7352,10 @@ fn sparse_extent_bytes(extents: &[SparseExtent], logical_size: u64) -> Result<u6
     Ok(stored_size)
 }
 
-fn encode_sparse_map(extents: &[SparseExtent], logical_size: u64) -> Result<Vec<u8>, FormatError> {
+pub fn encode_v45_sparse_map(
+    extents: &[SparseExtent],
+    logical_size: u64,
+) -> Result<Vec<u8>, FormatError> {
     sparse_extent_bytes(extents, logical_size)?;
     let mut map = Vec::new();
     map.extend_from_slice(extents.len().to_string().as_bytes());
@@ -7007,10 +7376,32 @@ fn encode_sparse_map(extents: &[SparseExtent], logical_size: u64) -> Result<Vec<
     Ok(map)
 }
 
-fn build_native_auxiliary_member(
+struct NativeAuxiliaryMemberPrefix {
+    bytes: Vec<u8>,
+    stored_size: u64,
+    sha256: [u8; 32],
+    parsed: crate::entry_metadata::AuxiliaryRecord,
+}
+
+fn build_native_auxiliary_member_prefix(
     ordinal: u32,
     record: &NativeAuxiliaryMetadata,
-) -> Result<(Vec<u8>, crate::entry_metadata::AuxiliaryRecord), FormatError> {
+) -> Result<NativeAuxiliaryMemberPrefix, FormatError> {
+    if record.is_streamed()
+        && !matches!(
+            record.kind.as_str(),
+            "windows.alternate-data"
+                | "windows.property-data"
+                | "windows.efs-raw"
+                | "macos.resource-fork"
+                | "generic.xattr"
+        )
+        && !record.kind.starts_with("x.")
+    {
+        return Err(FormatError::WriterUnsupported(
+            "this auxiliary kind requires inline structural payload validation",
+        ));
+    }
     let mut pax_records = BTreeMap::new();
     pax_records.insert("TZAP.aux.version".into(), b"1".to_vec());
     pax_records.insert("TZAP.aux.kind".into(), record.kind.as_bytes().to_vec());
@@ -7054,7 +7445,7 @@ fn build_native_auxiliary_member(
         "TZAP.aux.logical-size".into(),
         record.logical_size.to_string().into_bytes(),
     );
-    let digest = Sha256::digest(&record.payload);
+    let digest = record.sha256();
     pax_records.insert(
         "TZAP.aux.sha256".into(),
         digest
@@ -7071,31 +7462,36 @@ fn build_native_auxiliary_member(
         }
     }
 
-    let stored_size = record.payload.len() as u64;
+    let stored_size = record.stored_payload_size();
     let header_size = if tar_octal_fits(12, stored_size) {
         stored_size
     } else {
         pax_records.insert("size".into(), stored_size.to_string().into_bytes());
         0
     };
-    let parsed = parse_auxiliary_record(&pax_records, ordinal, stored_size, &record.payload)
-        .map_err(|_| {
-            FormatError::WriterUnsupported("native auxiliary metadata is not canonical")
-        })?;
+    let parsed = if record.is_streamed() {
+        parse_auxiliary_declaration_for_writer(&pax_records, ordinal, stored_size)
+    } else {
+        parse_auxiliary_record(&pax_records, ordinal, stored_size, &record.payload)
+    }
+    .map_err(|_| FormatError::WriterUnsupported("native auxiliary metadata is not canonical"))?;
     let pax_payload = encode_canonical_pax(&pax_records)?;
     let pax_label = format!("TZAP-PAX/AUX/{ordinal:08x}");
     let pax_header =
         build_ustar_header(pax_label.as_bytes(), pax_payload.len() as u64, 0, 0, b'x')?;
     let auxiliary_label = format!("TZAP-AUX/{ordinal:08x}");
     let auxiliary_header = build_ustar_header(auxiliary_label.as_bytes(), header_size, 0, 0, b'Z')?;
-    let mut out = Vec::new();
-    out.extend_from_slice(&pax_header);
-    out.extend_from_slice(&pax_payload);
-    out.resize(out.len() + padding_to_512(pax_payload.len()), 0);
-    out.extend_from_slice(&auxiliary_header);
-    out.extend_from_slice(&record.payload);
-    out.resize(out.len() + padding_to_512(record.payload.len()), 0);
-    Ok((out, parsed))
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&pax_header);
+    bytes.extend_from_slice(&pax_payload);
+    bytes.resize(bytes.len() + padding_to_512(pax_payload.len()), 0);
+    bytes.extend_from_slice(&auxiliary_header);
+    Ok(NativeAuxiliaryMemberPrefix {
+        bytes,
+        stored_size,
+        sha256: digest,
+        parsed,
+    })
 }
 
 fn merge_native_primary_metadata(
@@ -8272,6 +8668,73 @@ mod tests {
     }
 
     #[test]
+    fn hardlink_writer_emits_zero_data_alias_with_portable_mirror_only() {
+        let portable = PortableFileMetadata {
+            source_os: "other-unix".into(),
+            source_filesystem: "ext4".into(),
+            mode_origin: PortableModeOrigin::Native,
+            posix_owner: Some(PortablePosixOwner {
+                uid: 1000,
+                gid: 100,
+                uname: Some("owner".into()),
+                gname: Some("group".into()),
+            }),
+            attributes: Some(1),
+            native: NativeFileMetadata::default(),
+        };
+        let bytes = build_primary_member_prefix(
+            b"aliases/beta",
+            SourceEntryKind::Hardlink,
+            Some(b"aliases/alpha"),
+            0,
+            None,
+            0o640,
+            ArchiveTimestamp::new(1_700_000_000, 123_456_700),
+            &portable,
+        )
+        .unwrap();
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+        assert_eq!(parsed.kind, crate::tar_model::TarEntryKind::Hardlink);
+        assert_eq!(parsed.logical_size, 0);
+        assert_eq!(
+            parsed.link_target.as_deref(),
+            Some(b"aliases/alpha".as_slice())
+        );
+        assert_eq!(
+            parsed.v45_metadata.declaration.required_profiles,
+            ["portable-v1"]
+        );
+        assert!(parsed.v45_metadata.auxiliary.is_empty());
+        assert_eq!(parsed.v45_metadata.portable_mirror.mode, 0o640);
+        assert_eq!(parsed.v45_metadata.portable_mirror.uid, Some(1000));
+        assert_eq!(parsed.v45_metadata.portable_mirror.attributes, Some(1));
+    }
+
+    #[test]
+    fn hardlink_writer_rejects_native_file_object_metadata() {
+        let mut portable = PortableFileMetadata::default();
+        portable
+            .native
+            .primary_pax_records
+            .insert("TZAP.unix.ctime-observed".into(), b"1".to_vec());
+        assert!(matches!(
+            build_primary_member_prefix(
+                b"beta",
+                SourceEntryKind::Hardlink,
+                Some(b"alpha"),
+                0,
+                None,
+                0o644,
+                ArchiveTimestamp::UNIX_EPOCH,
+                &portable,
+            ),
+            Err(FormatError::WriterInvariant(
+                "hardlink alias carries native file-object metadata"
+            ))
+        ));
+    }
+
+    #[test]
     fn regular_file_writer_rejects_reserved_portable_attribute_bits() {
         let portable_metadata = PortableFileMetadata {
             attributes: Some(1 << 4),
@@ -8372,6 +8835,164 @@ mod tests {
             parsed.v45_metadata.file_entry_flags & HAS_AUXILIARY_STREAMS,
             0
         );
+    }
+
+    #[test]
+    fn streamed_auxiliary_sources_work_across_writer_modes_and_verify_digest() {
+        struct StreamedSource {
+            metadata: PortableFileMetadata,
+            payload: Vec<u8>,
+        }
+
+        impl RegularFileSource for StreamedSource {
+            fn archive_path(&self) -> &str {
+                "streamed-aux.txt"
+            }
+
+            fn file_data_size(&self) -> u64 {
+                8
+            }
+
+            fn mode(&self) -> u32 {
+                0o640
+            }
+
+            fn mtime(&self) -> ArchiveTimestamp {
+                ArchiveTimestamp::from_seconds(12)
+            }
+
+            fn portable_metadata(&self) -> PortableFileMetadata {
+                self.metadata.clone()
+            }
+
+            fn open(&self) -> Result<Box<dyn Read + '_>, ArchiveWriteError> {
+                Ok(Box::new(Cursor::new(b"contents".as_slice())))
+            }
+
+            fn open_auxiliary(
+                &self,
+                ordinal: usize,
+            ) -> Result<Box<dyn Read + '_>, ArchiveWriteError> {
+                assert_eq!(ordinal, 0);
+                Ok(Box::new(Cursor::new(self.payload.as_slice())))
+            }
+        }
+
+        let payload = deterministic_bytes(1024 * 1024 + 17);
+        let digest: [u8; 32] = Sha256::digest(&payload).into();
+        let mut auxiliary = NativeAuxiliaryMetadata::new_streamed(
+            "generic.xattr",
+            "posix-backup-v1",
+            RestoreClass::SameOs,
+            payload.len() as u64,
+            digest,
+        );
+        auxiliary.name_encoding = NativeAuxiliaryNameEncoding::Bytes;
+        auxiliary.name = b"user.large".to_vec();
+        let mut source = StreamedSource {
+            metadata: PortableFileMetadata {
+                source_os: "linux".into(),
+                native: NativeFileMetadata {
+                    required_profiles: vec!["posix-backup-v1".into()],
+                    auxiliary_records: vec![auxiliary],
+                    ..NativeFileMetadata::default()
+                },
+                ..PortableFileMetadata::default()
+            },
+            payload,
+        };
+        let key = MasterKey::from_raw_key(&[17u8; 32]).unwrap();
+        let options = WriterOptions {
+            stripe_width: 1,
+            volume_loss_tolerance: 0,
+            bit_rot_buffer_pct: 0,
+            ..WriterOptions::default()
+        };
+
+        let mut two_pass = MemoryArchiveSink::default();
+        write_archive_sources_to_sink(
+            std::slice::from_ref(&source),
+            &key,
+            options,
+            None,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut two_pass,
+        )
+        .unwrap();
+        open_archive(&two_pass.volumes[0], &key)
+            .unwrap()
+            .verify_content()
+            .unwrap();
+
+        let mut single_pass = MemoryArchiveSink::default();
+        write_archive_sources_to_sink_single_pass(
+            std::slice::from_ref(&source),
+            &key,
+            options,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut single_pass,
+        )
+        .unwrap();
+        open_archive(&single_pass.volumes[0], &key)
+            .unwrap()
+            .verify_content()
+            .unwrap();
+
+        let mut ordered = MemoryArchiveSink::default();
+        write_archive_sources_to_sink_ordered_parallel(
+            std::slice::from_ref(&source),
+            &key,
+            options,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut ordered,
+        )
+        .unwrap();
+        open_archive(&ordered.volumes[0], &key)
+            .unwrap()
+            .verify_content()
+            .unwrap();
+
+        let mut progress_sink = MemoryArchiveSink::default();
+        let mut progress = RecordingWriteProgress::default();
+        write_archive_sources_to_sink_single_pass_with_progress(
+            std::slice::from_ref(&source),
+            &key,
+            options,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut progress_sink,
+            &mut progress,
+        )
+        .unwrap();
+        assert_eq!(
+            progress.bytes_for(ArchiveWritePhase::EmittingPayload),
+            8 + source.payload.len() as u64
+        );
+
+        source.metadata.native.auxiliary_records[0]
+            .streamed_payload
+            .as_mut()
+            .unwrap()
+            .sha256[0] ^= 1;
+        let mut rejected = MemoryArchiveSink::default();
+        assert!(write_archive_sources_to_sink(
+            std::slice::from_ref(&source),
+            &key,
+            options,
+            None,
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut rejected,
+        )
+        .is_err());
     }
 
     #[test]
