@@ -3342,23 +3342,25 @@ impl OpenedArchive {
         entries: Vec<(String, WinningIndexEntry)>,
         root: &std::path::Path,
         options: SafeExtractionOptions,
-        _jobs: usize,
+        jobs: usize,
     ) -> Result<Vec<(String, Vec<MetadataDiagnostic>)>, FormatError> {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
-        let mut planned = Vec::with_capacity(entries.len());
-        for (path, entry) in entries {
+        let metadata = parallel_map_ref(&entries, jobs, |(_, entry)| {
             let shard = shards
                 .get(entry.shard_index)
                 .ok_or(FormatError::InvalidArchive(
                     "winning FileEntry shard is out of bounds",
                 ))?;
-            let member = self.decode_loaded_owned_tar_member(shard, entry.file_index, false)?;
-            planned.push((path, entry, member));
-        }
-        let metadata: Vec<_> = planned.iter().map(|(_, _, member)| member).collect();
-        validate_owned_restore_plan(&metadata, options)?;
+            self.decode_loaded_owned_tar_member(shard, entry.file_index, false)
+        })?;
+        validate_owned_restore_plan(&metadata.iter().collect::<Vec<_>>(), options)?;
+        let mut planned = entries
+            .into_iter()
+            .zip(metadata)
+            .map(|((path, entry), member)| (path, entry, member))
+            .collect::<Vec<_>>();
         planned.sort_by(|left, right| {
             restore_phase(&left.2)
                 .cmp(&restore_phase(&right.2))

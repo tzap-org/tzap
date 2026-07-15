@@ -3334,15 +3334,17 @@ fn collect_one_input_spec(
     #[cfg(windows)]
     reject_unsupported_windows_regular_file(&metadata, input)?;
     let archive_path = archive_path_to_string(archive_path)?;
-    let mut identity = input_identity(&metadata)
+    let identity = input_identity(&metadata)
         .with_context(|| format!("failed to identify input {}", input.display()))?;
     #[cfg(windows)]
-    {
+    let identity = {
+        let mut identity = identity;
         let file = File::open(input)
             .with_context(|| format!("failed to open {} for identity capture", input.display()))?;
         augment_windows_input_identity(&mut identity, &file)
             .with_context(|| format!("failed to identify Windows input {}", input.display()))?;
-    }
+        identity
+    };
     let portable_metadata = portable_input_metadata(identity, input)?;
     out.push(InputSpec {
         source: input.to_owned(),
@@ -3435,9 +3437,13 @@ fn input_identity(metadata: &fs::Metadata) -> io::Result<InputIdentity> {
 
 fn validate_opened_input_identity(file: &File, expected: InputIdentity) -> io::Result<()> {
     let actual_metadata = file.metadata()?;
-    let mut actual = input_identity(&actual_metadata)?;
+    let actual = input_identity(&actual_metadata)?;
     #[cfg(windows)]
-    augment_windows_input_identity(&mut actual, file)?;
+    let actual = {
+        let mut actual = actual;
+        augment_windows_input_identity(&mut actual, file)?;
+        actual
+    };
     if !input_identity_matches_after_read(expected, actual) {
         return Err(io::Error::other("input changed after scan"));
     }

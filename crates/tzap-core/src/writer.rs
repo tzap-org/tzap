@@ -20,7 +20,7 @@ use crate::entry_metadata::{
     canonical_base64_encode, encode_canonical_pax, is_source_os, parse_auxiliary_record,
     parse_primary_metadata, portable_primary_pax, valid_filesystem_token, validate_group_metadata,
     ArchiveTimestamp, RestoreClass, EXTENDED_METADATA_V1, HAS_AUXILIARY_STREAMS,
-    HAS_NATIVE_METADATA, REQUIRES_SYSTEM_RESTORE,
+    HAS_NATIVE_METADATA, HAS_SPARSE_EXTENTS, PORTABLE_PROFILE, REQUIRES_SYSTEM_RESTORE,
 };
 use crate::fec::encode_parity_gf16;
 use crate::format::{
@@ -6937,8 +6937,12 @@ fn v45_portable_file_entry_flags(mode: u32, metadata: &PortableFileMetadata) -> 
         } else {
             HAS_AUXILIARY_STREAMS
         }
-        | if !metadata.native.required_profiles.is_empty()
-            || !metadata.native.optional_profiles.is_empty()
+        | if metadata
+            .native
+            .required_profiles
+            .iter()
+            .chain(&metadata.native.optional_profiles)
+            .any(|profile| profile != PORTABLE_PROFILE)
             || !metadata.native.primary_pax_records.is_empty()
             || metadata
                 .native
@@ -6947,6 +6951,16 @@ fn v45_portable_file_entry_flags(mode: u32, metadata: &PortableFileMetadata) -> 
                 .any(|record| record.native)
         {
             HAS_NATIVE_METADATA
+        } else {
+            0
+        }
+        | if metadata
+            .native
+            .auxiliary_records
+            .iter()
+            .any(|record| record.flags & 1 != 0)
+        {
+            HAS_SPARSE_EXTENTS
         } else {
             0
         }
@@ -8572,6 +8586,80 @@ mod tests {
             opened.extract_file("wrapped.txt").unwrap(),
             Some(b"recipient sink payload".to_vec())
         );
+    }
+
+    #[test]
+    fn ordered_sink_writer_indexes_v45_metadata_flags_from_member_semantics() {
+        let mut sparse_payload = vec![0u8; TAR_BLOCK_LEN];
+        sparse_payload[..2].copy_from_slice(b"0\n");
+        let mut sparse_fork = NativeAuxiliaryMetadata::new(
+            "macos.resource-fork",
+            "macos-backup-v1",
+            RestoreClass::SameOs,
+            sparse_payload,
+        );
+        sparse_fork.flags = 1;
+        sparse_fork.logical_size = 4096;
+
+        let sparse_metadata = PortableFileMetadata {
+            source_os: "macos".into(),
+            native: NativeFileMetadata {
+                required_profiles: vec!["macos-backup-v1".into(), "posix-backup-v1".into()],
+                auxiliary_records: vec![sparse_fork],
+                ..NativeFileMetadata::default()
+            },
+            ..PortableFileMetadata::default()
+        };
+        let portable_only_metadata = PortableFileMetadata {
+            native: NativeFileMetadata {
+                required_profiles: vec![PORTABLE_PROFILE.into()],
+                ..NativeFileMetadata::default()
+            },
+            ..PortableFileMetadata::default()
+        };
+        let files = [
+            RegularFile {
+                path: "sparse-fork.bin",
+                contents: b"primary",
+                mode: 0o644,
+                mtime: ArchiveTimestamp::UNIX_EPOCH,
+                portable_metadata: sparse_metadata,
+            },
+            RegularFile {
+                path: "portable-only.bin",
+                contents: b"portable",
+                mode: 0o644,
+                mtime: ArchiveTimestamp::UNIX_EPOCH,
+                portable_metadata: portable_only_metadata,
+            },
+        ];
+        let master_key = MasterKey::from_raw_key(&[0x45; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+
+        write_archive_sources_to_sink_ordered_parallel(
+            &files,
+            &master_key,
+            single_volume_metadata_test_options(),
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+
+        let opened = open_archive(&sink.volumes[0], &master_key).unwrap();
+        opened.verify().unwrap();
+        let entries = opened.list_index_entries().unwrap();
+        let sparse = entries
+            .iter()
+            .find(|entry| entry.path == "sparse-fork.bin")
+            .unwrap();
+        assert_ne!(sparse.flags & HAS_SPARSE_EXTENTS, 0);
+        let portable_only = entries
+            .iter()
+            .find(|entry| entry.path == "portable-only.bin")
+            .unwrap();
+        assert_eq!(portable_only.flags & HAS_NATIVE_METADATA, 0);
     }
 
     #[test]

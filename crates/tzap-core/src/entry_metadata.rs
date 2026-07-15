@@ -1924,14 +1924,12 @@ fn validate_builtin_auxiliary_payload(
     retained: Option<&[u8]>,
 ) -> Result<(), FormatError> {
     match record.kind.as_str() {
-        CAPTURE_REPORT_KIND => {
-            if record.stored_size > MAX_LOCAL_PAX_PAYLOAD as u64 {
-                return Err(FormatError::ReaderResourceLimitExceeded {
-                    field: "capture report payload bytes",
-                    cap: MAX_LOCAL_PAX_PAYLOAD as u64,
-                    actual: record.stored_size,
-                });
-            }
+        CAPTURE_REPORT_KIND if record.stored_size > MAX_LOCAL_PAX_PAYLOAD as u64 => {
+            return Err(FormatError::ReaderResourceLimitExceeded {
+                field: "capture report payload bytes",
+                cap: MAX_LOCAL_PAX_PAYLOAD as u64,
+                actual: record.stored_size,
+            });
         }
         "windows.security-descriptor" => {
             let security_information = parse_fixed_hex_u32(
@@ -1970,13 +1968,11 @@ fn validate_builtin_auxiliary_payload(
         "windows.ea-data" => validate_windows_ea_stream(
             retained.ok_or(FormatError::InvalidArchive("EA payload was not retained"))?,
         )?,
-        "windows.object-id" => {
-            if retained.map_or(0, <[u8]>::len) != 64 {
-                return invalid(
-                    "AuxiliaryMetadata",
-                    "Windows object ID payload is not 64 bytes",
-                );
-            }
+        "windows.object-id" if retained.map_or(0, <[u8]>::len) != 64 => {
+            return invalid(
+                "AuxiliaryMetadata",
+                "Windows object ID payload is not 64 bytes",
+            );
         }
         "macos.finder-info" if retained.map_or(0, <[u8]>::len) != 32 => {
             return invalid("AuxiliaryMetadata", "FinderInfo payload is not 32 bytes");
