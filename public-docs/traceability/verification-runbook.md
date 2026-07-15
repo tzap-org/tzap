@@ -54,16 +54,21 @@ cargo install cargo-audit --locked
 
 ## Current record
 
-This record is updated by the 2026-07-15 revision-45 Windows metadata review.
+This record is updated by the 2026-07-16 revision-45 Windows metadata review.
 
 | Gate | Command | Result |
 |---|---|---|
 | Format | `cargo fmt --check` | Passed |
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| Workspace tests | `cargo test --workspace --all-features --locked` | Passed: 711 tests across workspace suites; doc tests also passed |
+| Workspace tests | `cargo test --workspace --all-features --locked` | Passed: 733 tests across workspace suites; doc tests also passed. The Windows run used a dedicated NTFS volume and included real sparse files/streams, reparse points, hardlinks, privileged owner/group/DACL/SACL restoration, and raw EFS export/import. |
 | Deterministic fuzz smoke | `cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked` | Passed: 39 deterministic seeds |
-| Dependency audit | `cargo audit` | The 2026-07-14 audit passed with no vulnerabilities or warnings. The 2026-07-15 managed Windows rerun was host-blocked (`Access is denied` executing the installed `cargo-audit.exe`); the lockfile adds no package, only the already-locked `windows-sys 0.61.2` as a direct Windows dependency. |
+| Dependency audit | `cargo audit` | Passed on 2026-07-16 after the elevated-app restart; 231 locked crate dependencies were scanned with no reported vulnerability. |
 | Bounded libFuzzer extension | `cargo +nightly fuzz run --features libfuzzer <target> -- -max_total_time=60` | Host-limited in this review: Windows ARM64 lacks AddressSanitizer support; the emulated Windows x64 target compiled through the fuzz crates but could not link because `clang_rt.asan_dynamic_runtime_thunk-x86_64.lib` is not installed. The earlier 2026-06-20 results predate the current v45 metadata changes and are not treated as current evidence. |
+
+The dedicated 32 GB test disk was split into a 15 GB NTFS volume and a second
+partition reserved for ReFS. NTFS and EFS fixtures passed. Windows Pro on this
+host does not expose ReFS formatting, so ReFS behavior remains an evidence gap
+rather than being inferred from NTFS results.
 
 Tools installed during this local pass:
 

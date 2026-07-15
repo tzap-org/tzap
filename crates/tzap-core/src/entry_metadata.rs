@@ -2050,12 +2050,45 @@ fn validate_self_relative_security_descriptor(
     const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
     const GROUP_SECURITY_INFORMATION: u32 = 0x0000_0002;
     const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
-    const SACL_FAMILY_SECURITY_INFORMATION: u32 = 0x0000_01f8;
+    const SACL_SECURITY_INFORMATION: u32 = 0x0000_0008;
+    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+    const PROTECTED_SACL_SECURITY_INFORMATION: u32 = 0x4000_0000;
+    const UNPROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x2000_0000;
+    const UNPROTECTED_SACL_SECURITY_INFORMATION: u32 = 0x1000_0000;
+    const ALLOWED_SECURITY_INFORMATION: u32 = OWNER_SECURITY_INFORMATION
+        | GROUP_SECURITY_INFORMATION
+        | DACL_SECURITY_INFORMATION
+        | SACL_SECURITY_INFORMATION
+        | PROTECTED_DACL_SECURITY_INFORMATION
+        | PROTECTED_SACL_SECURITY_INFORMATION
+        | UNPROTECTED_DACL_SECURITY_INFORMATION
+        | UNPROTECTED_SACL_SECURITY_INFORMATION;
+    let dacl_protection = security_information
+        & (PROTECTED_DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION);
+    let expected_dacl_protection = if control & 0x0004 == 0 {
+        0
+    } else if control & 0x1000 != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    let sacl_protection = security_information
+        & (PROTECTED_SACL_SECURITY_INFORMATION | UNPROTECTED_SACL_SECURITY_INFORMATION);
+    let expected_sacl_protection = if control & 0x0010 == 0 {
+        0
+    } else if control & 0x2000 != 0 {
+        PROTECTED_SACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_SACL_SECURITY_INFORMATION
+    };
     if security_information == 0
+        || security_information & !ALLOWED_SECURITY_INFORMATION != 0
         || (security_information & OWNER_SECURITY_INFORMATION != 0) != (owner != 0)
         || (security_information & GROUP_SECURITY_INFORMATION != 0) != (group != 0)
         || (security_information & DACL_SECURITY_INFORMATION != 0) != (control & 0x0004 != 0)
-        || (security_information & SACL_FAMILY_SECURITY_INFORMATION != 0) != (control & 0x0010 != 0)
+        || (security_information & SACL_SECURITY_INFORMATION != 0) != (control & 0x0010 != 0)
+        || (dacl_protection != 0 && dacl_protection != expected_dacl_protection)
+        || (sacl_protection != 0 && sacl_protection != expected_sacl_protection)
     {
         return invalid(
             "SecurityDescriptor",

@@ -568,7 +568,7 @@ currently has these platform boundaries:
 | Capture host | Captured for accepted regular files and directories | Rejected or not captured |
 |---|---|---|
 | Linux | Numeric ownership, readable xattrs, canonical POSIX.1e access/default ACLs, observed ctime, available creation time, exact Linux inode flags, and selected regular-file hardlink topology. | Native symlink ACL/xattr/flag metadata, special objects, and xattrs that make the bounded primary PAX record unrepresentable. |
-| Windows | Creation, access, write, and change times at 100-ns precision, including pre-1970 values; exact supported attributes; primary and alternate-stream sparse ranges; validated relative-symlink and junction reparse buffers; selected hardlink topology; owner/group/DACL self-relative security descriptor plus SACL when available; and supported backup streams. | Unknown reparse tags, raw EFS, offline/cloud placeholders, transactional/unknown backup streams, and native compression recreation. These cases fail creation instead of weakening `capture-status=complete`. |
+| Windows | Creation, access, write, and change times at 100-ns precision, including pre-1970 values; exact supported attributes; primary and alternate-stream sparse ranges; validated relative-symlink and junction reparse buffers; selected hardlink topology; owner/group/DACL self-relative security descriptor plus SACL when available; raw EFS regular files on NTFS; and supported backup streams. | Encrypted directories, unknown reparse tags, offline/cloud placeholders, transactional/unknown backup streams, and native compression recreation. These cases fail creation instead of weakening `capture-status=complete`. |
 | macOS | Numeric ownership, readable xattrs, exact Darwin flags, observed ctime, available creation time, native ACL external form, FinderInfo, and resource forks. Large xattrs use bounded auxiliary records. | Native symlink ACL/xattr/flag metadata, special objects, selected hardlink aliases, APFS clone hints, and metadata that cannot be read consistently during the scan. |
 | Other POSIX hosts | Portable regular-file, directory, and safe symlink fields. | Source-native profile capture is not yet implemented. |
 
@@ -588,6 +588,13 @@ Ordinary alternate data streams are hashed during `BackupRead` enumeration,
 then re-opened by their validated exact UTF-16 name during archive planning and
 emission. Their bytes are streamed through bounded writer buffers rather than
 retained in `NativeAuxiliaryMetadata`.
+Encrypted NTFS files retain a portable decrypted primary projection and a
+separate, hashed `windows.efs-raw` System record. Raw EFS bytes are exported
+and imported through the Windows callback APIs without buffering the complete
+payload. Authorized System restore imports into an unpublished temporary file,
+re-exports and hash-verifies the native encrypted form, and only then publishes
+the destination. ReFS is excluded because the Windows raw EFS APIs do not
+support it.
 
 Library writers expose native primary-PAX and auxiliary records through
 `NativeFileMetadata`, `NativeAuxiliaryMetadata`, and timestamps through
@@ -616,14 +623,15 @@ provided, so this document does not claim an internal WinRAR equivalence.
 | Hard-link topology | Stores one canonical owner plus selected aliases, keyed by volume and file ID | Preserves topology with `-snh`, keyed by volume and file ID | Implemented for selected regular-file aliases; unselected aliases are outside capture scope. |
 | Reparse points and symlinks | Portable relative-symlink projection plus exact supported symlink/junction data | Stores exact reparse data with `-snl` | Essential known tags are implemented; unknown tags remain rejected. |
 | Standalone directories | Stores directory entries and their metadata, including junction placeholders | Stores directory entries and their metadata | Implemented with deepest-first finalization and on-host Windows coverage. |
-| Sparse files, EFS, and offline/cloud placeholders | Streams and natively restores primary sparse ranges; rejects raw EFS and offline/cloud inputs | Not used as a parity claim here | Primary sparse support is implemented and allocation-verified; Specialist cases remain unsupported. |
+| Sparse files, EFS, and offline/cloud placeholders | Streams and natively restores primary sparse ranges; streams raw EFS on NTFS for authorized System restore; rejects offline/cloud inputs | Not used as a parity claim here | Primary sparse and raw-EFS support are implemented and verified on-host; offline/cloud Specialist cases remain unsupported. |
 
 Consequently, tzap now reaches the reviewed 7-Zip metadata capture level for an
 accepted ordinary Windows regular file, and captures some extra `BackupRead`
-stream classes. Ordinary and sparse ADS are streamed during capture, archive
-emission, and restoration and are verified byte-for-byte. It does **not** yet
-reach 7-Zip's full end-to-end filesystem-object support because raw EFS,
-unknown reparse tags, and some native stream classes remain absent. Other
+stream classes. Ordinary and sparse ADS and raw EFS are streamed during
+capture, archive emission, and restoration and are verified byte-for-byte or
+by authenticated size and SHA-256. It does **not** yet reach 7-Zip's full
+end-to-end filesystem-object support because unknown reparse tags and some
+native stream classes remain absent. Other
 auxiliary classes that are structurally bounded by the v45 parser can still be
 retained inline; callers may use the streamed auxiliary source contract only
 for payload-opaque registered kinds.
@@ -659,8 +667,9 @@ supported basic attributes/timestamps.
 System restore, after explicit authorization, also applies numeric UID/GID,
 set-ID modes, privileged xattr namespaces, and immutable/append-only Linux
 flags. On Windows, authorized system restore also recreates validated symlink
-and junction reparse buffers and applies security descriptors when required
-privileges are present. Application is descriptor-based and ordered as
+and junction reparse buffers, restores raw EFS on NTFS, and applies security
+descriptors when required privileges are present. Application is
+descriptor-based and ordered as
 ownership, mode, ACL, xattrs, timestamps/attributes, then no-change flags.
 Directory metadata is finalized deepest-to-root after children and hardlinks.
 Both modes preflight selected random-access
@@ -714,9 +723,9 @@ surface tar metadata fidelity should use `list_files`, `extract_member`,
 
 ### Remaining native-platform implementation plan
 
-The remaining Windows work is raw EFS callbacks, explicitly registered
-non-symlink/junction reparse tags, directory case-sensitive state, and
-policy-gated application of remaining backup-stream classes. Privileged
+The remaining Windows work is explicitly registered non-symlink/junction
+reparse tags, directory case-sensitive state, and policy-gated application of
+remaining backup-stream classes. Privileged
 security-descriptor fixtures and every added Specialist class need an on-host
 capture/restore corpus before the full Windows backup reader/writer class can
 be advertised.

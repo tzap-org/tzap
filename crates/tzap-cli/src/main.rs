@@ -3107,6 +3107,21 @@ impl RegularFileSource for InputSpec {
         }
         #[cfg(windows)]
         {
+            if record.kind == "windows.efs-raw" {
+                if record.name_encoding != NativeAuxiliaryNameEncoding::None
+                    || !record.name.is_empty()
+                {
+                    return Err(FormatError::WriterUnsupported(
+                        "raw EFS auxiliary source has an unexpected name",
+                    )
+                    .into());
+                }
+                return Ok(Box::new(WindowsRawEfsReader::spawn(
+                    self.source.clone(),
+                    self.identity,
+                    record.stored_payload_size(),
+                )));
+            }
             if record.kind != "windows.alternate-data"
                 || record.name_encoding != NativeAuxiliaryNameEncoding::Utf16Le
                 || record.name.len() % 2 != 0
@@ -3421,6 +3436,13 @@ fn collect_one_input_spec(
         return Ok(());
     }
     if metadata.is_dir() {
+        #[cfg(windows)]
+        if metadata.file_attributes() & 0x0000_4000 != 0 {
+            bail!(
+                "Windows metadata capture does not support encrypted directory {}: raw EFS directory import requires a distinct CREATE_FOR_DIR restore path",
+                input.display()
+            );
+        }
         let archive_path_string = archive_path_to_string(archive_path)?;
         let identity = input_identity(&metadata)
             .with_context(|| format!("failed to identify input {}", input.display()))?;
@@ -4239,15 +4261,10 @@ fn reject_unsupported_windows_regular_file(metadata: &fs::Metadata, input: &Path
 fn unsupported_windows_file_attribute_reason(attributes: u32) -> Option<&'static str> {
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
-    const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x0000_4000;
     [
         (
             FILE_ATTRIBUTE_REPARSE_POINT,
             "reparse points require exact reparse-data capture",
-        ),
-        (
-            FILE_ATTRIBUTE_ENCRYPTED,
-            "EFS files require raw EFS callback capture",
         ),
         (
             FILE_ATTRIBUTE_OFFLINE,
@@ -4709,15 +4726,29 @@ fn capture_native_file_metadata(
                 input.display()
             )
         })?);
+    const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x0000_4000;
     let (data_stream_attributes, mut streams) =
-        capture_windows_backup_streams(input, &file, reparse_data.as_deref()).with_context(
-            || {
-                format!(
-                    "failed to enumerate Windows streams for {}",
-                    input.display()
-                )
-            },
-        )?;
+        if identity.file_attributes & FILE_ATTRIBUTE_ENCRYPTED != 0 {
+            // The raw EFS APIs reject export while an ordinary handle to the encrypted file is
+            // open, even when that handle permits all sharing modes. Security capture above is
+            // complete, so release the metadata handle before opening the raw export context.
+            drop(file);
+            native
+                .auxiliary_records
+                .push(capture_windows_efs_raw(input, identity).with_context(|| {
+                    format!("failed to capture raw EFS data for {}", input.display())
+                })?);
+            (0, Vec::new())
+        } else {
+            capture_windows_backup_streams(input, &file, reparse_data.as_deref()).with_context(
+                || {
+                    format!(
+                        "failed to enumerate Windows streams for {}",
+                        input.display()
+                    )
+                },
+            )?
+        };
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     if identity.file_attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0 {
@@ -4749,67 +4780,370 @@ fn windows_filetime_timestamp(value_100ns: u64) -> Result<ArchiveTimestamp> {
 
 #[cfg(windows)]
 fn windows_sacl_capture_enabled() -> bool {
-    use std::ptr;
     use std::sync::OnceLock;
+    use windows_sys::Win32::Security::SE_SECURITY_NAME;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| enable_windows_privilege(SE_SECURITY_NAME))
+}
+
+#[cfg(windows)]
+fn windows_backup_capture_enabled() -> bool {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Security::SE_BACKUP_NAME;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| enable_windows_privilege(SE_BACKUP_NAME))
+}
+
+#[cfg(windows)]
+fn enable_windows_privilege(name: *const u16) -> bool {
+    use std::ptr;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, ERROR_SUCCESS};
     use windows_sys::Win32::Security::{
-        AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, SE_SECURITY_NAME,
+        AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
         TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let mut token = ptr::null_mut();
-        // SAFETY: `token` is a valid output pointer and the pseudo process handle is always live.
-        if unsafe {
-            OpenProcessToken(
-                GetCurrentProcess(),
-                TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
-                &mut token,
-            )
-        } == 0
+    let mut token = ptr::null_mut();
+    // SAFETY: `token` is a valid output pointer and the pseudo process handle is always live.
+    if unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+            &mut token,
+        )
+    } == 0
+    {
+        return false;
+    }
+    let enabled = {
+        let mut privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            ..Default::default()
+        };
+        // SAFETY: the one-element privilege array provides a valid LUID output slot.
+        if unsafe { LookupPrivilegeValueW(ptr::null(), name, &mut privileges.Privileges[0].Luid) }
+            == 0
         {
-            return false;
+            false
+        } else {
+            privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            unsafe { SetLastError(ERROR_SUCCESS) };
+            // SAFETY: `token` is live and `privileges` is a valid one-entry input structure.
+            unsafe {
+                AdjustTokenPrivileges(token, 0, &privileges, 0, ptr::null_mut(), ptr::null_mut())
+                    != 0
+                    && GetLastError() == ERROR_SUCCESS
+            }
         }
-        let enabled = {
-            let mut privileges = TOKEN_PRIVILEGES {
-                PrivilegeCount: 1,
-                ..Default::default()
-            };
-            // SAFETY: the one-element privilege array provides a valid LUID output slot.
-            if unsafe {
-                LookupPrivilegeValueW(
-                    ptr::null(),
-                    SE_SECURITY_NAME,
-                    &mut privileges.Privileges[0].Luid,
-                )
-            } == 0
-            {
-                false
-            } else {
-                privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-                // AdjustTokenPrivileges can report success while setting ERROR_NOT_ALL_ASSIGNED;
-                // clearing and checking last-error is the documented capability test used here.
-                unsafe { SetLastError(ERROR_SUCCESS) };
-                // SAFETY: `token` is live and `privileges` is a valid one-entry input structure.
-                unsafe {
-                    AdjustTokenPrivileges(
-                        token,
-                        0,
-                        &privileges,
-                        0,
-                        ptr::null_mut(),
-                        ptr::null_mut(),
-                    ) != 0
-                        && GetLastError() == ERROR_SUCCESS
+    };
+    // SAFETY: `token` was returned by OpenProcessToken and is closed exactly once.
+    unsafe { CloseHandle(token) };
+    enabled
+}
+
+#[cfg(windows)]
+struct WindowsRawEfsContext(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for WindowsRawEfsContext {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Storage::FileSystem::CloseEncryptedFileRaw;
+
+        if !self.0.is_null() {
+            // SAFETY: this context was returned by OpenEncryptedFileRawW and is closed once.
+            unsafe { CloseEncryptedFileRaw(self.0) };
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_windows_raw_efs(path: &Path, flags: u32) -> io::Result<WindowsRawEfsContext> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::ptr;
+    use windows_sys::Win32::Storage::FileSystem::OpenEncryptedFileRawW;
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut context = ptr::null_mut();
+    // SAFETY: the path is NUL-terminated and `context` is a valid output pointer.
+    let status = unsafe { OpenEncryptedFileRawW(wide.as_ptr(), flags, &mut context) };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(WindowsRawEfsContext(context))
+}
+
+#[cfg(windows)]
+struct WindowsRawEfsDigest {
+    hasher: sha2::Sha256,
+    size: u64,
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn hash_windows_raw_efs_callback(
+    data: *const u8,
+    context: *const std::ffi::c_void,
+    length: u32,
+) -> u32 {
+    use sha2::Digest as _;
+    use windows_sys::Win32::Foundation::{ERROR_ARITHMETIC_OVERFLOW, ERROR_SUCCESS};
+
+    if length == 0 {
+        return ERROR_SUCCESS;
+    }
+    if data.is_null() || context.is_null() {
+        return windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+    }
+    // SAFETY: EFS supplies `length` readable bytes and the caller supplied this digest context.
+    let bytes = unsafe { std::slice::from_raw_parts(data, length as usize) };
+    let state = unsafe { &mut *context.cast_mut().cast::<WindowsRawEfsDigest>() };
+    let Some(size) = state.size.checked_add(u64::from(length)) else {
+        return ERROR_ARITHMETIC_OVERFLOW;
+    };
+    state.hasher.update(bytes);
+    state.size = size;
+    ERROR_SUCCESS
+}
+
+#[cfg(windows)]
+fn hash_windows_raw_efs(path: &Path) -> io::Result<(u64, [u8; 32])> {
+    use sha2::Digest as _;
+    use windows_sys::Win32::Storage::FileSystem::ReadEncryptedFileRaw;
+
+    let _ = windows_backup_capture_enabled();
+    let context = open_windows_raw_efs(path, 0)?;
+    let mut state = WindowsRawEfsDigest {
+        hasher: sha2::Sha256::new(),
+        size: 0,
+    };
+    // SAFETY: callback state and raw EFS context remain live for the synchronous export.
+    let status = unsafe {
+        ReadEncryptedFileRaw(
+            Some(hash_windows_raw_efs_callback),
+            (&mut state as *mut WindowsRawEfsDigest).cast(),
+            context.0,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok((state.size, state.hasher.finalize().into()))
+}
+
+#[cfg(windows)]
+enum WindowsRawEfsMessage {
+    Data(Vec<u8>),
+    Done(io::Result<()>),
+}
+
+#[cfg(windows)]
+struct WindowsRawEfsSendContext {
+    sender: std::sync::mpsc::SyncSender<WindowsRawEfsMessage>,
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn send_windows_raw_efs_callback(
+    data: *const u8,
+    context: *const std::ffi::c_void,
+    length: u32,
+) -> u32 {
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_OPERATION_ABORTED};
+
+    if length == 0 {
+        return 0;
+    }
+    if data.is_null() || context.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    // SAFETY: EFS supplies readable callback bytes and the caller supplied this send context.
+    let bytes = unsafe { std::slice::from_raw_parts(data, length as usize) };
+    let state = unsafe { &*context.cast::<WindowsRawEfsSendContext>() };
+    for chunk in bytes.chunks(64 * 1024) {
+        if state
+            .sender
+            .send(WindowsRawEfsMessage::Data(chunk.to_vec()))
+            .is_err()
+        {
+            return ERROR_OPERATION_ABORTED;
+        }
+    }
+    0
+}
+
+#[cfg(windows)]
+fn validate_windows_input_path_identity(path: &Path, expected: InputIdentity) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    let mut actual = input_identity(&metadata)?;
+    let file = open_windows_metadata_handle(path)?;
+    augment_windows_input_identity(&mut actual, &file)?;
+    if input_identity_matches_after_read(expected, actual) {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "Windows input changed during raw EFS export",
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn export_windows_raw_efs_to_sender(
+    path: &Path,
+    expected: InputIdentity,
+    sender: std::sync::mpsc::SyncSender<WindowsRawEfsMessage>,
+) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::ReadEncryptedFileRaw;
+
+    validate_windows_input_path_identity(path, expected)?;
+    let _ = windows_backup_capture_enabled();
+    let context = open_windows_raw_efs(path, 0)?;
+    let state = WindowsRawEfsSendContext { sender };
+    // SAFETY: callback state and raw EFS context remain live for the synchronous export.
+    let status = unsafe {
+        ReadEncryptedFileRaw(
+            Some(send_windows_raw_efs_callback),
+            (&state as *const WindowsRawEfsSendContext).cast(),
+            context.0,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    drop(context);
+    validate_windows_input_path_identity(path, expected)
+}
+
+#[cfg(windows)]
+struct WindowsRawEfsReader {
+    receiver: Option<std::sync::mpsc::Receiver<WindowsRawEfsMessage>>,
+    current: Vec<u8>,
+    current_offset: usize,
+    remaining: u64,
+    finished: bool,
+    pending_error: Option<io::Error>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl WindowsRawEfsReader {
+    fn spawn(path: PathBuf, expected: InputIdentity, size: u64) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        let completion = sender.clone();
+        let thread = std::thread::spawn(move || {
+            let result = export_windows_raw_efs_to_sender(&path, expected, sender);
+            let _ = completion.send(WindowsRawEfsMessage::Done(result));
+        });
+        Self {
+            receiver: Some(receiver),
+            current: Vec::new(),
+            current_offset: 0,
+            remaining: size,
+            finished: false,
+            pending_error: None,
+            thread: Some(thread),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Read for WindowsRawEfsReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
+        let mut written = 0usize;
+        while written < out.len() {
+            if self.current_offset < self.current.len() {
+                let count = (self.current.len() - self.current_offset).min(out.len() - written);
+                if count as u64 > self.remaining {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "raw EFS export exceeded its declared size",
+                    ));
+                }
+                out[written..written + count].copy_from_slice(
+                    &self.current[self.current_offset..self.current_offset + count],
+                );
+                self.current_offset += count;
+                self.remaining -= count as u64;
+                written += count;
+                continue;
+            }
+            if self.finished {
+                break;
+            }
+            let message = self
+                .receiver
+                .as_ref()
+                .ok_or_else(|| io::Error::other("raw EFS export channel is closed"))?
+                .recv()
+                .map_err(|_| io::Error::other("raw EFS export terminated unexpectedly"))?;
+            match message {
+                WindowsRawEfsMessage::Data(bytes) => {
+                    self.current = bytes;
+                    self.current_offset = 0;
+                }
+                WindowsRawEfsMessage::Done(result) => {
+                    self.finished = true;
+                    if let Err(error) = result {
+                        if written == 0 {
+                            return Err(error);
+                        }
+                        self.pending_error = Some(error);
+                    } else if self.remaining != 0 {
+                        let error = io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "raw EFS export ended before its declared size",
+                        );
+                        if written == 0 {
+                            return Err(error);
+                        }
+                        self.pending_error = Some(error);
+                    }
                 }
             }
-        };
-        // SAFETY: `token` was returned by OpenProcessToken and is closed exactly once.
-        unsafe { CloseHandle(token) };
-        enabled
-    })
+        }
+        Ok(written)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsRawEfsReader {
+    fn drop(&mut self) {
+        self.receiver.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn capture_windows_efs_raw(
+    path: &Path,
+    expected: InputIdentity,
+) -> Result<NativeAuxiliaryMetadata> {
+    validate_windows_input_path_identity(path, expected)?;
+    let (size, sha256) = hash_windows_raw_efs(path)?;
+    validate_windows_input_path_identity(path, expected)?;
+    let mut record = NativeAuxiliaryMetadata::new_streamed(
+        "windows.efs-raw",
+        "windows-backup-v1",
+        RestoreClass::System,
+        size,
+        sha256,
+    );
+    record
+        .meta
+        .insert("TZAP.aux.meta.efs-version".into(), b"1".to_vec());
+    Ok(record)
 }
 
 #[cfg(windows)]
@@ -4822,7 +5156,9 @@ fn capture_windows_security_descriptor(file: &File) -> Result<NativeAuxiliaryMet
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
         GetSecurityDescriptorLength, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
-        OWNER_SECURITY_INFORMATION, SACL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        PROTECTED_SACL_SECURITY_INFORMATION, SACL_SECURITY_INFORMATION,
+        UNPROTECTED_DACL_SECURITY_INFORMATION, UNPROTECTED_SACL_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         ReOpenFile, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
@@ -4903,9 +5239,19 @@ fn capture_windows_security_descriptor(file: &File) -> Result<NativeAuxiliaryMet
     }
     if control & 0x0004 != 0 {
         captured_security_information |= DACL_SECURITY_INFORMATION;
+        captured_security_information |= if control & 0x1000 != 0 {
+            PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            UNPROTECTED_DACL_SECURITY_INFORMATION
+        };
     }
     if control & 0x0010 != 0 {
         captured_security_information |= SACL_SECURITY_INFORMATION;
+        captured_security_information |= if control & 0x2000 != 0 {
+            PROTECTED_SACL_SECURITY_INFORMATION
+        } else {
+            UNPROTECTED_SACL_SECURITY_INFORMATION
+        };
     }
     let required_identity = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION;
     if captured_security_information & required_identity != required_identity {
@@ -9396,9 +9742,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_capture_rejects_metadata_classes_that_are_not_exactly_supported() {
-        for attributes in [0x0000_0400, 0x0000_1000, 0x0000_4000] {
+        for attributes in [0x0000_0400, 0x0000_1000] {
             assert!(unsupported_windows_file_attribute_reason(attributes).is_some());
         }
+        assert_eq!(unsupported_windows_file_attribute_reason(0x0000_4000), None);
         assert_eq!(unsupported_windows_file_attribute_reason(0x0000_0200), None);
         assert_eq!(unsupported_windows_file_attribute_reason(0x20), None);
     }
@@ -9436,9 +9783,61 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn filesystem_scan_captures_windows_scalars_security_and_alternate_data() {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::ptr;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{
+            SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+            PROTECTED_SACL_SECURITY_INFORMATION, SACL_SECURITY_INFORMATION,
+        };
+
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("native.txt");
         fs::write(&path, b"payload").unwrap();
+        assert!(
+            windows_sacl_capture_enabled(),
+            "privileged descriptor fixture requires SeSecurityPrivilege"
+        );
+        let sddl = "D:P(A;;FA;;;SY)(A;;FA;;;BA)S:P(AU;SAFA;FW;;;WD)"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut descriptor = ptr::null_mut();
+        // SAFETY: the SDDL is NUL-terminated and the descriptor output is released with LocalFree.
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let path_wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // SAFETY: the path and descriptor remain live and valid for the call.
+        let set_security_ok = unsafe {
+            SetFileSecurityW(
+                path_wide.as_ptr(),
+                DACL_SECURITY_INFORMATION
+                    | SACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION
+                    | PROTECTED_SACL_SECURITY_INFORMATION,
+                descriptor,
+            )
+        };
+        let set_security_error = std::io::Error::last_os_error();
+        // SAFETY: the descriptor was allocated by the conversion API and is freed once.
+        assert!(unsafe { LocalFree(descriptor) }.is_null());
+        assert_ne!(set_security_ok, 0, "{set_security_error}");
         let alternate_path = PathBuf::from(format!("{}:tzap-test", path.display()));
         fs::write(&alternate_path, b"alternate metadata").unwrap();
         let unicode_alternate_path = PathBuf::from(format!("{}:元数据", path.display()));
@@ -9470,8 +9869,27 @@ mod tests {
             16,
         )
         .unwrap();
-        assert_eq!(security_mask & 0x3, 0x3);
-        assert_eq!(security_mask & !0xf, 0);
+        assert_eq!(security_mask & 0xf, 0xf);
+        assert_eq!(security_mask & !0xf000_000f, 0);
+        let security_control = u16::from_le_bytes([security.payload[2], security.payload[3]]);
+        assert_eq!(
+            security_mask & 0xa000_0000,
+            if security_control & 0x1000 != 0 {
+                0x8000_0000
+            } else {
+                0x2000_0000
+            }
+        );
+        assert_eq!(
+            security_mask & 0x5000_0000,
+            if security_control & 0x0010 == 0 {
+                0
+            } else if security_control & 0x2000 != 0 {
+                0x4000_0000
+            } else {
+                0x1000_0000
+            }
+        );
         let alternate = native
             .auxiliary_records
             .iter()
@@ -9552,6 +9970,135 @@ mod tests {
             .unwrap(),
             b"unicode alternate metadata"
         );
+
+        let system_output = temp.path().join("native-system-output");
+        fs::create_dir(&system_output).unwrap();
+        opened
+            .extract_all_to(
+                &system_output,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::System,
+                    system_authorized: true,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+        let restored_file = File::open(system_output.join("native.txt")).unwrap();
+        let restored_security = capture_windows_security_descriptor(&restored_file).unwrap();
+        let expected_security = specs[0]
+            .portable_metadata
+            .native
+            .auxiliary_records
+            .iter()
+            .find(|record| record.kind == "windows.security-descriptor")
+            .unwrap();
+        assert_eq!(restored_security.payload, expected_security.payload);
+        assert_eq!(restored_security.meta, expected_security.meta);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_raw_efs_round_trips_without_plaintext_substitution() {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Foundation::{ERROR_FILE_SYSTEM_LIMITATION, ERROR_NOT_SUPPORTED};
+        use windows_sys::Win32::Storage::FileSystem::EncryptFileW;
+
+        const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x0000_4000;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("encrypted.txt");
+        let plaintext = b"raw EFS must be archived and restored through the native callback APIs";
+        fs::write(&source, plaintext).unwrap();
+        let source_wide = source
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // SAFETY: the path is NUL-terminated and remains live for the synchronous call.
+        if unsafe { EncryptFileW(source_wide.as_ptr()) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error().map(|value| value as u32),
+                Some(code) if code == ERROR_NOT_SUPPORTED || code == ERROR_FILE_SYSTEM_LIMITATION
+            ) {
+                return;
+            }
+            panic!("failed to create raw EFS fixture: {error}");
+        }
+        assert_ne!(
+            fs::metadata(&source).unwrap().file_attributes() & FILE_ATTRIBUTE_ENCRYPTED,
+            0
+        );
+
+        let specs = collect_input_specs(&[source.to_string_lossy().into_owned()])
+            .unwrap_or_else(|error| panic!("{error:#}"));
+        let raw = specs[0]
+            .portable_metadata
+            .native
+            .auxiliary_records
+            .iter()
+            .find(|record| record.kind == "windows.efs-raw")
+            .expect("encrypted input must retain a raw EFS record");
+        assert!(raw.is_streamed());
+        assert_eq!(raw.meta["TZAP.aux.meta.efs-version"], b"1");
+        let (expected_raw_size, expected_raw_hash) = hash_windows_raw_efs(&source).unwrap();
+        assert_eq!(raw.stored_payload_size(), expected_raw_size);
+
+        let master_key = MasterKey::from_raw_key(&[19u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+        write_archive_sources_to_sink_ordered_parallel(
+            &specs,
+            &master_key,
+            WriterOptions {
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+        let opened = tzap_core::open_archive(&sink.volumes[0], &master_key).unwrap();
+        opened.verify().unwrap();
+        let output = temp.path().join("efs-output");
+        fs::create_dir(&output).unwrap();
+        opened
+            .extract_all_to(
+                &output,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::System,
+                    system_authorized: true,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+
+        let restored = output.join("encrypted.txt");
+        assert_eq!(fs::read(&restored).unwrap(), plaintext);
+        assert_ne!(
+            fs::metadata(&restored).unwrap().file_attributes() & FILE_ATTRIBUTE_ENCRYPTED,
+            0
+        );
+        assert_eq!(
+            hash_windows_raw_efs(&restored).unwrap(),
+            (expected_raw_size, expected_raw_hash)
+        );
+
+        let encrypted_directory = temp.path().join("encrypted-directory");
+        fs::create_dir(&encrypted_directory).unwrap();
+        let directory_wide = encrypted_directory
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // SAFETY: the directory path is NUL-terminated and remains live for the call.
+        assert_ne!(unsafe { EncryptFileW(directory_wide.as_ptr()) }, 0);
+        let error =
+            collect_input_specs(&[encrypted_directory.to_string_lossy().into_owned()]).unwrap_err();
+        assert!(format!("{error:#}").contains("CREATE_FOR_DIR"));
     }
 
     #[cfg(windows)]
