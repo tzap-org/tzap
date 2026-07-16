@@ -7796,7 +7796,7 @@ fn native_metadata_requires_system_restore(native: &NativeFileMetadata, source_o
                 && std::str::from_utf8(value)
                     .ok()
                     .and_then(|value| u64::from_str_radix(value, 16).ok())
-                    .is_some_and(|flags| flags & 0x0006_0006 != 0))
+                    .is_some_and(|flags| flags & 0x009f_0086 != 0))
     })
 }
 
@@ -8613,6 +8613,18 @@ mod tests {
                 "timestamp nanoseconds must be less than one billion"
             ))
         ));
+    }
+
+    #[test]
+    fn macos_entitlement_and_superuser_flags_require_system_restore() {
+        for flags in [0x0000_0080u64, 0x0008_0000, 0x0010_0000, 0x0080_0000] {
+            let mut native = NativeFileMetadata::default();
+            native.primary_pax_records.insert(
+                "TZAP.macos.st-flags".into(),
+                format!("{flags:016x}").into_bytes(),
+            );
+            assert!(native_metadata_requires_system_restore(&native, "macos"));
+        }
     }
 
     #[test]

@@ -5369,7 +5369,15 @@ fn cli_macos_native_metadata_round_trips_for_files_and_directories() {
         xattr::set(path, "com.tzap.test", &[marker; 17]).unwrap();
         xattr::set(path, "com.apple.FinderInfo", &[marker; 32]).unwrap();
         if path.is_file() {
-            xattr::set(path, "com.apple.ResourceFork", b"resource fork").unwrap();
+            fs::write(
+                path.join("..namedfork/rsrc"),
+                vec![marker; 2 * 1024 * 1024 + 31],
+            )
+            .unwrap();
+            assert_eq!(
+                fs::metadata(path.join("..namedfork/rsrc")).unwrap().len(),
+                2 * 1024 * 1024 + 31
+            );
         }
         assert!(std::process::Command::new("chmod")
             .args(["+a", "everyone deny delete"])
@@ -5438,12 +5446,9 @@ fn cli_macos_native_metadata_round_trips_for_files_and_directories() {
             Some([marker; 32].as_slice())
         );
         if restored.is_file() {
-            assert_eq!(
-                xattr::get(&restored, "com.apple.ResourceFork")
-                    .unwrap()
-                    .as_deref(),
-                Some(b"resource fork".as_slice())
-            );
+            let resource_fork = fs::read(restored.join("..namedfork/rsrc")).unwrap();
+            assert_eq!(resource_fork.len(), 2 * 1024 * 1024 + 31);
+            assert!(resource_fork.iter().all(|byte| *byte == marker));
         }
         let acl = std::process::Command::new("ls")
             .args(["-lde"])
@@ -5453,6 +5458,329 @@ fn cli_macos_native_metadata_round_trips_for_files_and_directories() {
         assert!(acl.status.success());
         assert!(String::from_utf8_lossy(&acl.stdout).contains("everyone deny delete"));
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cli_macos_symlink_metadata_round_trips_without_touching_target() {
+    use std::os::macos::fs::MetadataExt as _;
+    use std::os::unix::fs::symlink;
+
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input_root = temp.path().join("tree");
+    let target = input_root.join("target.txt");
+    let link = input_root.join("link.txt");
+    let archive = temp.path().join("macos-symlink-metadata.tzap");
+    let extract_dir = temp.path().join("extract");
+    fs::create_dir_all(&input_root).unwrap();
+    fs::write(&target, b"target bytes").unwrap();
+    symlink("target.txt", &link).unwrap();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    xattr::set(&target, "com.tzap.target", b"unchanged").unwrap();
+    xattr::set(&link, "com.tzap.link", b"link metadata").unwrap();
+    assert!(std::process::Command::new("chmod")
+        .args(["-h", "+a", "everyone deny delete"])
+        .arg(&link)
+        .status()
+        .unwrap()
+        .success());
+    assert!(std::process::Command::new("chflags")
+        .args(["-h", "hidden"])
+        .arg(&link)
+        .status()
+        .unwrap()
+        .success());
+    let source_link = fs::symlink_metadata(&link).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input_root.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--restore",
+            "same-os",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let restored_link = extract_dir.join("tree/link.txt");
+    let restored_target = extract_dir.join("tree/target.txt");
+    let actual_link = fs::symlink_metadata(&restored_link).unwrap();
+    assert!(actual_link.file_type().is_symlink());
+    assert_eq!(actual_link.st_flags(), source_link.st_flags());
+    assert_eq!(
+        xattr::get(&restored_link, "com.tzap.link")
+            .unwrap()
+            .as_deref(),
+        Some(b"link metadata".as_slice())
+    );
+    let acl = std::process::Command::new("ls")
+        .args(["-lde"])
+        .arg(&restored_link)
+        .output()
+        .unwrap();
+    assert!(acl.status.success());
+    assert!(String::from_utf8_lossy(&acl.stdout).contains("everyone deny delete"));
+    assert_eq!(
+        xattr::get(&restored_target, "com.tzap.target")
+            .unwrap()
+            .as_deref(),
+        Some(b"unchanged".as_slice())
+    );
+    assert_eq!(xattr::get(&restored_target, "com.tzap.link").unwrap(), None);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cli_macos_fifo_metadata_round_trips_in_system_mode() {
+    use std::ffi::CString;
+    use std::os::macos::fs::MetadataExt as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input_root = temp.path().join("tree");
+    let fifo = input_root.join("events.fifo");
+    let archive = temp.path().join("macos-fifo-metadata.tzap");
+    let same_os_extract_dir = temp.path().join("same-os-extract");
+    let extract_dir = temp.path().join("extract");
+    fs::create_dir_all(&input_root).unwrap();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o640) }, 0);
+    xattr::set(&fifo, "com.tzap.fifo", b"fifo metadata").unwrap();
+    assert!(std::process::Command::new("chmod")
+        .args(["+a", "everyone deny delete"])
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    assert!(std::process::Command::new("chflags")
+        .arg("hidden")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let source = fs::symlink_metadata(&fifo).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input_root.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--restore",
+            "same-os",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            same_os_extract_dir.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert!(!same_os_extract_dir.join("tree/events.fifo").exists());
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--restore",
+            "system",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let restored = extract_dir.join("tree/events.fifo");
+    let actual = fs::symlink_metadata(&restored).unwrap();
+    assert!(actual.file_type().is_fifo());
+    assert_eq!(actual.permissions().mode() & 0o7777, 0o640);
+    assert_eq!(actual.st_flags(), source.st_flags());
+    assert_eq!(
+        xattr::get(&restored, "com.tzap.fifo").unwrap().as_deref(),
+        Some(b"fifo metadata".as_slice())
+    );
+    let acl = std::process::Command::new("ls")
+        .args(["-lde"])
+        .arg(&restored)
+        .output()
+        .unwrap();
+    assert!(acl.status.success());
+    assert!(String::from_utf8_lossy(&acl.stdout).contains("everyone deny delete"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cli_macos_privileged_system_flags_round_trip() {
+    use std::os::macos::fs::MetadataExt as _;
+
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input_root = temp.path().join("tree");
+    let input_file = input_root.join("locked.txt");
+    let archive = temp.path().join("macos-system-flags.tzap");
+    let extract_dir = temp.path().join("extract");
+    fs::create_dir_all(&input_root).unwrap();
+    fs::write(&input_file, b"system flags").unwrap();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+    assert!(std::process::Command::new("chflags")
+        .args(["archived,schg"])
+        .arg(&input_file)
+        .status()
+        .unwrap()
+        .success());
+    let source_flags = fs::metadata(&input_file).unwrap().st_flags();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input_root.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--restore",
+            "system",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let restored = extract_dir.join("tree/locked.txt");
+    assert_eq!(fs::metadata(&restored).unwrap().st_flags(), source_flags);
+    for path in [&input_file, &restored] {
+        assert!(std::process::Command::new("chflags")
+            .args(["noarchived,noschg"])
+            .arg(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cli_macos_privileged_character_device_metadata_round_trips() {
+    use std::ffi::CString;
+    use std::os::macos::fs::MetadataExt as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let character = temp.path().join("character.dev");
+    let archive = temp.path().join("macos-devices.tzap");
+    let extract_dir = temp.path().join("extract");
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    let character_c = CString::new(character.as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+        unsafe {
+            libc::mknod(
+                character_c.as_ptr(),
+                libc::S_IFCHR | 0o640,
+                libc::makedev(3, 2),
+            )
+        },
+        0
+    );
+    assert!(std::process::Command::new("chflags")
+        .arg("hidden")
+        .arg(&character)
+        .status()
+        .unwrap()
+        .success());
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+        ])
+        .arg(&character)
+        .assert()
+        .success();
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--restore",
+            "system",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let source = fs::symlink_metadata(&character).unwrap();
+    let restored = fs::symlink_metadata(extract_dir.join("character.dev")).unwrap();
+    assert!(restored.file_type().is_char_device());
+    assert_eq!(restored.st_rdev(), source.st_rdev());
+    assert_eq!(
+        restored.permissions().mode() & 0o7777,
+        source.permissions().mode() & 0o7777
+    );
+    assert_eq!(restored.st_flags(), source.st_flags());
+    assert_eq!(restored.st_uid(), source.st_uid());
+    assert_eq!(restored.st_gid(), source.st_gid());
+    assert_eq!(restored.st_birthtime(), source.st_birthtime());
+    assert_eq!(restored.st_birthtime_nsec(), source.st_birthtime_nsec());
 }
 
 #[test]

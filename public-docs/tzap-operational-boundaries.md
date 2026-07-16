@@ -569,7 +569,7 @@ currently has these platform boundaries:
 |---|---|---|
 | Linux | Numeric ownership; no-follow symlink ownership and readable xattrs; canonical POSIX.1e access/default ACLs; inline and auxiliary xattrs; observed ctime; available creation time; exact Linux inode flags; optional project IDs; sparse allocation; FIFO, character-device, block-device, and whiteout descriptors; and selected regular-file hardlink topology. | Live sockets, unreadable privileged namespaces, filesystem metadata hidden from the caller, and source objects that change during capture. Linux birth time is captured where exposed but cannot generally be assigned during restore. |
 | Windows | Creation, access, write, and change times at 100-ns precision, including pre-1970 values; exact supported attributes; primary and alternate-stream sparse data; relative-symlink, junction, and opaque reparse buffers; directory case-sensitive state; selected hardlink topology; owner/group/DACL self-relative security descriptor plus SACL when available; raw EFS regular files where the Windows raw API accepts the source; native compression; and EA/property/object-ID backup streams when exposed. | Encrypted directories, offline/cloud placeholders without an explicit hydration policy, read-mutating streams, and transactional/ghosted or otherwise unregistered backup streams. These cases fail creation instead of silently discarding metadata. ReFS sparse layout is preserved logically but authenticated as partial because ReFS does not expose exact allocated ranges. |
-| macOS | Numeric ownership, readable xattrs, exact Darwin flags, observed ctime, available creation time, native ACL external form, FinderInfo, and resource forks. Large xattrs use bounded auxiliary records. | Native symlink ACL/xattr/flag metadata, special objects, selected hardlink aliases, APFS clone hints, and metadata that cannot be read consistently during the scan. |
+| macOS | Numeric ownership; no-follow symlink ownership, xattrs, ACLs, flags, and timestamps; readable inline/auxiliary xattrs; recognized Darwin flags with unknown bits retained but not applied; observed ctime; available creation time; native ACL external form; FinderInfo; streamed resource forks; FIFO and device descriptors; and selected regular-file hardlink topology. | Live sockets, unreadable privileged metadata, APFS clone hints, and source objects or resource forks that change during capture. Device recreation and system Darwin flags require an authorized System restore with superuser privilege. |
 | Other POSIX hosts | Portable regular-file, directory, and safe symlink fields. | Source-native profile capture is not yet implemented. |
 
 Linux POSIX ACL backing xattrs are converted to canonical `SCHILY.acl.*`
@@ -667,12 +667,18 @@ alternate data streams (including sparse streams), and exact supported basic
 attributes/timestamps.
 On macOS, same-OS restore applies and verifies inline and auxiliary xattrs,
 FinderInfo, resource forks, the native Darwin ACL external form, creation time,
-and ordinary Darwin flags for regular files and directories. Resource-fork
-payloads are staged and copied in bounded chunks, and directory metadata is
-finalized after descendants.
+and recognized ordinary Darwin flags for regular files, directories, and
+symlinks without following symlink targets. Unknown Darwin flag bits remain
+authenticated but are not applied; when such a bit belongs to a required
+same-OS scalar, strict restore rejects it unless `--allow-degraded` is explicit.
+Resource-fork capture and archive emission
+are streamed, restoration uses the native named fork, and exact bytes are read
+back before publication. Directory metadata is finalized after descendants.
 System restore, after explicit authorization, also applies numeric UID/GID,
 set-ID modes, privileged xattr namespaces, Linux project IDs,
-immutable/append-only Linux flags, and Linux FIFO/device/whiteout objects. On
+immutable/append-only Linux flags, Linux FIFO/device/whiteout objects, macOS
+FIFO/device objects, and macOS immutable/append/system flags when the process
+has the required superuser privilege. On
 Windows, authorized system restore also recreates validated symlink, junction,
 and opaque reparse buffers, restores raw EFS, applies directory case-sensitive
 state and object-ID streams, and applies security descriptors when required
@@ -731,10 +737,13 @@ surface tar metadata fidelity should use `list_files`, `extract_member`,
   security application are implemented. The remaining Windows limitation is
   evidence for privilege-only combinations and filesystem-exposed property
   streams, not a known code-path omission.
-  macOS ordinary file/directory flags, xattrs, ACLs, FinderInfo, resource forks,
-  and timestamps are captured, validated, applied, and verified on-host.
-  Native symlink metadata and remaining non-regular-file capture are not yet
-  implemented.
+  macOS regular-file, directory, symlink, and FIFO flags, xattrs, ACLs,
+  FinderInfo, resource forks, creation/modify times, and ownership-policy gates
+  are captured, validated, applied, and verified on-host. Privileged System
+  flags and character-device capture/recreation also have elevated on-host
+  evidence. Block-device capture/recreation still needs a raw-disk-entitled
+  runner before the macOS backup class is advertised; this app context returns
+  `EPERM` for `/dev/disk0` even as root.
 
 ### Remaining native-platform implementation plan
 
@@ -743,8 +752,10 @@ unimplemented. Release evidence still needs elevated CI for SACL/security,
 object-ID, and raw-EFS import combinations and a filesystem fixture that
 actually exposes `BACKUP_PROPERTY_DATA`.
 
-The remaining macOS work is native symlink metadata, remaining special-object
-coverage, and optional APFS clone hints.
+No required macOS metadata code path is knowingly unimplemented. Remaining
+release work is raw-disk-entitled on-host evidence for block devices. APFS
+clone hints remain an optional storage-layout
+optimization rather than a logical or metadata-fidelity requirement.
 The remaining POSIX/BSD writer work includes native symlink
 ownership/ACL/xattr fields, devices, FIFOs, hardlink topology, NFSv4 ACL
 implementations, native BSD flags, and

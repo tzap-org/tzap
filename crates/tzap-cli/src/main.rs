@@ -3138,6 +3138,30 @@ impl RegularFileSource for InputSpec {
         if !record.is_streamed() {
             return Ok(Box::new(io::Cursor::new(record.payload.as_slice())));
         }
+        #[cfg(target_os = "macos")]
+        {
+            if record.kind != "macos.resource-fork"
+                || record.name_encoding != NativeAuxiliaryNameEncoding::None
+                || !record.name.is_empty()
+            {
+                return Err(FormatError::WriterUnsupported(
+                    "unsupported streamed macOS auxiliary source",
+                )
+                .into());
+            }
+            let source = if self.entry_kind == SourceEntryKind::Symlink {
+                MacosResourceForkSource::Symlink(
+                    open_macos_symlink(&self.source).map_err(ArchiveWriteError::Io)?,
+                )
+            } else {
+                let file = File::open(&self.source).map_err(ArchiveWriteError::Io)?;
+                open_macos_resource_fork_for_read(file).map_err(ArchiveWriteError::Io)?
+            };
+            Ok(Box::new(
+                MacosResourceForkReader::new(source, self.identity, Some(record.logical_size))
+                    .map_err(ArchiveWriteError::Io)?,
+            ))
+        }
         #[cfg(windows)]
         {
             if record.kind == "windows.efs-raw" {
@@ -3196,7 +3220,7 @@ impl RegularFileSource for InputSpec {
             }
             Ok(Box::new(stream))
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         Err(
             FormatError::WriterUnsupported("streamed Windows auxiliary sources require Windows")
                 .into(),
@@ -3525,9 +3549,12 @@ fn collect_one_input_spec(
         }
         return Ok(());
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
+        #[cfg(target_os = "linux")]
         use std::os::linux::fs::MetadataExt as _;
+        #[cfg(target_os = "macos")]
+        use std::os::macos::fs::MetadataExt as _;
         use std::os::unix::fs::FileTypeExt as _;
 
         let file_type = metadata.file_type();
@@ -3553,7 +3580,8 @@ fn collect_one_input_spec(
                 entry_kind,
                 SourceEntryKind::CharacterDevice | SourceEntryKind::BlockDevice
             ) {
-                let device = metadata.st_rdev();
+                let device = libc::dev_t::try_from(metadata.st_rdev())
+                    .map_err(|_| anyhow!("device identifier exceeds host ABI"))?;
                 let major = libc::major(device);
                 let minor = libc::minor(device);
                 portable_metadata.native.primary_pax_records.insert(
@@ -3564,6 +3592,7 @@ fn collect_one_input_spec(
                     "TZAP.posix.device-minor".into(),
                     minor.to_string().into_bytes(),
                 );
+                #[cfg(target_os = "linux")]
                 if entry_kind == SourceEntryKind::CharacterDevice && major == 0 && minor == 0 {
                     portable_metadata
                         .native
@@ -3640,6 +3669,7 @@ fn collect_one_input_spec(
     };
     #[cfg(all(not(windows), not(target_os = "linux")))]
     let sparse_extents = None;
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut portable_metadata = portable_input_metadata(identity, input)?;
     #[cfg(windows)]
     if sparse_layout_partial {
@@ -4307,6 +4337,239 @@ struct SparseExtentInputReader<'a> {
     validated: bool,
 }
 
+#[cfg(target_os = "macos")]
+enum MacosResourceForkSource {
+    File { owner: File, fork: File },
+    Symlink(File),
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_symlink(input: &Path) -> io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const O_SYMLINK: libc::c_int = 0x0020_0000;
+    let path = CString::new(input.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | O_SYMLINK) };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_resource_fork_for_read(owner: File) -> io::Result<MacosResourceForkSource> {
+    use std::ffi::OsString;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut path = vec![0u8; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(owner.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let length = path.iter().position(|byte| *byte == 0).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "macOS returned an unterminated descriptor path",
+        )
+    })?;
+    path.truncate(length);
+    path.extend_from_slice(b"/..namedfork/rsrc");
+    let fork = File::open(PathBuf::from(OsString::from_vec(path)))?;
+    let owner_metadata = owner.metadata()?;
+    let fork_metadata = fork.metadata()?;
+    if owner_metadata.dev() != fork_metadata.dev() || owner_metadata.ino() != fork_metadata.ino() {
+        return Err(io::Error::other(
+            "resource fork path no longer identifies the pinned file",
+        ));
+    }
+    Ok(MacosResourceForkSource::File { owner, fork })
+}
+
+#[cfg(target_os = "macos")]
+struct MacosResourceForkReader {
+    source: MacosResourceForkSource,
+    expected: InputIdentity,
+    logical_size: u64,
+    offset: u64,
+    validated: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosResourceForkReader {
+    fn new(
+        source: MacosResourceForkSource,
+        expected: InputIdentity,
+        expected_size: Option<u64>,
+    ) -> io::Result<Self> {
+        let actual = Self::identity(&source)?;
+        if actual != expected {
+            return Err(io::Error::other(
+                "macOS resource-fork owner changed before read",
+            ));
+        }
+        let logical_size = macos_resource_fork_size(&source)?;
+        if expected_size.is_some_and(|size| size != logical_size) {
+            return Err(io::Error::other(
+                "macOS resource fork changed after metadata scan",
+            ));
+        }
+        if matches!(&source, MacosResourceForkSource::Symlink(_))
+            && logical_size > u64::from(u32::MAX)
+        {
+            return Err(io::Error::other(
+                "macOS resource fork exceeds Darwin positional xattr limits",
+            ));
+        }
+        Ok(Self {
+            source,
+            expected,
+            logical_size,
+            offset: 0,
+            validated: false,
+        })
+    }
+
+    fn identity(source: &MacosResourceForkSource) -> io::Result<InputIdentity> {
+        match source {
+            MacosResourceForkSource::File { owner, .. } => input_identity(&owner.metadata()?),
+            MacosResourceForkSource::Symlink(file) => {
+                let metadata = file.metadata()?;
+                if !metadata.file_type().is_symlink() {
+                    return Err(io::Error::other(
+                        "macOS resource-fork owner is no longer a symlink",
+                    ));
+                }
+                input_identity(&metadata)
+            }
+        }
+    }
+
+    fn validate_finished(&mut self) -> io::Result<()> {
+        if !self.validated {
+            if Self::identity(&self.source)? != self.expected
+                || macos_resource_fork_size(&self.source)? != self.logical_size
+            {
+                return Err(io::Error::other("macOS resource fork changed during read"));
+            }
+            self.validated = true;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Read for MacosResourceForkReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.offset == self.logical_size {
+            self.validate_finished()?;
+            return Ok(0);
+        }
+        let count =
+            usize::try_from((self.logical_size - self.offset).min(out.len() as u64)).unwrap();
+        let read = macos_read_resource_fork(&self.source, self.offset, &mut out[..count])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "macOS resource fork ended before its scanned size",
+            ));
+        }
+        self.offset += read as u64;
+        if self.offset == self.logical_size {
+            self.validate_finished()?;
+        }
+        Ok(read)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_resource_fork_size(source: &MacosResourceForkSource) -> io::Result<u64> {
+    use std::ffi::{c_char, c_int, c_void};
+    use std::os::fd::AsRawFd as _;
+
+    extern "C" {
+        fn fgetxattr(
+            fd: c_int,
+            name: *const c_char,
+            value: *mut c_void,
+            size: usize,
+            position: u32,
+            options: c_int,
+        ) -> libc::ssize_t;
+    }
+    const RESOURCE_FORK: &[u8] = b"com.apple.ResourceFork\0";
+    let size = match source {
+        MacosResourceForkSource::File { fork, .. } => return Ok(fork.metadata()?.len()),
+        MacosResourceForkSource::Symlink(file) => unsafe {
+            fgetxattr(
+                file.as_raw_fd(),
+                RESOURCE_FORK.as_ptr().cast(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+            )
+        },
+    };
+    if size < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(size as u64)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_read_resource_fork(
+    source: &MacosResourceForkSource,
+    position: u64,
+    out: &mut [u8],
+) -> io::Result<usize> {
+    use std::ffi::{c_char, c_int, c_void};
+    use std::os::fd::AsRawFd as _;
+
+    extern "C" {
+        fn fgetxattr(
+            fd: c_int,
+            name: *const c_char,
+            value: *mut c_void,
+            size: usize,
+            position: u32,
+            options: c_int,
+        ) -> libc::ssize_t;
+    }
+    const RESOURCE_FORK: &[u8] = b"com.apple.ResourceFork\0";
+    let read = match source {
+        MacosResourceForkSource::File { fork, .. } => {
+            use std::os::unix::fs::FileExt as _;
+            return fork.read_at(out, position);
+        }
+        MacosResourceForkSource::Symlink(file) => unsafe {
+            fgetxattr(
+                file.as_raw_fd(),
+                RESOURCE_FORK.as_ptr().cast(),
+                out.as_mut_ptr().cast(),
+                out.len(),
+                u32::try_from(position).map_err(|_| {
+                    io::Error::other("macOS symlink resource fork exceeds Darwin positional limits")
+                })?,
+                0,
+            )
+        },
+    };
+    if read < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(read as usize)
+    }
+}
+
 #[cfg(windows)]
 fn windows_alternate_stream_path(base: &Path, name: &[u8]) -> io::Result<PathBuf> {
     use std::ffi::OsString;
@@ -4629,7 +4892,9 @@ fn portable_symlink_metadata(
         attributes: identity.attributes,
         #[cfg(target_os = "linux")]
         native: capture_linux_symlink_metadata(_input, identity)?,
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        native: capture_macos_symlink_metadata(_input, identity)?,
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         native: NativeFileMetadata::default(),
     })
 }
@@ -4902,12 +5167,24 @@ fn open_linux_metadata_file(input: &Path) -> io::Result<(File, bool)> {
 }
 
 #[cfg(target_os = "macos")]
+fn open_macos_metadata_file(input: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    const O_EVTONLY: libc::c_int = 0x0000_8000;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK | O_EVTONLY)
+        .open(input)
+}
+
+#[cfg(target_os = "macos")]
 fn capture_native_file_metadata(
     input: &Path,
     identity: InputIdentity,
 ) -> Result<NativeFileMetadata> {
     use std::os::macos::fs::MetadataExt;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt as _;
     use xattr::FileExt as _;
 
     // Leave ample room below the 64 MiB local-PAX cap for declarations and
@@ -4915,10 +5192,21 @@ fn capture_native_file_metadata(
     // the format's hashed auxiliary representation instead.
     const INLINE_XATTR_BUDGET: usize = 32 * 1024 * 1024;
 
-    let file = File::open(input)
+    let file = open_macos_metadata_file(input)
         .with_context(|| format!("failed to open {} for metadata capture", input.display()))?;
+    let opened_identity = input_identity(&file.metadata().with_context(|| {
+        format!(
+            "failed to identify opened metadata object {}",
+            input.display()
+        )
+    })?)?;
+    if opened_identity != identity {
+        bail!("input changed before metadata capture: {}", input.display());
+    }
     let mut native = NativeFileMetadata::default();
     let mut inline_xattr_bytes = 0usize;
+    let file_type = file.metadata()?.file_type();
+    let device_without_metadata_api = file_type.is_char_device() || file_type.is_block_device();
     native.primary_pax_records.insert(
         "TZAP.macos.st-flags".into(),
         format!("{:016x}", file.metadata()?.st_flags()).into_bytes(),
@@ -4941,11 +5229,35 @@ fn capture_native_file_metadata(
         );
     }
 
-    for name in file
-        .list_xattr()
-        .with_context(|| format!("failed to list xattrs for {}", input.display()))?
-    {
+    let xattr_names = match file.list_xattr() {
+        Ok(names) => names.collect::<Vec<_>>(),
+        Err(error)
+            if device_without_metadata_api
+                && error
+                    .raw_os_error()
+                    .is_some_and(|code| code == libc::EPERM || code == libc::ENOTSUP) =>
+        {
+            Vec::new()
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to list xattrs for {}", input.display()));
+        }
+    };
+    for name in xattr_names {
         let name_bytes = name.as_bytes();
+        if name_bytes == b"com.apple.ResourceFork" {
+            native.auxiliary_records.push(
+                capture_macos_resource_fork(
+                    open_macos_resource_fork_for_read(file.try_clone()?)?,
+                    identity,
+                )
+                .with_context(|| {
+                    format!("failed to capture resource fork for {}", input.display())
+                })?,
+            );
+            continue;
+        }
         let Some(value) = file
             .get_xattr(&name)
             .with_context(|| format!("failed to read xattr on {}", input.display()))?
@@ -4953,14 +5265,6 @@ fn capture_native_file_metadata(
             bail!("xattr changed while scanning {}", input.display());
         };
         match name_bytes {
-            b"com.apple.ResourceFork" => {
-                native.auxiliary_records.push(NativeAuxiliaryMetadata::new(
-                    "macos.resource-fork",
-                    "macos-backup-v1",
-                    RestoreClass::SameOs,
-                    value,
-                ))
-            }
             b"com.apple.FinderInfo" => {
                 if value.len() != 32 {
                     bail!("FinderInfo on {} is not exactly 32 bytes", input.display());
@@ -5010,9 +5314,22 @@ fn capture_native_file_metadata(
         }
     }
 
-    if let Some(acl) = capture_macos_acl(&file)
-        .with_context(|| format!("failed to capture ACL for {}", input.display()))?
-    {
+    let acl = match capture_macos_acl(&file) {
+        Ok(acl) => acl,
+        Err(error)
+            if device_without_metadata_api
+                && error
+                    .raw_os_error()
+                    .is_some_and(|code| code == libc::EPERM || code == libc::ENOTSUP) =>
+        {
+            None
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to capture ACL for {}", input.display()));
+        }
+    };
+    if let Some(acl) = acl {
         let mut record = NativeAuxiliaryMetadata::new(
             "macos.acl-native",
             "macos-backup-v1",
@@ -5037,12 +5354,202 @@ fn capture_native_file_metadata(
     native.required_profiles.push("macos-backup-v1".into());
     native.required_profiles.push("posix-backup-v1".into());
     native.required_profiles.sort();
+    let final_identity =
+        input_identity(&file.metadata().with_context(|| {
+            format!("failed to reidentify metadata object {}", input.display())
+        })?)?;
+    if final_identity != identity {
+        bail!("input changed during metadata capture: {}", input.display());
+    }
+    Ok(native)
+}
+
+#[cfg(target_os = "macos")]
+fn capture_macos_symlink_metadata(
+    input: &Path,
+    identity: InputIdentity,
+) -> Result<NativeFileMetadata> {
+    use std::os::macos::fs::MetadataExt as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use xattr::FileExt as _;
+
+    const INLINE_XATTR_BUDGET: usize = 32 * 1024 * 1024;
+    let file = open_macos_symlink(input)
+        .with_context(|| format!("failed to open symlink {}", input.display()))?;
+    let current = file
+        .metadata()
+        .with_context(|| format!("failed to identify symlink {}", input.display()))?;
+    if !current.file_type().is_symlink() || input_identity(&current)? != identity {
+        bail!(
+            "symlink changed before metadata capture: {}",
+            input.display()
+        );
+    }
+
+    let mut native = NativeFileMetadata::default();
+    let mut inline_xattr_bytes = 0usize;
+    native.primary_pax_records.insert(
+        "TZAP.macos.st-flags".into(),
+        format!("{:016x}", current.st_flags()).into_bytes(),
+    );
+    native.primary_pax_records.insert(
+        "TZAP.unix.ctime-observed".into(),
+        ArchiveTimestamp::new(
+            identity.change_time_seconds,
+            identity.change_time_nanoseconds as u32,
+        )
+        .canonical_pax_value()
+        .map_err(|error| anyhow!(error))?,
+    );
+    if let Some(creation_time) = identity.creation_time {
+        native.primary_pax_records.insert(
+            "LIBARCHIVE.creationtime".into(),
+            creation_time
+                .canonical_pax_value()
+                .map_err(|error| anyhow!(error))?,
+        );
+    }
+
+    for name in file
+        .list_xattr()
+        .with_context(|| format!("failed to list symlink xattrs for {}", input.display()))?
+    {
+        let name_bytes = name.as_bytes();
+        if name_bytes == b"com.apple.ResourceFork" {
+            native.auxiliary_records.push(
+                capture_macos_resource_fork(
+                    MacosResourceForkSource::Symlink(file.try_clone()?),
+                    identity,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to capture symlink resource fork for {}",
+                        input.display()
+                    )
+                })?,
+            );
+            continue;
+        }
+        let Some(value) = file
+            .get_xattr(&name)
+            .with_context(|| format!("failed to read symlink xattr on {}", input.display()))?
+        else {
+            bail!("symlink xattr changed while scanning {}", input.display());
+        };
+        match name_bytes {
+            b"com.apple.FinderInfo" => {
+                if value.len() != 32 {
+                    bail!("FinderInfo on {} is not exactly 32 bytes", input.display());
+                }
+                native.auxiliary_records.push(NativeAuxiliaryMetadata::new(
+                    "macos.finder-info",
+                    "macos-backup-v1",
+                    RestoreClass::SameOs,
+                    value,
+                ));
+            }
+            _ if inline_xattr_bytes
+                .saturating_add(name_bytes.len())
+                .saturating_add(value.len().saturating_mul(4).div_ceil(3))
+                > INLINE_XATTR_BUDGET =>
+            {
+                let profile = if name_bytes.starts_with(b"com.apple.") {
+                    "macos-backup-v1"
+                } else {
+                    "posix-backup-v1"
+                };
+                let mut record = NativeAuxiliaryMetadata::new(
+                    "generic.xattr",
+                    profile,
+                    if macos_system_xattr(name_bytes) {
+                        RestoreClass::System
+                    } else {
+                        RestoreClass::SameOs
+                    },
+                    value,
+                );
+                record.name_encoding = NativeAuxiliaryNameEncoding::Bytes;
+                record.name = name_bytes.to_vec();
+                native.auxiliary_records.push(record);
+            }
+            _ => {
+                let encoded_name =
+                    encode_percent_name(name_bytes).map_err(|error| anyhow!(error))?;
+                let encoded_value = canonical_base64_encode(&value);
+                inline_xattr_bytes = inline_xattr_bytes
+                    .saturating_add(encoded_name.len())
+                    .saturating_add(encoded_value.len());
+                native
+                    .primary_pax_records
+                    .insert(format!("LIBARCHIVE.xattr.{encoded_name}"), encoded_value);
+            }
+        }
+    }
+
+    if let Some(acl) = capture_macos_acl(&file)? {
+        let mut record = NativeAuxiliaryMetadata::new(
+            "macos.acl-native",
+            "macos-backup-v1",
+            RestoreClass::SameOs,
+            acl,
+        );
+        record.meta.insert(
+            "TZAP.aux.meta.acl-format".into(),
+            b"darwin-acl-external-v1".to_vec(),
+        );
+        native.auxiliary_records.push(record);
+        native
+            .primary_pax_records
+            .insert("TZAP.acl.projection".into(), b"none".to_vec());
+    }
+    native.required_profiles = vec!["macos-backup-v1".into(), "posix-backup-v1".into()];
+    native.auxiliary_records.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let final_metadata = file
+        .metadata()
+        .with_context(|| format!("failed to reidentify symlink {}", input.display()))?;
+    if !final_metadata.file_type().is_symlink() || input_identity(&final_metadata)? != identity {
+        bail!(
+            "symlink changed during metadata capture: {}",
+            input.display()
+        );
+    }
     Ok(native)
 }
 
 #[cfg(target_os = "macos")]
 fn macos_system_xattr(name: &[u8]) -> bool {
     name.starts_with(b"security.") || name.starts_with(b"trusted.") || name.starts_with(b"system.")
+}
+
+#[cfg(target_os = "macos")]
+fn capture_macos_resource_fork(
+    source: MacosResourceForkSource,
+    identity: InputIdentity,
+) -> Result<NativeAuxiliaryMetadata> {
+    use sha2::{Digest as _, Sha256};
+
+    let mut reader = MacosResourceForkReader::new(source, identity, None)?;
+    let logical_size = reader.logical_size;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(NativeAuxiliaryMetadata::new_streamed(
+        "macos.resource-fork",
+        "macos-backup-v1",
+        RestoreClass::SameOs,
+        logical_size,
+        hasher.finalize().into(),
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -10558,7 +11065,9 @@ mod tests {
             .iter()
             .find(|record| record.kind == "macos.resource-fork")
             .unwrap();
-        assert_eq!(resource_fork.payload, b"resource fork");
+        assert!(resource_fork.is_streamed());
+        assert!(resource_fork.payload.is_empty());
+        assert_eq!(resource_fork.logical_size, b"resource fork".len() as u64);
         let acl = native
             .auxiliary_records
             .iter()
@@ -10568,6 +11077,22 @@ mod tests {
         assert_eq!(
             acl.meta.get("TZAP.aux.meta.acl-format").map(Vec::as_slice),
             Some(b"darwin-acl-external-v1".as_slice())
+        );
+
+        // `RegularFile` is the convenience in-memory source and cannot reopen a streamed
+        // filesystem fork. Keep this parser/writer assertion independent from the InputSpec
+        // streaming integration test by substituting the same bytes as an in-memory record.
+        let mut archive_native = native.clone();
+        let resource_index = archive_native
+            .auxiliary_records
+            .iter()
+            .position(|record| record.kind == "macos.resource-fork")
+            .unwrap();
+        archive_native.auxiliary_records[resource_index] = NativeAuxiliaryMetadata::new(
+            "macos.resource-fork",
+            "macos-backup-v1",
+            RestoreClass::SameOs,
+            b"resource fork".to_vec(),
         );
 
         let archive = write_archive(
@@ -10587,7 +11112,7 @@ mod tests {
                         gname: None,
                     }),
                     attributes: None,
-                    native,
+                    native: archive_native,
                 },
             }],
             &MasterKey::from_raw_key(&[7u8; 32]).unwrap(),
@@ -10620,6 +11145,42 @@ mod tests {
         assert!(report
             .auxiliary_kinds_present
             .contains(&"macos.resource-fork".to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_metadata_capture_rejects_a_replaced_source_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.txt");
+        let displaced = temp.path().join("displaced.txt");
+        fs::write(&path, b"original").unwrap();
+        let identity = input_identity(&fs::metadata(&path).unwrap()).unwrap();
+        fs::rename(&path, &displaced).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+
+        let error = capture_native_file_metadata(&path, identity).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed before metadata capture"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_symlink_capture_rejects_a_replaced_link_object() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source-link");
+        let displaced = temp.path().join("displaced-link");
+        symlink("original-target", &path).unwrap();
+        let identity = input_identity(&fs::symlink_metadata(&path).unwrap()).unwrap();
+        fs::rename(&path, &displaced).unwrap();
+        symlink("replacement-target", &path).unwrap();
+
+        let error = capture_macos_symlink_metadata(&path, identity).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed before metadata capture"));
     }
 
     #[cfg(windows)]

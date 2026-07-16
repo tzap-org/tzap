@@ -42,6 +42,90 @@ use crate::format::{ExtractError, FormatError};
 use crate::metadata::validate_file_path_bytes;
 
 const TAR_BLOCK_LEN: usize = 512;
+const MACOS_SETTABLE_ORDINARY_FLAGS: u32 = 0x0000_800f;
+const MACOS_SETTABLE_SYSTEM_FLAGS: u32 = 0x0007_0000;
+// UF_IMMUTABLE/UF_APPEND, entitlement-protected UF_DATAVAULT, and every
+// Darwin SF_SUPPORTED bit have System-class restore semantics even when this
+// reader deliberately does not register the bit for built-in application.
+const MACOS_SYSTEM_CLASS_FLAGS: u32 = 0x009f_0086;
+const MACOS_KNOWN_SETTABLE_FLAGS: u32 = MACOS_SETTABLE_ORDINARY_FLAGS | MACOS_SETTABLE_SYSTEM_FLAGS;
+
+fn parse_macos_flags(encoded: &[u8]) -> Result<u32, FormatError> {
+    std::str::from_utf8(encoded)
+        .ok()
+        .and_then(|value| u64::from_str_radix(value, 16).ok())
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(FormatError::InvalidArchive("invalid macOS file flags"))
+}
+
+fn macos_flags_supported(flags: u32) -> bool {
+    flags & !MACOS_KNOWN_SETTABLE_FLAGS == 0
+}
+
+fn macos_flags_require_system(flags: u32) -> bool {
+    flags & MACOS_SYSTEM_CLASS_FLAGS != 0
+}
+
+fn macos_system_flags_privileges_available(flags: u32) -> bool {
+    if flags & MACOS_SETTABLE_SYSTEM_FLAGS == 0 {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Setting system file flags is restricted to the superuser by Darwin.
+        (unsafe { libc::geteuid() }) == 0
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+fn special_object_restore_supported(kind: TarEntryKind) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = kind;
+        true
+    }
+    #[cfg(target_os = "macos")]
+    {
+        kind == TarEntryKind::Fifo || (unsafe { libc::geteuid() }) == 0
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = kind;
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_darwin_acl_external(value: &[u8]) -> Result<(), FormatError> {
+    const ACL_MAX_ENTRIES: usize = 128;
+    const DARWIN_EXTERNAL_ACL_HEADER: usize = 40;
+    const DARWIN_EXTERNAL_ACE_SIZE: usize = 28;
+    const DARWIN_EXTERNAL_ACL_MAGIC: [u8; 4] = [0x01, 0x2c, 0xc1, 0x6d];
+    if value.get(..4) != Some(DARWIN_EXTERNAL_ACL_MAGIC.as_slice()) {
+        return Err(FormatError::InvalidArchive(
+            "macOS ACL external form has an invalid magic value",
+        ));
+    }
+    let entry_count = value
+        .get(36..40)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_be_bytes)
+        .ok_or(FormatError::InvalidArchive(
+            "macOS ACL external form is truncated",
+        ))? as usize;
+    let expected = DARWIN_EXTERNAL_ACL_HEADER
+        .checked_add(entry_count.checked_mul(DARWIN_EXTERNAL_ACE_SIZE).ok_or(
+            FormatError::InvalidArchive("macOS ACL entry count overflows"),
+        )?)
+        .ok_or(FormatError::InvalidArchive("macOS ACL size overflows"))?;
+    if entry_count > ACL_MAX_ENTRIES || expected != value.len() {
+        return Err(FormatError::InvalidArchive(
+            "macOS ACL external form has an invalid size",
+        ));
+    }
+    Ok(())
+}
 
 #[cfg(target_os = "linux")]
 const LINUX_KNOWN_FSFLAGS: u64 = (linux_raw_sys::general::FS_SECRM_FL
@@ -3113,7 +3197,7 @@ fn plan_restore(
     if matches!(
         kind,
         TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
-    ) && !(cfg!(target_os = "linux")
+    ) && !(cfg!(any(target_os = "linux", target_os = "macos"))
         && options.restore_policy == RestorePolicy::System
         && options.system_authorized)
     {
@@ -3328,6 +3412,43 @@ fn plan_restore(
                 .for_restore(options.restore_policy, 4),
             );
         }
+        if metadata
+            .primary_records
+            .get("TZAP.macos.st-flags")
+            .and_then(|value| parse_macos_flags(value).ok())
+            .is_some_and(macos_flags_require_system)
+        {
+            diagnostics.push(
+                MetadataDiagnostic::new(
+                    path,
+                    "macos-backup-v1",
+                    "system-file-flags",
+                    MetadataOperation::Plan,
+                    MetadataDiagnosticStatus::Skipped,
+                    "system-class macOS file flags are outside same-os restore policy",
+                )
+                .for_restore(options.restore_policy, 4),
+            );
+        }
+    }
+    if requests_same_os
+        && metadata
+            .primary_records
+            .get("TZAP.macos.st-flags")
+            .and_then(|value| parse_macos_flags(value).ok())
+            .is_some_and(|flags| !macos_flags_supported(flags))
+    {
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                "macos-backup-v1",
+                "unrecognized-file-flags",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Skipped,
+                "unrecognized macOS file flags were preserved but will not be applied",
+            )
+            .for_restore(options.restore_policy, 4),
+        );
     }
     let profile_is_required = |profile: &str| {
         metadata
@@ -3369,17 +3490,13 @@ fn plan_restore(
     let unsupported_same_os = metadata.auxiliary.iter().any(|record| {
         record.restore_class == RestoreClass::SameOs
             && profile_is_required(&record.profile)
-            && !native_auxiliary_restore_supported(record, false)
+            && !native_auxiliary_restore_supported(record, false, Some(kind))
     }) || (required_native_scalar && unsupported_primary_same_os)
-        || matches!(
-            kind,
-            TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
-        )
         || (required_native_profile && !native_source_matches_host);
     let unsupported_system = metadata.auxiliary.iter().any(|record| {
         record.restore_class == RestoreClass::System
             && profile_is_required(&record.profile)
-            && !native_auxiliary_restore_supported(record, true)
+            && !native_auxiliary_restore_supported(record, true, Some(kind))
     }) || (metadata.declaration.owner_kind_posix
         && !numeric_ownership_supported(metadata))
         || (metadata.declaration.portable_mode & 0o6000 != 0 && !cfg!(unix))
@@ -3388,7 +3505,7 @@ fn plan_restore(
         || (matches!(
             kind,
             TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
-        ) && !cfg!(target_os = "linux"))
+        ) && !special_object_restore_supported(kind))
         || (required_native_profile && !native_source_matches_host);
 
     if (!requests_system && requests_same_os && unsupported_same_os)
@@ -3497,12 +3614,20 @@ fn plan_restore(
     Ok(diagnostics)
 }
 
-fn native_auxiliary_restore_supported(record: &AuxiliaryRecord, include_system: bool) -> bool {
+fn native_auxiliary_restore_supported(
+    record: &AuxiliaryRecord,
+    include_system: bool,
+    kind: Option<TarEntryKind>,
+) -> bool {
     if cfg!(target_os = "macos") {
         return match record.kind.as_str() {
             "macos.resource-fork" => {
                 record.restore_class == RestoreClass::SameOs
-                    && record.logical_size <= u64::from(u32::MAX)
+                    && match kind {
+                        Some(TarEntryKind::Symlink) => record.logical_size <= u64::from(u32::MAX),
+                        Some(TarEntryKind::Regular | TarEntryKind::Directory) | None => true,
+                        Some(_) => false,
+                    }
             }
             "macos.finder-info" => record.restore_class == RestoreClass::SameOs,
             "macos.acl-native" => {
@@ -3653,7 +3778,7 @@ fn windows_reparse_metadata_supported(metadata: &MemberMetadata) -> bool {
             .auxiliary
             .iter()
             .find(|record| record.kind == "windows.reparse-data")
-            .is_some_and(|record| native_auxiliary_restore_supported(record, true))
+            .is_some_and(|record| native_auxiliary_restore_supported(record, true, None))
 }
 
 fn native_primary_restore_unsupported(metadata: &MemberMetadata, include_system: bool) -> bool {
@@ -3679,8 +3804,11 @@ fn native_primary_restore_unsupported(metadata: &MemberMetadata, include_system:
         if key == "TZAP.linux.project-id" {
             return !cfg!(target_os = "linux") || !include_system;
         }
-        if key == "TZAP.linux.whiteout" || key.starts_with("TZAP.posix.device-") {
+        if key == "TZAP.linux.whiteout" {
             return !cfg!(target_os = "linux") || !include_system;
+        }
+        if key.starts_with("TZAP.posix.device-") {
+            return !cfg!(any(target_os = "linux", target_os = "macos")) || !include_system;
         }
         if key == "TZAP.windows.file-attributes" {
             if !cfg!(windows) || metadata.declaration.source_os != "windows" {
@@ -3725,21 +3853,20 @@ fn native_primary_restore_unsupported(metadata: &MemberMetadata, include_system:
             return !cfg!(target_os = "macos");
         }
         if key == "TZAP.macos.st-flags" {
+            let flags = metadata
+                .primary_records
+                .get(key)
+                .and_then(|value| parse_macos_flags(value).ok());
             return !cfg!(target_os = "macos")
                 || metadata.declaration.source_os != "macos"
-                || metadata
-                    .primary_records
-                    .get(key)
-                    .and_then(|value| std::str::from_utf8(value).ok())
-                    .and_then(|value| u64::from_str_radix(value, 16).ok())
-                    .is_none_or(|flags| flags > u64::from(u32::MAX))
-                || (metadata
-                    .primary_records
-                    .get(key)
-                    .and_then(|value| std::str::from_utf8(value).ok())
-                    .and_then(|value| u64::from_str_radix(value, 16).ok())
-                    .is_some_and(|flags| flags & 0x0006_0006 != 0)
-                    && !include_system);
+                || flags.is_none_or(|flags| {
+                    if macos_flags_require_system(flags) && !include_system {
+                        false
+                    } else {
+                        !macos_flags_supported(flags)
+                            || include_system && !macos_system_flags_privileges_available(flags)
+                    }
+                });
         }
         if key.starts_with("SCHILY.acl.") || key.starts_with("TZAP.acl.") {
             return !cfg!(target_os = "linux");
@@ -4114,6 +4241,10 @@ impl<'a> FilesystemRestoreHandler<'a> {
             }
         }
         diagnostics.append(&mut self.planned_diagnostics);
+        if self.skipped_reparse_placeholder || self.skipped_by_policy {
+            self.staged_auxiliary.clear();
+            return Ok(diagnostics);
+        }
         if !matches!(member.kind, TarEntryKind::Regular | TarEntryKind::Directory)
             && !self.staged_auxiliary.is_empty()
         {
@@ -4121,12 +4252,6 @@ impl<'a> FilesystemRestoreHandler<'a> {
                 "native auxiliary payload was not restored for its archive member",
             )
             .into());
-        }
-        if self.skipped_reparse_placeholder {
-            return Ok(diagnostics);
-        }
-        if self.skipped_by_policy {
-            return Ok(diagnostics);
         }
         if member.reparse_placeholder {
             return Ok(diagnostics);
@@ -4245,6 +4370,7 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
             || !native_auxiliary_restore_supported(
                 record,
                 self.options.restore_policy == RestorePolicy::System,
+                None,
             )
             || !matches!(
                 record.kind.as_str(),
@@ -4334,6 +4460,13 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
             member.reparse_placeholder,
             self.options,
         )?;
+        self.staged_auxiliary.retain(|item| {
+            native_auxiliary_restore_supported(
+                &item.record,
+                self.options.restore_policy == RestorePolicy::System,
+                Some(member.kind),
+            )
+        });
         let restore_exact_windows_reparse = cfg!(windows)
             && self.options.restore_policy == RestorePolicy::System
             && self.options.system_authorized
@@ -4348,13 +4481,13 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
             self.skipped_by_policy = true;
             return Ok(());
         }
-        let restore_linux_special = cfg!(target_os = "linux")
+        let restore_posix_special = cfg!(any(target_os = "linux", target_os = "macos"))
             && self.options.restore_policy == RestorePolicy::System
             && self.options.system_authorized;
         if matches!(
             member.kind,
             TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
-        ) && !restore_linux_special
+        ) && !restore_posix_special
         {
             self.skipped_by_policy = true;
             return Ok(());
@@ -4475,7 +4608,11 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                                     &mut self.planned_diagnostics,
                                 )?;
                             }
-                            #[cfg(all(not(windows), not(target_os = "linux")))]
+                            #[cfg(all(
+                                not(windows),
+                                not(target_os = "linux"),
+                                not(target_os = "macos")
+                            ))]
                             self.staged_auxiliary.clear();
                         }
                         if self.options.restore_policy != RestorePolicy::Content {
@@ -4502,13 +4639,28 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                                     &mut self.planned_diagnostics,
                                 )?;
                             }
-                            apply_restored_symlink_mtime(
+                            apply_restored_macos_symlink_metadata(
                                 &destination,
                                 &member.path,
-                                member.v45_metadata.portable_mirror.mtime,
+                                &member.v45_metadata,
+                                &mut self.staged_auxiliary,
                                 self.options,
                                 &mut self.planned_diagnostics,
                             )?;
+                            if member.v45_metadata.declaration.source_os != "macos"
+                                || !matches!(
+                                    self.options.restore_policy,
+                                    RestorePolicy::SameOs | RestorePolicy::System
+                                )
+                            {
+                                apply_restored_symlink_mtime(
+                                    &destination,
+                                    &member.path,
+                                    member.v45_metadata.portable_mirror.mtime,
+                                    self.options,
+                                    &mut self.planned_diagnostics,
+                                )?;
+                            }
                         }
                         #[cfg(windows)]
                         if member.v45_metadata.declaration.source_os == "windows"
@@ -4589,7 +4741,10 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                 }
             }
             TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo => {
-                if let Err(error) = create_linux_special_object(
+                if self.options.restore_policy != RestorePolicy::System {
+                    return Ok(());
+                }
+                if let Err(error) = create_posix_special_object(
                     &destination,
                     &member.path,
                     member.kind,
@@ -5067,13 +5222,29 @@ fn restore_tar_member(
                     options,
                     &mut diagnostics,
                 )?;
-                apply_restored_symlink_mtime(
+                let mut staged = Vec::new();
+                apply_restored_macos_symlink_metadata(
                     &destination,
                     &member.path,
-                    metadata.portable_mirror.mtime,
+                    metadata,
+                    &mut staged,
                     options,
                     &mut diagnostics,
                 )?;
+                if metadata.declaration.source_os != "macos"
+                    || !matches!(
+                        options.restore_policy,
+                        RestorePolicy::SameOs | RestorePolicy::System
+                    )
+                {
+                    apply_restored_symlink_mtime(
+                        &destination,
+                        &member.path,
+                        metadata.portable_mirror.mtime,
+                        options,
+                        &mut diagnostics,
+                    )?;
+                }
             }
         }
         TarEntryKind::Hardlink => {
@@ -5227,12 +5398,29 @@ fn apply_restored_regular_file_metadata_parts(
     if let Some(member_metadata) = member_metadata {
         apply_regular_file_posix_acl(file, path, member_metadata, options, diagnostics)?;
         if let Some(staged) = staged_auxiliary {
-            apply_generic_xattr_auxiliaries(file, path, staged, options, diagnostics)?;
             apply_macos_native_metadata(file, path, member_metadata, staged, options, diagnostics)?;
+            apply_generic_xattr_auxiliaries(file, path, staged, options, diagnostics)?;
         }
         apply_regular_file_xattrs(file, path, member_metadata, options, diagnostics)?;
     }
-    apply_regular_file_mtime(file, path, mtime, options, diagnostics)?;
+    if member_metadata.is_some_and(|metadata| {
+        metadata.declaration.source_os == "macos"
+            && matches!(
+                options.restore_policy,
+                RestorePolicy::SameOs | RestorePolicy::System
+            )
+    }) {
+        apply_macos_file_timestamps(
+            file,
+            path,
+            member_metadata.unwrap(),
+            mtime,
+            options,
+            diagnostics,
+        )?;
+    } else {
+        apply_regular_file_mtime(file, path, mtime, options, diagnostics)?;
+    }
     apply_regular_file_attributes(file, path, attributes, options, diagnostics)?;
     if let Some(member_metadata) = member_metadata {
         apply_windows_security_descriptor(file, path, member_metadata, options, diagnostics)?;
@@ -5435,7 +5623,7 @@ fn restore_windows_efs_temp(
     destination: &PreparedDestination,
     temp_leaf: &Path,
     mut output: fs::File,
-    staged: &mut Vec<StagedAuxiliary>,
+    staged: &mut [StagedAuxiliary],
     options: SafeExtractionOptions,
 ) -> Result<fs::File, FormatError> {
     use std::os::windows::fs::MetadataExt as _;
@@ -5544,7 +5732,7 @@ fn restore_windows_efs_temp(
     _destination: &PreparedDestination,
     _temp_leaf: &Path,
     output: fs::File,
-    staged: &mut Vec<StagedAuxiliary>,
+    staged: &mut [StagedAuxiliary],
     _options: SafeExtractionOptions,
 ) -> Result<fs::File, FormatError> {
     if staged
@@ -6111,6 +6299,43 @@ fn apply_generic_xattr_auxiliaries(
 }
 
 #[cfg(target_os = "macos")]
+fn open_macos_resource_fork(file: &fs::File, write: bool) -> std::io::Result<fs::File> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut path = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: `path` is writable for PATH_MAX bytes and F_GETPATH writes a NUL-terminated path.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let length = path.iter().position(|byte| *byte == 0).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macOS returned an unterminated descriptor path",
+        )
+    })?;
+    path.truncate(length);
+    path.extend_from_slice(b"/..namedfork/rsrc");
+    let path = PathBuf::from(OsString::from_vec(path));
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    if write {
+        options.write(true).truncate(true).create(true);
+    }
+    let fork = options.open(path)?;
+    let owner = file.metadata()?;
+    let fork_metadata = fork.metadata()?;
+    #[allow(clippy::unnecessary_cast)]
+    if owner.dev() != fork_metadata.dev() || owner.ino() != fork_metadata.ino() {
+        return Err(std::io::Error::other(
+            "resource fork path no longer identifies the pinned file",
+        ));
+    }
+    Ok(fork)
+}
+
+#[cfg(target_os = "macos")]
 fn apply_macos_native_metadata(
     file: &fs::File,
     path: &[u8],
@@ -6119,8 +6344,7 @@ fn apply_macos_native_metadata(
     options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Result<(), FormatError> {
-    use std::ffi::{c_char, c_int, c_void, OsStr};
-    use std::os::macos::fs::MetadataExt as _;
+    use std::ffi::{c_int, c_void, OsStr};
     use std::os::unix::ffi::OsStrExt as _;
     use xattr::FileExt as _;
 
@@ -6134,23 +6358,6 @@ fn apply_macos_native_metadata(
     }
 
     extern "C" {
-        fn fgetxattr(
-            fd: c_int,
-            name: *const c_char,
-            value: *mut c_void,
-            size: usize,
-            position: u32,
-            options: c_int,
-        ) -> libc::ssize_t;
-        fn fsetxattr(
-            fd: c_int,
-            name: *const c_char,
-            value: *const c_void,
-            size: usize,
-            position: u32,
-            options: c_int,
-        ) -> c_int;
-        fn fremovexattr(fd: c_int, name: *const c_char, options: c_int) -> c_int;
         fn acl_copy_int(buffer: *const c_void) -> *mut c_void;
         fn acl_copy_ext(
             buffer: *mut c_void,
@@ -6164,12 +6371,6 @@ fn apply_macos_native_metadata(
     }
 
     const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
-    const ACL_MAX_ENTRIES: usize = 128;
-    const DARWIN_EXTERNAL_ACL_HEADER: usize = 40;
-    const DARWIN_EXTERNAL_ACE_SIZE: usize = 28;
-    const DARWIN_EXTERNAL_ACL_MAGIC: [u8; 4] = [0x01, 0x2c, 0xc1, 0x6d];
-    const XATTR_CREATE: c_int = 0x0002;
-    const RESOURCE_FORK: &[u8] = b"com.apple.ResourceFork\0";
 
     let fail = |diagnostics: &mut Vec<MetadataDiagnostic>,
                 class: &'static str,
@@ -6190,8 +6391,15 @@ fn apply_macos_native_metadata(
         record_metadata_application_failure(diagnostics, diagnostic, options, message)
     };
 
+    let mut items = std::mem::take(staged);
+    items.sort_by_key(|item| match item.record.kind.as_str() {
+        "macos.resource-fork" => 0,
+        "macos.acl-native" => 1,
+        "macos.finder-info" => 2,
+        _ => 3,
+    });
     let mut remaining = Vec::new();
-    for mut item in std::mem::take(staged) {
+    for mut item in items {
         match item.record.kind.as_str() {
             "macos.finder-info" => {
                 if item.record.logical_size != 32 {
@@ -6233,133 +6441,69 @@ fn apply_macos_native_metadata(
                         "failed to rewind staged macOS resource fork",
                     )
                 })?;
-                let name = RESOURCE_FORK.as_ptr().cast::<c_char>();
-                // Start from an absent fork so an existing merged directory cannot retain
-                // authenticated trailing bytes from a longer pre-existing resource fork.
-                // SAFETY: the descriptor is live and the xattr name is NUL-terminated.
-                if unsafe { fremovexattr(file.as_raw_fd(), name, 0) } != 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ENOATTR) {
+                let mut fork = match open_macos_resource_fork(file, true) {
+                    Ok(fork) => fork,
+                    Err(error) => {
                         fail(
                             diagnostics,
                             "resource-fork",
-                            "failed to replace existing macOS resource fork",
+                            "failed to open macOS resource fork",
                             Some(&error),
                         )?;
                         continue;
                     }
-                }
-                let mut offset = 0u64;
-                let mut buffer = vec![0u8; 1024 * 1024];
-                if item.record.logical_size == 0 {
-                    // SAFETY: the descriptor is live and the xattr name is NUL-terminated.
-                    if unsafe {
-                        fsetxattr(file.as_raw_fd(), name, std::ptr::null(), 0, 0, XATTR_CREATE)
-                    } != 0
-                    {
-                        let error = std::io::Error::last_os_error();
-                        fail(
-                            diagnostics,
-                            "resource-fork",
-                            "failed to create macOS resource fork",
-                            Some(&error),
-                        )?;
-                        continue;
-                    }
-                }
-                while offset < item.record.logical_size {
-                    let count = usize::try_from(
-                        (item.record.logical_size - offset).min(buffer.len() as u64),
-                    )
-                    .unwrap();
-                    item.file.read_exact(&mut buffer[..count]).map_err(|_| {
-                        FormatError::FilesystemExtractionFailed(
-                            "failed to read staged macOS resource fork",
-                        )
-                    })?;
-                    let position = u32::try_from(offset).map_err(|_| {
-                        FormatError::ReaderUnsupported(
-                            "macOS resource fork exceeds Darwin xattr position range",
-                        )
-                    })?;
-                    // SAFETY: all pointers describe live buffers and the exact byte count.
-                    if unsafe {
-                        fsetxattr(
-                            file.as_raw_fd(),
-                            name,
-                            buffer.as_ptr().cast(),
-                            count,
-                            position,
-                            if offset == 0 { XATTR_CREATE } else { 0 },
-                        )
-                    } != 0
-                    {
-                        let error = std::io::Error::last_os_error();
-                        fail(
-                            diagnostics,
-                            "resource-fork",
-                            "failed to write macOS resource fork",
-                            Some(&error),
-                        )?;
-                        break;
-                    }
-                    offset += count as u64;
-                }
-                // SAFETY: this size query uses a live descriptor and NUL-terminated name.
-                let actual =
-                    unsafe { fgetxattr(file.as_raw_fd(), name, std::ptr::null_mut(), 0, 0, 0) };
-                if actual < 0 || actual as u64 != item.record.logical_size {
+                };
+                if std::io::copy(&mut item.file, &mut fork)
+                    .ok()
+                    .is_none_or(|copied| copied != item.record.logical_size)
+                    || fork.sync_all().is_err()
+                {
                     fail(
                         diagnostics,
                         "resource-fork",
-                        "macOS resource fork length did not verify after restoration",
+                        "failed to write macOS resource fork",
                         None,
                     )?;
                 } else {
+                    drop(fork);
+                    let mut fork = open_macos_resource_fork(file, false).map_err(|_| {
+                        FormatError::FilesystemExtractionFailed(
+                            "failed to reopen macOS resource fork for verification",
+                        )
+                    })?;
                     item.file.seek(SeekFrom::Start(0)).map_err(|_| {
                         FormatError::FilesystemExtractionFailed(
                             "failed to rewind staged macOS resource fork",
                         )
                     })?;
-                    let mut verify_offset = 0u64;
-                    let mut actual_buffer = vec![0u8; buffer.len()];
-                    while verify_offset < item.record.logical_size {
-                        let count = usize::try_from(
-                            (item.record.logical_size - verify_offset).min(buffer.len() as u64),
-                        )
-                        .unwrap();
-                        item.file.read_exact(&mut buffer[..count]).map_err(|_| {
-                            FormatError::FilesystemExtractionFailed(
-                                "failed to read staged macOS resource fork",
-                            )
-                        })?;
-                        // SAFETY: the destination buffer is writable for `count` bytes.
-                        let read = unsafe {
-                            fgetxattr(
-                                file.as_raw_fd(),
-                                name,
-                                actual_buffer.as_mut_ptr().cast(),
-                                count,
-                                u32::try_from(verify_offset).map_err(|_| {
-                                    FormatError::ReaderUnsupported(
-                                        "macOS resource fork exceeds Darwin xattr position range",
-                                    )
-                                })?,
-                                0,
-                            )
-                        };
-                        if read != count as libc::ssize_t
-                            || actual_buffer[..count] != buffer[..count]
+                    let mut expected = vec![0u8; 1024 * 1024];
+                    let mut actual = vec![0u8; 1024 * 1024];
+                    let mut remaining = item.record.logical_size;
+                    let mut verified = true;
+                    while remaining > 0 {
+                        let count = expected
+                            .len()
+                            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+                        if item.file.read_exact(&mut expected[..count]).is_err()
+                            || fork.read_exact(&mut actual[..count]).is_err()
+                            || expected[..count] != actual[..count]
                         {
-                            fail(
-                                diagnostics,
-                                "resource-fork",
-                                "macOS resource fork content did not verify after restoration",
-                                None,
-                            )?;
+                            verified = false;
                             break;
                         }
-                        verify_offset += count as u64;
+                        remaining -= count as u64;
+                    }
+                    let mut trailing = [0u8; 1];
+                    if verified && fork.read(&mut trailing).ok() != Some(0) {
+                        verified = false;
+                    }
+                    if !verified {
+                        fail(
+                            diagnostics,
+                            "resource-fork",
+                            "macOS resource fork content did not verify after restoration",
+                            None,
+                        )?;
                     }
                 }
             }
@@ -6374,28 +6518,7 @@ fn apply_macos_native_metadata(
                 item.file.read_exact(&mut value).map_err(|_| {
                     FormatError::FilesystemExtractionFailed("failed to read staged macOS ACL")
                 })?;
-                if value.get(..4) != Some(DARWIN_EXTERNAL_ACL_MAGIC.as_slice()) {
-                    return Err(FormatError::InvalidArchive(
-                        "macOS ACL external form has an invalid magic value",
-                    ));
-                }
-                let entry_count = value
-                    .get(36..40)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .map(u32::from_be_bytes)
-                    .ok_or(FormatError::InvalidArchive(
-                        "macOS ACL external form is truncated",
-                    ))? as usize;
-                let expected = DARWIN_EXTERNAL_ACL_HEADER
-                    .checked_add(entry_count.checked_mul(DARWIN_EXTERNAL_ACE_SIZE).ok_or(
-                        FormatError::InvalidArchive("macOS ACL entry count overflows"),
-                    )?)
-                    .ok_or(FormatError::InvalidArchive("macOS ACL size overflows"))?;
-                if entry_count > ACL_MAX_ENTRIES || expected != value.len() {
-                    return Err(FormatError::InvalidArchive(
-                        "macOS ACL external form has an invalid size",
-                    ));
-                }
+                validate_darwin_acl_external(&value)?;
                 // SAFETY: the external form was structurally bounded above; returned ACLs are freed.
                 let acl = unsafe { acl_copy_int(value.as_ptr().cast()) };
                 if acl.is_null() || unsafe { acl_size(acl) } != size as libc::ssize_t {
@@ -6450,75 +6573,6 @@ fn apply_macos_native_metadata(
     }
     *staged = remaining;
 
-    if let Some(encoded) = metadata.primary_records.get("LIBARCHIVE.creationtime") {
-        #[repr(C)]
-        struct AttrList {
-            bitmap_count: u16,
-            reserved: u16,
-            common_attr: u32,
-            volume_attr: u32,
-            directory_attr: u32,
-            file_attr: u32,
-            fork_attr: u32,
-        }
-        extern "C" {
-            fn fsetattrlist(
-                fd: c_int,
-                attributes: *const AttrList,
-                buffer: *const c_void,
-                size: usize,
-                options: u32,
-            ) -> c_int;
-        }
-        let (seconds, nanoseconds) = parse_timestamp(encoded)?;
-        let timestamp = libc::timespec {
-            tv_sec: seconds,
-            tv_nsec: i64::from(nanoseconds),
-        };
-        let attributes = AttrList {
-            bitmap_count: 5,
-            reserved: 0,
-            common_attr: 0x0000_0200,
-            volume_attr: 0,
-            directory_attr: 0,
-            file_attr: 0,
-            fork_attr: 0,
-        };
-        if unsafe {
-            fsetattrlist(
-                file.as_raw_fd(),
-                &attributes,
-                (&timestamp as *const libc::timespec).cast(),
-                std::mem::size_of::<libc::timespec>(),
-                0,
-            )
-        } != 0
-        {
-            let error = std::io::Error::last_os_error();
-            fail(
-                diagnostics,
-                "creation-time",
-                "failed to apply macOS creation time",
-                Some(&error),
-            )?;
-        } else {
-            let actual = file.metadata().map_err(|_| {
-                FormatError::FilesystemExtractionFailed(
-                    "failed to inspect restored macOS creation time",
-                )
-            })?;
-            if (actual.st_birthtime(), actual.st_birthtime_nsec() as u32) != (seconds, nanoseconds)
-            {
-                fail(
-                    diagnostics,
-                    "creation-time",
-                    "macOS creation time did not verify after restoration",
-                    None,
-                )?;
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -6528,6 +6582,129 @@ fn apply_macos_native_metadata(
     _path: &[u8],
     _metadata: &MemberMetadata,
     _staged: &mut Vec<StagedAuxiliary>,
+    _options: SafeExtractionOptions,
+    _diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn apply_macos_file_timestamps(
+    file: &fs::File,
+    path: &[u8],
+    metadata: &MemberMetadata,
+    mtime: (i64, u32),
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use std::ffi::{c_int, c_void};
+    use std::os::macos::fs::MetadataExt as _;
+
+    #[repr(C)]
+    struct AttrList {
+        bitmap_count: u16,
+        reserved: u16,
+        common_attr: u32,
+        volume_attr: u32,
+        directory_attr: u32,
+        file_attr: u32,
+        fork_attr: u32,
+    }
+    extern "C" {
+        fn fsetattrlist(
+            fd: c_int,
+            attributes: *const c_void,
+            buffer: *const c_void,
+            size: usize,
+            options: u32,
+        ) -> c_int;
+    }
+    let mut common_attr = 0x0000_0400;
+    let mut times = Vec::<libc::timespec>::new();
+    let creation_time = metadata
+        .primary_records
+        .get("LIBARCHIVE.creationtime")
+        .map(|encoded| parse_timestamp(encoded))
+        .transpose()?;
+    if let Some((seconds, nanoseconds)) = creation_time {
+        common_attr |= 0x0000_0200;
+        times.push(libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: i64::from(nanoseconds),
+        });
+    }
+    times.push(libc::timespec {
+        tv_sec: mtime.0,
+        tv_nsec: i64::from(mtime.1),
+    });
+    let attributes = AttrList {
+        bitmap_count: 5,
+        reserved: 0,
+        common_attr,
+        volume_attr: 0,
+        directory_attr: 0,
+        file_attr: 0,
+        fork_attr: 0,
+    };
+    if unsafe {
+        fsetattrlist(
+            file.as_raw_fd(),
+            (&attributes as *const AttrList).cast(),
+            times.as_ptr().cast(),
+            times.len() * std::mem::size_of::<libc::timespec>(),
+            0,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "macos-backup-v1",
+                "timestamps",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to apply macOS timestamps",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "failed to apply macOS timestamps",
+        );
+    }
+    let actual = file.metadata().map_err(|_| {
+        FormatError::FilesystemExtractionFailed("failed to inspect restored macOS timestamps")
+    })?;
+    if (actual.st_mtime(), actual.st_mtime_nsec() as u32) != mtime
+        || creation_time.is_some_and(|creation| {
+            (actual.st_birthtime(), actual.st_birthtime_nsec() as u32) != creation
+        })
+    {
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "macos-backup-v1",
+                "timestamps",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "macOS timestamps did not verify after restoration",
+            )
+            .for_restore(options.restore_policy, 4),
+            options,
+            "macOS timestamps did not verify after restoration",
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn apply_macos_file_timestamps(
+    _file: &fs::File,
+    _path: &[u8],
+    _metadata: &MemberMetadata,
+    _mtime: (i64, u32),
     _options: SafeExtractionOptions,
     _diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Result<(), FormatError> {
@@ -6555,18 +6732,19 @@ fn apply_macos_file_flags(
     let Some(encoded) = metadata.primary_records.get("TZAP.macos.st-flags") else {
         return Ok(());
     };
-    let desired = std::str::from_utf8(encoded)
-        .ok()
-        .and_then(|value| u64::from_str_radix(value, 16).ok())
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or(FormatError::InvalidArchive("invalid macOS file flags"))?;
-    let no_change = desired & 0x0006_0006 != 0;
-    if no_change && !(options.restore_policy == RestorePolicy::System && options.system_authorized)
+    let desired = parse_macos_flags(encoded)? & MACOS_KNOWN_SETTABLE_FLAGS;
+    if macos_flags_require_system(desired)
+        && !(options.restore_policy == RestorePolicy::System && options.system_authorized)
     {
         return Ok(());
     }
+    let retained_unknown = file
+        .metadata()
+        .map(|value| value.st_flags() & !MACOS_KNOWN_SETTABLE_FLAGS)
+        .unwrap_or(0);
+    let applied = retained_unknown | desired;
     // SAFETY: `file` owns a live descriptor and the desired value was range checked.
-    if unsafe { libc::fchflags(file.as_raw_fd(), desired) } != 0 {
+    if unsafe { libc::fchflags(file.as_raw_fd(), applied) } != 0 {
         let error = std::io::Error::last_os_error();
         return record_metadata_application_failure(
             diagnostics,
@@ -6584,7 +6762,12 @@ fn apply_macos_file_flags(
             "failed to apply macOS file flags",
         );
     }
-    if file.metadata().map(|value| value.st_flags()).ok() != Some(desired) {
+    if file
+        .metadata()
+        .map(|value| value.st_flags() & MACOS_KNOWN_SETTABLE_FLAGS)
+        .ok()
+        != Some(desired)
+    {
         return record_metadata_application_failure(
             diagnostics,
             MetadataDiagnostic::new(
@@ -8784,6 +8967,620 @@ fn apply_restored_linux_symlink_metadata(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn apply_restored_macos_symlink_metadata(
+    destination: &PreparedDestination,
+    path: &[u8],
+    metadata: &MemberMetadata,
+    staged: &mut Vec<StagedAuxiliary>,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use std::ffi::{c_char, c_int, c_void, CString};
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    if metadata.declaration.source_os != "macos"
+        || !matches!(
+            options.restore_policy,
+            RestorePolicy::SameOs | RestorePolicy::System
+        )
+    {
+        return Ok(());
+    }
+    let current = destination
+        .parent
+        .symlink_metadata(&destination.leaf)
+        .map_err(|_| FormatError::UnsafeArchivePath)?;
+    if !current.file_type().is_symlink() {
+        return Err(FormatError::UnsafeArchivePath);
+    }
+    let leaf = destination.leaf.as_os_str().as_bytes();
+    let leaf_c = CString::new(leaf).map_err(|_| FormatError::UnsafeArchivePath)?;
+    const O_SYMLINK: c_int = 0x0020_0000;
+    // SAFETY: the parent directory is pinned and `leaf_c` is a validated single path component.
+    let link_fd = unsafe {
+        libc::openat(
+            destination.parent.as_raw_fd(),
+            leaf_c.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | O_SYMLINK | 0x0000_1000,
+        )
+    };
+    if link_fd < 0 {
+        return Err(FormatError::UnsafeArchivePath);
+    }
+    // SAFETY: `openat` returned a new owned descriptor.
+    let link_fd = unsafe { OwnedFd::from_raw_fd(link_fd) };
+    let mut pinned_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(link_fd.as_raw_fd(), pinned_stat.as_mut_ptr()) } != 0
+        || unsafe { pinned_stat.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFLNK
+    {
+        return Err(FormatError::UnsafeArchivePath);
+    }
+
+    extern "C" {
+        fn fgetxattr(
+            fd: c_int,
+            name: *const c_char,
+            value: *mut c_void,
+            size: usize,
+            position: u32,
+            options: c_int,
+        ) -> libc::ssize_t;
+        fn fsetxattr(
+            fd: c_int,
+            name: *const c_char,
+            value: *const c_void,
+            size: usize,
+            position: u32,
+            options: c_int,
+        ) -> c_int;
+        fn fremovexattr(fd: c_int, name: *const c_char, options: c_int) -> c_int;
+        fn acl_copy_int(buffer: *const c_void) -> *mut c_void;
+        fn acl_copy_ext(
+            buffer: *mut c_void,
+            acl: *mut c_void,
+            size: libc::ssize_t,
+        ) -> libc::ssize_t;
+        fn acl_size(acl: *mut c_void) -> libc::ssize_t;
+        fn acl_set_fd_np(fd: c_int, acl: *mut c_void, acl_type: c_int) -> c_int;
+        fn acl_get_fd_np(fd: c_int, acl_type: c_int) -> *mut c_void;
+        fn acl_free(object: *mut c_void) -> c_int;
+        fn fsetattrlist(
+            fd: c_int,
+            attributes: *const c_void,
+            buffer: *const c_void,
+            size: usize,
+            options: u32,
+        ) -> c_int;
+        fn fchflags(fd: c_int, flags: u32) -> c_int;
+    }
+    const XATTR_CREATE: c_int = 0x0002;
+    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+    const RESOURCE_FORK: &[u8] = b"com.apple.ResourceFork\0";
+    const FINDER_INFO: &[u8] = b"com.apple.FinderInfo\0";
+
+    let fail = |diagnostics: &mut Vec<MetadataDiagnostic>,
+                class: &'static str,
+                message: &'static str,
+                error: Option<&std::io::Error>| {
+        let mut diagnostic = MetadataDiagnostic::new(
+            path,
+            "macos-backup-v1",
+            class,
+            MetadataOperation::Restore,
+            MetadataDiagnosticStatus::Failed,
+            message,
+        )
+        .for_restore(options.restore_policy, 4);
+        if let Some(error) = error {
+            diagnostic = diagnostic.with_native_error(error);
+        }
+        record_metadata_application_failure(diagnostics, diagnostic, options, message)
+    };
+
+    if options.restore_policy == RestorePolicy::System && options.system_authorized {
+        if let (Some(uid), Some(gid)) = (metadata.portable_mirror.uid, metadata.portable_mirror.gid)
+        {
+            let uid = libc::uid_t::try_from(uid).map_err(|_| {
+                FormatError::FilesystemExtractionFailed("archived UID exceeds host uid_t")
+            })?;
+            let gid = libc::gid_t::try_from(gid).map_err(|_| {
+                FormatError::FilesystemExtractionFailed("archived GID exceeds host gid_t")
+            })?;
+            if unsafe { libc::fchown(link_fd.as_raw_fd(), uid, gid) } != 0 {
+                let error = std::io::Error::last_os_error();
+                fail(
+                    diagnostics,
+                    "numeric-ownership",
+                    "failed to apply macOS symlink ownership",
+                    Some(&error),
+                )?;
+            }
+        }
+    }
+
+    let mut items = std::mem::take(staged);
+    items.sort_by_key(|item| match item.record.kind.as_str() {
+        "macos.resource-fork" => 0,
+        "macos.acl-native" => 1,
+        "macos.finder-info" => 2,
+        "generic.xattr" => 3,
+        _ => 4,
+    });
+    let mut remaining = Vec::new();
+    for mut item in items {
+        if item.record.restore_class == RestoreClass::System
+            && !(options.restore_policy == RestorePolicy::System && options.system_authorized)
+        {
+            continue;
+        }
+        match item.record.kind.as_str() {
+            "macos.resource-fork" => {
+                let name = RESOURCE_FORK.as_ptr().cast::<c_char>();
+                if unsafe { fremovexattr(link_fd.as_raw_fd(), name, 0) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ENOATTR) {
+                        fail(
+                            diagnostics,
+                            "resource-fork",
+                            "failed to replace macOS symlink resource fork",
+                            Some(&error),
+                        )?;
+                        continue;
+                    }
+                }
+                item.file.seek(SeekFrom::Start(0)).map_err(|_| {
+                    FormatError::FilesystemExtractionFailed(
+                        "failed to rewind staged macOS symlink resource fork",
+                    )
+                })?;
+                let mut offset = 0u64;
+                let mut buffer = vec![0u8; 1024 * 1024];
+                if item.record.logical_size == 0
+                    && unsafe {
+                        fsetxattr(
+                            link_fd.as_raw_fd(),
+                            name,
+                            std::ptr::null(),
+                            0,
+                            0,
+                            XATTR_CREATE,
+                        )
+                    } != 0
+                {
+                    let error = std::io::Error::last_os_error();
+                    fail(
+                        diagnostics,
+                        "resource-fork",
+                        "failed to create macOS symlink resource fork",
+                        Some(&error),
+                    )?;
+                    continue;
+                }
+                while offset < item.record.logical_size {
+                    let count = usize::try_from(
+                        (item.record.logical_size - offset).min(buffer.len() as u64),
+                    )
+                    .unwrap();
+                    item.file.read_exact(&mut buffer[..count]).map_err(|_| {
+                        FormatError::FilesystemExtractionFailed(
+                            "failed to read staged macOS symlink resource fork",
+                        )
+                    })?;
+                    if unsafe {
+                        fsetxattr(
+                            link_fd.as_raw_fd(),
+                            name,
+                            buffer.as_ptr().cast(),
+                            count,
+                            u32::try_from(offset).map_err(|_| {
+                                FormatError::ReaderUnsupported(
+                                    "macOS resource fork exceeds Darwin xattr position range",
+                                )
+                            })?,
+                            if offset == 0 { XATTR_CREATE } else { 0 },
+                        )
+                    } != 0
+                    {
+                        let error = std::io::Error::last_os_error();
+                        fail(
+                            diagnostics,
+                            "resource-fork",
+                            "failed to write macOS symlink resource fork",
+                            Some(&error),
+                        )?;
+                        break;
+                    }
+                    offset += count as u64;
+                }
+                let actual =
+                    unsafe { fgetxattr(link_fd.as_raw_fd(), name, std::ptr::null_mut(), 0, 0, 0) };
+                if actual < 0 || actual as u64 != item.record.logical_size {
+                    fail(
+                        diagnostics,
+                        "resource-fork",
+                        "macOS symlink resource fork did not verify after restoration",
+                        None,
+                    )?;
+                } else {
+                    item.file.seek(SeekFrom::Start(0)).map_err(|_| {
+                        FormatError::FilesystemExtractionFailed(
+                            "failed to rewind staged macOS symlink resource fork",
+                        )
+                    })?;
+                    let mut expected = vec![0u8; 1024 * 1024];
+                    let mut restored = vec![0u8; 1024 * 1024];
+                    let mut verify_offset = 0u64;
+                    while verify_offset < item.record.logical_size {
+                        let count = usize::try_from(
+                            (item.record.logical_size - verify_offset).min(expected.len() as u64),
+                        )
+                        .unwrap();
+                        item.file.read_exact(&mut expected[..count]).map_err(|_| {
+                            FormatError::FilesystemExtractionFailed(
+                                "failed to read staged macOS symlink resource fork",
+                            )
+                        })?;
+                        let copied = unsafe {
+                            fgetxattr(
+                                link_fd.as_raw_fd(),
+                                name,
+                                restored.as_mut_ptr().cast(),
+                                count,
+                                u32::try_from(verify_offset).map_err(|_| {
+                                    FormatError::ReaderUnsupported(
+                                        "macOS resource fork exceeds Darwin xattr position range",
+                                    )
+                                })?,
+                                0,
+                            )
+                        };
+                        if copied != count as libc::ssize_t
+                            || restored[..count] != expected[..count]
+                        {
+                            fail(
+                                diagnostics,
+                                "resource-fork",
+                                "macOS symlink resource fork did not verify after restoration",
+                                None,
+                            )?;
+                            break;
+                        }
+                        verify_offset += count as u64;
+                    }
+                }
+            }
+            "macos.acl-native" => {
+                let size = usize::try_from(item.record.logical_size).map_err(|_| {
+                    FormatError::ReaderUnsupported("macOS ACL exceeds platform limits")
+                })?;
+                let mut value = vec![0u8; size];
+                item.file.seek(SeekFrom::Start(0)).map_err(|_| {
+                    FormatError::FilesystemExtractionFailed("failed to rewind staged macOS ACL")
+                })?;
+                item.file.read_exact(&mut value).map_err(|_| {
+                    FormatError::FilesystemExtractionFailed("failed to read staged macOS ACL")
+                })?;
+                validate_darwin_acl_external(&value)?;
+                let acl = unsafe { acl_copy_int(value.as_ptr().cast()) };
+                if acl.is_null() {
+                    return Err(FormatError::InvalidArchive(
+                        "macOS ACL external form is invalid",
+                    ));
+                }
+                if unsafe { acl_set_fd_np(link_fd.as_raw_fd(), acl, ACL_TYPE_EXTENDED) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    unsafe { acl_free(acl) };
+                    fail(
+                        diagnostics,
+                        "acl-native",
+                        "failed to apply native macOS symlink ACL",
+                        Some(&error),
+                    )?;
+                    continue;
+                }
+                unsafe { acl_free(acl) };
+                let restored = unsafe { acl_get_fd_np(link_fd.as_raw_fd(), ACL_TYPE_EXTENDED) };
+                if restored.is_null() || unsafe { acl_size(restored) } != size as libc::ssize_t {
+                    if !restored.is_null() {
+                        unsafe { acl_free(restored) };
+                    }
+                    fail(
+                        diagnostics,
+                        "acl-native",
+                        "native macOS symlink ACL did not verify after restoration",
+                        None,
+                    )?;
+                    continue;
+                }
+                let mut actual = vec![0u8; size];
+                let copied = unsafe {
+                    acl_copy_ext(actual.as_mut_ptr().cast(), restored, size as libc::ssize_t)
+                };
+                unsafe { acl_free(restored) };
+                if copied != size as libc::ssize_t || actual != value {
+                    fail(
+                        diagnostics,
+                        "acl-native",
+                        "native macOS symlink ACL did not verify after restoration",
+                        None,
+                    )?;
+                }
+            }
+            "macos.finder-info" | "generic.xattr" => {
+                let (name, class) = if item.record.kind == "macos.finder-info" {
+                    (FINDER_INFO.to_vec(), "finder-info")
+                } else {
+                    let mut name = item.record.decoded_name.clone();
+                    name.push(0);
+                    (name, "extended-attribute")
+                };
+                let value_len = usize::try_from(item.record.logical_size).map_err(|_| {
+                    FormatError::ReaderUnsupported("extended attribute exceeds platform limits")
+                })?;
+                let mut value = vec![0u8; value_len];
+                item.file.seek(SeekFrom::Start(0)).map_err(|_| {
+                    FormatError::FilesystemExtractionFailed(
+                        "failed to rewind staged macOS symlink xattr",
+                    )
+                })?;
+                item.file.read_exact(&mut value).map_err(|_| {
+                    FormatError::FilesystemExtractionFailed(
+                        "failed to read staged macOS symlink xattr",
+                    )
+                })?;
+                if item.record.kind == "macos.finder-info" && value.len() != 32 {
+                    return Err(FormatError::InvalidArchive(
+                        "macOS FinderInfo is not exactly 32 bytes",
+                    ));
+                }
+                if unsafe {
+                    fsetxattr(
+                        link_fd.as_raw_fd(),
+                        name.as_ptr().cast(),
+                        value.as_ptr().cast(),
+                        value.len(),
+                        0,
+                        0,
+                    )
+                } != 0
+                {
+                    let error = std::io::Error::last_os_error();
+                    fail(
+                        diagnostics,
+                        class,
+                        "failed to apply macOS symlink extended attribute",
+                        Some(&error),
+                    )?;
+                    continue;
+                }
+                let actual_len = unsafe {
+                    fgetxattr(
+                        link_fd.as_raw_fd(),
+                        name.as_ptr().cast(),
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                        0,
+                    )
+                };
+                let mut actual = vec![0u8; value.len()];
+                let copied = if actual_len == value.len() as libc::ssize_t {
+                    unsafe {
+                        fgetxattr(
+                            link_fd.as_raw_fd(),
+                            name.as_ptr().cast(),
+                            actual.as_mut_ptr().cast(),
+                            actual.len(),
+                            0,
+                            0,
+                        )
+                    }
+                } else {
+                    -1
+                };
+                if copied != value.len() as libc::ssize_t || actual != value {
+                    fail(
+                        diagnostics,
+                        class,
+                        "macOS symlink extended attribute did not verify after restoration",
+                        None,
+                    )?;
+                }
+            }
+            _ => remaining.push(item),
+        }
+    }
+    *staged = remaining;
+
+    for (key, encoded) in metadata
+        .primary_records
+        .iter()
+        .filter(|(key, _)| key.starts_with("LIBARCHIVE.xattr."))
+    {
+        let name = decode_percent_name(&key.as_bytes()["LIBARCHIVE.xattr.".len()..])?;
+        let system = system_xattr_name(&name, "macos");
+        if system && !(options.restore_policy == RestorePolicy::System && options.system_authorized)
+        {
+            continue;
+        }
+        let value = canonical_base64_decode(encoded)?;
+        let name = CString::new(name)
+            .map_err(|_| FormatError::InvalidArchive("xattr name contains NUL"))?;
+        if unsafe {
+            fsetxattr(
+                link_fd.as_raw_fd(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            fail(
+                diagnostics,
+                "extended-attribute",
+                "failed to apply macOS symlink extended attribute",
+                Some(&error),
+            )?;
+            continue;
+        }
+        let mut actual = vec![0u8; value.len()];
+        let copied = unsafe {
+            fgetxattr(
+                link_fd.as_raw_fd(),
+                name.as_ptr(),
+                actual.as_mut_ptr().cast(),
+                actual.len(),
+                0,
+                0,
+            )
+        };
+        if copied != value.len() as libc::ssize_t || actual != value {
+            fail(
+                diagnostics,
+                "extended-attribute",
+                "macOS symlink extended attribute did not verify after restoration",
+                None,
+            )?;
+        }
+    }
+
+    #[repr(C)]
+    struct AttrList {
+        bitmap_count: u16,
+        reserved: u16,
+        common_attr: u32,
+        volume_attr: u32,
+        directory_attr: u32,
+        file_attr: u32,
+        fork_attr: u32,
+    }
+    let mut common_attr = 0x0000_0400;
+    let mut times = Vec::<libc::timespec>::new();
+    if let Some(encoded) = metadata.primary_records.get("LIBARCHIVE.creationtime") {
+        let (seconds, nanoseconds) = parse_timestamp(encoded)?;
+        common_attr |= 0x0000_0200;
+        times.push(libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: i64::from(nanoseconds),
+        });
+    }
+    let (seconds, nanoseconds) = metadata.portable_mirror.mtime;
+    times.push(libc::timespec {
+        tv_sec: seconds,
+        tv_nsec: i64::from(nanoseconds),
+    });
+    let attributes = AttrList {
+        bitmap_count: 5,
+        reserved: 0,
+        common_attr,
+        volume_attr: 0,
+        directory_attr: 0,
+        file_attr: 0,
+        fork_attr: 0,
+    };
+    if unsafe {
+        fsetattrlist(
+            link_fd.as_raw_fd(),
+            (&attributes as *const AttrList).cast(),
+            times.as_ptr().cast(),
+            times.len() * std::mem::size_of::<libc::timespec>(),
+            0,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        fail(
+            diagnostics,
+            "timestamps",
+            "failed to apply macOS symlink timestamps",
+            Some(&error),
+        )?;
+    } else {
+        let mut actual = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let status = unsafe { libc::fstat(link_fd.as_raw_fd(), actual.as_mut_ptr()) };
+        let verified = if status == 0 {
+            let actual = unsafe { actual.assume_init() };
+            actual.st_mtime == seconds
+                && actual.st_mtime_nsec == i64::from(nanoseconds)
+                && metadata
+                    .primary_records
+                    .get("LIBARCHIVE.creationtime")
+                    .map(|encoded| parse_timestamp(encoded))
+                    .transpose()?
+                    .is_none_or(|(birth_seconds, birth_nanoseconds)| {
+                        actual.st_birthtime == birth_seconds
+                            && actual.st_birthtime_nsec == i64::from(birth_nanoseconds)
+                    })
+        } else {
+            false
+        };
+        if !verified {
+            fail(
+                diagnostics,
+                "timestamps",
+                "macOS symlink timestamps did not verify after restoration",
+                None,
+            )?;
+        }
+    }
+
+    if let Some(encoded) = metadata.primary_records.get("TZAP.macos.st-flags") {
+        let desired = parse_macos_flags(encoded)? & MACOS_KNOWN_SETTABLE_FLAGS;
+        if !macos_flags_require_system(desired)
+            || options.restore_policy == RestorePolicy::System && options.system_authorized
+        {
+            let mut before = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let retained_unknown =
+                if unsafe { libc::fstat(link_fd.as_raw_fd(), before.as_mut_ptr()) } == 0 {
+                    unsafe { before.assume_init() }.st_flags & !MACOS_KNOWN_SETTABLE_FLAGS
+                } else {
+                    0
+                };
+            if unsafe { fchflags(link_fd.as_raw_fd(), retained_unknown | desired) } != 0 {
+                let error = std::io::Error::last_os_error();
+                fail(
+                    diagnostics,
+                    "file-flags",
+                    "failed to apply macOS symlink flags",
+                    Some(&error),
+                )?;
+            } else {
+                let mut actual = std::mem::MaybeUninit::<libc::stat>::uninit();
+                let status = unsafe { libc::fstat(link_fd.as_raw_fd(), actual.as_mut_ptr()) };
+                let verified = status == 0
+                    && unsafe { actual.assume_init() }.st_flags & MACOS_KNOWN_SETTABLE_FLAGS
+                        == desired;
+                if !verified {
+                    fail(
+                        diagnostics,
+                        "file-flags",
+                        "macOS symlink flags did not verify after restoration",
+                        None,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn apply_restored_macos_symlink_metadata(
+    _destination: &PreparedDestination,
+    _path: &[u8],
+    _metadata: &MemberMetadata,
+    _staged: &mut Vec<StagedAuxiliary>,
+    _options: SafeExtractionOptions,
+    _diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    Ok(())
+}
+
 fn create_temp_regular_file(
     destination: &PreparedDestination,
 ) -> Result<(PathBuf, fs::File), FormatError> {
@@ -9331,7 +10128,7 @@ fn create_symlink(
 }
 
 #[cfg(target_os = "linux")]
-fn create_linux_special_object(
+fn create_posix_special_object(
     destination: &PreparedDestination,
     path: &[u8],
     kind: TarEntryKind,
@@ -9356,7 +10153,7 @@ fn create_linux_special_object(
         .map_err(|_| FormatError::UnsafeArchivePath)?;
     let permission_mode = metadata.portable_mirror.mode & 0o7777;
     let (object_mode, device) = match kind {
-        TarEntryKind::Fifo => (libc::S_IFIFO | permission_mode, 0),
+        TarEntryKind::Fifo => (u32::from(libc::S_IFIFO) | permission_mode, 0),
         TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice => {
             let major = metadata
                 .primary_records
@@ -9381,7 +10178,10 @@ fn create_linux_special_object(
             } else {
                 libc::S_IFBLK
             };
-            (type_mode | permission_mode, libc::makedev(major, minor))
+            (
+                u32::from(type_mode) | permission_mode,
+                libc::makedev(major, minor),
+            )
         }
         _ => {
             return Err(FormatError::WriterInvariant(
@@ -9643,8 +10443,120 @@ fn create_linux_special_object(
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-fn create_linux_special_object(
+#[cfg(target_os = "macos")]
+fn create_posix_special_object(
+    destination: &PreparedDestination,
+    path: &[u8],
+    kind: TarEntryKind,
+    metadata: &MemberMetadata,
+    staged: &mut Vec<StagedAuxiliary>,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    if options.restore_policy != RestorePolicy::System || !options.system_authorized {
+        return Err(FormatError::ReaderUnsupported(
+            "special POSIX objects require authorized system restore",
+        ));
+    }
+    if options.overwrite_existing {
+        remove_existing_leaf_if_needed(destination)?;
+    }
+    let leaf = CString::new(destination.leaf.as_os_str().as_bytes())
+        .map_err(|_| FormatError::UnsafeArchivePath)?;
+    let permission_mode = metadata.portable_mirror.mode & 0o7777;
+    let (object_mode, device) = match kind {
+        TarEntryKind::Fifo => (u32::from(libc::S_IFIFO) | permission_mode, 0),
+        TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice => {
+            let major = metadata
+                .primary_records
+                .get("TZAP.posix.device-major")
+                .ok_or(FormatError::InvalidArchive(
+                    "device major number is missing",
+                ))?;
+            let minor = metadata
+                .primary_records
+                .get("TZAP.posix.device-minor")
+                .ok_or(FormatError::InvalidArchive(
+                    "device minor number is missing",
+                ))?;
+            let major = libc::c_int::try_from(parse_minimal_decimal_u64(major, "device major")?)
+                .map_err(|_| FormatError::ReaderUnsupported("device major exceeds host ABI"))?;
+            let minor = libc::c_int::try_from(parse_minimal_decimal_u64(minor, "device minor")?)
+                .map_err(|_| FormatError::ReaderUnsupported("device minor exceeds host ABI"))?;
+            let type_mode = if kind == TarEntryKind::CharacterDevice {
+                libc::S_IFCHR
+            } else {
+                libc::S_IFBLK
+            };
+            (
+                u32::from(type_mode) | permission_mode,
+                libc::makedev(major, minor),
+            )
+        }
+        _ => {
+            return Err(FormatError::WriterInvariant(
+                "non-special member reached macOS special-object creation",
+            ));
+        }
+    };
+    if unsafe {
+        libc::mknodat(
+            destination.parent.as_raw_fd(),
+            leaf.as_ptr(),
+            object_mode as libc::mode_t,
+            device,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "posix-backup-v1",
+                "special-object",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to create macOS special object",
+            )
+            .for_restore(options.restore_policy, 2)
+            .with_native_error(&error),
+            options,
+            "failed to create macOS special object",
+        );
+    }
+
+    const O_EVTONLY: libc::c_int = 0x0000_8000;
+    let open_flags = if kind == TarEntryKind::Fifo {
+        libc::O_RDWR | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    } else {
+        libc::O_RDONLY | O_EVTONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    };
+    let fd = unsafe { libc::openat(destination.parent.as_raw_fd(), leaf.as_ptr(), open_flags) };
+    if fd < 0 {
+        let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
+        return Err(FormatError::FilesystemExtractionFailed(
+            "failed to pin restored macOS special object",
+        ));
+    }
+    let pinned = unsafe { fs::File::from_raw_fd(fd) };
+    apply_restored_regular_file_metadata_parts(
+        &pinned,
+        path,
+        RestoredRegularMetadata::from(&metadata.portable_mirror),
+        Some(metadata),
+        Some(staged),
+        options,
+        diagnostics,
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn create_posix_special_object(
     _destination: &PreparedDestination,
     _path: &[u8],
     _kind: TarEntryKind,
@@ -9654,7 +10566,7 @@ fn create_linux_special_object(
     _diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Result<(), FormatError> {
     Err(FormatError::ReaderUnsupported(
-        "Linux special-object restore is unavailable on this host",
+        "POSIX special-object restore is unavailable on this host",
     ))
 }
 
@@ -11026,6 +11938,256 @@ mod tests {
                 "requested native metadata is not supported by this conformance class"
             )
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_restore_plans_unknown_and_system_flags_without_silently_applying_them() {
+        let bytes = member(b"file.txt", b'0', b"payload", b"");
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+        let mut metadata = parsed.v45_metadata;
+        metadata.declaration.source_os = "macos".into();
+        metadata
+            .declaration
+            .required_profiles
+            .extend(["macos-backup-v1".into(), "posix-backup-v1".into()]);
+        metadata.declaration.required_profiles.sort();
+        metadata.declaration.required_profiles.dedup();
+        metadata.primary_has_native_scalar = true;
+        // UF_COMPRESSED is retained but deliberately not in the recognized/settable mask;
+        // UF_IMMUTABLE is recognized but System-class under the v45 restore policy.
+        metadata
+            .primary_records
+            .insert("TZAP.macos.st-flags".into(), b"0000000000000022".to_vec());
+
+        let diagnostics = plan_restore(
+            b"file.txt",
+            &metadata,
+            TarEntryKind::Regular,
+            false,
+            SafeExtractionOptions {
+                restore_policy: RestorePolicy::SameOs,
+                ..SafeExtractionOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.metadata_class == "unrecognized-file-flags"
+                && diagnostic.status == MetadataDiagnosticStatus::Skipped
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.metadata_class == "system-file-flags"
+                && diagnostic.status == MetadataDiagnosticStatus::Skipped
+        }));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_required_unknown_ordinary_flag_needs_explicit_degraded_restore() {
+        let bytes = member(b"file.txt", b'0', b"payload", b"");
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+        let mut metadata = parsed.v45_metadata;
+        metadata.declaration.source_os = "macos".into();
+        metadata
+            .declaration
+            .required_profiles
+            .extend(["macos-backup-v1".into(), "posix-backup-v1".into()]);
+        metadata.declaration.required_profiles.sort();
+        metadata.declaration.required_profiles.dedup();
+        metadata.primary_has_native_scalar = true;
+        metadata
+            .primary_records
+            .insert("TZAP.macos.st-flags".into(), b"0000000000000020".to_vec());
+
+        let strict = plan_restore(
+            b"file.txt",
+            &metadata,
+            TarEntryKind::Regular,
+            false,
+            SafeExtractionOptions {
+                restore_policy: RestorePolicy::SameOs,
+                ..SafeExtractionOptions::default()
+            },
+        );
+        assert_eq!(
+            strict.unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "requested native metadata is not supported by this conformance class"
+            )
+        );
+        let degraded = plan_restore(
+            b"file.txt",
+            &metadata,
+            TarEntryKind::Regular,
+            false,
+            SafeExtractionOptions {
+                restore_policy: RestorePolicy::SameOs,
+                allow_degraded: true,
+                ..SafeExtractionOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(degraded.iter().any(|diagnostic| {
+            diagnostic.metadata_class == "unrecognized-file-flags"
+                && diagnostic.status == MetadataDiagnosticStatus::Skipped
+        }));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unregistered_superuser_flag_stays_system_class() {
+        let bytes = member(b"file.txt", b'0', b"payload", b"");
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+        let mut metadata = parsed.v45_metadata;
+        metadata.declaration.source_os = "macos".into();
+        metadata
+            .declaration
+            .required_profiles
+            .extend(["macos-backup-v1".into(), "posix-backup-v1".into()]);
+        metadata.declaration.required_profiles.sort();
+        metadata.declaration.required_profiles.dedup();
+        metadata.primary_has_native_scalar = true;
+        // SF_NOUNLINK is Darwin System-class but is not registered for built-in application.
+        metadata
+            .primary_records
+            .insert("TZAP.macos.st-flags".into(), b"0000000000100000".to_vec());
+
+        let same_os = plan_restore(
+            b"file.txt",
+            &metadata,
+            TarEntryKind::Regular,
+            false,
+            SafeExtractionOptions {
+                restore_policy: RestorePolicy::SameOs,
+                ..SafeExtractionOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(same_os.iter().any(|diagnostic| {
+            diagnostic.metadata_class == "system-file-flags"
+                && diagnostic.status == MetadataDiagnosticStatus::Skipped
+        }));
+        assert_eq!(
+            plan_restore(
+                b"file.txt",
+                &metadata,
+                TarEntryKind::Regular,
+                false,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::System,
+                    system_authorized: true,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "requested native metadata is not supported by this conformance class"
+            )
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_system_file_flags_fail_preflight_without_superuser_privilege() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let bytes = member(b"file.txt", b'0', b"payload", b"");
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+        let mut metadata = parsed.v45_metadata;
+        metadata.declaration.source_os = "macos".into();
+        metadata
+            .declaration
+            .required_profiles
+            .extend(["macos-backup-v1".into(), "posix-backup-v1".into()]);
+        metadata.declaration.required_profiles.sort();
+        metadata.declaration.required_profiles.dedup();
+        metadata.primary_has_native_scalar = true;
+        metadata
+            .primary_records
+            .insert("TZAP.macos.st-flags".into(), b"0000000000020000".to_vec());
+
+        assert_eq!(
+            plan_restore(
+                b"file.txt",
+                &metadata,
+                TarEntryKind::Regular,
+                false,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::System,
+                    system_authorized: true,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "requested native metadata is not supported by this conformance class"
+            )
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_device_restore_fails_preflight_without_superuser_privilege() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let bytes = member(b"device", b'0', b"", b"");
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+
+        assert_eq!(
+            plan_restore(
+                b"device",
+                &parsed.v45_metadata,
+                TarEntryKind::CharacterDevice,
+                false,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::System,
+                    system_authorized: true,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "requested native metadata is not supported by this conformance class"
+            )
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_resource_fork_support_is_primary_kind_aware() {
+        let record = AuxiliaryRecord {
+            ordinal: 0,
+            kind: "macos.resource-fork".into(),
+            profile: "macos-backup-v1".into(),
+            restore_class: RestoreClass::SameOs,
+            native: true,
+            name_encoding: "none".into(),
+            decoded_name: Vec::new(),
+            flags: 0,
+            logical_size: u64::from(u32::MAX) + 1,
+            stored_size: 0,
+            sha256: [0; 32],
+            meta: BTreeMap::new(),
+            sparse_layout: None,
+            capture_report_payload: None,
+        };
+        assert!(native_auxiliary_restore_supported(
+            &record,
+            false,
+            Some(TarEntryKind::Regular)
+        ));
+        assert!(!native_auxiliary_restore_supported(
+            &record,
+            false,
+            Some(TarEntryKind::Symlink)
+        ));
+        assert!(!native_auxiliary_restore_supported(
+            &record,
+            false,
+            Some(TarEntryKind::Fifo)
+        ));
     }
 
     #[cfg(target_os = "linux")]

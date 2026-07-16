@@ -1896,8 +1896,51 @@ fn retained_auxiliary_cap(kind: &str) -> usize {
         "windows.security-descriptor" => 256 * 1024,
         "windows.reparse-data" => 16 * 1024,
         "windows.object-id" | "macos.finder-info" => 64,
+        "macos.acl-native" => 40 + 128 * 28,
         _ => 0,
     }
+}
+
+fn validate_darwin_acl_external(value: &[u8]) -> Result<(), FormatError> {
+    const HEADER: usize = 40;
+    const ACE_SIZE: usize = 28;
+    const MAX_ENTRIES: usize = 128;
+    const MAGIC: [u8; 4] = [0x01, 0x2c, 0xc1, 0x6d];
+    if value.get(..4) != Some(MAGIC.as_slice()) {
+        return invalid("AuxiliaryMetadata", "invalid macOS ACL external magic");
+    }
+    let count = value
+        .get(36..40)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_be_bytes)
+        .ok_or(FormatError::InvalidArchive(
+            "macOS ACL external form is truncated",
+        ))? as usize;
+    let expected = HEADER
+        .checked_add(
+            count
+                .checked_mul(ACE_SIZE)
+                .ok_or(FormatError::InvalidArchive(
+                    "macOS ACL entry count overflows",
+                ))?,
+        )
+        .ok_or(FormatError::InvalidArchive("macOS ACL size overflows"))?;
+    if count > MAX_ENTRIES || expected != value.len() {
+        return invalid("AuxiliaryMetadata", "invalid macOS ACL external size");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn acl_copy_int(buffer: *const libc::c_void) -> *mut libc::c_void;
+            fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+        }
+        let acl = unsafe { acl_copy_int(value.as_ptr().cast()) };
+        if acl.is_null() {
+            return invalid("AuxiliaryMetadata", "invalid macOS ACL external payload");
+        }
+        unsafe { acl_free(acl) };
+    }
+    Ok(())
 }
 
 fn validate_generic_xattr_name(record: &AuxiliaryRecord) -> Result<(), FormatError> {
@@ -1990,6 +2033,9 @@ fn validate_builtin_auxiliary_payload(
         "macos.finder-info" if retained.map_or(0, <[u8]>::len) != 32 => {
             return invalid("AuxiliaryMetadata", "FinderInfo payload is not 32 bytes");
         }
+        "macos.acl-native" => validate_darwin_acl_external(retained.ok_or(
+            FormatError::InvalidArchive("macOS ACL payload was not retained"),
+        )?)?,
         _ => {}
     }
     Ok(())
@@ -2853,7 +2899,7 @@ fn has_no_change_flags(records: &PaxRecords) -> Result<bool, FormatError> {
         .get("TZAP.macos.st-flags")
         .map(|value| parse_fixed_hex_u64(value, 16, "macOS file flags"))
         .transpose()?
-        .is_some_and(|value| value & 0x0006_0006 != 0);
+        .is_some_and(|value| value & 0x009f_0086 != 0);
     let projected = records.get("SCHILY.fflags").is_some_and(|value| {
         value.split(|byte| *byte == b',').any(|token| {
             matches!(
@@ -3012,6 +3058,18 @@ mod tests {
     }
 
     #[test]
+    fn macos_entitlement_and_superuser_flags_are_system_class() {
+        for flags in [0x0000_0080u64, 0x0008_0000, 0x0010_0000, 0x0080_0000] {
+            let mut records = PaxRecords::new();
+            records.insert(
+                "TZAP.macos.st-flags".into(),
+                format!("{flags:016x}").into_bytes(),
+            );
+            assert!(has_no_change_flags(&records).unwrap());
+        }
+    }
+
+    #[test]
     fn generic_xattr_auxiliary_uses_the_declared_source_os_namespace_rules() {
         let mut records = portable_primary_pax(b"file.txt", 0o644, "macos", false).unwrap();
         records.insert(
@@ -3097,5 +3155,20 @@ mod tests {
 
         records.insert("SCHILY.acl.ace".into(), b"owner@:rwx:fd:allow".to_vec());
         assert!(parse_primary_metadata(&records).is_err());
+    }
+
+    #[test]
+    fn darwin_acl_external_form_rejects_malformed_or_unbounded_payloads() {
+        let mut empty = vec![0u8; 40];
+        empty[..4].copy_from_slice(&[0x01, 0x2c, 0xc1, 0x6d]);
+
+        let mut bad_magic = empty.clone();
+        bad_magic[0] = 0;
+        assert!(validate_darwin_acl_external(&bad_magic).is_err());
+        assert!(validate_darwin_acl_external(&empty[..39]).is_err());
+
+        let mut oversized_count = empty;
+        oversized_count[36..40].copy_from_slice(&129u32.to_be_bytes());
+        assert!(validate_darwin_acl_external(&oversized_count).is_err());
     }
 }
