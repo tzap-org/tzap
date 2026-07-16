@@ -483,7 +483,9 @@ fn public_docs_pin_tar_metadata_profile() {
 
     assert!(boundaries.contains("## Tar metadata profile"));
     assert!(boundaries.contains("complete `portable-v1` regular-file,"));
-    assert!(boundaries.contains("symlink emission plus declared"));
+    assert!(boundaries.contains("symlink emission plus the declared Linux native records"));
+    assert!(boundaries.contains("Linux project IDs"));
+    assert!(boundaries.contains("Linux FIFO/device/whiteout objects"));
     assert!(boundaries.contains("mandatory canonical"));
     assert!(boundaries.contains("streamed"));
     assert!(boundaries.contains("auxiliary hashes"));

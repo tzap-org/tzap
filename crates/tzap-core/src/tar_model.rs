@@ -28,11 +28,13 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_WRITE_ATTRIBUTES,
 };
 
+#[cfg(windows)]
+use crate::entry_metadata::parse_timestamp;
 use crate::entry_metadata::{
     decode_percent_name, parse_auxiliary_record, parse_canonical_pax, parse_primary_metadata,
-    parse_sparse_payload, parse_timestamp, validate_group_metadata, ArchiveTimestamp,
-    AuxiliaryRecord, AuxiliaryStreamValidator, CaptureReportRow, CaptureStatus, MemberMetadata,
-    PaxRecords, PortableMetadataMirror, PrimaryMetadata, RestoreClass, RestorePolicy, SparseExtent,
+    parse_sparse_payload, validate_group_metadata, ArchiveTimestamp, AuxiliaryRecord,
+    AuxiliaryStreamValidator, CaptureReportRow, CaptureStatus, MemberMetadata, PaxRecords,
+    PortableMetadataMirror, PrimaryMetadata, RestoreClass, RestorePolicy, SparseExtent,
     SparseStreamValidator, CAPTURE_REPORT_KIND, HAS_NATIVE_METADATA, HAS_SPARSE_EXTENTS,
     MAX_AGGREGATE_PAX_PAYLOAD, MAX_LOCAL_PAX_PAYLOAD, REQUIRES_SYSTEM_RESTORE,
 };
@@ -3319,6 +3321,10 @@ fn plan_restore(
             && profile_is_required(&record.profile)
             && !native_auxiliary_restore_supported(record, false)
     }) || (required_native_scalar && unsupported_primary_same_os)
+        || matches!(
+            kind,
+            TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
+        )
         || (required_native_profile && !native_source_matches_host);
     let unsupported_system = metadata.auxiliary.iter().any(|record| {
         record.restore_class == RestoreClass::System
@@ -3329,10 +3335,10 @@ fn plan_restore(
         || (metadata.declaration.portable_mode & 0o6000 != 0 && !cfg!(unix))
         || (required_native_scalar && unsupported_primary_system)
         || (reparse_placeholder && !windows_reparse_metadata_supported(metadata))
-        || matches!(
+        || (matches!(
             kind,
             TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
-        )
+        ) && !cfg!(target_os = "linux"))
         || (required_native_profile && !native_source_matches_host);
 
     if (requests_same_os && unsupported_same_os) || (requests_system && unsupported_system) {
@@ -3440,6 +3446,10 @@ fn plan_restore(
 }
 
 fn native_auxiliary_restore_supported(record: &AuxiliaryRecord, include_system: bool) -> bool {
+    if cfg!(target_os = "linux") && record.kind == "generic.xattr" {
+        return record.restore_class == RestoreClass::SameOs
+            || (include_system && record.restore_class == RestoreClass::System);
+    }
     if !cfg!(windows) {
         return false;
     }
@@ -3559,6 +3569,9 @@ fn native_primary_restore_unsupported(metadata: &MemberMetadata, include_system:
         }
         if key == "TZAP.linux.fsflags" {
             return !cfg!(target_os = "linux");
+        }
+        if key == "TZAP.linux.project-id" {
+            return !cfg!(target_os = "linux") || !include_system;
         }
         if key == "TZAP.windows.file-attributes" {
             if !cfg!(windows) || metadata.declaration.source_os != "windows" {
@@ -3949,7 +3962,9 @@ impl<'a> FilesystemRestoreHandler<'a> {
             }
         }
         diagnostics.append(&mut self.planned_diagnostics);
-        if member.kind != TarEntryKind::Regular && !self.staged_auxiliary.is_empty() {
+        if !matches!(member.kind, TarEntryKind::Regular | TarEntryKind::Directory)
+            && !self.staged_auxiliary.is_empty()
+        {
             return Err(FormatError::InvalidArchive(
                 "native auxiliary payload was not restored for its archive member",
             )
@@ -4007,6 +4022,17 @@ impl<'a> FilesystemRestoreHandler<'a> {
         };
         let file = publish_regular_file(&destination, &temp_leaf, file, self.options)?;
         if self.options.restore_policy != RestorePolicy::Content {
+            if let Err(error) = apply_generic_xattr_auxiliaries(
+                &file,
+                &member.path,
+                &mut self.staged_auxiliary,
+                self.options,
+                &mut diagnostics,
+            ) {
+                drop(file);
+                let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
+                return Err(error.into());
+            }
             if let Err(error) = apply_windows_alternate_streams(
                 &file,
                 &member.path,
@@ -4065,7 +4091,7 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
             )
             || !matches!(
                 record.kind.as_str(),
-                "windows.alternate-data" | "windows.efs-raw"
+                "windows.alternate-data" | "windows.efs-raw" | "generic.xattr"
             )
         {
             return Ok(false);
@@ -4157,10 +4183,14 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
             self.skipped_by_policy = true;
             return Ok(());
         }
+        let restore_linux_special = cfg!(target_os = "linux")
+            && self.options.restore_policy == RestorePolicy::System
+            && self.options.system_authorized;
         if matches!(
             member.kind,
             TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
-        ) {
+        ) && !restore_linux_special
+        {
             self.skipped_by_policy = true;
             return Ok(());
         }
@@ -4202,6 +4232,13 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                     };
                     #[cfg(not(windows))]
                     let directory = open_existing_directory(&destination)?;
+                    apply_generic_xattr_auxiliaries(
+                        &directory,
+                        &member.path,
+                        &mut self.staged_auxiliary,
+                        self.options,
+                        &mut self.planned_diagnostics,
+                    )?;
                     apply_windows_alternate_streams(
                         &directory,
                         &member.path,
@@ -4249,6 +4286,13 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                             self.staged_auxiliary.clear();
                         }
                         if self.options.restore_policy != RestorePolicy::Content {
+                            apply_restored_linux_symlink_metadata(
+                                &destination,
+                                &member.path,
+                                &member.v45_metadata,
+                                self.options,
+                                &mut self.planned_diagnostics,
+                            )?;
                             apply_restored_symlink_mtime(
                                 &destination,
                                 &member.path,
@@ -4336,7 +4380,14 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                 }
             }
             TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo => {
-                unreachable!("special objects return before destination preparation")
+                create_linux_special_object(
+                    &destination,
+                    &member.path,
+                    member.kind,
+                    &member.v45_metadata,
+                    self.options,
+                    &mut self.planned_diagnostics,
+                )?;
             }
         }
         Ok(())
@@ -4370,7 +4421,22 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
             self.sparse_extents = extents.to_vec();
             Ok(true)
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            let file = self.file.as_mut().ok_or(FormatError::InvalidArchive(
+                "regular file output is missing",
+            ))?;
+            file.set_len(logical_size).map_err(|_| {
+                FormatError::FilesystemExtractionFailed(
+                    "failed to set Linux sparse output logical size",
+                )
+            })?;
+            self.native_sparse_active = true;
+            self.sparse_logical_size = logical_size;
+            self.sparse_extents = extents.to_vec();
+            Ok(true)
+        }
+        #[cfg(all(not(windows), not(target_os = "linux")))]
         {
             let _ = (logical_size, extents);
             Ok(false)
@@ -4418,9 +4484,59 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
         }
         #[cfg(windows)]
         verify_windows_sparse_file(file, self.sparse_logical_size, &self.sparse_extents)?;
+        #[cfg(target_os = "linux")]
+        punch_linux_sparse_holes(file, self.sparse_logical_size, &self.sparse_extents)?;
         self.native_sparse_active = false;
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn punch_linux_sparse_holes(
+    file: &fs::File,
+    logical_size: u64,
+    extents: &[SparseExtent],
+) -> Result<(), FormatError> {
+    let mut cursor = 0u64;
+    for extent in extents {
+        if extent.offset > cursor {
+            punch_linux_sparse_hole(file, cursor, extent.offset - cursor)?;
+        }
+        cursor = extent
+            .offset
+            .checked_add(extent.length)
+            .ok_or(FormatError::InvalidArchive("sparse extent overflow"))?;
+    }
+    if cursor < logical_size {
+        punch_linux_sparse_hole(file, cursor, logical_size - cursor)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn punch_linux_sparse_hole(file: &fs::File, offset: u64, length: u64) -> Result<(), FormatError> {
+    if length == 0 {
+        return Ok(());
+    }
+    let offset = libc::off_t::try_from(offset)
+        .map_err(|_| FormatError::ReaderUnsupported("sparse offset exceeds Linux off_t"))?;
+    let length = libc::off_t::try_from(length)
+        .map_err(|_| FormatError::ReaderUnsupported("sparse length exceeds Linux off_t"))?;
+    // SAFETY: the descriptor is live and the checked range lies within the logical file.
+    if unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset,
+            length,
+        )
+    } != 0
+    {
+        return Err(FormatError::FilesystemExtractionFailed(
+            "failed to preserve Linux sparse holes",
+        ));
+    }
+    Ok(())
 }
 
 fn format_error_from_extract_error(error: ExtractError) -> FormatError {
@@ -4730,6 +4846,13 @@ fn restore_tar_member(
                     .ok_or(FormatError::InvalidArchive(
                         "revision-45 member metadata is missing",
                     ))?;
+                apply_restored_linux_symlink_metadata(
+                    &destination,
+                    &member.path,
+                    metadata,
+                    options,
+                    &mut diagnostics,
+                )?;
                 apply_restored_symlink_mtime(
                     &destination,
                     &member.path,
@@ -4893,6 +5016,7 @@ fn apply_restored_regular_file_metadata_parts(
     if let Some(member_metadata) = member_metadata {
         apply_windows_security_descriptor(file, path, member_metadata, options, diagnostics)?;
         apply_windows_basic_metadata(file, path, member_metadata, options, diagnostics)?;
+        apply_linux_project_id(file, path, member_metadata, options, diagnostics)?;
         apply_linux_inode_flags(file, path, member_metadata, options, diagnostics)?;
     }
     Ok(())
@@ -5089,7 +5213,7 @@ fn restore_windows_efs_temp(
     destination: &PreparedDestination,
     temp_leaf: &Path,
     mut output: fs::File,
-    staged: &mut Vec<StagedAuxiliary>,
+    staged: &mut [StagedAuxiliary],
     options: SafeExtractionOptions,
 ) -> Result<fs::File, FormatError> {
     use std::os::windows::fs::MetadataExt as _;
@@ -5198,7 +5322,7 @@ fn restore_windows_efs_temp(
     _destination: &PreparedDestination,
     _temp_leaf: &Path,
     output: fs::File,
-    staged: &mut Vec<StagedAuxiliary>,
+    staged: &mut [StagedAuxiliary],
     _options: SafeExtractionOptions,
 ) -> Result<fs::File, FormatError> {
     if staged
@@ -5489,6 +5613,90 @@ fn compare_exact_bytes(
         }
         remaining -= count as u64;
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn apply_generic_xattr_auxiliaries(
+    base_file: &fs::File,
+    path: &[u8],
+    staged: &mut Vec<StagedAuxiliary>,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use xattr::FileExt as _;
+
+    let mut remaining = Vec::new();
+    for mut item in std::mem::take(staged) {
+        if item.record.kind != "generic.xattr" {
+            remaining.push(item);
+            continue;
+        }
+        if item.record.restore_class == RestoreClass::System
+            && !(options.restore_policy == RestorePolicy::System && options.system_authorized)
+        {
+            continue;
+        }
+        item.file.seek(SeekFrom::Start(0)).map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to rewind staged extended attribute")
+        })?;
+        let value_len = usize::try_from(item.record.logical_size).map_err(|_| {
+            FormatError::ReaderUnsupported("extended attribute exceeds platform limits")
+        })?;
+        let mut value = vec![0u8; value_len];
+        item.file.read_exact(&mut value).map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to read staged extended attribute")
+        })?;
+        let name = OsStr::from_bytes(&item.record.decoded_name);
+        if let Err(error) = base_file.set_xattr(name, &value) {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    &item.record.profile,
+                    "extended-attribute",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "failed to apply auxiliary extended attribute",
+                )
+                .for_restore(options.restore_policy, 4)
+                .with_native_error(&error),
+                options,
+                "failed to apply auxiliary extended attribute",
+            )?;
+            continue;
+        }
+        if base_file.get_xattr(name).ok().flatten().as_deref() != Some(value.as_slice()) {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    &item.record.profile,
+                    "extended-attribute",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "auxiliary extended attribute did not verify after restoration",
+                )
+                .for_restore(options.restore_policy, 4),
+                options,
+                "auxiliary extended attribute did not verify after restoration",
+            )?;
+        }
+    }
+    *staged = remaining;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_generic_xattr_auxiliaries(
+    _base_file: &fs::File,
+    _path: &[u8],
+    _staged: &mut Vec<StagedAuxiliary>,
+    _options: SafeExtractionOptions,
+    _diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
     Ok(())
 }
 
@@ -6132,6 +6340,89 @@ fn apply_linux_inode_flags(
         options,
         "failed to apply Linux inode flags",
     )
+}
+
+#[cfg(target_os = "linux")]
+fn apply_linux_project_id(
+    file: &fs::File,
+    path: &[u8],
+    metadata: &MemberMetadata,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    if metadata.declaration.source_os != "linux"
+        || options.restore_policy != RestorePolicy::System
+        || !options.system_authorized
+    {
+        return Ok(());
+    }
+    let Some(encoded) = metadata.primary_records.get("TZAP.linux.project-id") else {
+        return Ok(());
+    };
+    let desired = std::str::from_utf8(encoded)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or(FormatError::InvalidArchive("Linux project ID is invalid"))?;
+    // fsxattr consists only of integer and reserved-byte fields; zero is valid initialization.
+    let mut attributes: linux_raw_sys::general::fsxattr = unsafe { std::mem::zeroed() };
+    let get_result = unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            linux_raw_sys::ioctl::FS_IOC_FSGETXATTR as libc::c_ulong,
+            &mut attributes,
+        )
+    };
+    if get_result == 0 {
+        attributes.fsx_projid = desired;
+        if unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                linux_raw_sys::ioctl::FS_IOC_FSSETXATTR as libc::c_ulong,
+                &attributes,
+            )
+        } == 0
+        {
+            let mut actual: linux_raw_sys::general::fsxattr = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::ioctl(
+                    file.as_raw_fd(),
+                    linux_raw_sys::ioctl::FS_IOC_FSGETXATTR as libc::c_ulong,
+                    &mut actual,
+                )
+            } == 0
+                && actual.fsx_projid == desired
+            {
+                return Ok(());
+            }
+        }
+    }
+    let error = std::io::Error::last_os_error();
+    record_metadata_application_failure(
+        diagnostics,
+        MetadataDiagnostic::new(
+            path,
+            "linux-backup-v1",
+            "project-id",
+            MetadataOperation::Restore,
+            MetadataDiagnosticStatus::Failed,
+            "failed to apply Linux project ID",
+        )
+        .for_restore(options.restore_policy, 4)
+        .with_native_error(&error),
+        options,
+        "failed to apply Linux project ID",
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_linux_project_id(
+    _file: &fs::File,
+    _path: &[u8],
+    _metadata: &MemberMetadata,
+    _options: SafeExtractionOptions,
+    _diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -6945,6 +7236,129 @@ fn apply_restored_symlink_mtime(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn apply_restored_linux_symlink_metadata(
+    destination: &PreparedDestination,
+    path: &[u8],
+    metadata: &MemberMetadata,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use std::ffi::{CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    if metadata.declaration.source_os != "linux"
+        || !matches!(
+            options.restore_policy,
+            RestorePolicy::SameOs | RestorePolicy::System
+        )
+    {
+        return Ok(());
+    }
+    let leaf = destination.leaf.as_os_str().as_bytes();
+    let leaf_c = CString::new(leaf).map_err(|_| FormatError::UnsafeArchivePath)?;
+    let current = destination
+        .parent
+        .symlink_metadata(&destination.leaf)
+        .map_err(|_| FormatError::UnsafeArchivePath)?;
+    if !current.file_type().is_symlink() {
+        return Err(FormatError::UnsafeArchivePath);
+    }
+
+    if options.restore_policy == RestorePolicy::System && options.system_authorized {
+        if let (Some(uid), Some(gid)) = (metadata.portable_mirror.uid, metadata.portable_mirror.gid)
+        {
+            let uid = libc::uid_t::try_from(uid).map_err(|_| {
+                FormatError::FilesystemExtractionFailed("archived UID exceeds host uid_t")
+            })?;
+            let gid = libc::gid_t::try_from(gid).map_err(|_| {
+                FormatError::FilesystemExtractionFailed("archived GID exceeds host gid_t")
+            })?;
+            // SAFETY: the pinned parent fd and validated leaf name identify the symlink itself.
+            if unsafe {
+                libc::fchownat(
+                    destination.parent.as_raw_fd(),
+                    leaf_c.as_ptr(),
+                    uid,
+                    gid,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                let error = std::io::Error::last_os_error();
+                record_metadata_application_failure(
+                    diagnostics,
+                    MetadataDiagnostic::new(
+                        path,
+                        "portable-v1",
+                        "numeric-ownership",
+                        MetadataOperation::Restore,
+                        MetadataDiagnosticStatus::Failed,
+                        "failed to apply symlink numeric ownership",
+                    )
+                    .for_restore(options.restore_policy, 4)
+                    .with_native_error(&error),
+                    options,
+                    "failed to apply symlink numeric ownership",
+                )?;
+            }
+        }
+    }
+
+    let proc_path = PathBuf::from(format!(
+        "/proc/self/fd/{}/{}",
+        destination.parent.as_raw_fd(),
+        destination.leaf.to_string_lossy()
+    ));
+    for (key, encoded) in metadata
+        .primary_records
+        .iter()
+        .filter(|(key, _)| key.starts_with("LIBARCHIVE.xattr."))
+    {
+        let name = decode_percent_name(&key.as_bytes()["LIBARCHIVE.xattr.".len()..])?;
+        let system = system_xattr_name(&name, "linux");
+        if system && !(options.restore_policy == RestorePolicy::System && options.system_authorized)
+        {
+            continue;
+        }
+        let value = canonical_base64_decode(encoded)?;
+        let name = OsStr::from_bytes(&name);
+        if let Err(error) = xattr::set(&proc_path, name, &value) {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    if system {
+                        "linux-backup-v1"
+                    } else {
+                        "posix-backup-v1"
+                    },
+                    "extended-attribute",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "failed to apply symlink extended attribute",
+                )
+                .for_restore(options.restore_policy, 4)
+                .with_native_error(&error),
+                options,
+                "failed to apply symlink extended attribute",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_restored_linux_symlink_metadata(
+    _destination: &PreparedDestination,
+    _path: &[u8],
+    _metadata: &MemberMetadata,
+    _options: SafeExtractionOptions,
+    _diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    Ok(())
+}
+
 fn create_temp_regular_file(
     destination: &PreparedDestination,
 ) -> Result<(PathBuf, fs::File), FormatError> {
@@ -7283,7 +7697,43 @@ fn publish_regular_file(
         Ok(temp_file)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        temp_file
+            .flush()
+            .map_err(|_| FormatError::FilesystemExtractionFailed("failed to flush regular file"))?;
+        let source = CString::new(temp_leaf.as_os_str().as_bytes())
+            .map_err(|_| FormatError::UnsafeArchivePath)?;
+        let target = CString::new(destination.leaf.as_os_str().as_bytes())
+            .map_err(|_| FormatError::UnsafeArchivePath)?;
+        // SAFETY: both names are validated single components beneath the same pinned parent.
+        if unsafe {
+            libc::renameat2(
+                destination.parent.as_raw_fd(),
+                source.as_ptr(),
+                destination.parent.as_raw_fd(),
+                target.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            let _ = destination.parent.remove_file_or_symlink(temp_leaf);
+            return if error.raw_os_error() == Some(libc::EEXIST) {
+                Err(FormatError::UnsafeOverwrite)
+            } else {
+                Err(FormatError::FilesystemExtractionFailed(
+                    "failed to publish allocation-preserving output",
+                ))
+            };
+        }
+        Ok(temp_file)
+    }
+
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     let mut output = match destination
         .parent
         .open_with(&destination.leaf, &create_new_file_options())
@@ -7301,13 +7751,13 @@ fn publish_regular_file(
         }
     };
 
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     let copy_result = temp_file
         .seek(SeekFrom::Start(0))
         .and_then(|_| std::io::copy(&mut temp_file, &mut output))
         .and_then(|_| output.flush());
 
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     if copy_result.is_err() {
         let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
         let _ = destination.parent.remove_file_or_symlink(temp_leaf);
@@ -7316,7 +7766,7 @@ fn publish_regular_file(
         ));
     }
 
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     {
         let _ = destination.parent.remove_file_or_symlink(temp_leaf);
         Ok(output)
@@ -7416,6 +7866,232 @@ fn create_symlink(
             "failed to create symlink",
         )),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn create_linux_special_object(
+    destination: &PreparedDestination,
+    path: &[u8],
+    kind: TarEntryKind,
+    metadata: &MemberMetadata,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use std::ffi::{CString, OsStr};
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    if options.restore_policy != RestorePolicy::System || !options.system_authorized {
+        return Err(FormatError::ReaderUnsupported(
+            "special POSIX objects require authorized system restore",
+        ));
+    }
+    if options.overwrite_existing {
+        remove_existing_leaf_if_needed(destination)?;
+    }
+    let leaf = CString::new(destination.leaf.as_os_str().as_bytes())
+        .map_err(|_| FormatError::UnsafeArchivePath)?;
+    let permission_mode = metadata.portable_mirror.mode & 0o7777;
+    let (object_mode, device) = match kind {
+        TarEntryKind::Fifo => (libc::S_IFIFO | permission_mode, 0),
+        TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice => {
+            let major = metadata
+                .primary_records
+                .get("TZAP.posix.device-major")
+                .ok_or(FormatError::InvalidArchive(
+                    "device major number is missing",
+                ))?;
+            let minor = metadata
+                .primary_records
+                .get("TZAP.posix.device-minor")
+                .ok_or(FormatError::InvalidArchive(
+                    "device minor number is missing",
+                ))?;
+            let major = parse_minimal_decimal_u64(major, "device major")?;
+            let minor = parse_minimal_decimal_u64(minor, "device minor")?;
+            let major = libc::c_uint::try_from(major)
+                .map_err(|_| FormatError::ReaderUnsupported("device major exceeds host ABI"))?;
+            let minor = libc::c_uint::try_from(minor)
+                .map_err(|_| FormatError::ReaderUnsupported("device minor exceeds host ABI"))?;
+            let type_mode = if kind == TarEntryKind::CharacterDevice {
+                libc::S_IFCHR
+            } else {
+                libc::S_IFBLK
+            };
+            (type_mode | permission_mode, libc::makedev(major, minor))
+        }
+        _ => {
+            return Err(FormatError::WriterInvariant(
+                "non-special member reached Linux special-object creation",
+            ));
+        }
+    };
+    // SAFETY: the parent directory is pinned and `leaf` is a validated single component.
+    if unsafe {
+        libc::mknodat(
+            destination.parent.as_raw_fd(),
+            leaf.as_ptr(),
+            object_mode as libc::mode_t,
+            device,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "posix-backup-v1",
+                "special-object",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to create Linux special object",
+            )
+            .for_restore(options.restore_policy, 2)
+            .with_native_error(&error),
+            options,
+            "failed to create Linux special object",
+        );
+    }
+
+    // Pin the newly created object without opening a device or blocking on a FIFO.
+    let fd = unsafe {
+        libc::openat(
+            destination.parent.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
+        return Err(FormatError::FilesystemExtractionFailed(
+            "failed to pin restored Linux special object",
+        ));
+    }
+    // SAFETY: `fd` is newly owned and transferred exactly once.
+    let pinned = unsafe { fs::File::from_raw_fd(fd) };
+    let proc_path = PathBuf::from(format!("/proc/self/fd/{}", pinned.as_raw_fd()));
+    let proc_c = CString::new(proc_path.as_os_str().as_bytes())
+        .map_err(|_| FormatError::UnsafeArchivePath)?;
+
+    if let (Some(uid), Some(gid)) = (metadata.portable_mirror.uid, metadata.portable_mirror.gid) {
+        let uid = libc::uid_t::try_from(uid)
+            .map_err(|_| FormatError::ReaderUnsupported("archived UID exceeds host uid_t"))?;
+        let gid = libc::gid_t::try_from(gid)
+            .map_err(|_| FormatError::ReaderUnsupported("archived GID exceeds host gid_t"))?;
+        // SAFETY: the procfs magic link refers to the pinned special object.
+        if unsafe { libc::chown(proc_c.as_ptr(), uid, gid) } != 0 {
+            let error = std::io::Error::last_os_error();
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    "portable-v1",
+                    "numeric-ownership",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "failed to apply special-object ownership",
+                )
+                .for_restore(options.restore_policy, 4)
+                .with_native_error(&error),
+                options,
+                "failed to apply special-object ownership",
+            )?;
+        }
+    }
+    // SAFETY: as above, chmod follows the procfs magic link to the pinned object.
+    if unsafe { libc::chmod(proc_c.as_ptr(), permission_mode as libc::mode_t) } != 0 {
+        let error = std::io::Error::last_os_error();
+        record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                "mode",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to apply special-object mode",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "failed to apply special-object mode",
+        )?;
+    }
+    for (key, encoded) in metadata
+        .primary_records
+        .iter()
+        .filter(|(key, _)| key.starts_with("LIBARCHIVE.xattr."))
+    {
+        let name = decode_percent_name(&key.as_bytes()["LIBARCHIVE.xattr.".len()..])?;
+        let value = canonical_base64_decode(encoded)?;
+        if let Err(error) = xattr::set_deref(&proc_path, OsStr::from_bytes(&name), &value) {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    if system_xattr_name(&name, "linux") {
+                        "linux-backup-v1"
+                    } else {
+                        "posix-backup-v1"
+                    },
+                    "extended-attribute",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "failed to apply special-object extended attribute",
+                )
+                .for_restore(options.restore_policy, 4)
+                .with_native_error(&error),
+                options,
+                "failed to apply special-object extended attribute",
+            )?;
+        }
+    }
+    let (seconds, nanoseconds) = metadata.portable_mirror.mtime;
+    let times = [
+        libc::timespec {
+            tv_sec: seconds as libc::time_t,
+            tv_nsec: nanoseconds as libc::c_long,
+        },
+        libc::timespec {
+            tv_sec: seconds as libc::time_t,
+            tv_nsec: nanoseconds as libc::c_long,
+        },
+    ];
+    // SAFETY: the path points to the pinned object and `times` contains two valid timespecs.
+    if unsafe { libc::utimensat(libc::AT_FDCWD, proc_c.as_ptr(), times.as_ptr(), 0) } != 0 {
+        let error = std::io::Error::last_os_error();
+        record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "portable-v1",
+                "mtime",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to apply special-object mtime",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "failed to apply special-object mtime",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_linux_special_object(
+    _destination: &PreparedDestination,
+    _path: &[u8],
+    _kind: TarEntryKind,
+    _metadata: &MemberMetadata,
+    _options: SafeExtractionOptions,
+    _diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    Err(FormatError::ReaderUnsupported(
+        "Linux special-object restore is unavailable on this host",
+    ))
 }
 
 #[cfg(windows)]

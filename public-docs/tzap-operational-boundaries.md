@@ -567,7 +567,7 @@ currently has these platform boundaries:
 
 | Capture host | Captured for accepted regular files and directories | Rejected or not captured |
 |---|---|---|
-| Linux | Numeric ownership, readable xattrs, canonical POSIX.1e access/default ACLs, observed ctime, available creation time, exact Linux inode flags, and selected regular-file hardlink topology. | Native symlink ACL/xattr/flag metadata, special objects, and xattrs that make the bounded primary PAX record unrepresentable. |
+| Linux | Numeric ownership; no-follow symlink ownership and readable xattrs; canonical POSIX.1e access/default ACLs; inline and auxiliary xattrs; observed ctime; available creation time; exact Linux inode flags; optional project IDs; sparse allocation; FIFO, character-device, block-device, and whiteout descriptors; and selected regular-file hardlink topology. | Live sockets, unreadable privileged namespaces, filesystem metadata hidden from the caller, and source objects that change during capture. Linux birth time is captured where exposed but cannot generally be assigned during restore. |
 | Windows | Creation, access, write, and change times at 100-ns precision, including pre-1970 values; exact supported attributes; primary and alternate-stream sparse ranges; validated relative-symlink and junction reparse buffers; selected hardlink topology; owner/group/DACL self-relative security descriptor plus SACL when available; raw EFS regular files on NTFS; and supported backup streams. | Encrypted directories, unknown reparse tags, offline/cloud placeholders, transactional/unknown backup streams, and native compression recreation. These cases fail creation instead of weakening `capture-status=complete`. |
 | macOS | Numeric ownership, readable xattrs, exact Darwin flags, observed ctime, available creation time, native ACL external form, FinderInfo, and resource forks. Large xattrs use bounded auxiliary records. | Native symlink ACL/xattr/flag metadata, special objects, selected hardlink aliases, APFS clone hints, and metadata that cannot be read consistently during the scan. |
 | Other POSIX hosts | Portable regular-file, directory, and safe symlink fields. | Source-native profile capture is not yet implemented. |
@@ -660,13 +660,15 @@ Content mode writes regular bytes and safe directories, skips symlinks and
 special/reparse objects, and materializes hardlink aliases as independent
 files. Portable mode additionally restores safe symlinks and hardlinks,
 symbolic-link mtimes through no-follow APIs, and ordinary file and post-order
-directory mode/mtime metadata. Same-OS restore applies ordinary xattrs,
-canonical Linux POSIX ACLs, modifiable Linux inode flags, and native Windows
-sparse allocation, alternate data streams (including sparse streams), and exact
-supported basic attributes/timestamps.
+directory mode/mtime metadata. Same-OS restore applies ordinary inline and
+auxiliary xattrs, canonical Linux POSIX ACLs, modifiable Linux inode flags,
+native Linux sparse allocation, and native Windows sparse allocation,
+alternate data streams (including sparse streams), and exact supported basic
+attributes/timestamps.
 System restore, after explicit authorization, also applies numeric UID/GID,
-set-ID modes, privileged xattr namespaces, and immutable/append-only Linux
-flags. On Windows, authorized system restore also recreates validated symlink
+set-ID modes, privileged xattr namespaces, Linux project IDs,
+immutable/append-only Linux flags, and Linux FIFO/device/whiteout objects. On
+Windows, authorized system restore also recreates validated symlink
 and junction reparse buffers, restores raw EFS on NTFS, and applies security
 descriptors when required privileges are present. Application is
 descriptor-based and ordered as
@@ -702,18 +704,20 @@ surface tar metadata fidelity should use `list_files`, `extract_member`,
 - `tzap-core`: revision-45 Core reader and physical archive reader/writer for
   the documented archive workflows.
 - CLI/core writer: complete `portable-v1` regular-file, directory, and safe
-  symlink emission plus declared
-  Linux file/directory native records and Windows primary/auxiliary
-  records listed above. It does not claim the full Portable, POSIX, Linux, or
-  Windows backup reader/writer class because Specialist objects, several OS
-  metadata classes, and full native restoration
-  remain incomplete.
+  symlink emission plus the declared Linux native records and Windows
+  primary/auxiliary records listed above. It does not yet claim every OS backup
+  reader/writer class because privileged conformance corpora and several
+  non-Linux specialist classes remain incomplete.
 - `tzap-plugin-keywrap`: `x509-hpke-recipient-v1` for revision 45.
 - `tzap-plugin-signing`: `ed25519-archiveroot-v1` and the revision-45 X.509
   RootAuth profile.
-- POSIX, Linux, macOS, and Windows backup reader/writer classes are not
-  advertised. Linux file/directory ownership, xattrs, ACLs, and flags are
-  captured/applied as described above. Windows ordinary regular-file metadata
+- POSIX, Linux, macOS, and Windows backup reader/writer classes are not yet
+  advertised. Linux implementation paths now cover regular files, directories,
+  symlinks, hardlinks, sparse allocation, inline/auxiliary xattrs, POSIX ACLs,
+  inode flags, project IDs, FIFO/device descriptors, and whiteouts as described
+  above. The Linux class remains pending a published privileged on-host corpus
+  for nonzero project IDs, device recreation, privileged namespaces, labels,
+  capabilities, and immutable/append-only flags. Windows ordinary regular-file metadata
   and supported backup streams are captured, authenticated, parsed, and
   preserved. Essential sparse/reparse/basic metadata and privilege-gated
   security application are implemented, but richer streams remain incomplete.

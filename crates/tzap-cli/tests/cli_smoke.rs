@@ -5906,9 +5906,9 @@ fn cli_create_rejects_volume_size_output_collisions_for_dotted_base() {
         .stderr(predicate::str::contains("output path collision"));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
-fn cli_create_rejects_char_device_input_type() {
+fn cli_create_archives_char_device_descriptor() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");
     let output = temp.path().join("char.tzap");
@@ -5926,8 +5926,20 @@ fn cli_create_rejects_char_device_input_type() {
             "/dev/null",
         ])
         .assert()
-        .code(1)
-        .stderr(predicate::str::contains("unsupported input type"));
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "list",
+            "--long",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("character-device"));
 }
 
 #[cfg(unix)]

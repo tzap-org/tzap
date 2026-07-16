@@ -10491,7 +10491,6 @@ mod tests {
         serialize_raw_stream_content_model_extension, RAW_STREAM_UNSUPPORTED_MESSAGE,
     };
     use crate::wire::RecipientRecordV1;
-    use crate::writer::NativeFileMetadata;
     use crate::writer::{
         write_archive, write_archive_unencrypted, write_archive_with_dictionary,
         write_archive_with_kdf, write_archive_with_recipient_wrap_records,
@@ -10499,6 +10498,7 @@ mod tests {
         PortableFileMetadata, PortableModeOrigin, PortablePosixOwner, RegularFile,
         RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions,
     };
+    use crate::writer::{NativeAuxiliaryMetadata, NativeAuxiliaryNameEncoding, NativeFileMetadata};
 
     fn master_key() -> MasterKey {
         MasterKey::from_raw_key(&[0x42; 32]).unwrap()
@@ -12305,6 +12305,53 @@ mod tests {
         assert_eq!(
             xattr::get(native_root.path().join("xattr.txt"), "user.tzap-test").unwrap(),
             Some(b"native value".to_vec())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compressed_archive_extraction_restores_auxiliary_linux_xattr() {
+        let mut record = NativeAuxiliaryMetadata::new(
+            "generic.xattr",
+            "posix-backup-v1",
+            crate::entry_metadata::RestoreClass::SameOs,
+            b"auxiliary xattr value".to_vec(),
+        );
+        record.name_encoding = NativeAuxiliaryNameEncoding::Bytes;
+        record.name = b"user.tzap-aux".to_vec();
+        let native = NativeFileMetadata {
+            required_profiles: vec!["posix-backup-v1".into(), "linux-backup-v1".into()],
+            auxiliary_records: vec![record],
+            ..NativeFileMetadata::default()
+        };
+        let archive = write_archive(
+            &[RegularFile {
+                portable_metadata: PortableFileMetadata {
+                    source_os: "linux".into(),
+                    native,
+                    ..PortableFileMetadata::default()
+                },
+                ..RegularFile::new("aux-xattr.txt", b"payload")
+            }],
+            &master_key(),
+            single_stream_options(),
+        )
+        .unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        opened
+            .extract_file_to(
+                "aux-xattr.txt",
+                root.path(),
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::SameOs,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            xattr::get(root.path().join("aux-xattr.txt"), "user.tzap-aux").unwrap(),
+            Some(b"auxiliary xattr value".to_vec())
         );
     }
 

@@ -68,7 +68,7 @@ use tzap_core::{
 use tzap_core::{write_archive_with_kdf, RegularFile};
 #[cfg(test)]
 use tzap_core::{MetadataDiagnosticStatus, MetadataOperation};
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use tzap_core::{NativeAuxiliaryMetadata, NativeAuxiliaryNameEncoding, RestoreClass};
 use tzap_plugin_keywrap::{
     dispatch_key_wrap_record, wrap_master_key_for_recipient,
@@ -3033,6 +3033,27 @@ impl RegularFileSource for InputSpec {
                 SourceEntryKind::Directory => metadata.is_dir(),
                 SourceEntryKind::Symlink => metadata.file_type().is_symlink(),
                 SourceEntryKind::Hardlink => metadata.is_file(),
+                #[cfg(unix)]
+                SourceEntryKind::CharacterDevice => {
+                    use std::os::unix::fs::FileTypeExt;
+                    metadata.file_type().is_char_device()
+                }
+                #[cfg(not(unix))]
+                SourceEntryKind::CharacterDevice => false,
+                #[cfg(unix)]
+                SourceEntryKind::BlockDevice => {
+                    use std::os::unix::fs::FileTypeExt;
+                    metadata.file_type().is_block_device()
+                }
+                #[cfg(not(unix))]
+                SourceEntryKind::BlockDevice => false,
+                #[cfg(unix)]
+                SourceEntryKind::Fifo => {
+                    use std::os::unix::fs::FileTypeExt;
+                    metadata.file_type().is_fifo()
+                }
+                #[cfg(not(unix))]
+                SourceEntryKind::Fifo => false,
                 #[cfg(windows)]
                 SourceEntryKind::ReparseDirectory => open_windows_metadata_handle(&self.source)
                     .and_then(|file| query_windows_reparse_data(&file))
@@ -3428,7 +3449,7 @@ fn collect_one_input_spec(
             link_target: Some(link_target),
             mode: readonly_mode(&metadata),
             mtime: identity.mtime,
-            portable_metadata: portable_symlink_metadata(identity),
+            portable_metadata: portable_symlink_metadata(identity, input)?,
             size: 0,
             sparse_extents: None,
             identity,
@@ -3482,6 +3503,69 @@ fn collect_one_input_spec(
         }
         return Ok(());
     }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::linux::fs::MetadataExt as _;
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let file_type = metadata.file_type();
+        let entry_kind = if file_type.is_char_device() {
+            Some(SourceEntryKind::CharacterDevice)
+        } else if file_type.is_block_device() {
+            Some(SourceEntryKind::BlockDevice)
+        } else if file_type.is_fifo() {
+            Some(SourceEntryKind::Fifo)
+        } else {
+            None
+        };
+        if let Some(entry_kind) = entry_kind {
+            let archive_path = archive_path_to_string(archive_path)?;
+            let identity = input_identity(&metadata)
+                .with_context(|| format!("failed to identify input {}", input.display()))?;
+            let mut portable_metadata = portable_input_metadata(identity, input)?;
+            portable_metadata
+                .native
+                .required_profiles
+                .push("posix-backup-v1".into());
+            if matches!(
+                entry_kind,
+                SourceEntryKind::CharacterDevice | SourceEntryKind::BlockDevice
+            ) {
+                let device = metadata.st_rdev();
+                let major = libc::major(device);
+                let minor = libc::minor(device);
+                portable_metadata.native.primary_pax_records.insert(
+                    "TZAP.posix.device-major".into(),
+                    major.to_string().into_bytes(),
+                );
+                portable_metadata.native.primary_pax_records.insert(
+                    "TZAP.posix.device-minor".into(),
+                    minor.to_string().into_bytes(),
+                );
+                if entry_kind == SourceEntryKind::CharacterDevice && major == 0 && minor == 0 {
+                    portable_metadata
+                        .native
+                        .primary_pax_records
+                        .insert("TZAP.linux.whiteout".into(), b"1".to_vec());
+                }
+            }
+            portable_metadata.native.required_profiles.sort();
+            portable_metadata.native.required_profiles.dedup();
+            out.push(InputSpec {
+                source: input.to_owned(),
+                archive_path,
+                entry_kind,
+                link_target: None,
+                mode: readonly_mode(&metadata),
+                mtime: identity.mtime,
+                portable_metadata,
+                size: 0,
+                sparse_extents: None,
+                identity,
+            });
+            return Ok(());
+        }
+    }
     if !metadata.is_file() {
         bail!("unsupported input type {}", input.display());
     }
@@ -3512,7 +3596,22 @@ fn collect_one_input_spec(
         };
         (identity, sparse_extents)
     };
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    let sparse_extents = {
+        let file = File::open(input).with_context(|| {
+            format!(
+                "failed to open {} for sparse-range capture",
+                input.display()
+            )
+        })?;
+        query_linux_sparse_extents(&file, identity.len).with_context(|| {
+            format!(
+                "failed to query sparse ranges for Linux input {}",
+                input.display()
+            )
+        })?
+    };
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     let sparse_extents = None;
     let portable_metadata = portable_input_metadata(identity, input)?;
     out.push(InputSpec {
@@ -3528,6 +3627,64 @@ fn collect_one_input_spec(
         identity,
     });
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn query_linux_sparse_extents(
+    file: &File,
+    logical_size: u64,
+) -> io::Result<Option<Vec<SparseExtent>>> {
+    use std::os::fd::AsRawFd;
+
+    if logical_size == 0 {
+        return Ok(None);
+    }
+    let end = libc::off_t::try_from(logical_size)
+        .map_err(|_| io::Error::other("file size exceeds Linux off_t"))?;
+    let fd = file.as_raw_fd();
+    let mut cursor: libc::off_t = 0;
+    let mut extents = Vec::new();
+    while cursor < end {
+        // SAFETY: `fd` is live and SEEK_DATA does not mutate caller memory.
+        let data = unsafe { libc::lseek(fd, cursor, libc::SEEK_DATA) };
+        if data < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            if cursor == 0
+                && error.raw_os_error().is_some_and(|code| {
+                    code == libc::EINVAL || code == libc::EOPNOTSUPP || code == libc::ENOTSUP
+                })
+            {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        // SAFETY: as above, SEEK_HOLE only updates the descriptor offset.
+        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let data = u64::try_from(data).map_err(|_| io::Error::other("negative data offset"))?;
+        let hole = u64::try_from(hole).map_err(|_| io::Error::other("negative hole offset"))?;
+        let hole = hole.min(logical_size);
+        if hole <= data {
+            return Err(io::Error::other("Linux sparse-range query did not advance"));
+        }
+        extents.push(SparseExtent {
+            offset: data,
+            length: hole - data,
+        });
+        cursor = libc::off_t::try_from(hole)
+            .map_err(|_| io::Error::other("sparse offset exceeds Linux off_t"))?;
+    }
+
+    let allocated = extents.iter().try_fold(0u64, |sum, extent| {
+        sum.checked_add(extent.length)
+            .ok_or_else(|| io::Error::other("sparse extent length overflow"))
+    })?;
+    Ok((allocated < logical_size).then_some(extents))
 }
 
 #[cfg(windows)]
@@ -4313,8 +4470,11 @@ fn portable_input_metadata(identity: InputIdentity, input: &Path) -> Result<Port
     })
 }
 
-fn portable_symlink_metadata(identity: InputIdentity) -> PortableFileMetadata {
-    PortableFileMetadata {
+fn portable_symlink_metadata(
+    identity: InputIdentity,
+    input: &Path,
+) -> Result<PortableFileMetadata> {
+    Ok(PortableFileMetadata {
         source_os: source_os_label().into(),
         source_filesystem: "unknown".into(),
         mode_origin: if cfg!(unix) {
@@ -4332,8 +4492,59 @@ fn portable_symlink_metadata(identity: InputIdentity) -> PortableFileMetadata {
         #[cfg(not(unix))]
         posix_owner: None,
         attributes: identity.attributes,
+        #[cfg(target_os = "linux")]
+        native: capture_linux_symlink_metadata(input, identity)?,
+        #[cfg(not(target_os = "linux"))]
         native: NativeFileMetadata::default(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn capture_linux_symlink_metadata(
+    input: &Path,
+    identity: InputIdentity,
+) -> Result<NativeFileMetadata> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut native = NativeFileMetadata::default();
+    for name in xattr::list(input)
+        .with_context(|| format!("failed to list symlink xattrs for {}", input.display()))?
+    {
+        let Some(value) = xattr::get(input, &name)
+            .with_context(|| format!("failed to read symlink xattr on {}", input.display()))?
+        else {
+            bail!("symlink xattr changed while scanning {}", input.display());
+        };
+        let name_bytes = name.as_bytes();
+        let profile = if name_bytes.starts_with(b"security.")
+            || name_bytes.starts_with(b"trusted.")
+            || name_bytes.starts_with(b"system.")
+        {
+            "linux-backup-v1"
+        } else {
+            "posix-backup-v1"
+        };
+        let encoded_name = encode_percent_name(name_bytes).map_err(|error| anyhow!(error))?;
+        native.primary_pax_records.insert(
+            format!("LIBARCHIVE.xattr.{encoded_name}"),
+            canonical_base64_encode(&value),
+        );
+        native.required_profiles.push(profile.into());
     }
+    native.primary_pax_records.insert(
+        "TZAP.unix.ctime-observed".into(),
+        ArchiveTimestamp::new(
+            identity.change_time_seconds,
+            identity.change_time_nanoseconds as u32,
+        )
+        .canonical_pax_value()
+        .map_err(|error| anyhow!(error))?,
+    );
+    native.required_profiles.push("posix-backup-v1".into());
+    native.required_profiles.push("linux-backup-v1".into());
+    native.required_profiles.sort();
+    native.required_profiles.dedup();
+    Ok(native)
 }
 
 #[cfg(unix)]
@@ -4358,9 +4569,13 @@ fn capture_native_file_metadata(
     use std::os::unix::ffi::OsStrExt;
     use xattr::FileExt as _;
 
-    let file = File::open(input)
+    let file = open_linux_metadata_file(input)
         .with_context(|| format!("failed to open {} for metadata capture", input.display()))?;
     let mut native = NativeFileMetadata::default();
+    // Keep the primary local-PAX record comfortably below its aggregate cap.
+    // Larger aggregate xattr sets use the format's hashed auxiliary framing.
+    const INLINE_XATTR_BUDGET: usize = 32 * 1024 * 1024;
+    let mut inline_xattr_bytes = 0usize;
     #[cfg(target_os = "linux")]
     let mut captured_posix_acl = false;
     for name in file
@@ -4389,11 +4604,6 @@ fn capture_native_file_metadata(
             native.required_profiles.push("posix-backup-v1".into());
             continue;
         }
-        let encoded_name = encode_percent_name(name_bytes).map_err(|error| anyhow!(error))?;
-        native.primary_pax_records.insert(
-            format!("LIBARCHIVE.xattr.{encoded_name}"),
-            canonical_base64_encode(&value),
-        );
         let profile = if name_bytes.starts_with(b"security.")
             || name_bytes.starts_with(b"trusted.")
             || name_bytes.starts_with(b"system.")
@@ -4404,6 +4614,31 @@ fn capture_native_file_metadata(
         } else {
             "posix-backup-v1"
         };
+        let restore_class = if profile == "linux-backup-v1" {
+            RestoreClass::System
+        } else {
+            RestoreClass::SameOs
+        };
+        let encoded_name = encode_percent_name(name_bytes).map_err(|error| anyhow!(error))?;
+        let encoded_value = canonical_base64_encode(&value);
+        if inline_xattr_bytes
+            .saturating_add(encoded_name.len())
+            .saturating_add(encoded_value.len())
+            > INLINE_XATTR_BUDGET
+        {
+            let mut record =
+                NativeAuxiliaryMetadata::new("generic.xattr", profile, restore_class, value);
+            record.name_encoding = NativeAuxiliaryNameEncoding::Bytes;
+            record.name = name_bytes.to_vec();
+            native.auxiliary_records.push(record);
+        } else {
+            inline_xattr_bytes = inline_xattr_bytes
+                .saturating_add(encoded_name.len())
+                .saturating_add(encoded_value.len());
+            native
+                .primary_pax_records
+                .insert(format!("LIBARCHIVE.xattr.{encoded_name}"), encoded_value);
+        }
         native.required_profiles.push(profile.into());
     }
     #[cfg(target_os = "linux")]
@@ -4424,6 +4659,8 @@ fn capture_native_file_metadata(
             input.display()
         )
     })?;
+    capture_linux_project_id(&file, &mut native)
+        .with_context(|| format!("failed to capture Linux project ID for {}", input.display()))?;
     native.primary_pax_records.insert(
         "TZAP.unix.ctime-observed".into(),
         ArchiveTimestamp::new(
@@ -4445,7 +4682,22 @@ fn capture_native_file_metadata(
     native.required_profiles.push("linux-backup-v1".into());
     native.required_profiles.sort();
     native.required_profiles.dedup();
+    native.auxiliary_records.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.name.cmp(&right.name))
+    });
     Ok(native)
+}
+
+#[cfg(target_os = "linux")]
+fn open_linux_metadata_file(input: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(input)
 }
 
 #[cfg(target_os = "macos")]
@@ -5675,6 +5927,38 @@ fn capture_linux_inode_flags(file: &File, native: &mut NativeFileMetadata) -> io
         "TZAP.linux.fsflags".into(),
         format!("{:016x}", flags as u64).into_bytes(),
     );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn capture_linux_project_id(file: &File, native: &mut NativeFileMetadata) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // All fields are integer/reserved storage, so an all-zero value is valid input.
+    let mut attributes: linux_raw_sys::general::fsxattr = unsafe { std::mem::zeroed() };
+    // SAFETY: the request writes one fsxattr through a valid pointer for a live descriptor.
+    if unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            linux_raw_sys::ioctl::FS_IOC_FSGETXATTR as libc::c_ulong,
+            &mut attributes,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error().is_some_and(|code| {
+            code == libc::ENOTTY || code == libc::EOPNOTSUPP || code == libc::EINVAL
+        }) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    if attributes.fsx_projid != 0 {
+        native.primary_pax_records.insert(
+            "TZAP.linux.project-id".into(),
+            attributes.fsx_projid.to_string().into_bytes(),
+        );
+    }
     Ok(())
 }
 
@@ -9623,6 +9907,147 @@ mod tests {
         assert!(native
             .primary_pax_records
             .contains_key("TZAP.unix.ctime-observed"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn filesystem_scan_and_restore_preserve_linux_fifo() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("events.fifo");
+        let source_c = CString::new(source.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(source_c.as_ptr(), 0o640) }, 0);
+
+        let specs = collect_input_specs(&[source.to_string_lossy().into_owned()]).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].entry_kind, SourceEntryKind::Fifo);
+        assert_eq!(specs[0].size, 0);
+
+        let key = MasterKey::from_raw_key(&[41u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+        write_archive_sources_to_sink_ordered_parallel(
+            &specs,
+            &key,
+            WriterOptions {
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+        let opened = tzap_core::open_archive(&sink.volumes[0], &key).unwrap();
+        opened.verify().unwrap();
+        let output = temp.path().join("fifo-output");
+        fs::create_dir(&output).unwrap();
+        opened
+            .extract_all_to(
+                &output,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::System,
+                    system_authorized: true,
+                    // Linux exposes birth time on some filesystems but has no general API to
+                    // restore it, so the unrelated FIFO recreation proceeds explicitly degraded.
+                    allow_degraded: true,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+        let restored = fs::symlink_metadata(output.join("events.fifo")).unwrap();
+        assert!(restored.file_type().is_fifo());
+        assert_eq!(readonly_mode(&restored) & 0o777, 0o640);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn filesystem_scan_discovers_linux_sparse_extents() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("sparse.bin");
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&source)
+            .unwrap();
+        let logical_size = 512 * 1024u64;
+        file.set_len(logical_size).unwrap();
+        file.seek(SeekFrom::Start(64 * 1024)).unwrap();
+        file.write_all(b"first extent").unwrap();
+        file.seek(SeekFrom::Start(384 * 1024)).unwrap();
+        file.write_all(b"last extent").unwrap();
+        file.flush().unwrap();
+
+        let specs = collect_input_specs(&[source.to_string_lossy().into_owned()]).unwrap();
+        let extents = specs[0]
+            .sparse_extents
+            .as_ref()
+            .expect("filesystem should expose SEEK_DATA/SEEK_HOLE");
+        assert!(!extents.is_empty());
+        assert!(extents.iter().map(|extent| extent.length).sum::<u64>() < logical_size);
+
+        let key = MasterKey::from_raw_key(&[42u8; 32]).unwrap();
+        let mut sink = MemoryArchiveSink::default();
+        write_archive_sources_to_sink_ordered_parallel(
+            &specs,
+            &key,
+            WriterOptions {
+                stripe_width: 1,
+                volume_loss_tolerance: 0,
+                bit_rot_buffer_pct: 0,
+                ..WriterOptions::default()
+            },
+            &KdfParams::Raw,
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+        let opened = tzap_core::open_archive(&sink.volumes[0], &key).unwrap();
+        let indexed = opened.lookup_index_entry("sparse.bin").unwrap().unwrap();
+        assert_ne!(
+            indexed.flags & (1 << 3),
+            0,
+            "archive index lost sparse metadata"
+        );
+        let output = temp.path().join("sparse-output");
+        fs::create_dir(&output).unwrap();
+        opened
+            .extract_all_to(
+                &output,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::SameOs,
+                    allow_degraded: true,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap();
+        let restored_path = output.join("sparse.bin");
+        let restored = File::open(&restored_path).unwrap();
+        assert_eq!(restored.metadata().unwrap().len(), logical_size);
+        let restored_extents = query_linux_sparse_extents(&restored, logical_size).unwrap();
+        use std::os::unix::fs::MetadataExt as _;
+        assert!(
+            restored_extents.is_some(),
+            "restored output should remain sparse; source extents={extents:?}, blocks={}",
+            restored.metadata().unwrap().blocks()
+        );
+        let restored_extents = restored_extents.unwrap();
+        assert!(
+            restored_extents
+                .iter()
+                .map(|extent| extent.length)
+                .sum::<u64>()
+                < logical_size
+        );
+        let bytes = fs::read(restored_path).unwrap();
+        assert_eq!(&bytes[64 * 1024..64 * 1024 + 12], b"first extent");
+        assert_eq!(&bytes[384 * 1024..384 * 1024 + 11], b"last extent");
     }
 
     #[cfg(target_os = "macos")]

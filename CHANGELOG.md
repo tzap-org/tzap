@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Closes Linux revision-45 metadata gaps for sparse allocation, auxiliary
+  xattrs, no-follow symlink metadata, project IDs, FIFO/device descriptors,
+  whiteouts, and authorized native restoration.
 - Captures macOS regular-file metadata, including Darwin flags, xattrs, native
   ACLs, FinderInfo, resource forks, creation time, and observed ctime.
 - Replaces logical-source-only create progress with phase-native writer progress.

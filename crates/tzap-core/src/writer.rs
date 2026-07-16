@@ -501,6 +501,9 @@ pub enum SourceEntryKind {
     Directory,
     Symlink,
     Hardlink,
+    CharacterDevice,
+    BlockDevice,
+    Fifo,
     /// Zero-data directory primary whose native metadata contains an exact,
     /// validated Windows mount-point reparse payload.
     ReparseDirectory,
@@ -7299,6 +7302,9 @@ fn build_primary_member_layout(
         SourceEntryKind::Directory | SourceEntryKind::ReparseDirectory => b'5',
         SourceEntryKind::Symlink => b'2',
         SourceEntryKind::Hardlink => b'1',
+        SourceEntryKind::CharacterDevice => b'3',
+        SourceEntryKind::BlockDevice => b'4',
+        SourceEntryKind::Fifo => b'6',
     };
     let mut header = build_ustar_header(&header_path, header_size, mode, header_mtime, typeflag)?;
     if let Some(target) = link_target.filter(|_| !use_linkpath_override) {
@@ -7306,6 +7312,31 @@ fn build_primary_member_layout(
         finalize_tar_checksum(&mut header)?;
     }
     apply_primary_tar_identity(&mut header, &primary_identity)?;
+    if matches!(
+        entry_kind,
+        SourceEntryKind::CharacterDevice | SourceEntryKind::BlockDevice
+    ) {
+        let parse_device = |key: &str| -> Result<u64, FormatError> {
+            let value = pax_records.get(key).ok_or(FormatError::WriterInvariant(
+                "device member lacks device-number metadata",
+            ))?;
+            let text = std::str::from_utf8(value).map_err(|_| {
+                FormatError::WriterUnsupported("device number is not canonical decimal")
+            })?;
+            text.parse::<u64>().map_err(|_| {
+                FormatError::WriterUnsupported("device number is not canonical decimal")
+            })
+        };
+        let major = parse_device("TZAP.posix.device-major")?;
+        let minor = parse_device("TZAP.posix.device-minor")?;
+        if tar_octal_fits(8, major) {
+            write_tar_octal(&mut header[329..337], major)?;
+        }
+        if tar_octal_fits(8, minor) {
+            write_tar_octal(&mut header[337..345], minor)?;
+        }
+        finalize_tar_checksum(&mut header)?;
+    }
     primary.extend_from_slice(&header);
     if let Some(sparse_map) = sparse_map {
         primary.extend_from_slice(&sparse_map);
@@ -8636,6 +8667,58 @@ mod tests {
         assert_eq!(
             parsed.v45_metadata.portable_mirror.mtime,
             (1_700_000_000, 123_456_789)
+        );
+    }
+
+    #[test]
+    fn posix_special_writer_emits_fifo_and_device_primaries() {
+        let mut portable = PortableFileMetadata {
+            source_os: "linux".into(),
+            mode_origin: PortableModeOrigin::Native,
+            native: NativeFileMetadata {
+                required_profiles: vec!["posix-backup-v1".into(), "linux-backup-v1".into()],
+                ..NativeFileMetadata::default()
+            },
+            ..PortableFileMetadata::default()
+        };
+        let fifo = build_primary_member_prefix(
+            b"pipe",
+            SourceEntryKind::Fifo,
+            None,
+            0,
+            None,
+            0o640,
+            ArchiveTimestamp::UNIX_EPOCH,
+            &portable,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_tar_member_group(&fifo, 4096).unwrap().kind,
+            crate::tar_model::TarEntryKind::Fifo
+        );
+
+        portable
+            .native
+            .primary_pax_records
+            .insert("TZAP.posix.device-major".into(), b"1".to_vec());
+        portable
+            .native
+            .primary_pax_records
+            .insert("TZAP.posix.device-minor".into(), b"3".to_vec());
+        let device = build_primary_member_prefix(
+            b"null",
+            SourceEntryKind::CharacterDevice,
+            None,
+            0,
+            None,
+            0o666,
+            ArchiveTimestamp::UNIX_EPOCH,
+            &portable,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_tar_member_group(&device, 4096).unwrap().kind,
+            crate::tar_model::TarEntryKind::CharacterDevice
         );
     }
 
