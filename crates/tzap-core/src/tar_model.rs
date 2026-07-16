@@ -28,7 +28,6 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_WRITE_ATTRIBUTES,
 };
 
-#[cfg(windows)]
 use crate::entry_metadata::parse_timestamp;
 use crate::entry_metadata::{
     decode_percent_name, parse_auxiliary_record, parse_canonical_pax, parse_primary_metadata,
@@ -3080,7 +3079,10 @@ fn plan_restore(
     if matches!(
         kind,
         TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo
-    ) {
+    ) && !(cfg!(target_os = "linux")
+        && options.restore_policy == RestorePolicy::System
+        && options.system_authorized)
+    {
         diagnostics.push(
             MetadataDiagnostic::new(
                 path,
@@ -3098,7 +3100,7 @@ fn plan_restore(
         );
     }
     if metadata.file_entry_flags & HAS_SPARSE_EXTENTS != 0 {
-        let native_sparse_supported = cfg!(windows);
+        let native_sparse_supported = cfg!(any(windows, target_os = "linux"));
         if options.restore_policy != RestorePolicy::Content
             && !native_sparse_supported
             && !options.allow_degraded
@@ -3341,7 +3343,9 @@ fn plan_restore(
         ) && !cfg!(target_os = "linux"))
         || (required_native_profile && !native_source_matches_host);
 
-    if (requests_same_os && unsupported_same_os) || (requests_system && unsupported_system) {
+    if (!requests_system && requests_same_os && unsupported_same_os)
+        || (requests_system && unsupported_system)
+    {
         if !options.allow_degraded {
             return Err(FormatError::ReaderUnsupported(
                 "requested native metadata is not supported by this conformance class",
@@ -3571,6 +3575,9 @@ fn native_primary_restore_unsupported(metadata: &MemberMetadata, include_system:
             return !cfg!(target_os = "linux");
         }
         if key == "TZAP.linux.project-id" {
+            return !cfg!(target_os = "linux") || !include_system;
+        }
+        if key == "TZAP.linux.whiteout" || key.starts_with("TZAP.posix.device-") {
             return !cfg!(target_os = "linux") || !include_system;
         }
         if key == "TZAP.windows.file-attributes" {
@@ -4296,6 +4303,12 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                             apply_restored_symlink_mtime(
                                 &destination,
                                 &member.path,
+                                member
+                                    .v45_metadata
+                                    .primary_records
+                                    .get("atime")
+                                    .map(|value| parse_timestamp(value))
+                                    .transpose()?,
                                 member.v45_metadata.portable_mirror.mtime,
                                 self.options,
                                 &mut self.planned_diagnostics,
@@ -4856,6 +4869,11 @@ fn restore_tar_member(
                 apply_restored_symlink_mtime(
                     &destination,
                     &member.path,
+                    metadata
+                        .primary_records
+                        .get("atime")
+                        .map(|value| parse_timestamp(value))
+                        .transpose()?,
                     metadata.portable_mirror.mtime,
                     options,
                     &mut diagnostics,
@@ -7184,6 +7202,7 @@ pub(crate) fn finalize_committed_directory_metadata(
 fn apply_restored_symlink_mtime(
     destination: &PreparedDestination,
     path: &[u8],
+    access_time: Option<(i64, u32)>,
     (seconds, nanoseconds): (i64, u32),
     options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
@@ -7210,9 +7229,36 @@ fn apply_restored_symlink_mtime(
             "symlink mtime cannot be represented on this host",
         );
     };
+    let accessed = access_time.and_then(|(seconds, nanoseconds)| {
+        let duration = Duration::new(seconds.unsigned_abs(), nanoseconds);
+        let time = if seconds < 0 {
+            SystemTime::UNIX_EPOCH.checked_sub(duration)
+        } else {
+            SystemTime::UNIX_EPOCH.checked_add(duration)
+        }?;
+        Some(SystemTimeSpec::Absolute(
+            cap_std::time::SystemTime::from_std(time),
+        ))
+    });
+    if access_time.is_some() && accessed.is_none() {
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "posix-backup-v1",
+                "atime",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to apply symlink atime metadata",
+            )
+            .for_restore(options.restore_policy, 4),
+            options,
+            "symlink atime cannot be represented on this host",
+        );
+    }
     if let Err(error) = destination.parent.set_symlink_times(
         &destination.leaf,
-        None,
+        accessed,
         Some(SystemTimeSpec::Absolute(
             cap_std::time::SystemTime::from_std(modified),
         )),
@@ -9407,9 +9453,9 @@ mod tests {
             false,
             SafeExtractionOptions::default(),
         );
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         assert!(strict.unwrap().is_empty());
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         assert_eq!(
             strict.unwrap_err(),
             FormatError::ReaderUnsupported(
@@ -9428,9 +9474,9 @@ mod tests {
             },
         )
         .unwrap();
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         assert!(degraded.is_empty());
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         assert!(degraded.iter().any(|diagnostic| {
             diagnostic.metadata_class == "sparse-layout"
                 && diagnostic.status == MetadataDiagnosticStatus::Materialized

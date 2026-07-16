@@ -5942,6 +5942,54 @@ fn cli_create_archives_char_device_descriptor() {
         .stdout(predicate::str::contains("character-device"));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_create_archives_unopenable_block_device_descriptor_when_privileged() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let input = temp.path().join("unused-block-device");
+    let output = temp.path().join("block.tzap");
+    let input_c = CString::new(input.as_os_str().as_bytes()).unwrap();
+    let status = unsafe {
+        libc::mknod(
+            input_c.as_ptr(),
+            libc::S_IFBLK | 0o600,
+            libc::makedev(240, 2),
+        )
+    };
+    if status != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EPERM) {
+            return;
+        }
+        panic!("failed to create block-device descriptor: {error}");
+    }
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--no-encryption",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["list", "--long", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("block-device"));
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_symlink_target_and_mtime_round_trip_without_following_target() {
@@ -5959,12 +6007,14 @@ fn cli_symlink_target_and_mtime_round_trip_without_following_target() {
     fs::write(&keyfile, KEY_HEX).unwrap();
     std::os::unix::fs::symlink("target.txt", &link).unwrap();
     let link_path = CString::new(link.as_os_str().as_bytes()).unwrap();
+    let expected_access_seconds = 1_699_000_123;
+    let expected_access_nanoseconds = 123_456_000;
     let expected_seconds = 1_700_000_321;
     let expected_nanoseconds = 654_321_000;
     let times = [
         libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
+            tv_sec: expected_access_seconds,
+            tv_nsec: expected_access_nanoseconds,
         },
         libc::timespec {
             tv_sec: expected_seconds,
@@ -6017,11 +6067,13 @@ fn cli_symlink_target_and_mtime_round_trip_without_following_target() {
         .success();
 
     let restored_link = extract_dir.join("link.txt");
+    let restored = fs::symlink_metadata(&restored_link).unwrap();
+    assert_eq!(restored.atime(), expected_access_seconds);
+    assert_eq!(restored.atime_nsec(), expected_access_nanoseconds);
     assert_eq!(
         fs::read_link(&restored_link).unwrap(),
         Path::new("target.txt")
     );
-    let restored = fs::symlink_metadata(restored_link).unwrap();
     assert_eq!(restored.mtime(), expected_seconds);
     assert_eq!(restored.mtime_nsec(), expected_nanoseconds);
     let target_after = fs::symlink_metadata(restored_target).unwrap();

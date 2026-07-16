@@ -3211,6 +3211,8 @@ struct InputIdentity {
     #[cfg(unix)]
     change_time_nanoseconds: i64,
     #[cfg(unix)]
+    access_time: ArchiveTimestamp,
+    #[cfg(unix)]
     creation_time: Option<ArchiveTimestamp>,
     #[cfg(unix)]
     dev: u64,
@@ -3922,6 +3924,8 @@ fn input_identity(metadata: &fs::Metadata) -> io::Result<InputIdentity> {
             metadata.ctime_nsec()
         },
         #[cfg(unix)]
+        access_time: archive_timestamp(metadata.accessed()?)?,
+        #[cfg(unix)]
         creation_time: metadata
             .created()
             .ok()
@@ -3988,7 +3992,17 @@ fn input_identity_matches_after_read(expected: InputIdentity, actual: InputIdent
         actual.last_access_time_100ns = 0;
         expected == actual
     }
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(windows)))]
+    {
+        let mut expected = expected;
+        let mut actual = actual;
+        // Opening and reading can update atime. Preserve the scanned value for
+        // symlink metadata, but exclude it from content change detection.
+        expected.access_time = ArchiveTimestamp::from_seconds(0);
+        actual.access_time = ArchiveTimestamp::from_seconds(0);
+        expected == actual
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         expected == actual
     }
@@ -4540,6 +4554,13 @@ fn capture_linux_symlink_metadata(
         .canonical_pax_value()
         .map_err(|error| anyhow!(error))?,
     );
+    native.primary_pax_records.insert(
+        "atime".into(),
+        identity
+            .access_time
+            .canonical_pax_value()
+            .map_err(|error| anyhow!(error))?,
+    );
     native.required_profiles.push("posix-backup-v1".into());
     native.required_profiles.push("linux-backup-v1".into());
     native.required_profiles.sort();
@@ -4569,7 +4590,7 @@ fn capture_native_file_metadata(
     use std::os::unix::ffi::OsStrExt;
     use xattr::FileExt as _;
 
-    let file = open_linux_metadata_file(input)
+    let (file, metadata_only) = open_linux_metadata_file(input)
         .with_context(|| format!("failed to open {} for metadata capture", input.display()))?;
     let mut native = NativeFileMetadata::default();
     // Keep the primary local-PAX record comfortably below its aggregate cap.
@@ -4578,14 +4599,20 @@ fn capture_native_file_metadata(
     let mut inline_xattr_bytes = 0usize;
     #[cfg(target_os = "linux")]
     let mut captured_posix_acl = false;
-    for name in file
-        .list_xattr()
-        .with_context(|| format!("failed to list xattrs for {}", input.display()))?
+    for name in if metadata_only {
+        xattr::list(input)
+    } else {
+        file.list_xattr()
+    }
+    .with_context(|| format!("failed to list xattrs for {}", input.display()))?
     {
         let name_bytes = name.as_bytes();
-        let Some(value) = file
-            .get_xattr(&name)
-            .with_context(|| format!("failed to read xattr on {}", input.display()))?
+        let Some(value) = if metadata_only {
+            xattr::get(input, &name)
+        } else {
+            file.get_xattr(&name)
+        }
+        .with_context(|| format!("failed to read xattr on {}", input.display()))?
         else {
             bail!("xattr changed while scanning {}", input.display());
         };
@@ -4653,14 +4680,17 @@ fn capture_native_file_metadata(
     }
     native.required_profiles.sort();
     native.required_profiles.dedup();
-    capture_linux_inode_flags(&file, &mut native).with_context(|| {
-        format!(
-            "failed to capture Linux inode flags for {}",
-            input.display()
-        )
-    })?;
-    capture_linux_project_id(&file, &mut native)
-        .with_context(|| format!("failed to capture Linux project ID for {}", input.display()))?;
+    if !metadata_only {
+        capture_linux_inode_flags(&file, &mut native).with_context(|| {
+            format!(
+                "failed to capture Linux inode flags for {}",
+                input.display()
+            )
+        })?;
+        capture_linux_project_id(&file, &mut native).with_context(|| {
+            format!("failed to capture Linux project ID for {}", input.display())
+        })?;
+    }
     native.primary_pax_records.insert(
         "TZAP.unix.ctime-observed".into(),
         ArchiveTimestamp::new(
@@ -4670,14 +4700,6 @@ fn capture_native_file_metadata(
         .canonical_pax_value()
         .map_err(|error| anyhow!(error))?,
     );
-    if let Some(creation_time) = identity.creation_time {
-        native.primary_pax_records.insert(
-            "LIBARCHIVE.creationtime".into(),
-            creation_time
-                .canonical_pax_value()
-                .map_err(|error| anyhow!(error))?,
-        );
-    }
     native.required_profiles.push("posix-backup-v1".into());
     native.required_profiles.push("linux-backup-v1".into());
     native.required_profiles.sort();
@@ -4691,13 +4713,43 @@ fn capture_native_file_metadata(
 }
 
 #[cfg(target_os = "linux")]
-fn open_linux_metadata_file(input: &Path) -> io::Result<File> {
+fn open_linux_metadata_file(input: &Path) -> io::Result<(File, bool)> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    fs::OpenOptions::new()
+    match fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(input)
+    {
+        Ok(file) => Ok((file, false)),
+        Err(error)
+            if error.raw_os_error() == Some(libc::ENXIO)
+                || error.raw_os_error() == Some(libc::ENODEV) =>
+        {
+            use std::ffi::CString;
+            use std::os::fd::FromRawFd as _;
+            use std::os::unix::ffi::OsStrExt as _;
+
+            let path = CString::new(input.as_os_str().as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte")
+            })?;
+            // SAFETY: `path` is NUL-terminated and a successful descriptor is
+            // transferred immediately to `File`.
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_PATH,
+                )
+            };
+            if fd < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                // SAFETY: `fd` is newly opened and exclusively owned here.
+                Ok((unsafe { File::from_raw_fd(fd) }, true))
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -10022,7 +10074,6 @@ mod tests {
                 &output,
                 SafeExtractionOptions {
                     restore_policy: RestorePolicy::SameOs,
-                    allow_degraded: true,
                     ..SafeExtractionOptions::default()
                 },
             )
