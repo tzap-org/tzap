@@ -6576,7 +6576,7 @@ fn apply_linux_project_id(
     let get_result = unsafe {
         libc::ioctl(
             file.as_raw_fd(),
-            linux_raw_sys::ioctl::FS_IOC_FSGETXATTR as libc::c_ulong,
+            linux_raw_sys::ioctl::FS_IOC_FSGETXATTR as libc::Ioctl,
             &mut attributes,
         )
     };
@@ -6585,7 +6585,7 @@ fn apply_linux_project_id(
         if unsafe {
             libc::ioctl(
                 file.as_raw_fd(),
-                linux_raw_sys::ioctl::FS_IOC_FSSETXATTR as libc::c_ulong,
+                linux_raw_sys::ioctl::FS_IOC_FSSETXATTR as libc::Ioctl,
                 &attributes,
             )
         } == 0
@@ -6594,7 +6594,7 @@ fn apply_linux_project_id(
             if unsafe {
                 libc::ioctl(
                     file.as_raw_fd(),
-                    linux_raw_sys::ioctl::FS_IOC_FSGETXATTR as libc::c_ulong,
+                    linux_raw_sys::ioctl::FS_IOC_FSGETXATTR as libc::Ioctl,
                     &mut actual,
                 )
             } == 0
@@ -7982,9 +7982,12 @@ fn publish_regular_file(
             .map_err(|_| FormatError::UnsafeArchivePath)?;
         let target = CString::new(destination.leaf.as_os_str().as_bytes())
             .map_err(|_| FormatError::UnsafeArchivePath)?;
-        // SAFETY: both names are validated single components beneath the same pinned parent.
+        // libc does not expose renameat2 on every Linux libc target, so invoke the
+        // kernel interface directly. Both names are validated single components
+        // beneath the same pinned parent.
         if unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 destination.parent.as_raw_fd(),
                 source.as_ptr(),
                 destination.parent.as_raw_fd(),
@@ -8398,7 +8401,7 @@ fn create_linux_special_object(
             tv_nsec: libc::UTIME_OMIT,
         },
         libc::timespec {
-            tv_sec: seconds as libc::time_t,
+            tv_sec: seconds as _,
             tv_nsec: nanoseconds as libc::c_long,
         },
     ];

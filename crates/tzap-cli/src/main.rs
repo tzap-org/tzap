@@ -6015,7 +6015,7 @@ fn capture_linux_project_id(file: &File, native: &mut NativeFileMetadata) -> io:
     if unsafe {
         libc::ioctl(
             file.as_raw_fd(),
-            linux_raw_sys::ioctl::FS_IOC_FSGETXATTR as libc::c_ulong,
+            linux_raw_sys::ioctl::FS_IOC_FSGETXATTR as libc::Ioctl,
             &mut attributes,
         )
     } != 0
