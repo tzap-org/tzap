@@ -3598,7 +3598,8 @@ fn windows_reparse_metadata_supported(metadata: &MemberMetadata) -> bool {
         && metadata
             .auxiliary
             .iter()
-            .any(|record| native_auxiliary_restore_supported(record, true))
+            .find(|record| record.kind == "windows.reparse-data")
+            .is_some_and(|record| native_auxiliary_restore_supported(record, true))
 }
 
 fn native_primary_restore_unsupported(metadata: &MemberMetadata, include_system: bool) -> bool {
@@ -6199,10 +6200,7 @@ fn windows_security_descriptors_equivalent(expected: &[u8], actual: &[u8]) -> bo
     const DACL_PROTECTED: u16 = 0x1000;
     const SACL_PROTECTED: u16 = 0x2000;
 
-    if expected.len() != actual.len() || expected.len() < 4 {
-        return false;
-    }
-    if expected[..2] != actual[..2] || expected[4..] != actual[4..] {
+    if expected.len() < 20 || actual.len() < 20 || expected[..2] != actual[..2] {
         return false;
     }
     let expected_control = u16::from_le_bytes([expected[2], expected[3]]);
@@ -6214,7 +6212,57 @@ fn windows_security_descriptors_equivalent(expected: &[u8], actual: &[u8]) -> bo
     if expected_control & SACL_PRESENT == 0 && actual_control & SACL_PRESENT == 0 {
         ignorable |= SACL_PROTECTED;
     }
-    (expected_control ^ actual_control) & !ignorable == 0
+    if (expected_control ^ actual_control) & !ignorable != 0 {
+        return false;
+    }
+
+    // A self-relative descriptor does not prescribe component order or offsets. In particular,
+    // EFS import followed by GetKernelObjectSecurity can return the same SIDs and ACLs in a
+    // differently packed buffer than GetSecurityInfo used during capture. Compare the represented
+    // components rather than requiring byte-identical offset fields and padding.
+    for (offset_field, acl, represented) in [
+        (4usize, false, true),
+        (8, false, true),
+        (12, true, expected_control & SACL_PRESENT != 0),
+        (16, true, expected_control & DACL_PRESENT != 0),
+    ] {
+        if represented {
+            let Some(expected_component) =
+                security_descriptor_component(expected, offset_field, acl)
+            else {
+                return false;
+            };
+            let Some(actual_component) = security_descriptor_component(actual, offset_field, acl)
+            else {
+                return false;
+            };
+            if expected_component != actual_component {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(windows)]
+fn security_descriptor_component(
+    descriptor: &[u8],
+    offset_field: usize,
+    acl: bool,
+) -> Option<&[u8]> {
+    let offset_bytes = descriptor.get(offset_field..offset_field.checked_add(4)?)?;
+    let offset = u32::from_le_bytes(offset_bytes.try_into().ok()?) as usize;
+    if offset == 0 {
+        return Some(&[]);
+    }
+    let length = if acl {
+        let header = descriptor.get(offset..offset.checked_add(4)?)?;
+        u16::from_le_bytes([header[2], header[3]]) as usize
+    } else {
+        let header = descriptor.get(offset..offset.checked_add(8)?)?;
+        8usize.checked_add(usize::from(header[1]).checked_mul(4)?)?
+    };
+    descriptor.get(offset..offset.checked_add(length)?)
 }
 
 #[cfg(not(windows))]
@@ -7265,6 +7313,30 @@ fn existing_safe_regular_path(
     Ok(PreparedDestination { parent, leaf })
 }
 
+#[cfg(windows)]
+fn existing_safe_windows_reparse_path(
+    root: &Path,
+    archive_path: &[u8],
+) -> Result<PreparedDestination, FormatError> {
+    validate_file_path_bytes(archive_path, u32::MAX)?;
+    let components = path_components(archive_path)?;
+    let mut parent = open_extraction_root(root)?;
+    for component in &components[..components.len().saturating_sub(1)] {
+        parent = parent
+            .open_dir_nofollow(component)
+            .map_err(|_| FormatError::UnsafeArchivePath)?;
+    }
+
+    let leaf = PathBuf::from(components.last().ok_or(FormatError::UnsafeArchivePath)?);
+    let destination = PreparedDestination { parent, leaf };
+    // Pin and validate the final leaf without following it. This deliberately differs from
+    // `prepare_destination`: an exact Windows reparse restore has already created this leaf, and
+    // directory finalization must address the reparse object itself rather than reject it as an
+    // alias. Every ancestor remains subject to the ordinary no-follow traversal checks above.
+    drop(open_existing_windows_reparse(&destination)?);
+    Ok(destination)
+}
+
 fn create_new_file_options() -> CapOpenOptions {
     let mut options = CapOpenOptions::new();
     options
@@ -7383,7 +7455,25 @@ fn apply_restored_directory_metadata(
     options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Result<(), FormatError> {
+    #[cfg(windows)]
+    let exact_reparse = options.restore_policy == RestorePolicy::System
+        && options.system_authorized
+        && windows_reparse_metadata_supported(metadata);
+    #[cfg(windows)]
+    let destination = if exact_reparse {
+        existing_safe_windows_reparse_path(root, path)?
+    } else {
+        prepare_destination(root, path, TarEntryKind::Directory, options)?
+    };
+    #[cfg(not(windows))]
     let destination = prepare_destination(root, path, TarEntryKind::Directory, options)?;
+    #[cfg(windows)]
+    let directory = if exact_reparse {
+        open_existing_windows_reparse(&destination)?
+    } else {
+        open_existing_directory(&destination)?
+    };
+    #[cfg(not(windows))]
     let directory = open_existing_directory(&destination)?;
     apply_restored_regular_file_metadata_parts(
         &directory,
@@ -8893,6 +8983,44 @@ mod tests {
         assert!(!windows_security_descriptors_equivalent(
             &changed_body,
             &descriptor(base)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn security_descriptor_equivalence_ignores_self_relative_component_layout() {
+        let owner = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+        let group = [1, 1, 0, 0, 0, 0, 0, 5, 32, 2, 0, 0];
+        let dacl = [2, 0, 8, 0, 0, 0, 0, 0];
+        let descriptor = |order: [usize; 3]| {
+            let components: [&[u8]; 3] = [&owner, &group, &dacl];
+            let mut bytes = vec![0u8; 20];
+            bytes[0] = 1;
+            bytes[2..4].copy_from_slice(&0x8004u16.to_le_bytes());
+            for index in order {
+                let offset = bytes.len() as u32;
+                let field = match index {
+                    0 => 4,
+                    1 => 8,
+                    2 => 16,
+                    _ => unreachable!(),
+                };
+                bytes[field..field + 4].copy_from_slice(&offset.to_le_bytes());
+                bytes.extend_from_slice(components[index]);
+            }
+            bytes
+        };
+        let expected = descriptor([0, 1, 2]);
+        let actual = descriptor([2, 1, 0]);
+        assert_ne!(expected, actual);
+        assert!(windows_security_descriptors_equivalent(&expected, &actual));
+
+        let mut changed_dacl = actual;
+        let dacl_offset = u32::from_le_bytes(changed_dacl[16..20].try_into().unwrap()) as usize;
+        changed_dacl[dacl_offset] = 4;
+        assert!(!windows_security_descriptors_equivalent(
+            &expected,
+            &changed_dacl
         ));
     }
 

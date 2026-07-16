@@ -9487,6 +9487,19 @@ mod tests {
         MasterKey::from_raw_key(&[0x42; MASTER_KEY_LEN]).unwrap()
     }
 
+    #[cfg(windows)]
+    fn windows_test_tempdir() -> tempfile::TempDir {
+        let Some(root) = std::env::var_os("TZAP_WINDOWS_TEST_ROOT") else {
+            return tempfile::tempdir().unwrap();
+        };
+        let root = PathBuf::from(root);
+        fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("tzap-windows-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
     fn test_tar_stream(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
         for (path, data) in entries {
@@ -10324,7 +10337,7 @@ mod tests {
             PROTECTED_SACL_SECURITY_INFORMATION, SACL_SECURITY_INFORMATION,
         };
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = windows_test_tempdir();
         let path = temp.path().join("native.txt");
         fs::write(&path, b"payload").unwrap();
         assert!(
@@ -10535,7 +10548,7 @@ mod tests {
         use windows_sys::Win32::Storage::FileSystem::EncryptFileW;
 
         const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x0000_4000;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = windows_test_tempdir();
         let source = temp.path().join("encrypted.txt");
         let plaintext = b"raw EFS must be archived and restored through the native callback APIs";
         fs::write(&source, plaintext).unwrap();
@@ -10634,7 +10647,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn standalone_windows_directory_alternate_data_round_trips() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = windows_test_tempdir();
         let source = temp.path().join("native-directory");
         fs::create_dir(&source).unwrap();
         fs::write(
@@ -10704,7 +10717,7 @@ mod tests {
         use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
         use windows_sys::Win32::System::IO::DeviceIoControl;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = windows_test_tempdir();
         let source = temp.path().join("sparse-ads.bin");
         fs::write(&source, b"base payload").unwrap();
         let stream_path = PathBuf::from(format!("{}:sparse-test", source.display()));
@@ -10818,7 +10831,7 @@ mod tests {
         use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
         use windows_sys::Win32::System::IO::DeviceIoControl;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = windows_test_tempdir();
         let path = temp.path().join("sparse.bin");
         let mut file = fs::OpenOptions::new()
             .read(true)
@@ -10921,7 +10934,7 @@ mod tests {
         const MUTABLE_MASK: u32 = READONLY | HIDDEN | SYSTEM | ARCHIVE | 0x100 | 0x2000;
         const WINDOWS_EPOCH_OFFSET: i64 = 116_444_736_000_000_000;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = windows_test_tempdir();
         let source = temp.path().join("basic.bin");
         fs::write(&source, b"windows basic metadata").unwrap();
         let source_file = fs::OpenOptions::new()
@@ -11013,7 +11026,7 @@ mod tests {
     fn windows_relative_symlink_round_trips_portable_and_exact_reparse_data() {
         use std::os::windows::fs::symlink_file;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = windows_test_tempdir();
         fs::write(temp.path().join("target.txt"), b"target").unwrap();
         let source = temp.path().join("link.txt");
         symlink_file("target.txt", &source).unwrap();
@@ -11101,7 +11114,7 @@ mod tests {
         use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
         use windows_sys::Win32::System::IO::DeviceIoControl;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = windows_test_tempdir();
         let target = temp.path().join("junction-target");
         fs::create_dir(&target).unwrap();
         let junction = temp.path().join("junction");
@@ -11211,7 +11224,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_selected_hardlinks_store_data_once_and_restore_shared_file_identity() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = windows_test_tempdir();
         let alpha = temp.path().join("alpha.bin");
         let beta = temp.path().join("beta.bin");
         fs::write(&alpha, b"one physical file").unwrap();
