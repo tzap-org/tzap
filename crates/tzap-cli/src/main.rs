@@ -6806,9 +6806,7 @@ fn capture_linux_project_id(file: &File, native: &mut NativeFileMetadata) -> io:
     } != 0
     {
         let error = io::Error::last_os_error();
-        if error.raw_os_error().is_some_and(|code| {
-            code == libc::ENOTTY || code == libc::EOPNOTSUPP || code == libc::EINVAL
-        }) {
+        if linux_project_id_ioctl_unavailable(&error) {
             return Ok(());
         }
         return Err(error);
@@ -6821,6 +6819,16 @@ fn capture_linux_project_id(file: &File, native: &mut NativeFileMetadata) -> io:
         native.required_profiles.push("linux-backup-v1".into());
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_project_id_ioctl_unavailable(error: &io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        code == libc::ENOTTY
+            || code == libc::EOPNOTSUPP
+            || code == libc::EINVAL
+            || code == libc::ENOSYS
+    })
 }
 
 fn source_os_label() -> &'static str {
@@ -10931,6 +10939,19 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn linux_project_id_capture_treats_missing_ioctl_as_unavailable() {
+        for code in [libc::ENOTTY, libc::EOPNOTSUPP, libc::EINVAL, libc::ENOSYS] {
+            assert!(linux_project_id_ioctl_unavailable(
+                &io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(!linux_project_id_ioctl_unavailable(
+            &io::Error::from_raw_os_error(libc::EIO)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn filesystem_scan_discovers_linux_sparse_extents() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("sparse.bin");
@@ -11692,7 +11713,7 @@ mod tests {
         fs::remove_file(&source).unwrap();
         let output = temp.path().join("object-id-output");
         fs::create_dir(&output).unwrap();
-        opened
+        let diagnostics = opened
             .extract_all_to(
                 &output,
                 SafeExtractionOptions {
@@ -11703,6 +11724,16 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(
+            !diagnostics
+                .iter()
+                .flat_map(|(_, diagnostics)| diagnostics)
+                .any(|diagnostic| {
+                    diagnostic.metadata_class == "windows.object-id"
+                        && diagnostic.status == MetadataDiagnosticStatus::Failed
+                }),
+            "object-ID restoration degraded: {diagnostics:#?}"
+        );
         let restored = output.join("object-id-source.bin");
         let restored_specs =
             collect_input_specs(&[restored.to_string_lossy().into_owned()]).unwrap();

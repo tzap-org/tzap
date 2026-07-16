@@ -5623,7 +5623,7 @@ fn restore_windows_efs_temp(
     destination: &PreparedDestination,
     temp_leaf: &Path,
     mut output: fs::File,
-    staged: &mut [StagedAuxiliary],
+    staged: &mut Vec<StagedAuxiliary>,
     options: SafeExtractionOptions,
 ) -> Result<fs::File, FormatError> {
     use std::os::windows::fs::MetadataExt as _;
@@ -5922,6 +5922,9 @@ fn restore_windows_backup_metadata_stream(
             "Windows backup metadata stream declaration is inconsistent",
         ));
     }
+    if record.kind == "windows.object-id" {
+        return restore_windows_object_id(base_file, path, record, payload, options, diagnostics);
+    }
     // SAFETY: the source handle is live; the returned handle, if valid, receives independent
     // ownership and is converted to `File` exactly once.
     let reopened = unsafe {
@@ -6023,6 +6026,107 @@ fn restore_windows_backup_metadata_stream(
         }
         Err(error) => Err(error),
     }
+}
+
+#[cfg(windows)]
+fn restore_windows_object_id(
+    destination: &fs::File,
+    path: &[u8],
+    record: &AuxiliaryRecord,
+    payload: &mut fs::File,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::System::Ioctl::{
+        FILE_OBJECTID_BUFFER, FSCTL_GET_OBJECT_ID, FSCTL_SET_OBJECT_ID,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let size = size_of::<FILE_OBJECTID_BUFFER>();
+    if record.logical_size != size as u64 {
+        return Err(FormatError::InvalidArchive(
+            "Windows object-ID backup stream is not exactly 64 bytes",
+        ));
+    }
+    let mut desired = FILE_OBJECTID_BUFFER::default();
+    payload.seek(SeekFrom::Start(0)).map_err(|_| {
+        FormatError::FilesystemExtractionFailed("failed to rewind staged Windows object ID")
+    })?;
+    {
+        // SAFETY: `desired` is live and writable, and the slice covers exactly its object
+        // representation so the authenticated 64-byte stream can be copied without alignment loss.
+        let desired_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                (&mut desired as *mut FILE_OBJECTID_BUFFER).cast::<u8>(),
+                size,
+            )
+        };
+        payload.read_exact(desired_bytes).map_err(|_| {
+            FormatError::FilesystemExtractionFailed("staged Windows object ID ended early")
+        })?;
+    }
+
+    let mut returned = 0u32;
+    // SAFETY: the destination handle is live and `desired` is a fully initialized fixed-size
+    // FILE_OBJECTID_BUFFER retained for the duration of this synchronous control request.
+    let set_ok = unsafe {
+        DeviceIoControl(
+            destination.as_raw_handle().cast(),
+            FSCTL_SET_OBJECT_ID,
+            (&mut desired as *mut FILE_OBJECTID_BUFFER).cast(),
+            size as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    } != 0;
+    let set_error = (!set_ok).then(std::io::Error::last_os_error);
+    let mut actual = FILE_OBJECTID_BUFFER::default();
+    returned = 0;
+    // SAFETY: the destination handle and writable `actual` output buffer remain live for this
+    // synchronous request, with the exact structure size supplied to the kernel.
+    let get_ok = unsafe {
+        DeviceIoControl(
+            destination.as_raw_handle().cast(),
+            FSCTL_GET_OBJECT_ID,
+            std::ptr::null(),
+            0,
+            (&mut actual as *mut FILE_OBJECTID_BUFFER).cast(),
+            size as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    } != 0;
+    // SAFETY: both initialized structures remain live and are viewed over their exact object
+    // representations solely for byte-for-byte verification.
+    let actual_bytes = unsafe {
+        std::slice::from_raw_parts((&actual as *const FILE_OBJECTID_BUFFER).cast::<u8>(), size)
+    };
+    let desired_bytes = unsafe {
+        std::slice::from_raw_parts((&desired as *const FILE_OBJECTID_BUFFER).cast::<u8>(), size)
+    };
+    if get_ok && returned as usize == size && actual_bytes == desired_bytes {
+        return Ok(());
+    }
+    let error = set_error.unwrap_or_else(std::io::Error::last_os_error);
+    record_metadata_application_failure(
+        diagnostics,
+        MetadataDiagnostic::new(
+            path,
+            "windows-backup-v1",
+            "windows.object-id",
+            MetadataOperation::Restore,
+            MetadataDiagnosticStatus::Failed,
+            "failed to restore and verify Windows object ID",
+        )
+        .for_restore(options.restore_policy, 2)
+        .with_native_error(&error),
+        options,
+        "failed to restore and verify Windows object ID",
+    )
 }
 
 #[cfg(windows)]
@@ -10153,7 +10257,7 @@ fn create_posix_special_object(
         .map_err(|_| FormatError::UnsafeArchivePath)?;
     let permission_mode = metadata.portable_mirror.mode & 0o7777;
     let (object_mode, device) = match kind {
-        TarEntryKind::Fifo => (u32::from(libc::S_IFIFO) | permission_mode, 0),
+        TarEntryKind::Fifo => (libc::S_IFIFO | permission_mode, 0),
         TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice => {
             let major = metadata
                 .primary_records
@@ -10178,10 +10282,7 @@ fn create_posix_special_object(
             } else {
                 libc::S_IFBLK
             };
-            (
-                u32::from(type_mode) | permission_mode,
-                libc::makedev(major, minor),
-            )
+            (type_mode | permission_mode, libc::makedev(major, minor))
         }
         _ => {
             return Err(FormatError::WriterInvariant(
