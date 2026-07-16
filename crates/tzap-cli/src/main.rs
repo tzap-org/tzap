@@ -4480,7 +4480,7 @@ fn portable_input_metadata(identity: InputIdentity, input: &Path) -> Result<Port
 
 fn portable_symlink_metadata(
     identity: InputIdentity,
-    input: &Path,
+    _input: &Path,
 ) -> Result<PortableFileMetadata> {
     Ok(PortableFileMetadata {
         source_os: source_os_label().into(),
@@ -4501,7 +4501,7 @@ fn portable_symlink_metadata(
         posix_owner: None,
         attributes: identity.attributes,
         #[cfg(target_os = "linux")]
-        native: capture_linux_symlink_metadata(input, identity)?,
+        native: capture_linux_symlink_metadata(_input, identity)?,
         #[cfg(not(target_os = "linux"))]
         native: NativeFileMetadata::default(),
     })
