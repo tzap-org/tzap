@@ -10,6 +10,8 @@ use unicode_normalization::UnicodeNormalization;
 
 #[cfg(unix)]
 use crate::entry_metadata::canonical_base64_decode;
+#[cfg(windows)]
+use crate::entry_metadata::parse_timestamp;
 #[cfg(target_os = "linux")]
 use crate::entry_metadata::schily_posix_acl_to_linux_xattr;
 #[cfg(windows)]
@@ -5317,7 +5319,7 @@ fn restore_windows_efs_temp(
     destination: &PreparedDestination,
     temp_leaf: &Path,
     mut output: fs::File,
-    staged: &mut [StagedAuxiliary],
+    staged: &mut Vec<StagedAuxiliary>,
     options: SafeExtractionOptions,
 ) -> Result<fs::File, FormatError> {
     use std::os::windows::fs::MetadataExt as _;
@@ -5426,7 +5428,7 @@ fn restore_windows_efs_temp(
     _destination: &PreparedDestination,
     _temp_leaf: &Path,
     output: fs::File,
-    staged: &mut [StagedAuxiliary],
+    staged: &mut Vec<StagedAuxiliary>,
     _options: SafeExtractionOptions,
 ) -> Result<fs::File, FormatError> {
     if staged

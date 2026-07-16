@@ -10491,6 +10491,7 @@ mod tests {
         serialize_raw_stream_content_model_extension, RAW_STREAM_UNSUPPORTED_MESSAGE,
     };
     use crate::wire::RecipientRecordV1;
+    use crate::writer::NativeFileMetadata;
     use crate::writer::{
         write_archive, write_archive_unencrypted, write_archive_with_dictionary,
         write_archive_with_kdf, write_archive_with_recipient_wrap_records,
@@ -10498,7 +10499,8 @@ mod tests {
         PortableFileMetadata, PortableModeOrigin, PortablePosixOwner, RegularFile,
         RootAuthSigningRequest, RootAuthWriterConfig, WriterOptions,
     };
-    use crate::writer::{NativeAuxiliaryMetadata, NativeAuxiliaryNameEncoding, NativeFileMetadata};
+    #[cfg(target_os = "linux")]
+    use crate::writer::{NativeAuxiliaryMetadata, NativeAuxiliaryNameEncoding};
 
     fn master_key() -> MasterKey {
         MasterKey::from_raw_key(&[0x42; 32]).unwrap()
