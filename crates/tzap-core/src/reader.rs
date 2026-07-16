@@ -12422,13 +12422,33 @@ mod tests {
     fn compressed_archive_extraction_restores_linux_inode_flags() {
         use std::os::fd::AsRawFd;
 
+        let root = tempfile::tempdir().unwrap();
+        let probe_path = root.path().join("flags-probe.txt");
+        fs::write(&probe_path, b"probe").unwrap();
+        let probe = fs::File::open(&probe_path).unwrap();
+        let mut intrinsic_flags: libc::c_long = 0;
+        assert_eq!(
+            unsafe {
+                libc::ioctl(
+                    probe.as_raw_fd(),
+                    libc::FS_IOC_GETFLAGS,
+                    &mut intrinsic_flags,
+                )
+            },
+            0
+        );
+        drop(probe);
+        fs::remove_file(probe_path).unwrap();
+        let expected_flags =
+            intrinsic_flags as u64 | u64::from(linux_raw_sys::general::FS_NODUMP_FL);
         let mut native = NativeFileMetadata {
             required_profiles: vec!["posix-backup-v1".into(), "linux-backup-v1".into()],
             ..NativeFileMetadata::default()
         };
-        native
-            .primary_pax_records
-            .insert("TZAP.linux.fsflags".into(), b"0000000000000040".to_vec());
+        native.primary_pax_records.insert(
+            "TZAP.linux.fsflags".into(),
+            format!("{expected_flags:016x}").into_bytes(),
+        );
         let archive = write_archive(
             &[RegularFile {
                 portable_metadata: PortableFileMetadata {
@@ -12443,7 +12463,6 @@ mod tests {
         )
         .unwrap();
         let opened = open_archive(&archive.bytes, &master_key()).unwrap();
-        let root = tempfile::tempdir().unwrap();
         opened
             .extract_file_to(
                 "flags.txt",
@@ -12461,7 +12480,7 @@ mod tests {
             unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags,) },
             0
         );
-        assert_ne!(flags as u64 & 0x40, 0);
+        assert_eq!(flags as u64, expected_flags);
     }
 
     #[cfg(target_os = "linux")]

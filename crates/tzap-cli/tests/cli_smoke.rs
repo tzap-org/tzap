@@ -6068,8 +6068,11 @@ fn cli_symlink_target_and_mtime_round_trip_without_following_target() {
 
     let restored_link = extract_dir.join("link.txt");
     let restored = fs::symlink_metadata(&restored_link).unwrap();
-    assert_eq!(restored.atime(), expected_access_seconds);
-    assert_eq!(restored.atime_nsec(), expected_access_nanoseconds);
+    assert_ne!(
+        (restored.atime(), restored.atime_nsec()),
+        (expected_access_seconds, expected_access_nanoseconds),
+        "portable restore must not replay source atime"
+    );
     assert_eq!(
         fs::read_link(&restored_link).unwrap(),
         Path::new("target.txt")

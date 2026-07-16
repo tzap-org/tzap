@@ -3211,8 +3211,6 @@ struct InputIdentity {
     #[cfg(unix)]
     change_time_nanoseconds: i64,
     #[cfg(unix)]
-    access_time: ArchiveTimestamp,
-    #[cfg(unix)]
     creation_time: Option<ArchiveTimestamp>,
     #[cfg(unix)]
     dev: u64,
@@ -3549,6 +3547,10 @@ fn collect_one_input_spec(
                         .native
                         .primary_pax_records
                         .insert("TZAP.linux.whiteout".into(), b"1".to_vec());
+                    portable_metadata
+                        .native
+                        .required_profiles
+                        .push("linux-backup-v1".into());
                 }
             }
             portable_metadata.native.required_profiles.sort();
@@ -3924,8 +3926,6 @@ fn input_identity(metadata: &fs::Metadata) -> io::Result<InputIdentity> {
             metadata.ctime_nsec()
         },
         #[cfg(unix)]
-        access_time: archive_timestamp(metadata.accessed()?)?,
-        #[cfg(unix)]
         creation_time: metadata
             .created()
             .ok()
@@ -3994,12 +3994,6 @@ fn input_identity_matches_after_read(expected: InputIdentity, actual: InputIdent
     }
     #[cfg(all(unix, not(windows)))]
     {
-        let mut expected = expected;
-        let mut actual = actual;
-        // Opening and reading can update atime. Preserve the scanned value for
-        // symlink metadata, but exclude it from content change detection.
-        expected.access_time = ArchiveTimestamp::from_seconds(0);
-        actual.access_time = ArchiveTimestamp::from_seconds(0);
         expected == actual
     }
     #[cfg(not(any(unix, windows)))]
@@ -4554,15 +4548,16 @@ fn capture_linux_symlink_metadata(
         .canonical_pax_value()
         .map_err(|error| anyhow!(error))?,
     );
-    native.primary_pax_records.insert(
-        "atime".into(),
-        identity
-            .access_time
-            .canonical_pax_value()
-            .map_err(|error| anyhow!(error))?,
-    );
+    if let Some(creation_time) = identity.creation_time {
+        native.primary_pax_records.insert(
+            "LIBARCHIVE.creationtime".into(),
+            creation_time
+                .canonical_pax_value()
+                .map_err(|error| anyhow!(error))?,
+        );
+        native.required_profiles.push("linux-backup-v1".into());
+    }
     native.required_profiles.push("posix-backup-v1".into());
-    native.required_profiles.push("linux-backup-v1".into());
     native.required_profiles.sort();
     native.required_profiles.dedup();
     Ok(native)
@@ -4587,11 +4582,21 @@ fn capture_native_file_metadata(
     input: &Path,
     identity: InputIdentity,
 ) -> Result<NativeFileMetadata> {
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::ffi::OsStrExt;
     use xattr::FileExt as _;
 
     let (file, metadata_only) = open_linux_metadata_file(input)
         .with_context(|| format!("failed to open {} for metadata capture", input.display()))?;
+    let opened_identity = input_identity(&file.metadata().with_context(|| {
+        format!(
+            "failed to identify opened metadata object {}",
+            input.display()
+        )
+    })?)?;
+    if opened_identity != identity {
+        bail!("input changed before metadata capture: {}", input.display());
+    }
     let mut native = NativeFileMetadata::default();
     // Keep the primary local-PAX record comfortably below its aggregate cap.
     // Larger aggregate xattr sets use the format's hashed auxiliary framing.
@@ -4599,16 +4604,18 @@ fn capture_native_file_metadata(
     let mut inline_xattr_bytes = 0usize;
     #[cfg(target_os = "linux")]
     let mut captured_posix_acl = false;
-    for name in if metadata_only {
-        xattr::list(input)
+    let metadata_path =
+        metadata_only.then(|| PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())));
+    for name in if let Some(path) = &metadata_path {
+        xattr::list_deref(path)
     } else {
         file.list_xattr()
     }
     .with_context(|| format!("failed to list xattrs for {}", input.display()))?
     {
         let name_bytes = name.as_bytes();
-        let Some(value) = if metadata_only {
-            xattr::get(input, &name)
+        let Some(value) = if let Some(path) = &metadata_path {
+            xattr::get_deref(path, &name)
         } else {
             file.get_xattr(&name)
         }
@@ -4700,8 +4707,16 @@ fn capture_native_file_metadata(
         .canonical_pax_value()
         .map_err(|error| anyhow!(error))?,
     );
+    if let Some(creation_time) = identity.creation_time {
+        native.primary_pax_records.insert(
+            "LIBARCHIVE.creationtime".into(),
+            creation_time
+                .canonical_pax_value()
+                .map_err(|error| anyhow!(error))?,
+        );
+        native.required_profiles.push("linux-backup-v1".into());
+    }
     native.required_profiles.push("posix-backup-v1".into());
-    native.required_profiles.push("linux-backup-v1".into());
     native.required_profiles.sort();
     native.required_profiles.dedup();
     native.auxiliary_records.sort_by(|left, right| {
@@ -4709,6 +4724,13 @@ fn capture_native_file_metadata(
             .cmp(&right.kind)
             .then_with(|| left.name.cmp(&right.name))
     });
+    let final_identity =
+        input_identity(&file.metadata().with_context(|| {
+            format!("failed to reidentify metadata object {}", input.display())
+        })?)?;
+    if final_identity != identity {
+        bail!("input changed during metadata capture: {}", input.display());
+    }
     Ok(native)
 }
 
@@ -5979,6 +6001,7 @@ fn capture_linux_inode_flags(file: &File, native: &mut NativeFileMetadata) -> io
         "TZAP.linux.fsflags".into(),
         format!("{:016x}", flags as u64).into_bytes(),
     );
+    native.required_profiles.push("linux-backup-v1".into());
     Ok(())
 }
 
@@ -6010,6 +6033,7 @@ fn capture_linux_project_id(file: &File, native: &mut NativeFileMetadata) -> io:
             "TZAP.linux.project-id".into(),
             attributes.fsx_projid.to_string().into_bytes(),
         );
+        native.required_profiles.push("linux-backup-v1".into());
     }
     Ok(())
 }
@@ -9959,6 +9983,11 @@ mod tests {
         assert!(native
             .primary_pax_records
             .contains_key("TZAP.unix.ctime-observed"));
+        if identity.creation_time.is_some() {
+            assert!(native
+                .primary_pax_records
+                .contains_key("LIBARCHIVE.creationtime"));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -9972,11 +10001,28 @@ mod tests {
         let source = temp.path().join("events.fifo");
         let source_c = CString::new(source.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(source_c.as_ptr(), 0o640) }, 0);
+        let acl = [
+            2, 0, 0, 0, // POSIX ACL xattr version
+            1, 0, 6, 0, 0xff, 0xff, 0xff, 0xff, // owning user
+            2, 0, 6, 0, 0x39, 0x30, 0, 0, // named user 12345
+            4, 0, 4, 0, 0xff, 0xff, 0xff, 0xff, // owning group
+            0x10, 0, 6, 0, 0xff, 0xff, 0xff, 0xff, // mask
+            0x20, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, // other
+        ];
+        xattr::set(&source, "system.posix_acl_access", &acl).unwrap();
+        let expected_acl = xattr::get(&source, "system.posix_acl_access")
+            .unwrap()
+            .unwrap();
 
         let specs = collect_input_specs(&[source.to_string_lossy().into_owned()]).unwrap();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].entry_kind, SourceEntryKind::Fifo);
         assert_eq!(specs[0].size, 0);
+        assert!(specs[0]
+            .portable_metadata
+            .native
+            .primary_pax_records
+            .contains_key("SCHILY.acl.access"));
 
         let key = MasterKey::from_raw_key(&[41u8; 32]).unwrap();
         let mut sink = MemoryArchiveSink::default();
@@ -10014,7 +10060,13 @@ mod tests {
             .unwrap();
         let restored = fs::symlink_metadata(output.join("events.fifo")).unwrap();
         assert!(restored.file_type().is_fifo());
-        assert_eq!(readonly_mode(&restored) & 0o777, 0o640);
+        assert_eq!(readonly_mode(&restored) & 0o777, 0o660);
+        assert_eq!(
+            xattr::get(output.join("events.fifo"), "system.posix_acl_access")
+                .unwrap()
+                .unwrap(),
+            expected_acl
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -10074,6 +10126,8 @@ mod tests {
                 &output,
                 SafeExtractionOptions {
                     restore_policy: RestorePolicy::SameOs,
+                    // Linux exposes birth time but has no general API to assign it.
+                    allow_degraded: true,
                     ..SafeExtractionOptions::default()
                 },
             )

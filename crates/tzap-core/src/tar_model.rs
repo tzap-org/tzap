@@ -28,7 +28,6 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_WRITE_ATTRIBUTES,
 };
 
-use crate::entry_metadata::parse_timestamp;
 use crate::entry_metadata::{
     decode_percent_name, parse_auxiliary_record, parse_canonical_pax, parse_primary_metadata,
     parse_sparse_payload, validate_group_metadata, ArchiveTimestamp, AuxiliaryRecord,
@@ -41,6 +40,36 @@ use crate::format::{ExtractError, FormatError};
 use crate::metadata::validate_file_path_bytes;
 
 const TAR_BLOCK_LEN: usize = 512;
+
+#[cfg(target_os = "linux")]
+const LINUX_KNOWN_FSFLAGS: u64 = (linux_raw_sys::general::FS_SECRM_FL
+    | linux_raw_sys::general::FS_UNRM_FL
+    | linux_raw_sys::general::FS_COMPR_FL
+    | linux_raw_sys::general::FS_SYNC_FL
+    | linux_raw_sys::general::FS_IMMUTABLE_FL
+    | linux_raw_sys::general::FS_APPEND_FL
+    | linux_raw_sys::general::FS_NODUMP_FL
+    | linux_raw_sys::general::FS_NOATIME_FL
+    | linux_raw_sys::general::FS_DIRTY_FL
+    | linux_raw_sys::general::FS_COMPRBLK_FL
+    | linux_raw_sys::general::FS_NOCOMP_FL
+    | linux_raw_sys::general::FS_ENCRYPT_FL
+    | linux_raw_sys::general::FS_BTREE_FL
+    | linux_raw_sys::general::FS_IMAGIC_FL
+    | linux_raw_sys::general::FS_JOURNAL_DATA_FL
+    | linux_raw_sys::general::FS_NOTAIL_FL
+    | linux_raw_sys::general::FS_DIRSYNC_FL
+    | linux_raw_sys::general::FS_TOPDIR_FL
+    | linux_raw_sys::general::FS_HUGE_FILE_FL
+    | linux_raw_sys::general::FS_EXTENT_FL
+    | linux_raw_sys::general::FS_VERITY_FL
+    | linux_raw_sys::general::FS_EA_INODE_FL
+    | linux_raw_sys::general::FS_EOFBLOCKS_FL
+    | linux_raw_sys::general::FS_NOCOW_FL
+    | linux_raw_sys::general::FS_DAX_FL
+    | linux_raw_sys::general::FS_INLINE_DATA_FL
+    | linux_raw_sys::general::FS_PROJINHERIT_FL
+    | linux_raw_sys::general::FS_CASEFOLD_FL) as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TarEntryKind {
@@ -3240,6 +3269,20 @@ fn plan_restore(
         RestorePolicy::SameOs | RestorePolicy::System
     );
     let requests_system = options.restore_policy == RestorePolicy::System;
+    if metadata.primary_records.contains_key("atime") && metadata.declaration.source_os != "windows"
+    {
+        diagnostics.push(
+            MetadataDiagnostic::new(
+                path,
+                "posix-backup-v1",
+                "atime",
+                MetadataOperation::Plan,
+                MetadataDiagnosticStatus::Skipped,
+                "access time restoration was not explicitly requested",
+            )
+            .for_restore(options.restore_policy, 4),
+        );
+    }
     if requests_same_os && !requests_system {
         for key in metadata
             .primary_records
@@ -3572,7 +3615,9 @@ fn native_primary_restore_unsupported(metadata: &MemberMetadata, include_system:
             return false;
         }
         if key == "TZAP.linux.fsflags" {
-            return !cfg!(target_os = "linux");
+            return linux_inode_flags_restore_unsupported(
+                metadata.primary_records.get(key).map(Vec::as_slice),
+            );
         }
         if key == "TZAP.linux.project-id" {
             return !cfg!(target_os = "linux") || !include_system;
@@ -3626,6 +3671,19 @@ fn native_primary_restore_unsupported(metadata: &MemberMetadata, include_system:
         }
         true
     })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_inode_flags_restore_unsupported(encoded: Option<&[u8]>) -> bool {
+    encoded
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| u64::from_str_radix(value, 16).ok())
+        .is_none_or(|flags| flags & !LINUX_KNOWN_FSFLAGS != 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_inode_flags_restore_unsupported(_encoded: Option<&[u8]>) -> bool {
+    true
 }
 
 fn source_os_matches_current_host(source_os: &str) -> bool {
@@ -3857,7 +3915,7 @@ struct FilesystemRestoreHandler<'a> {
     defer_hardlinks: bool,
     deferred_hardlinks: Vec<(Vec<u8>, Vec<u8>)>,
     defer_directories: bool,
-    deferred_directories: Vec<(Vec<u8>, MemberMetadata)>,
+    deferred_directories: Vec<(Vec<u8>, MemberMetadata, Vec<StagedAuxiliary>)>,
     active_auxiliary: Option<StagedAuxiliary>,
     staged_auxiliary: Vec<StagedAuxiliary>,
 }
@@ -3939,14 +3997,20 @@ impl<'a> FilesystemRestoreHandler<'a> {
                 .then_with(|| left.0.cmp(&right.0))
         });
         if self.options.restore_policy != RestorePolicy::Content {
-            for (path, metadata) in directories {
+            for (path, metadata, mut staged) in directories {
                 apply_restored_directory_metadata(
                     self.root,
                     &path,
                     &metadata,
+                    Some(&mut staged),
                     self.options,
                     &mut diagnostics,
                 )?;
+                if !staged.is_empty() {
+                    return Err(FormatError::InvalidArchive(
+                        "native auxiliary payload was not restored for its directory member",
+                    ));
+                }
             }
         }
         Ok(diagnostics)
@@ -3992,9 +4056,16 @@ impl<'a> FilesystemRestoreHandler<'a> {
                     self.root,
                     &member.path,
                     &member.v45_metadata,
+                    Some(&mut self.staged_auxiliary),
                     self.options,
                     &mut diagnostics,
                 )?;
+                if !self.staged_auxiliary.is_empty() {
+                    return Err(FormatError::InvalidArchive(
+                        "native auxiliary payload was not restored for its directory member",
+                    )
+                    .into());
+                }
             }
             return Ok(diagnostics);
         }
@@ -4029,17 +4100,6 @@ impl<'a> FilesystemRestoreHandler<'a> {
         };
         let file = publish_regular_file(&destination, &temp_leaf, file, self.options)?;
         if self.options.restore_policy != RestorePolicy::Content {
-            if let Err(error) = apply_generic_xattr_auxiliaries(
-                &file,
-                &member.path,
-                &mut self.staged_auxiliary,
-                self.options,
-                &mut diagnostics,
-            ) {
-                drop(file);
-                let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
-                return Err(error.into());
-            }
             if let Err(error) = apply_windows_alternate_streams(
                 &file,
                 &member.path,
@@ -4056,12 +4116,21 @@ impl<'a> FilesystemRestoreHandler<'a> {
                 &member.path,
                 RestoredRegularMetadata::from(&member.v45_metadata.portable_mirror),
                 Some(&member.v45_metadata),
+                Some(&mut self.staged_auxiliary),
                 self.options,
                 &mut diagnostics,
             ) {
                 drop(file);
                 let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
                 return Err(error.into());
+            }
+            if !self.staged_auxiliary.is_empty() {
+                drop(file);
+                let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
+                return Err(FormatError::InvalidArchive(
+                    "native auxiliary payload was not restored for its regular-file member",
+                )
+                .into());
             }
         }
         Ok(diagnostics)
@@ -4225,20 +4294,14 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                     unreachable!("exact Windows reparse restore is Windows-only");
                 } else {
                     create_directory(&destination)?;
-                    if self.defer_directories {
-                        self.deferred_directories
-                            .push((member.path.clone(), member.v45_metadata.clone()));
-                    }
                 }
+                #[cfg(windows)]
                 if !self.staged_auxiliary.is_empty() {
-                    #[cfg(windows)]
                     let directory = if member.reparse_placeholder {
                         open_existing_windows_reparse(&destination)?
                     } else {
                         open_existing_directory(&destination)?
                     };
-                    #[cfg(not(windows))]
-                    let directory = open_existing_directory(&destination)?;
                     apply_generic_xattr_auxiliaries(
                         &directory,
                         &member.path,
@@ -4253,6 +4316,13 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                         self.options,
                         &mut self.planned_diagnostics,
                     )?;
+                }
+                if self.defer_directories {
+                    self.deferred_directories.push((
+                        member.path.clone(),
+                        member.v45_metadata.clone(),
+                        std::mem::take(&mut self.staged_auxiliary),
+                    ));
                 }
             }
             TarEntryKind::Symlink => {
@@ -4289,7 +4359,7 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                                     &mut self.planned_diagnostics,
                                 )?;
                             }
-                            #[cfg(not(windows))]
+                            #[cfg(all(not(windows), not(target_os = "linux")))]
                             self.staged_auxiliary.clear();
                         }
                         if self.options.restore_policy != RestorePolicy::Content {
@@ -4300,15 +4370,25 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                                 self.options,
                                 &mut self.planned_diagnostics,
                             )?;
+                            #[cfg(target_os = "linux")]
+                            if !self.staged_auxiliary.is_empty() {
+                                let mut proc_path = PathBuf::from(format!(
+                                    "/proc/self/fd/{}",
+                                    destination.parent.as_raw_fd()
+                                ));
+                                proc_path.push(&destination.leaf);
+                                apply_generic_xattr_auxiliaries_to_path(
+                                    &proc_path,
+                                    false,
+                                    &member.path,
+                                    &mut self.staged_auxiliary,
+                                    self.options,
+                                    &mut self.planned_diagnostics,
+                                )?;
+                            }
                             apply_restored_symlink_mtime(
                                 &destination,
                                 &member.path,
-                                member
-                                    .v45_metadata
-                                    .primary_records
-                                    .get("atime")
-                                    .map(|value| parse_timestamp(value))
-                                    .transpose()?,
                                 member.v45_metadata.portable_mirror.mtime,
                                 self.options,
                                 &mut self.planned_diagnostics,
@@ -4393,14 +4473,18 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
                 }
             }
             TarEntryKind::CharacterDevice | TarEntryKind::BlockDevice | TarEntryKind::Fifo => {
-                create_linux_special_object(
+                if let Err(error) = create_linux_special_object(
                     &destination,
                     &member.path,
                     member.kind,
                     &member.v45_metadata,
+                    &mut self.staged_auxiliary,
                     self.options,
                     &mut self.planned_diagnostics,
-                )?;
+                ) {
+                    let _ = destination.parent.remove_file_or_symlink(&destination.leaf);
+                    return Err(error.into());
+                }
             }
         }
         Ok(())
@@ -4840,6 +4924,7 @@ fn restore_tar_member(
                     root,
                     &member.path,
                     metadata,
+                    None,
                     options,
                     &mut diagnostics,
                 )?;
@@ -4869,11 +4954,6 @@ fn restore_tar_member(
                 apply_restored_symlink_mtime(
                     &destination,
                     &member.path,
-                    metadata
-                        .primary_records
-                        .get("atime")
-                        .map(|value| parse_timestamp(value))
-                        .transpose()?,
                     metadata.portable_mirror.mtime,
                     options,
                     &mut diagnostics,
@@ -4942,6 +5022,7 @@ pub(crate) fn restore_regular_file_metadata_to_open_file(
             &member.path,
             RestoredRegularMetadata::from(&metadata.portable_mirror),
             Some(metadata),
+            None,
             options,
             &mut diagnostics,
         )?;
@@ -4973,6 +5054,7 @@ fn apply_restored_regular_file_metadata(
             uid: None,
             gid: None,
         },
+        None,
         None,
         options,
         diagnostics,
@@ -5007,6 +5089,7 @@ fn apply_restored_regular_file_metadata_parts(
     path: &[u8],
     metadata: RestoredRegularMetadata,
     member_metadata: Option<&MemberMetadata>,
+    staged_auxiliary: Option<&mut Vec<StagedAuxiliary>>,
     options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Result<(), FormatError> {
@@ -5027,6 +5110,9 @@ fn apply_restored_regular_file_metadata_parts(
     apply_regular_file_mode(file, path, mode, mode_origin_native, options, diagnostics)?;
     if let Some(member_metadata) = member_metadata {
         apply_regular_file_posix_acl(file, path, member_metadata, options, diagnostics)?;
+        if let Some(staged) = staged_auxiliary {
+            apply_generic_xattr_auxiliaries(file, path, staged, options, diagnostics)?;
+        }
         apply_regular_file_xattrs(file, path, member_metadata, options, diagnostics)?;
     }
     apply_regular_file_mtime(file, path, mtime, options, diagnostics)?;
@@ -5707,6 +5793,89 @@ fn apply_generic_xattr_auxiliaries(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn apply_generic_xattr_auxiliaries_to_path(
+    base_path: &Path,
+    dereference: bool,
+    path: &[u8],
+    staged: &mut Vec<StagedAuxiliary>,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut remaining = Vec::new();
+    for mut item in std::mem::take(staged) {
+        if item.record.kind != "generic.xattr" {
+            remaining.push(item);
+            continue;
+        }
+        if item.record.restore_class == RestoreClass::System
+            && !(options.restore_policy == RestorePolicy::System && options.system_authorized)
+        {
+            continue;
+        }
+        item.file.seek(SeekFrom::Start(0)).map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to rewind staged extended attribute")
+        })?;
+        let value_len = usize::try_from(item.record.logical_size).map_err(|_| {
+            FormatError::ReaderUnsupported("extended attribute exceeds platform limits")
+        })?;
+        let mut value = vec![0u8; value_len];
+        item.file.read_exact(&mut value).map_err(|_| {
+            FormatError::FilesystemExtractionFailed("failed to read staged extended attribute")
+        })?;
+        let name = OsStr::from_bytes(&item.record.decoded_name);
+        let set_result = if dereference {
+            xattr::set_deref(base_path, name, &value)
+        } else {
+            xattr::set(base_path, name, &value)
+        };
+        if let Err(error) = set_result {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    &item.record.profile,
+                    "extended-attribute",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "failed to apply auxiliary extended attribute",
+                )
+                .for_restore(options.restore_policy, 4)
+                .with_native_error(&error),
+                options,
+                "failed to apply auxiliary extended attribute",
+            )?;
+            continue;
+        }
+        let restored = if dereference {
+            xattr::get_deref(base_path, name)
+        } else {
+            xattr::get(base_path, name)
+        };
+        if restored.ok().flatten().as_deref() != Some(value.as_slice()) {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    &item.record.profile,
+                    "extended-attribute",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "auxiliary extended attribute did not verify after restoration",
+                )
+                .for_restore(options.restore_policy, 4),
+                options,
+                "auxiliary extended attribute did not verify after restoration",
+            )?;
+        }
+    }
+    *staged = remaining;
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn apply_generic_xattr_auxiliaries(
     _base_file: &fs::File,
@@ -5722,11 +5891,10 @@ fn apply_generic_xattr_auxiliaries(
 fn apply_windows_alternate_streams(
     _base_file: &fs::File,
     _path: &[u8],
-    staged: &mut Vec<StagedAuxiliary>,
+    _staged: &mut Vec<StagedAuxiliary>,
     _options: SafeExtractionOptions,
     _diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Result<(), FormatError> {
-    staged.clear();
     Ok(())
 }
 
@@ -6329,20 +6497,42 @@ fn apply_linux_inode_flags(
     {
         return Ok(());
     }
-    let mut current: libc::c_long = 0;
-    // SAFETY: these ioctls read/write one c_long through valid pointers and
-    // operate on the live descriptor owned by `file`.
-    let get_result = unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut current) };
-    if get_result == 0 {
+    let apply_result = (|| -> std::io::Result<()> {
+        if desired & !LINUX_KNOWN_FSFLAGS != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "archive contains unrecognized Linux inode flag bits",
+            ));
+        }
+        let mut current: libc::c_long = 0;
+        // SAFETY: these ioctls read/write one c_long through valid pointers and
+        // operate on the live descriptor owned by `file`.
+        if unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut current) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
         let modifiable = u64::from(linux_raw_sys::general::FS_FL_USER_MODIFIABLE);
         let mut restored =
             ((current as u64 & !modifiable) | (desired & modifiable)) as libc::c_long;
         // SAFETY: as above, SETFLAGS reads the initialized c_long value.
-        if unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &mut restored) } == 0 {
-            return Ok(());
+        if unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &mut restored) } != 0 {
+            return Err(std::io::Error::last_os_error());
         }
+        let mut actual: libc::c_long = 0;
+        if unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut actual) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if actual as u64 != desired {
+            return Err(std::io::Error::other(format!(
+                "Linux inode flags did not verify: wanted {desired:016x}, got {:016x}",
+                actual as u64
+            )));
+        }
+        Ok(())
+    })();
+    if apply_result.is_ok() {
+        return Ok(());
     }
-    let error = std::io::Error::last_os_error();
+    let error = apply_result.unwrap_err();
     record_metadata_application_failure(
         diagnostics,
         MetadataDiagnostic::new(
@@ -6496,6 +6686,23 @@ fn apply_regular_file_posix_acl(
                 options,
                 "failed to apply POSIX ACL",
             )?;
+            continue;
+        }
+        if file.get_xattr(name).ok().flatten().as_deref() != Some(value.as_slice()) {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    "posix-backup-v1",
+                    "posix-acl",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "POSIX ACL did not verify after restoration",
+                )
+                .for_restore(options.restore_policy, 4),
+                options,
+                "POSIX ACL did not verify after restoration",
+            )?;
         }
     }
     Ok(())
@@ -6563,6 +6770,33 @@ fn apply_regular_file_xattrs(
                 .with_native_error(&error),
                 options,
                 "failed to apply extended attribute",
+            )?;
+            continue;
+        }
+        if file
+            .get_xattr(OsStr::from_bytes(&name))
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some(value.as_slice())
+        {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    if system {
+                        "linux-backup-v1"
+                    } else {
+                        "posix-backup-v1"
+                    },
+                    "extended-attribute",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "extended attribute did not verify after restoration",
+                )
+                .for_restore(options.restore_policy, 4),
+                options,
+                "extended attribute did not verify after restoration",
             )?;
         }
     }
@@ -7143,6 +7377,7 @@ fn apply_restored_directory_metadata(
     root: &Path,
     path: &[u8],
     metadata: &MemberMetadata,
+    staged_auxiliary: Option<&mut Vec<StagedAuxiliary>>,
     options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Result<(), FormatError> {
@@ -7153,6 +7388,7 @@ fn apply_restored_directory_metadata(
         path,
         RestoredRegularMetadata::from(&metadata.portable_mirror),
         Some(metadata),
+        staged_auxiliary,
         options,
         diagnostics,
     )
@@ -7192,6 +7428,7 @@ pub(crate) fn finalize_committed_directory_metadata(
             root,
             &member.path,
             &member.v45_metadata,
+            None,
             options,
             &mut member.diagnostics,
         )?;
@@ -7202,7 +7439,6 @@ pub(crate) fn finalize_committed_directory_metadata(
 fn apply_restored_symlink_mtime(
     destination: &PreparedDestination,
     path: &[u8],
-    access_time: Option<(i64, u32)>,
     (seconds, nanoseconds): (i64, u32),
     options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
@@ -7229,36 +7465,9 @@ fn apply_restored_symlink_mtime(
             "symlink mtime cannot be represented on this host",
         );
     };
-    let accessed = access_time.and_then(|(seconds, nanoseconds)| {
-        let duration = Duration::new(seconds.unsigned_abs(), nanoseconds);
-        let time = if seconds < 0 {
-            SystemTime::UNIX_EPOCH.checked_sub(duration)
-        } else {
-            SystemTime::UNIX_EPOCH.checked_add(duration)
-        }?;
-        Some(SystemTimeSpec::Absolute(
-            cap_std::time::SystemTime::from_std(time),
-        ))
-    });
-    if access_time.is_some() && accessed.is_none() {
-        return record_metadata_application_failure(
-            diagnostics,
-            MetadataDiagnostic::new(
-                path,
-                "posix-backup-v1",
-                "atime",
-                MetadataOperation::Restore,
-                MetadataDiagnosticStatus::Failed,
-                "failed to apply symlink atime metadata",
-            )
-            .for_restore(options.restore_policy, 4),
-            options,
-            "symlink atime cannot be represented on this host",
-        );
-    }
     if let Err(error) = destination.parent.set_symlink_times(
         &destination.leaf,
-        accessed,
+        None,
         Some(SystemTimeSpec::Absolute(
             cap_std::time::SystemTime::from_std(modified),
         )),
@@ -7351,11 +7560,8 @@ fn apply_restored_linux_symlink_metadata(
         }
     }
 
-    let proc_path = PathBuf::from(format!(
-        "/proc/self/fd/{}/{}",
-        destination.parent.as_raw_fd(),
-        destination.leaf.to_string_lossy()
-    ));
+    let mut proc_path = PathBuf::from(format!("/proc/self/fd/{}", destination.parent.as_raw_fd()));
+    proc_path.push(&destination.leaf);
     for (key, encoded) in metadata
         .primary_records
         .iter()
@@ -7388,6 +7594,27 @@ fn apply_restored_linux_symlink_metadata(
                 .with_native_error(&error),
                 options,
                 "failed to apply symlink extended attribute",
+            )?;
+            continue;
+        }
+        if xattr::get(&proc_path, name).ok().flatten().as_deref() != Some(value.as_slice()) {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    if system {
+                        "linux-backup-v1"
+                    } else {
+                        "posix-backup-v1"
+                    },
+                    "extended-attribute",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "symlink extended attribute did not verify after restoration",
+                )
+                .for_restore(options.restore_policy, 4),
+                options,
+                "symlink extended attribute did not verify after restoration",
             )?;
         }
     }
@@ -7920,6 +8147,7 @@ fn create_linux_special_object(
     path: &[u8],
     kind: TarEntryKind,
     metadata: &MemberMetadata,
+    staged: &mut Vec<StagedAuxiliary>,
     options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Result<(), FormatError> {
@@ -8064,6 +8292,50 @@ fn create_linux_special_object(
             "failed to apply special-object mode",
         )?;
     }
+    for (key, name) in [
+        ("SCHILY.acl.access", "system.posix_acl_access"),
+        ("SCHILY.acl.default", "system.posix_acl_default"),
+    ] {
+        let Some(text) = metadata.primary_records.get(key) else {
+            continue;
+        };
+        let value = schily_posix_acl_to_linux_xattr(text)?;
+        if let Err(error) = xattr::set_deref(&proc_path, name, &value) {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    "posix-backup-v1",
+                    "posix-acl",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "failed to apply special-object POSIX ACL",
+                )
+                .for_restore(options.restore_policy, 4)
+                .with_native_error(&error),
+                options,
+                "failed to apply special-object POSIX ACL",
+            )?;
+            continue;
+        }
+        if xattr::get_deref(&proc_path, name).ok().flatten().as_deref() != Some(value.as_slice()) {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    "posix-backup-v1",
+                    "posix-acl",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "special-object POSIX ACL did not verify after restoration",
+                )
+                .for_restore(options.restore_policy, 4),
+                options,
+                "special-object POSIX ACL did not verify after restoration",
+            )?;
+        }
+    }
+    apply_generic_xattr_auxiliaries_to_path(&proc_path, true, path, staged, options, diagnostics)?;
     for (key, encoded) in metadata
         .primary_records
         .iter()
@@ -8091,13 +8363,39 @@ fn create_linux_special_object(
                 options,
                 "failed to apply special-object extended attribute",
             )?;
+            continue;
+        }
+        if xattr::get_deref(&proc_path, OsStr::from_bytes(&name))
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some(value.as_slice())
+        {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    if system_xattr_name(&name, "linux") {
+                        "linux-backup-v1"
+                    } else {
+                        "posix-backup-v1"
+                    },
+                    "extended-attribute",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "special-object extended attribute did not verify after restoration",
+                )
+                .for_restore(options.restore_policy, 4),
+                options,
+                "special-object extended attribute did not verify after restoration",
+            )?;
         }
     }
     let (seconds, nanoseconds) = metadata.portable_mirror.mtime;
     let times = [
         libc::timespec {
-            tv_sec: seconds as libc::time_t,
-            tv_nsec: nanoseconds as libc::c_long,
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
         },
         libc::timespec {
             tv_sec: seconds as libc::time_t,
@@ -8123,6 +8421,36 @@ fn create_linux_special_object(
             "failed to apply special-object mtime",
         )?;
     }
+    if kind == TarEntryKind::Fifo {
+        let fd = unsafe {
+            libc::openat(
+                destination.parent.as_raw_fd(),
+                leaf.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    "linux-backup-v1",
+                    "fifo-native-metadata",
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    "failed to open restored FIFO for native metadata",
+                )
+                .for_restore(options.restore_policy, 4)
+                .with_native_error(&error),
+                options,
+                "failed to open restored FIFO for native metadata",
+            );
+        }
+        let fifo = unsafe { fs::File::from_raw_fd(fd) };
+        apply_linux_project_id(&fifo, path, metadata, options, diagnostics)?;
+        apply_linux_inode_flags(&fifo, path, metadata, options, diagnostics)?;
+    }
     Ok(())
 }
 
@@ -8132,6 +8460,7 @@ fn create_linux_special_object(
     _path: &[u8],
     _kind: TarEntryKind,
     _metadata: &MemberMetadata,
+    _staged: &mut Vec<StagedAuxiliary>,
     _options: SafeExtractionOptions,
     _diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Result<(), FormatError> {
@@ -9438,6 +9767,100 @@ mod tests {
         )
         .unwrap();
         assert!(diagnostics.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_linux_restore_rejects_unrecognized_inode_flag_bits() {
+        let bytes = member(b"file.txt", b'0', b"payload", b"");
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+        let mut metadata = parsed.v45_metadata;
+        metadata.declaration.source_os = "linux".into();
+        metadata
+            .declaration
+            .required_profiles
+            .push("linux-backup-v1".into());
+        metadata.declaration.required_profiles.sort();
+        metadata.primary_has_native_scalar = true;
+        metadata
+            .primary_records
+            .insert("TZAP.linux.fsflags".into(), b"0000000080000000".to_vec());
+
+        assert_eq!(
+            plan_restore(
+                b"file.txt",
+                &metadata,
+                TarEntryKind::Regular,
+                false,
+                SafeExtractionOptions {
+                    restore_policy: RestorePolicy::System,
+                    system_authorized: true,
+                    ..SafeExtractionOptions::default()
+                },
+            )
+            .unwrap_err(),
+            FormatError::ReaderUnsupported(
+                "requested native metadata is not supported by this conformance class"
+            )
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn generic_xattr_auxiliary_failure_is_bound_to_pinned_special_object() {
+        use sha2::{Digest as _, Sha256};
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fifo = temp.path().join("events.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let value = b"member-bound auxiliary value";
+        let mut staged_file = tempfile::tempfile().unwrap();
+        staged_file.write_all(value).unwrap();
+        staged_file.seek(SeekFrom::Start(0)).unwrap();
+        let mut staged = vec![StagedAuxiliary {
+            record: AuxiliaryRecord {
+                ordinal: 0,
+                kind: "generic.xattr".into(),
+                profile: "posix-backup-v1".into(),
+                restore_class: RestoreClass::SameOs,
+                native: true,
+                name_encoding: "bytes".into(),
+                decoded_name: b"user.tzap-aux".to_vec(),
+                flags: 0,
+                logical_size: value.len() as u64,
+                stored_size: value.len() as u64,
+                sha256: Sha256::digest(value).into(),
+                meta: BTreeMap::new(),
+                sparse_layout: None,
+                capture_report_payload: None,
+            },
+            file: staged_file,
+        }];
+        let mut diagnostics = Vec::new();
+
+        apply_generic_xattr_auxiliaries_to_path(
+            &fifo,
+            true,
+            b"events.fifo",
+            &mut staged,
+            SafeExtractionOptions {
+                restore_policy: RestorePolicy::SameOs,
+                allow_degraded: true,
+                ..SafeExtractionOptions::default()
+            },
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert!(staged.is_empty());
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.metadata_class == "extended-attribute"
+                && diagnostic.status == MetadataDiagnosticStatus::Failed
+        }));
+        assert_eq!(xattr::get(&fifo, "user.tzap-aux").unwrap(), None);
     }
 
     #[test]
