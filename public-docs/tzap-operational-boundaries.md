@@ -740,10 +740,10 @@ surface tar metadata fidelity should use `list_files`, `extract_member`,
   macOS regular-file, directory, symlink, and FIFO flags, xattrs, ACLs,
   FinderInfo, resource forks, creation/modify times, and ownership-policy gates
   are captured, validated, applied, and verified on-host. Privileged System
-  flags and character-device capture/recreation also have elevated on-host
-  evidence. Block-device capture/recreation still needs a raw-disk-entitled
-  runner before the macOS backup class is advertised; this app context returns
-  `EPERM` for `/dev/disk0` even as root.
+  flags and character-device capture/recreation have elevated on-host evidence.
+  Block-device capture/recreation also passed a strict, zero-degradation System
+  restore from `/dev/disk0` in a Full-Disk-Access Terminal context, including
+  exact type, device identifier, mode, ownership, flags, mtime, and birth time.
 
 ### Remaining native-platform implementation plan
 
@@ -752,9 +752,9 @@ unimplemented. Release evidence still needs elevated CI for SACL/security,
 object-ID, and raw-EFS import combinations and a filesystem fixture that
 actually exposes `BACKUP_PROPERTY_DATA`.
 
-No required macOS metadata code path is knowingly unimplemented. Remaining
-release work is raw-disk-entitled on-host evidence for block devices. APFS
-clone hints remain an optional storage-layout
+No required macOS metadata code path is knowingly unimplemented, and the
+privileged on-host corpus now covers System flags, character devices, and block
+devices. APFS clone hints remain an optional storage-layout
 optimization rather than a logical or metadata-fidelity requirement.
 The remaining POSIX/BSD writer work includes native symlink
 ownership/ACL/xattr fields, devices, FIFOs, hardlink topology, NFSv4 ACL
