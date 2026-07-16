@@ -1343,6 +1343,7 @@ const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0000_0100;
 const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x0000_0800;
 const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x0000_2000;
 const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x0000_4000;
 const WINDOWS_ESSENTIAL_SETTABLE_ATTRIBUTES: u32 = FILE_ATTRIBUTE_READONLY
@@ -1354,7 +1355,9 @@ const WINDOWS_ESSENTIAL_SETTABLE_ATTRIBUTES: u32 = FILE_ATTRIBUTE_READONLY
 const WINDOWS_ESSENTIAL_INTRINSIC_ATTRIBUTES: u32 = FILE_ATTRIBUTE_DIRECTORY
     | FILE_ATTRIBUTE_SPARSE_FILE
     | FILE_ATTRIBUTE_REPARSE_POINT
+    | FILE_ATTRIBUTE_COMPRESSED
     | FILE_ATTRIBUTE_ENCRYPTED;
+const STREAM_MODIFIED_WHEN_READ: u32 = 0x0000_0001;
 const STREAM_CONTAINS_SECURITY: u32 = 0x0000_0002;
 const STREAM_SPARSE_ATTRIBUTE: u32 = 0x0000_0008;
 
@@ -1366,7 +1369,8 @@ fn validate_windows_essential_reparse_data(data: &[u8]) -> Result<u32, FormatErr
     }
     let tag = u32::from_le_bytes(data[0..4].try_into().unwrap());
     let payload_len = usize::from(u16::from_le_bytes(data[4..6].try_into().unwrap()));
-    if payload_len + 8 != data.len() {
+    let header_len = if tag & 0x8000_0000 == 0 { 24 } else { 8 };
+    if payload_len + header_len != data.len() {
         return Err(FormatError::InvalidArchive(
             "reparse buffer length is inconsistent",
         ));
@@ -1384,11 +1388,10 @@ fn validate_windows_essential_reparse_data(data: &[u8]) -> Result<u32, FormatErr
         IO_REPARSE_TAG_SYMLINK | IO_REPARSE_TAG_MOUNT_POINT => {
             return Err(FormatError::InvalidArchive("reparse payload is truncated"));
         }
-        _ => {
-            return Err(FormatError::ReaderUnsupported(
-                "reparse tag is not supported by Windows Essential",
-            ));
-        }
+        // Opaque registered or user-defined tags have tag-specific payloads that cannot be
+        // decoded here. The common header and exact length were validated above; preserve the
+        // bytes without interpreting or following the reparse point.
+        _ => return Ok(tag),
     };
     let substitute_offset = usize::from(u16::from_le_bytes(data[8..10].try_into().unwrap()));
     let substitute_len = usize::from(u16::from_le_bytes(data[10..12].try_into().unwrap()));
@@ -3512,6 +3515,37 @@ fn native_auxiliary_restore_supported(record: &AuxiliaryRecord, include_system: 
                         || value == b"00000008" && record.flags == 1
                 });
     }
+    if matches!(
+        record.kind.as_str(),
+        "windows.ea-data" | "windows.property-data" | "windows.object-id"
+    ) {
+        let expected_type = match record.kind.as_str() {
+            "windows.ea-data" => b"00000002".as_slice(),
+            "windows.property-data" => b"00000006".as_slice(),
+            "windows.object-id" => b"00000007".as_slice(),
+            _ => unreachable!(),
+        };
+        return (record.restore_class == RestoreClass::SameOs
+            || include_system && record.restore_class == RestoreClass::System)
+            && (record.restore_class != RestoreClass::System
+                || windows_security_restore_privileges_available(0))
+            && record.flags == 0
+            && record.name_encoding == "none"
+            && record.decoded_name.is_empty()
+            && record
+                .meta
+                .get("TZAP.aux.meta.stream-type")
+                .is_some_and(|value| value == expected_type)
+            && record
+                .meta
+                .get("TZAP.aux.meta.stream-attributes")
+                .and_then(|value| parse_lower_hex_u32(value, "Windows stream attributes").ok())
+                .is_some_and(|attributes| {
+                    attributes & !(STREAM_MODIFIED_WHEN_READ | STREAM_CONTAINS_SECURITY) == 0
+                        && (attributes & STREAM_CONTAINS_SECURITY != 0)
+                            == (record.restore_class == RestoreClass::System)
+                });
+    }
     if !include_system {
         return false;
     }
@@ -3520,8 +3554,7 @@ fn native_auxiliary_restore_supported(record: &AuxiliaryRecord, include_system: 
             && record
                 .meta
                 .get("TZAP.aux.meta.efs-version")
-                .is_some_and(|value| value == b"1")
-            && windows_security_restore_privileges_available(0);
+                .is_some_and(|value| value == b"1");
     }
     if record.kind == "windows.reparse-data" {
         return record
@@ -3659,6 +3692,10 @@ fn native_primary_restore_unsupported(metadata: &MemberMetadata, include_system:
             return !cfg!(windows)
                 || !include_system
                 || !windows_reparse_metadata_supported(metadata);
+        }
+        if key == "TZAP.windows.directory-case-sensitive" {
+            return include_system
+                && (!cfg!(windows) || metadata.declaration.source_os != "windows");
         }
         if key == "LIBARCHIVE.creationtime" && metadata.declaration.source_os == "windows" {
             return !cfg!(windows);
@@ -4170,7 +4207,12 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
             )
             || !matches!(
                 record.kind.as_str(),
-                "windows.alternate-data" | "windows.efs-raw" | "generic.xattr"
+                "windows.alternate-data"
+                    | "windows.ea-data"
+                    | "windows.property-data"
+                    | "windows.object-id"
+                    | "windows.efs-raw"
+                    | "generic.xattr"
             )
         {
             return Ok(false);
@@ -4276,10 +4318,37 @@ impl TarMemberStreamHandler for FilesystemRestoreHandler<'_> {
         let destination = prepare_destination(self.root, &member.path, member.kind, self.options)?;
         match member.kind {
             TarEntryKind::Regular => {
-                let (temp_leaf, file) = create_temp_regular_file(&destination)?;
-                self.destination = Some(destination);
-                self.temp_leaf = Some(temp_leaf);
-                self.file = Some(file);
+                if member.reparse_placeholder {
+                    #[cfg(windows)]
+                    {
+                        create_windows_reparse_object(
+                            &destination,
+                            &member.path,
+                            member.kind,
+                            &member.v45_metadata,
+                            &mut self.staged_auxiliary,
+                            self.options,
+                            &mut self.planned_diagnostics,
+                        )?;
+                        if !self.staged_auxiliary.is_empty() {
+                            let reparse = open_existing_windows_reparse(&destination)?;
+                            apply_windows_alternate_streams(
+                                &reparse,
+                                &member.path,
+                                &mut self.staged_auxiliary,
+                                self.options,
+                                &mut self.planned_diagnostics,
+                            )?;
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    unreachable!("exact Windows reparse restore is Windows-only");
+                } else {
+                    let (temp_leaf, file) = create_temp_regular_file(&destination)?;
+                    self.destination = Some(destination);
+                    self.temp_leaf = Some(temp_leaf);
+                    self.file = Some(file);
+                }
             }
             TarEntryKind::Directory => {
                 if member.reparse_placeholder {
@@ -5506,9 +5575,15 @@ fn apply_windows_alternate_streams(
     for staged_record in std::mem::take(staged) {
         let StagedAuxiliary { record, mut file } = staged_record;
         if record.kind != "windows.alternate-data" {
-            return Err(FormatError::InvalidArchive(
-                "staged Windows alternate stream has unsupported framing",
-            ));
+            restore_windows_backup_metadata_stream(
+                base_file,
+                path,
+                &record,
+                &mut file,
+                options,
+                diagnostics,
+            )?;
+            continue;
         }
         if record.decoded_name.len() % 2 != 0 {
             return Err(FormatError::InvalidArchive(
@@ -5561,6 +5636,198 @@ fn apply_windows_alternate_streams(
         restore_windows_alternate_stream_payload(&mut file, &mut stream, &record)?;
     }
     rollback.committed = true;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn restore_windows_backup_metadata_stream(
+    base_file: &fs::File,
+    path: &[u8],
+    record: &AuxiliaryRecord,
+    payload: &mut fs::File,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::ptr;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BackupWrite, ReOpenFile, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let stream_type = record
+        .meta
+        .get("TZAP.aux.meta.stream-type")
+        .ok_or(FormatError::InvalidArchive(
+            "Windows backup metadata stream type is missing",
+        ))
+        .and_then(|value| parse_lower_hex_u32(value, "Windows backup stream type"))?;
+    let stream_attributes = record
+        .meta
+        .get("TZAP.aux.meta.stream-attributes")
+        .ok_or(FormatError::InvalidArchive(
+            "Windows backup metadata stream attributes are missing",
+        ))
+        .and_then(|value| parse_lower_hex_u32(value, "Windows backup stream attributes"))?;
+    let expected_type = match record.kind.as_str() {
+        "windows.ea-data" => 2,
+        "windows.property-data" => 6,
+        "windows.object-id" => 7,
+        _ => {
+            return Err(FormatError::InvalidArchive(
+                "staged Windows backup metadata stream has unsupported framing",
+            ));
+        }
+    };
+    if stream_type != expected_type
+        || record.flags != 0
+        || record.logical_size != record.stored_size
+        || !record.decoded_name.is_empty()
+    {
+        return Err(FormatError::InvalidArchive(
+            "Windows backup metadata stream declaration is inconsistent",
+        ));
+    }
+    // SAFETY: the source handle is live; the returned handle, if valid, receives independent
+    // ownership and is converted to `File` exactly once.
+    let reopened = unsafe {
+        ReOpenFile(
+            base_file.as_raw_handle().cast(),
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    };
+    if reopened.is_null() || reopened as isize == -1 {
+        let error = std::io::Error::last_os_error();
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                &record.kind,
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to reopen Windows object for backup-stream restoration",
+            )
+            .for_restore(options.restore_policy, 2)
+            .with_native_error(&error),
+            options,
+            "failed to reopen Windows object for backup-stream restoration",
+        );
+    }
+    // SAFETY: ownership of the newly reopened handle transfers to `destination` once.
+    let destination = unsafe { fs::File::from_raw_handle(reopened.cast()) };
+    let mut context = ptr::null_mut();
+    let signed_size = i64::try_from(record.logical_size).map_err(|_| {
+        FormatError::ReaderUnsupported("Windows backup metadata stream exceeds i64")
+    })?;
+    let mut header = [0u8; 20];
+    header[0..4].copy_from_slice(&stream_type.to_le_bytes());
+    header[4..8].copy_from_slice(&stream_attributes.to_le_bytes());
+    header[8..16].copy_from_slice(&signed_size.to_le_bytes());
+    let result = (|| {
+        windows_backup_write_all(&destination, &mut context, &header)?;
+        payload.seek(SeekFrom::Start(0)).map_err(|_| {
+            FormatError::FilesystemExtractionFailed(
+                "failed to rewind staged Windows backup metadata stream",
+            )
+        })?;
+        let mut buffer = [0u8; 64 * 1024];
+        let mut remaining = record.logical_size;
+        while remaining != 0 {
+            let count = buffer
+                .len()
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            payload.read_exact(&mut buffer[..count]).map_err(|_| {
+                FormatError::FilesystemExtractionFailed(
+                    "staged Windows backup metadata stream ended early",
+                )
+            })?;
+            windows_backup_write_all(&destination, &mut context, &buffer[..count])?;
+            remaining -= count as u64;
+        }
+        Ok(())
+    })();
+    let mut ignored = 0u32;
+    // SAFETY: aborting with an empty buffer releases exactly this BackupWrite context.
+    let abort_ok = unsafe {
+        BackupWrite(
+            destination.as_raw_handle().cast(),
+            ptr::null(),
+            0,
+            &mut ignored,
+            1,
+            0,
+            &mut context,
+        )
+    } != 0;
+    let result = if result.is_ok() && !abort_ok {
+        Err(FormatError::FilesystemExtractionFailed(
+            "failed to finalize Windows backup metadata stream restoration",
+        ))
+    } else {
+        result
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error @ FormatError::FilesystemExtractionFailed(_)) => {
+            record_metadata_application_failure(
+                diagnostics,
+                MetadataDiagnostic::new(
+                    path,
+                    "windows-backup-v1",
+                    &record.kind,
+                    MetadataOperation::Restore,
+                    MetadataDiagnosticStatus::Failed,
+                    error.to_string(),
+                )
+                .for_restore(options.restore_policy, 2),
+                options,
+                "failed to restore Windows backup metadata stream",
+            )
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn windows_backup_write_all(
+    destination: &fs::File,
+    context: &mut *mut std::ffi::c_void,
+    mut bytes: &[u8],
+) -> Result<(), FormatError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::BackupWrite;
+
+    while !bytes.is_empty() {
+        let count = bytes.len().min(u32::MAX as usize);
+        let mut written = 0u32;
+        // SAFETY: the destination and context are live, and the input slice is readable for the
+        // exact requested byte count during this synchronous call.
+        if unsafe {
+            BackupWrite(
+                destination.as_raw_handle().cast(),
+                bytes.as_ptr(),
+                count as u32,
+                &mut written,
+                0,
+                0,
+                context,
+            )
+        } == 0
+        {
+            return Err(FormatError::FilesystemExtractionFailed(
+                "failed to restore Windows backup metadata stream",
+            ));
+        }
+        if written == 0 || written as usize > count {
+            return Err(FormatError::FilesystemExtractionFailed(
+                "Windows BackupWrite made no progress",
+            ));
+        }
+        bytes = &bytes[written as usize..];
+    }
     Ok(())
 }
 
@@ -5632,7 +5899,8 @@ fn restore_windows_alternate_stream_payload(
         ));
     }
     if let Some(extents) = extents {
-        if query_windows_sparse_ranges(stream, record.logical_size)? != extents {
+        let actual_extents = query_windows_sparse_ranges(stream, record.logical_size)?;
+        if actual_extents != extents && !windows_file_system_is_refs(stream)? {
             return Err(FormatError::FilesystemExtractionFailed(
                 "Windows sparse alternate stream ranges did not verify",
             ));
@@ -6168,7 +6436,7 @@ fn apply_windows_security_descriptor(
                 "security-descriptor",
                 MetadataOperation::Restore,
                 MetadataDiagnosticStatus::Materialized,
-                "Windows normalized an inheritance-protection bit on an absent ACL; all represented security components verified",
+                "Windows returned a semantically equivalent security descriptor with normalized self-relative layout or absent-ACL protection; all represented components verified",
             )
             .for_restore(options.restore_policy, 4),
         );
@@ -6318,11 +6586,37 @@ fn apply_windows_basic_metadata(
         return Ok(());
     }
 
+    apply_windows_directory_case_sensitive(file, path, metadata, options, diagnostics)?;
+
     let desired_attributes = metadata
         .primary_records
         .get("TZAP.windows.file-attributes")
         .map(|value| parse_lower_hex_u32(value, "Windows file attributes"))
         .transpose()?;
+    let compression_exact = if let Some(desired) = desired_attributes {
+        apply_windows_compression(
+            file,
+            path,
+            desired & FILE_ATTRIBUTE_COMPRESSED != 0,
+            options,
+            diagnostics,
+        )?
+    } else {
+        true
+    };
+    let intrinsic_verification_mask = WINDOWS_ESSENTIAL_INTRINSIC_ATTRIBUTES
+        & if options.restore_policy == RestorePolicy::System {
+            u32::MAX
+        } else {
+            !FILE_ATTRIBUTE_ENCRYPTED
+        }
+        & if compression_exact {
+            u32::MAX
+        } else {
+            !FILE_ATTRIBUTE_COMPRESSED
+        };
+    let attribute_verification_mask =
+        WINDOWS_ESSENTIAL_SETTABLE_ATTRIBUTES | intrinsic_verification_mask;
     let parse_optional_timestamp = |key: &str| {
         metadata
             .primary_records
@@ -6403,12 +6697,6 @@ fn apply_windows_basic_metadata(
                 ));
             }
         }
-        let intrinsic_verification_mask = WINDOWS_ESSENTIAL_INTRINSIC_ATTRIBUTES
-            & if options.restore_policy == RestorePolicy::System {
-                u32::MAX
-            } else {
-                !FILE_ATTRIBUTE_ENCRYPTED
-            };
         let intrinsic_mismatch = (current.FileAttributes ^ desired) & intrinsic_verification_mask;
         if intrinsic_mismatch != 0 {
             record_metadata_application_failure(
@@ -6482,10 +6770,8 @@ fn apply_windows_basic_metadata(
         || actual.LastAccessTime != restored.LastAccessTime
         || actual.LastWriteTime != restored.LastWriteTime
         || actual.ChangeTime != restored.ChangeTime
-        || actual.FileAttributes
-            & (WINDOWS_ESSENTIAL_SETTABLE_ATTRIBUTES | WINDOWS_ESSENTIAL_INTRINSIC_ATTRIBUTES)
-            != restored.FileAttributes
-                & (WINDOWS_ESSENTIAL_SETTABLE_ATTRIBUTES | WINDOWS_ESSENTIAL_INTRINSIC_ATTRIBUTES)
+        || actual.FileAttributes & attribute_verification_mask
+            != restored.FileAttributes & attribute_verification_mask
     {
         let error = std::io::Error::last_os_error();
         return record_metadata_application_failure(
@@ -6502,6 +6788,226 @@ fn apply_windows_basic_metadata(
             .with_native_error(&error),
             options,
             "Windows basic metadata did not verify after restoration",
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn apply_windows_compression(
+    file: &fs::File,
+    path: &[u8],
+    compressed: bool,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<bool, FormatError> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, GetFileInformationByHandleEx, COMPRESSION_FORMAT_DEFAULT,
+        COMPRESSION_FORMAT_NONE, FILE_BASIC_INFO,
+    };
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_COMPRESSION;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let handle = file.as_raw_handle().cast();
+    let mut current = FILE_BASIC_INFO::default();
+    // SAFETY: the handle is live and `current` is correctly sized and writable.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            (&mut current as *mut FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(FormatError::FilesystemExtractionFailed(
+            "failed to inspect Windows compression state",
+        ));
+    }
+    if (current.FileAttributes & FILE_ATTRIBUTE_COMPRESSED != 0) == compressed {
+        return Ok(true);
+    }
+    let mut format = if compressed {
+        COMPRESSION_FORMAT_DEFAULT
+    } else {
+        COMPRESSION_FORMAT_NONE
+    };
+    let mut ignored = 0u32;
+    // SAFETY: the handle is live, the compression-format input is initialized, and this
+    // synchronous FSCTL has no output buffer.
+    if unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_SET_COMPRESSION,
+            (&mut format as *mut u16).cast(),
+            std::mem::size_of::<u16>() as u32,
+            ptr::null_mut(),
+            0,
+            &mut ignored,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                "compression-layout",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Materialized,
+                if compressed {
+                    "native Windows compression could not be recreated"
+                } else {
+                    "native Windows compression could not be removed"
+                },
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "failed to apply native Windows compression state",
+        )?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn apply_windows_directory_case_sensitive(
+    file: &fs::File,
+    path: &[u8],
+    metadata: &MemberMetadata,
+    options: SafeExtractionOptions,
+    diagnostics: &mut Vec<MetadataDiagnostic>,
+) -> Result<(), FormatError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileCaseSensitiveInfo, GetFileInformationByHandleEx, SetFileInformationByHandle,
+        FILE_CASE_SENSITIVE_INFO,
+    };
+    use windows_sys::Win32::System::SystemServices::FILE_CS_FLAG_CASE_SENSITIVE_DIR;
+
+    let Some(encoded) = metadata
+        .primary_records
+        .get("TZAP.windows.directory-case-sensitive")
+    else {
+        return Ok(());
+    };
+    let desired = match encoded.as_slice() {
+        b"0" => 0,
+        b"1" => FILE_CS_FLAG_CASE_SENSITIVE_DIR,
+        _ => {
+            return Err(FormatError::InvalidArchive(
+                "invalid Windows directory case-sensitivity state",
+            ));
+        }
+    };
+    let handle = file.as_raw_handle().cast();
+    let mut current = FILE_CASE_SENSITIVE_INFO::default();
+    // SAFETY: the handle is live and `current` is correctly sized and writable.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileCaseSensitiveInfo,
+            (&mut current as *mut FILE_CASE_SENSITIVE_INFO).cast(),
+            std::mem::size_of::<FILE_CASE_SENSITIVE_INFO>() as u32,
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                "directory-case-sensitive",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to inspect Windows directory case-sensitivity state",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "failed to inspect Windows directory case-sensitivity state",
+        );
+    }
+    if current.Flags == desired {
+        return Ok(());
+    }
+    if options.restore_policy != RestorePolicy::System || !options.system_authorized {
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                "directory-case-sensitive",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Unsupported,
+                "changing Windows directory case-sensitivity requires authorized System restore",
+            )
+            .for_restore(options.restore_policy, 4),
+            options,
+            "Windows directory case-sensitivity state requires authorized System restore",
+        );
+    }
+    let updated = FILE_CASE_SENSITIVE_INFO { Flags: desired };
+    // SAFETY: the handle is live and `updated` is a correctly sized initialized structure.
+    if unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileCaseSensitiveInfo,
+            (&updated as *const FILE_CASE_SENSITIVE_INFO).cast(),
+            std::mem::size_of::<FILE_CASE_SENSITIVE_INFO>() as u32,
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                "directory-case-sensitive",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to apply Windows directory case-sensitivity state",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "failed to apply Windows directory case-sensitivity state",
+        );
+    }
+    let mut actual = FILE_CASE_SENSITIVE_INFO::default();
+    // SAFETY: the handle is live and `actual` is correctly sized and writable.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileCaseSensitiveInfo,
+            (&mut actual as *mut FILE_CASE_SENSITIVE_INFO).cast(),
+            std::mem::size_of::<FILE_CASE_SENSITIVE_INFO>() as u32,
+        )
+    } == 0
+        || actual.Flags != desired
+    {
+        let error = std::io::Error::last_os_error();
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                "directory-case-sensitive",
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "Windows directory case-sensitivity state did not verify after restoration",
+            )
+            .for_restore(options.restore_policy, 4)
+            .with_native_error(&error),
+            options,
+            "Windows directory case-sensitivity state did not verify after restoration",
         );
     }
     Ok(())
@@ -7891,6 +8397,38 @@ fn query_windows_sparse_ranges(
 }
 
 #[cfg(windows)]
+fn windows_file_system_is_refs(file: &fs::File) -> Result<bool, FormatError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
+
+    let mut name = [0u16; 32];
+    // SAFETY: the file handle is live, optional outputs are null, and `name` is a writable buffer
+    // whose capacity is passed exactly to the synchronous query.
+    if unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle().cast(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+        )
+    } == 0
+    {
+        return Err(FormatError::FilesystemExtractionFailed(
+            "failed to identify Windows destination filesystem",
+        ));
+    }
+    let length = name
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(name.len());
+    Ok(String::from_utf16_lossy(&name[..length]).eq_ignore_ascii_case("refs"))
+}
+
+#[cfg(windows)]
 fn verify_windows_sparse_file(
     file: &fs::File,
     logical_size: u64,
@@ -7919,7 +8457,9 @@ fn verify_windows_sparse_file(
             "restored file is not marked sparse",
         ));
     }
-    if query_windows_sparse_ranges(file, logical_size)? != expected_extents {
+    if query_windows_sparse_ranges(file, logical_size)? != expected_extents
+        && !windows_file_system_is_refs(file)?
+    {
         return Err(FormatError::FilesystemExtractionFailed(
             "restored sparse ranges do not match archive",
         ));
@@ -8616,12 +9156,8 @@ fn create_windows_reparse_object(
             "Windows reparse data was not retained",
         ))?;
     let tag = validate_windows_essential_reparse_data(payload)?;
-    let expected_tag = if kind == TarEntryKind::Symlink {
-        0xA000_000Cu32
-    } else {
-        0xA000_0003u32
-    };
-    if tag != expected_tag {
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+    if (kind == TarEntryKind::Symlink) != (tag == IO_REPARSE_TAG_SYMLINK) {
         return Err(FormatError::InvalidArchive(
             "Windows reparse tag disagrees with primary object kind",
         ));

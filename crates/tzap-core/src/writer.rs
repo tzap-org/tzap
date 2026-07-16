@@ -20,8 +20,9 @@ use crate::entry_metadata::{
     canonical_base64_encode, encode_canonical_pax, is_source_os,
     parse_auxiliary_declaration_for_writer, parse_auxiliary_record, parse_primary_metadata,
     portable_primary_pax, valid_filesystem_token, validate_group_metadata, ArchiveTimestamp,
-    RestoreClass, SparseExtent, EXTENDED_METADATA_V1, HAS_AUXILIARY_STREAMS, HAS_NATIVE_METADATA,
-    HAS_SPARSE_EXTENTS, MAX_SPARSE_EXTENTS, PORTABLE_PROFILE, REQUIRES_SYSTEM_RESTORE,
+    RestoreClass, SparseExtent, CAPTURE_PARTIAL, CAPTURE_REPORT_KIND, EXTENDED_METADATA_V1,
+    HAS_AUXILIARY_STREAMS, HAS_NATIVE_METADATA, HAS_SPARSE_EXTENTS, MAX_SPARSE_EXTENTS,
+    PORTABLE_PROFILE, REQUIRES_SYSTEM_RESTORE,
 };
 use crate::fec::encode_parity_gf16;
 use crate::format::{
@@ -507,6 +508,9 @@ pub enum SourceEntryKind {
     /// Zero-data directory primary whose native metadata contains an exact,
     /// validated Windows mount-point reparse payload.
     ReparseDirectory,
+    /// Zero-data regular primary whose native metadata contains an exact opaque Windows reparse
+    /// payload that has no safe portable projection.
+    ReparseRegular,
 }
 
 impl Default for PortableFileMetadata {
@@ -7201,9 +7205,13 @@ fn build_primary_member_layout(
         .native
         .primary_pax_records
         .contains_key("TZAP.windows.reparse-placeholder");
-    if (entry_kind == SourceEntryKind::ReparseDirectory) != reparse_placeholder {
+    if matches!(
+        entry_kind,
+        SourceEntryKind::ReparseDirectory | SourceEntryKind::ReparseRegular
+    ) != reparse_placeholder
+    {
         return Err(FormatError::WriterInvariant(
-            "Windows reparse directory kind and placeholder metadata disagree",
+            "Windows reparse source kind and placeholder metadata disagree",
         ));
     }
     let mut pax_records =
@@ -7235,6 +7243,14 @@ fn build_primary_member_layout(
         );
     }
     merge_native_primary_metadata(&mut pax_records, &portable_metadata.native)?;
+    if portable_metadata
+        .native
+        .auxiliary_records
+        .iter()
+        .any(|record| record.kind == CAPTURE_REPORT_KIND)
+    {
+        pax_records.insert("TZAP.metadata.capture-status".into(), b"partial".to_vec());
+    }
     let use_linkpath_override = link_target.is_some_and(|target| target.len() > 100);
     if use_linkpath_override {
         pax_records.insert(
@@ -7298,7 +7314,7 @@ fn build_primary_member_layout(
     };
 
     let typeflag = match entry_kind {
-        SourceEntryKind::Regular => b'0',
+        SourceEntryKind::Regular | SourceEntryKind::ReparseRegular => b'0',
         SourceEntryKind::Directory | SourceEntryKind::ReparseDirectory => b'5',
         SourceEntryKind::Symlink => b'2',
         SourceEntryKind::Hardlink => b'1',
@@ -7699,6 +7715,16 @@ fn v45_portable_file_entry_flags(
     metadata: &PortableFileMetadata,
 ) -> u32 {
     EXTENDED_METADATA_V1
+        | if metadata
+            .native
+            .auxiliary_records
+            .iter()
+            .any(|record| record.kind == CAPTURE_REPORT_KIND)
+        {
+            CAPTURE_PARTIAL
+        } else {
+            0
+        }
         | if metadata.native.auxiliary_records.is_empty() {
             0
         } else {
