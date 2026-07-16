@@ -5349,6 +5349,112 @@ fn cli_directory_metadata_round_trips_after_children() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn cli_macos_native_metadata_round_trips_for_files_and_directories() {
+    use std::os::macos::fs::MetadataExt as _;
+
+    let temp = tempdir().unwrap();
+    let keyfile = temp.path().join("key.hex");
+    let input_root = temp.path().join("tree");
+    let nested = input_root.join("nested");
+    let input_file = nested.join("native.txt");
+    let archive = temp.path().join("macos-metadata.tzap");
+    let extract_dir = temp.path().join("extract");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(&input_file, b"primary payload").unwrap();
+    fs::write(&keyfile, KEY_HEX).unwrap();
+
+    for (path, marker) in [(&input_file, 0x5au8), (&nested, 0x6bu8)] {
+        xattr::set(path, "com.tzap.test", &[marker; 17]).unwrap();
+        xattr::set(path, "com.apple.FinderInfo", &[marker; 32]).unwrap();
+        if path.is_file() {
+            xattr::set(path, "com.apple.ResourceFork", b"resource fork").unwrap();
+        }
+        assert!(std::process::Command::new("chmod")
+            .args(["+a", "everyone deny delete"])
+            .arg(path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("chflags")
+            .arg("hidden")
+            .arg(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let source_file = fs::metadata(&input_file).unwrap();
+    let source_directory = fs::metadata(&nested).unwrap();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "create",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            input_root.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args([
+            "extract",
+            "--restore",
+            "same-os",
+            "--keyfile",
+            keyfile.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    for (restored, source, marker) in [
+        (
+            extract_dir.join("tree/nested/native.txt"),
+            &source_file,
+            0x5au8,
+        ),
+        (extract_dir.join("tree/nested"), &source_directory, 0x6bu8),
+    ] {
+        let actual = fs::metadata(&restored).unwrap();
+        assert_eq!(actual.st_flags(), source.st_flags());
+        assert_eq!(actual.st_birthtime(), source.st_birthtime());
+        assert_eq!(actual.st_birthtime_nsec(), source.st_birthtime_nsec());
+        assert_eq!(
+            xattr::get(&restored, "com.tzap.test").unwrap().as_deref(),
+            Some([marker; 17].as_slice())
+        );
+        assert_eq!(
+            xattr::get(&restored, "com.apple.FinderInfo")
+                .unwrap()
+                .as_deref(),
+            Some([marker; 32].as_slice())
+        );
+        if restored.is_file() {
+            assert_eq!(
+                xattr::get(&restored, "com.apple.ResourceFork")
+                    .unwrap()
+                    .as_deref(),
+                Some(b"resource fork".as_slice())
+            );
+        }
+        let acl = std::process::Command::new("ls")
+            .args(["-lde"])
+            .arg(&restored)
+            .output()
+            .unwrap();
+        assert!(acl.status.success());
+        assert!(String::from_utf8_lossy(&acl.stdout).contains("everyone deny delete"));
+    }
+}
+
 #[test]
 fn cli_create_supports_unicode_archive_paths() {
     let temp = tempdir().unwrap();

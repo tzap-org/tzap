@@ -665,6 +665,11 @@ auxiliary xattrs, canonical Linux POSIX ACLs, modifiable Linux inode flags,
 native Linux sparse allocation, and native Windows sparse allocation,
 alternate data streams (including sparse streams), and exact supported basic
 attributes/timestamps.
+On macOS, same-OS restore applies and verifies inline and auxiliary xattrs,
+FinderInfo, resource forks, the native Darwin ACL external form, creation time,
+and ordinary Darwin flags for regular files and directories. Resource-fork
+payloads are staged and copied in bounded chunks, and directory metadata is
+finalized after descendants.
 System restore, after explicit authorization, also applies numeric UID/GID,
 set-ID modes, privileged xattr namespaces, Linux project IDs,
 immutable/append-only Linux flags, and Linux FIFO/device/whiteout objects. On
@@ -727,8 +732,9 @@ surface tar metadata fidelity should use `list_files`, `extract_member`,
   evidence for privilege-only combinations and filesystem-exposed property
   streams, not a known code-path omission.
   macOS ordinary file/directory flags, xattrs, ACLs, FinderInfo, resource forks,
-  and timestamps are captured and validated, but native auxiliary application
-  and remaining non-regular-file capture are not yet implemented.
+  and timestamps are captured, validated, applied, and verified on-host.
+  Native symlink metadata and remaining non-regular-file capture are not yet
+  implemented.
 
 ### Remaining native-platform implementation plan
 
@@ -737,8 +743,8 @@ unimplemented. Release evidence still needs elevated CI for SACL/security,
 object-ID, and raw-EFS import combinations and a filesystem fixture that
 actually exposes `BACKUP_PROPERTY_DATA`.
 
-The remaining macOS work is native application of captured ACLs, FinderInfo,
-resource forks, birth time, and flags, plus APFS clone hints.
+The remaining macOS work is native symlink metadata, remaining special-object
+coverage, and optional APFS clone hints.
 The remaining POSIX/BSD writer work includes native symlink
 ownership/ACL/xattr fields, devices, FIFOs, hardlink topology, NFSv4 ACL
 implementations, native BSD flags, and

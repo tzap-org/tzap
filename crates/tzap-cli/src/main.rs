@@ -4278,6 +4278,7 @@ fn windows_file_system_is_refs(file: &File) -> io::Result<bool> {
     Ok(String::from_utf16_lossy(&name[..length]).eq_ignore_ascii_case("refs"))
 }
 
+#[cfg(windows)]
 fn open_windows_metadata_handle(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
