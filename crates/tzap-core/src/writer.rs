@@ -7493,10 +7493,7 @@ fn build_native_auxiliary_member_prefix(
         record.logical_size.to_string().into_bytes(),
     );
     let digest = record.sha256();
-    pax_records.insert(
-        "TZAP.aux.sha256".into(),
-        hex::encode(digest).into_bytes(),
-    );
+    pax_records.insert("TZAP.aux.sha256".into(), hex::encode(digest).into_bytes());
     for (key, value) in &record.meta {
         if pax_records.insert(key.clone(), value.clone()).is_some() {
             return Err(FormatError::WriterUnsupported(
@@ -7853,7 +7850,7 @@ fn write_tar_octal(field: &mut [u8], mut value: u64) -> Result<(), FormatError> 
     }
     let mut i = field.len() - 1;
     field[i] = 0;
-    
+
     if value == 0 {
         if i == 0 {
             return Err(FormatError::WriterUnsupported("tar octal field overflow"));
@@ -7895,7 +7892,9 @@ fn tar_octal_fits(field_len: usize, mut value: u64) -> bool {
 
 fn write_tar_checksum(field: &mut [u8], mut value: u64) -> Result<(), FormatError> {
     if field.len() < 8 {
-        return Err(FormatError::WriterUnsupported("tar checksum field overflow"));
+        return Err(FormatError::WriterUnsupported(
+            "tar checksum field overflow",
+        ));
     }
     let mut i = 6;
     while i > 0 {
@@ -7904,7 +7903,9 @@ fn write_tar_checksum(field: &mut [u8], mut value: u64) -> Result<(), FormatErro
         value >>= 3;
     }
     if value > 0 {
-        return Err(FormatError::WriterUnsupported("tar checksum field overflow"));
+        return Err(FormatError::WriterUnsupported(
+            "tar checksum field overflow",
+        ));
     }
     field[6] = 0;
     field[7] = b' ';
