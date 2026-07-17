@@ -3688,7 +3688,8 @@ fn native_auxiliary_restore_supported(
                 .and_then(|value| parse_lower_hex_u32(value, "Windows stream attributes").ok())
                 .is_some_and(|attributes| {
                     attributes & !(STREAM_MODIFIED_WHEN_READ | STREAM_CONTAINS_SECURITY) == 0
-                        && (record.kind == "windows.object-id" || attributes & STREAM_CONTAINS_SECURITY != 0)
+                        && (record.kind == "windows.object-id"
+                            || attributes & STREAM_CONTAINS_SECURITY != 0)
                             == (record.restore_class == RestoreClass::System)
                 });
     }
