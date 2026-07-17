@@ -3688,7 +3688,7 @@ fn native_auxiliary_restore_supported(
                 .and_then(|value| parse_lower_hex_u32(value, "Windows stream attributes").ok())
                 .is_some_and(|attributes| {
                     attributes & !(STREAM_MODIFIED_WHEN_READ | STREAM_CONTAINS_SECURITY) == 0
-                        && (attributes & STREAM_CONTAINS_SECURITY != 0)
+                        && (record.kind == "windows.object-id" || attributes & STREAM_CONTAINS_SECURITY != 0)
                             == (record.restore_class == RestoreClass::System)
                 });
     }
@@ -6038,7 +6038,11 @@ fn restore_windows_object_id(
     diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Result<(), FormatError> {
     use std::mem::size_of;
-    use std::os::windows::io::AsRawHandle as _;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        ReOpenFile, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
     use windows_sys::Win32::System::Ioctl::{
         FILE_OBJECTID_BUFFER, FSCTL_GET_OBJECT_ID, FSCTL_SET_OBJECT_ID,
     };
@@ -6068,12 +6072,40 @@ fn restore_windows_object_id(
         })?;
     }
 
+    let reopened_handle = unsafe {
+        ReOpenFile(
+            destination.as_raw_handle().cast(),
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    };
+    if reopened_handle.is_null() || reopened_handle as isize == -1 {
+        let error = std::io::Error::last_os_error();
+        return record_metadata_application_failure(
+            diagnostics,
+            MetadataDiagnostic::new(
+                path,
+                "windows-backup-v1",
+                &record.kind,
+                MetadataOperation::Restore,
+                MetadataDiagnosticStatus::Failed,
+                "failed to reopen Windows object for object-ID restoration",
+            )
+            .for_restore(options.restore_policy, 2)
+            .with_native_error(&error),
+            options,
+            "failed to reopen Windows object for object-ID restoration",
+        );
+    }
+    let reopened = unsafe { fs::File::from_raw_handle(reopened_handle.cast()) };
+
     let mut returned = 0u32;
     // SAFETY: the destination handle is live and `desired` is a fully initialized fixed-size
     // FILE_OBJECTID_BUFFER retained for the duration of this synchronous control request.
     let set_ok = unsafe {
         DeviceIoControl(
-            destination.as_raw_handle().cast(),
+            reopened.as_raw_handle().cast(),
             FSCTL_SET_OBJECT_ID,
             (&mut desired as *mut FILE_OBJECTID_BUFFER).cast(),
             size as u32,
@@ -6090,7 +6122,7 @@ fn restore_windows_object_id(
     // synchronous request, with the exact structure size supplied to the kernel.
     let get_ok = unsafe {
         DeviceIoControl(
-            destination.as_raw_handle().cast(),
+            reopened.as_raw_handle().cast(),
             FSCTL_GET_OBJECT_ID,
             std::ptr::null(),
             0,
