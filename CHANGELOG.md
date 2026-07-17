@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.11 - 2026-07-17
+
 - Closes Linux revision-45 metadata gaps for sparse allocation, auxiliary
   xattrs, no-follow symlink metadata, project IDs, FIFO/device descriptors,
   whiteouts, and authorized native restoration.
