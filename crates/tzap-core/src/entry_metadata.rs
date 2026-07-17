@@ -71,9 +71,13 @@ impl ArchiveTimestamp {
         if self.nanoseconds == 0 {
             return Ok(self.seconds.to_string().into_bytes());
         }
-        let fraction = format!("{:09}", self.nanoseconds);
-        let fraction = fraction.trim_end_matches('0');
-        Ok(format!("{}.{fraction}", self.seconds).into_bytes())
+        let mut buffer = Vec::with_capacity(32);
+        use std::io::Write;
+        write!(&mut buffer, "{}.{:09}", self.seconds, self.nanoseconds).unwrap();
+        while buffer.last() == Some(&b'0') {
+            buffer.pop();
+        }
+        Ok(buffer)
     }
 }
 
@@ -645,7 +649,7 @@ pub fn portable_primary_pax(
     records.insert("TZAP.metadata.version".into(), b"1".to_vec());
     records.insert(
         "TZAP.portable.mode".into(),
-        format!("{mode:08x}").into_bytes(),
+        hex::encode(mode.to_be_bytes()).into_bytes(),
     );
     records.insert("TZAP.portable.mode-origin".into(), b"projected".to_vec());
     records.insert("TZAP.portable.owner-kind".into(), b"none".to_vec());
