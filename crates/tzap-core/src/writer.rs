@@ -7520,8 +7520,7 @@ fn build_native_auxiliary_member_prefix(
         parse_auxiliary_declaration_for_writer(&pax_records, ordinal, stored_size)
     } else {
         parse_auxiliary_record(&pax_records, ordinal, stored_size, &record.payload)
-    }
-    .map_err(|_| FormatError::WriterUnsupported("native auxiliary metadata is not canonical"))?;
+    }?;
     let pax_payload = encode_canonical_pax(&pax_records)?;
     let pax_label = format!("TZAP-PAX/AUX/{ordinal:08x}");
     let pax_header =
@@ -7792,11 +7791,30 @@ fn native_metadata_requires_system_restore(native: &NativeFileMetadata, source_o
                     .ok()
                     .and_then(|value| u64::from_str_radix(value, 16).ok())
                     .is_some_and(|flags| flags & 0x30 != 0))
+            || (key == "TZAP.bsd.st-flags"
+                && std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|value| u64::from_str_radix(value, 16).ok())
+                    .is_some_and(|flags| flags & 0x0006_0006 != 0))
             || (key == "TZAP.macos.st-flags"
                 && std::str::from_utf8(value)
                     .ok()
                     .and_then(|value| u64::from_str_radix(value, 16).ok())
                     .is_some_and(|flags| flags & 0x009f_0086 != 0))
+            || (key == "TZAP.windows.data-stream-attributes"
+                && std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|value| u32::from_str_radix(value, 16).ok())
+                    .is_some_and(|flags| flags & 0x0000_0002 != 0))
+            || (key == "SCHILY.fflags"
+                && std::str::from_utf8(value).ok().is_some_and(|value| {
+                    value.split(',').any(|token| {
+                        matches!(
+                            token,
+                            "append" | "immutable" | "sappnd" | "schg" | "uappnd" | "uchg"
+                        )
+                    })
+                }))
     })
 }
 
@@ -8628,6 +8646,52 @@ mod tests {
     }
 
     #[test]
+    fn linux_bsd_macos_immutable_flags_require_system_restore() {
+        let mut native = NativeFileMetadata::default();
+        native.primary_pax_records.insert(
+            "TZAP.linux.fsflags".into(),
+            "0000000000000030".into(), // append and immutable
+        );
+        assert!(native_metadata_requires_system_restore(&native, "linux"));
+
+        let mut native = NativeFileMetadata::default();
+        native.primary_pax_records.insert(
+            "TZAP.bsd.st-flags".into(),
+            "0000000000060006".into(), // append and immutable
+        );
+        assert!(native_metadata_requires_system_restore(&native, "freebsd"));
+
+        let mut native = NativeFileMetadata::default();
+        native.primary_pax_records.insert(
+            "TZAP.macos.st-flags".into(),
+            "0000000000040000".into(), // SF_IMMUTABLE
+        );
+        assert!(native_metadata_requires_system_restore(&native, "macos"));
+
+        let mut native = NativeFileMetadata::default();
+        native
+            .primary_pax_records
+            .insert("SCHILY.fflags".into(), "uchg,uappnd".into());
+        assert!(native_metadata_requires_system_restore(&native, "linux"));
+    }
+
+    #[test]
+    fn windows_reparse_and_attributes_require_system_restore() {
+        let mut native = NativeFileMetadata::default();
+        native
+            .primary_pax_records
+            .insert("TZAP.windows.reparse-placeholder".into(), "1".into());
+        assert!(native_metadata_requires_system_restore(&native, "windows"));
+
+        let mut native = NativeFileMetadata::default();
+        native.primary_pax_records.insert(
+            "TZAP.windows.data-stream-attributes".into(),
+            "00000002".into(), // stream contains security
+        );
+        assert!(native_metadata_requires_system_restore(&native, "windows"));
+    }
+
+    #[test]
     fn regular_file_writer_round_trips_portable_owner_origin_and_attributes() {
         let portable_metadata = PortableFileMetadata {
             source_os: "other-unix".into(),
@@ -8956,6 +9020,41 @@ mod tests {
             parsed.v45_metadata.file_entry_flags & HAS_AUXILIARY_STREAMS,
             0
         );
+    }
+
+    #[test]
+    fn regular_file_writer_emits_capture_partial_flag_when_capture_report_present() {
+        let mut native = NativeFileMetadata::default();
+        let mut auxiliary = NativeAuxiliaryMetadata::new(
+            "tzap.capture-report",
+            "tzap-core-v1",
+            RestoreClass::None,
+            b"tzap-capture-report-v1\nportable-v1\ttzap-core-v1\texcluded-policy\tdetail\n"
+                .to_vec(),
+        );
+        auxiliary.native = false;
+        auxiliary.name_encoding = NativeAuxiliaryNameEncoding::None;
+        auxiliary.name = vec![];
+        native.auxiliary_records.push(auxiliary);
+        let metadata = PortableFileMetadata {
+            source_os: "linux".into(),
+            native,
+            ..PortableFileMetadata::default()
+        };
+
+        let group = build_regular_file_member_group(
+            b"capture-report.txt",
+            b"contents",
+            0o640,
+            ArchiveTimestamp::from_seconds(12),
+            &metadata,
+        )
+        .unwrap();
+        let parsed = parse_tar_member_group(&group, 4096).unwrap();
+
+        assert_eq!(parsed.v45_metadata.auxiliary.len(), 1);
+        assert_eq!(parsed.v45_metadata.auxiliary[0].kind, "tzap.capture-report");
+        assert_ne!(parsed.v45_metadata.file_entry_flags & CAPTURE_PARTIAL, 0);
     }
 
     #[test]
