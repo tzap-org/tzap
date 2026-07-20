@@ -8559,10 +8559,7 @@ fn record_metadata_application_failure(
 }
 
 pub(crate) fn validate_symlink_target(link_path: &[u8], target: &[u8]) -> Result<(), FormatError> {
-    if target.is_empty()
-        || target.contains(&0)
-        || target.contains(&b'\\')
-        || target.contains(&b':')
+    if target.is_empty() || target.contains(&0) || target.contains(&b'\\') || target.contains(&b':')
     {
         return Err(FormatError::UnsafeArchivePath);
     }
