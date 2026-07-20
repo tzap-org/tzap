@@ -375,6 +375,8 @@ pub struct SafeExtractionOptions {
     /// Explicit caller authorization for system-class restoration. The core
     /// implementation still applies only system items it understands.
     pub system_authorized: bool,
+    /// Permit absolute symlinks to be extracted. If false, an error will be returned when an absolute symlink is encountered during extraction.
+    pub allow_absolute_symlinks: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8561,12 +8563,14 @@ pub(crate) fn validate_symlink_target(link_path: &[u8], target: &[u8]) -> Result
         || target.contains(&0)
         || target.contains(&b'\\')
         || target.contains(&b':')
-        || target[0] == b'/'
     {
         return Err(FormatError::UnsafeArchivePath);
     }
     let target = std::str::from_utf8(target).map_err(|_| FormatError::UnsafeArchivePath)?;
     let link_path = std::str::from_utf8(link_path).map_err(|_| FormatError::UnsafeArchivePath)?;
+    if target.starts_with('/') {
+        return Ok(());
+    }
     if target.nfc().collect::<String>() != target {
         return Err(FormatError::UnsafeArchivePath);
     }
@@ -10253,6 +10257,9 @@ fn create_symlink(
         remove_existing_leaf_if_needed(destination)?;
     }
     let target = std::str::from_utf8(target).map_err(|_| FormatError::UnsafeArchivePath)?;
+    if target.starts_with('/') && !options.allow_absolute_symlinks {
+        return Err(FormatError::UnsafeArchivePath);
+    }
     match destination.parent.symlink_file(target, &destination.leaf) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {

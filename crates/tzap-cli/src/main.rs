@@ -475,6 +475,12 @@ enum Command {
         allow_degraded: bool,
 
         #[arg(
+            long = "allow-absolute-symlinks",
+            help = "Permit extraction of symlinks pointing to absolute paths outside the destination directory."
+        )]
+        allow_absolute_symlinks: bool,
+
+        #[arg(
             long = "password-stdin",
             conflicts_with = "keyfile",
             conflicts_with = "password",
@@ -1487,6 +1493,7 @@ fn run(cli: Cli) -> Result<()> {
                     restore_policy: restore.into(),
                     allow_degraded,
                     system_authorized: restore == CliRestorePolicy::System,
+                    allow_absolute_symlinks,
                 };
                 let bootstrap_bytes = read_optional_bootstrap_sidecar(bootstrap.as_deref())?;
                 let stdin = io::stdin();
@@ -1641,6 +1648,7 @@ fn run(cli: Cli) -> Result<()> {
                 restore_policy: restore.into(),
                 allow_degraded,
                 system_authorized: restore == CliRestorePolicy::System,
+                allow_absolute_symlinks,
             };
             let diagnostics = if paths.is_empty() {
                 opened.extract_indexed_files_to(&root, options, reader_options.jobs)?
