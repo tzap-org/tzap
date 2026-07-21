@@ -1458,6 +1458,7 @@ fn run(cli: Cli) -> Result<()> {
             overwrite,
             restore,
             allow_degraded,
+            allow_absolute_symlinks,
             password_stdin,
             password,
             keyfile,
