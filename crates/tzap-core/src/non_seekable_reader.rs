@@ -523,7 +523,11 @@ where
             return Err(FormatError::KeyMaterialMismatch);
         }
         (false, _, NonSeekableKeySource::MasterKey(_)) => Subkeys::unencrypted_placeholder(),
-        (true, crate::crypto::KdfParams::RecipientWrap { .. }, NonSeekableKeySource::RecipientWrap(resolver)) => {
+        (
+            true,
+            crate::crypto::KdfParams::RecipientWrap { .. } | crate::crypto::KdfParams::Argon2idRecipientWrap { .. },
+            NonSeekableKeySource::RecipientWrap(resolver),
+        ) => {
             let table = startup_key_wrap_table.as_ref().ok_or(FormatError::KeyMaterialMismatch)?;
             recipient_wrap_subkeys_from_table(&volume_header, &parsed_crypto, &table.table, resolver)?
         }

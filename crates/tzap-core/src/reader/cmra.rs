@@ -1574,7 +1574,8 @@ pub(crate) fn validate_image_identity(
 
 pub(crate) fn validate_image_key_wrap_table(image: &CriticalMetadataImage, volume_header: &VolumeHeader, kdf_params: &KdfParams) -> Result<(), FormatError> {
     match kdf_params {
-        KdfParams::RecipientWrap { key_wrap_table_length, key_wrap_table_record_count, key_wrap_table_digest, .. } => {
+        KdfParams::RecipientWrap { key_wrap_table_length, key_wrap_table_record_count, key_wrap_table_digest, .. }
+        | KdfParams::Argon2idRecipientWrap { key_wrap_table_length, key_wrap_table_record_count, key_wrap_table_digest, .. } => {
             if image.layout_flags & 0x0000_0002 == 0 || image.key_wrap_table_length != *key_wrap_table_length {
                 return Err(FormatError::InvalidArchive("CriticalMetadataImage key-wrap fields do not match KdfParams"));
             }
@@ -1669,7 +1670,9 @@ where
     let crypto_region = image.region(2).ok_or(FormatError::InvalidArchive("missing CryptoHeader region"))?;
     let crypto_header_bytes = crypto_region.bytes.clone();
     let parsed_crypto = CryptoHeader::parse(&crypto_header_bytes, image.crypto_header_length)?;
-    if !matches!(parsed_crypto.kdf_params, KdfParams::RecipientWrap { .. }) || !parsed_crypto.fixed.aead_algo.is_encrypted() {
+    if !matches!(parsed_crypto.kdf_params, KdfParams::RecipientWrap { .. } | KdfParams::Argon2idRecipientWrap { .. })
+        || !parsed_crypto.fixed.aead_algo.is_encrypted()
+    {
         return Err(FormatError::KeyMaterialMismatch);
     }
     validate_seekable_supported_volume(&volume_header, &parsed_crypto.fixed, &[])?;

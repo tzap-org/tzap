@@ -66,6 +66,7 @@ pub use tar_model::{
 };
 pub use writer::{
     encode_v45_sparse_map, write_archive, write_archive_sources_to_sink, write_archive_sources_to_sink_ordered_parallel,
+    write_archive_sources_to_sink_ordered_parallel_with_kdf_params_and_recipient_wrap_records_and_progress,
     write_archive_sources_to_sink_ordered_parallel_with_progress, write_archive_sources_to_sink_ordered_parallel_with_recipient_wrap_records,
     write_archive_sources_to_sink_ordered_parallel_with_recipient_wrap_records_and_progress, write_archive_sources_to_sink_single_pass,
     write_archive_sources_to_sink_single_pass_with_progress, write_archive_sources_to_sink_single_pass_with_recipient_wrap_records,

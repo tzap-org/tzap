@@ -86,8 +86,9 @@ pub(crate) fn startup_key_wrap_table(
     mut read_key_wrap_table: impl FnMut(u64, usize) -> Result<Vec<u8>, FormatError>,
 ) -> Result<Option<StartupKeyWrapTable>, FormatError> {
     let crypto_end = checked_u64_add(volume_header.crypto_header_offset as u64, volume_header.crypto_header_length as u64, "CryptoHeader")?;
-    let &KdfParams::RecipientWrap { key_wrap_table_length, .. } = kdf_params else {
-        return Ok(None);
+    let key_wrap_table_length = match kdf_params {
+        KdfParams::RecipientWrap { key_wrap_table_length, .. } | KdfParams::Argon2idRecipientWrap { key_wrap_table_length, .. } => *key_wrap_table_length,
+        _ => return Ok(None),
     };
     if volume_header.volume_format_rev != VOLUME_FORMAT_REV_45 {
         return Err(FormatError::InvalidArchive("RecipientWrap KdfParams require volume_format_rev 45"));
@@ -103,17 +104,21 @@ pub(crate) fn parse_startup_key_wrap_table_bytes(
     key_wrap_table_bytes: Vec<u8>,
 ) -> Result<StartupKeyWrapTable, FormatError> {
     let crypto_end = checked_u64_add(volume_header.crypto_header_offset as u64, volume_header.crypto_header_length as u64, "CryptoHeader")?;
-    let KdfParams::RecipientWrap { key_wrap_table_length, key_wrap_table_record_count, key_wrap_table_digest, .. } = kdf_params else {
-        return Err(FormatError::KeyMaterialMismatch);
+    let (key_wrap_table_length, key_wrap_table_record_count, key_wrap_table_digest) = match kdf_params {
+        KdfParams::RecipientWrap { key_wrap_table_length, key_wrap_table_record_count, key_wrap_table_digest, .. }
+        | KdfParams::Argon2idRecipientWrap { key_wrap_table_length, key_wrap_table_record_count, key_wrap_table_digest, .. } => {
+            (*key_wrap_table_length, *key_wrap_table_record_count, *key_wrap_table_digest)
+        }
+        _ => return Err(FormatError::KeyMaterialMismatch),
     };
     let key_wrap_table = KeyWrapTableV1::parse(
         &key_wrap_table_bytes,
         &volume_header.archive_uuid,
         &volume_header.session_id,
-        *key_wrap_table_length,
-        *key_wrap_table_record_count,
+        key_wrap_table_length,
+        key_wrap_table_record_count,
     )?;
-    if compute_key_wrap_table_digest(*key_wrap_table_length, &key_wrap_table_bytes) != *key_wrap_table_digest {
+    if compute_key_wrap_table_digest(key_wrap_table_length, &key_wrap_table_bytes) != key_wrap_table_digest {
         return Err(FormatError::IntegrityDigestMismatch { structure: "KeyWrapTableV1" });
     }
     let block_records_start = checked_u64_add(crypto_end, key_wrap_table.table_length as u64, "KeyWrapTableV1")?;
@@ -294,7 +299,7 @@ pub(crate) fn prefix_uses_recipient_wrap(bytes: &[u8]) -> bool {
     let Ok(parsed_crypto) = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length) else {
         return false;
     };
-    matches!(parsed_crypto.kdf_params, KdfParams::RecipientWrap { .. })
+    matches!(parsed_crypto.kdf_params, KdfParams::RecipientWrap { .. } | KdfParams::Argon2idRecipientWrap { .. })
 }
 
 pub(crate) fn parse_open_prefix_with_recipient_wrap_resolver<F>(bytes: &[u8], resolver: &mut F) -> Result<ParsedOpenPrefix, FormatError>
@@ -307,7 +312,9 @@ where
     let crypto_len = volume_header.crypto_header_length as usize;
     let crypto_bytes = slice(bytes, crypto_start, crypto_len, "CryptoHeader")?;
     let parsed_crypto = CryptoHeader::parse(crypto_bytes, volume_header.crypto_header_length)?;
-    if !matches!(parsed_crypto.kdf_params, KdfParams::RecipientWrap { .. }) || !parsed_crypto.fixed.aead_algo.is_encrypted() {
+    if !matches!(parsed_crypto.kdf_params, KdfParams::RecipientWrap { .. } | KdfParams::Argon2idRecipientWrap { .. })
+        || !parsed_crypto.fixed.aead_algo.is_encrypted()
+    {
         return Err(FormatError::KeyMaterialMismatch);
     }
 
@@ -628,7 +635,9 @@ where
     let crypto_len = volume_header.crypto_header_length as u64;
     let crypto_bytes = read_at_vec(reader, crypto_start, to_usize(crypto_len, "CryptoHeader")?, "CryptoHeader")?;
     let parsed_crypto = CryptoHeader::parse(&crypto_bytes, volume_header.crypto_header_length)?;
-    if !matches!(parsed_crypto.kdf_params, KdfParams::RecipientWrap { .. }) || !parsed_crypto.fixed.aead_algo.is_encrypted() {
+    if !matches!(parsed_crypto.kdf_params, KdfParams::RecipientWrap { .. } | KdfParams::Argon2idRecipientWrap { .. })
+        || !parsed_crypto.fixed.aead_algo.is_encrypted()
+    {
         return Err(FormatError::KeyMaterialMismatch);
     }
 
@@ -888,7 +897,9 @@ pub(crate) fn parse_public_no_key_volume(bytes: &[u8], options: ReaderOptions) -
 
     let terminal = locate_v45_public_terminal(bytes, &volume_header, &parsed_crypto, options)?;
     let block_records_start = match &parsed_crypto.kdf_params {
-        KdfParams::RecipientWrap { key_wrap_table_length, .. } => checked_add(crypto_end, *key_wrap_table_length as usize, "KeyWrapTableV1")?,
+        KdfParams::RecipientWrap { key_wrap_table_length, .. } | KdfParams::Argon2idRecipientWrap { key_wrap_table_length, .. } => {
+            checked_add(crypto_end, *key_wrap_table_length as usize, "KeyWrapTableV1")?
+        }
         _ => crypto_end,
     };
     let block_region = parse_public_block_observation(bytes, block_records_start, &terminal.image, parsed_crypto.fixed.block_size as usize, &volume_header)?;
@@ -942,7 +953,9 @@ pub(crate) fn parse_public_no_key_volume_read_at(reader: &dyn ArchiveReadAt, opt
     let terminal = locate_v45_public_terminal_read_at(reader, len, &volume_header, &parsed_crypto, options)?;
     let crypto_end = checked_u64_add(crypto_start, crypto_len as u64, "CryptoHeader")?;
     let block_records_start = match &parsed_crypto.kdf_params {
-        KdfParams::RecipientWrap { key_wrap_table_length, .. } => checked_u64_add(crypto_end, *key_wrap_table_length as u64, "KeyWrapTableV1")?,
+        KdfParams::RecipientWrap { key_wrap_table_length, .. } | KdfParams::Argon2idRecipientWrap { key_wrap_table_length, .. } => {
+            checked_u64_add(crypto_end, *key_wrap_table_length as u64, "KeyWrapTableV1")?
+        }
         _ => crypto_end,
     };
     let footer = &terminal.root_auth_footer;
@@ -1079,6 +1092,38 @@ pub(crate) fn public_kdf_profiles_agree(left: &KdfParams, right: &KdfParams) -> 
                 key_wrap_table_digest: right_digest,
             },
         ) => left_length == right_length && left_count == right_count && left_version == right_version && left_digest == right_digest,
+        (
+            KdfParams::Argon2idRecipientWrap {
+                t_cost: left_t,
+                m_cost_kib: left_m,
+                parallelism: left_p,
+                salt: left_salt,
+                key_wrap_table_length: left_length,
+                key_wrap_table_record_count: left_count,
+                key_wrap_table_version: left_version,
+                key_wrap_table_digest: left_digest,
+            },
+            KdfParams::Argon2idRecipientWrap {
+                t_cost: right_t,
+                m_cost_kib: right_m,
+                parallelism: right_p,
+                salt: right_salt,
+                key_wrap_table_length: right_length,
+                key_wrap_table_record_count: right_count,
+                key_wrap_table_version: right_version,
+                key_wrap_table_digest: right_digest,
+            },
+        ) => {
+            left_t == right_t
+                && left_m == right_m
+                && left_p == right_p
+                && left_salt == right_salt
+                && left_length == right_length
+                && left_count == right_count
+                && left_version == right_version
+                && left_digest == right_digest
+        }
+        (KdfParams::Argon2idRecipientWrap { .. }, _) | (_, KdfParams::Argon2idRecipientWrap { .. }) => false,
         (KdfParams::RecipientWrap { .. }, _) | (_, KdfParams::RecipientWrap { .. }) => false,
         _ => true,
     }

@@ -92,59 +92,71 @@ pub(crate) fn resolve_key_wrap_artifacts(
     session_id: &[u8; 16],
     key_wrap_records: Option<&KeyWrapRecordSource>,
 ) -> Result<(KdfParams, Option<Vec<u8>>), FormatError> {
-    match kdf_params {
-        KdfParams::RecipientWrap { key_wrap_table_length, key_wrap_table_record_count, key_wrap_table_version, .. } => {
-            if *key_wrap_table_version != 1 {
-                return Err(FormatError::InvalidKdfParams("recipient-wrap table version must be 1"));
-            }
-            let Some(records) = key_wrap_records.ok_or(FormatError::WriterUnsupported("RecipientWrap requires key-wrap records"))?.resolve()? else {
-                return Err(FormatError::WriterUnsupported("RecipientWrap requires key-wrap records"));
-            };
-            if records.is_empty() {
-                return Err(FormatError::WriterUnsupported("RecipientWrap requires at least one recipient record"));
-            }
-            let mut recipient_records = Vec::with_capacity(records.len());
-            for record in records {
-                let mut prepared = record.clone();
-                let record_length = u32_len(prepared.to_bytes()?.len(), "RecipientWrap record")?;
-                prepared = prepared.with_record_length(record_length);
-                recipient_records.push(prepared);
-            }
-            let declared_record_count = u32_len(recipient_records.len(), "KeyWrapTableV1 recipient_record_count")?;
-            if *key_wrap_table_record_count != 0 && *key_wrap_table_record_count != declared_record_count {
-                return Err(FormatError::InvalidKdfParams("recipient-wrap key_wrap_table_record_count mismatch"));
-            }
-
-            let key_wrap_table = KeyWrapTableV1 {
-                version: *key_wrap_table_version,
-                volume_format_rev: VOLUME_FORMAT_REV_45,
-                table_length: 0,
-                flags: 0,
-                archive_uuid: *archive_uuid,
-                session_id: *session_id,
-                recipient_record_count: declared_record_count,
-                records_offset: 96,
-                records_length: 0,
-                recipient_records,
-            }
-            .to_bytes()?;
-            let computed_key_wrap_table_length = u32_len(key_wrap_table.len(), "KeyWrapTableV1 table_length")?;
-            if *key_wrap_table_length != 0 && computed_key_wrap_table_length != *key_wrap_table_length {
-                return Err(FormatError::InvalidKdfParams("recipient-wrap key_wrap_table_length mismatch"));
-            }
-            let key_wrap_table_digest = compute_key_wrap_table_digest(computed_key_wrap_table_length, &key_wrap_table);
-            Ok((
-                KdfParams::RecipientWrap {
-                    key_wrap_table_length: computed_key_wrap_table_length,
-                    key_wrap_table_record_count: declared_record_count,
-                    key_wrap_table_version: *key_wrap_table_version,
-                    key_wrap_table_digest,
-                },
-                Some(key_wrap_table),
-            ))
+    let (key_wrap_table_length, key_wrap_table_record_count, key_wrap_table_version) = match kdf_params {
+        KdfParams::RecipientWrap { key_wrap_table_length, key_wrap_table_record_count, key_wrap_table_version, .. }
+        | KdfParams::Argon2idRecipientWrap { key_wrap_table_length, key_wrap_table_record_count, key_wrap_table_version, .. } => {
+            (*key_wrap_table_length, *key_wrap_table_record_count, *key_wrap_table_version)
         }
-        _ => Ok((kdf_params.clone(), None)),
+        _ => return Ok((kdf_params.clone(), None)),
+    };
+    if key_wrap_table_version != 1 {
+        return Err(FormatError::InvalidKdfParams("recipient-wrap table version must be 1"));
     }
+    let Some(records) = key_wrap_records.ok_or(FormatError::WriterUnsupported("RecipientWrap requires key-wrap records"))?.resolve()? else {
+        return Err(FormatError::WriterUnsupported("RecipientWrap requires key-wrap records"));
+    };
+    if records.is_empty() {
+        return Err(FormatError::WriterUnsupported("RecipientWrap requires at least one recipient record"));
+    }
+    let recipient_records = records
+        .into_iter()
+        .map(|record| {
+            let record_length = u32_len(record.to_bytes()?.len(), "RecipientWrap record")?;
+            Ok(record.with_record_length(record_length))
+        })
+        .collect::<Result<Vec<_>, FormatError>>()?;
+    let declared_record_count = u32_len(recipient_records.len(), "KeyWrapTableV1 recipient_record_count")?;
+    if key_wrap_table_record_count != 0 && key_wrap_table_record_count != declared_record_count {
+        return Err(FormatError::InvalidKdfParams("recipient-wrap key_wrap_table_record_count mismatch"));
+    }
+    let key_wrap_table = KeyWrapTableV1 {
+        version: key_wrap_table_version,
+        volume_format_rev: VOLUME_FORMAT_REV_45,
+        table_length: 0,
+        flags: 0,
+        archive_uuid: *archive_uuid,
+        session_id: *session_id,
+        recipient_record_count: declared_record_count,
+        records_offset: 96,
+        records_length: 0,
+        recipient_records,
+    }
+    .to_bytes()?;
+    let computed_key_wrap_table_length = u32_len(key_wrap_table.len(), "KeyWrapTableV1 table_length")?;
+    if key_wrap_table_length != 0 && computed_key_wrap_table_length != key_wrap_table_length {
+        return Err(FormatError::InvalidKdfParams("recipient-wrap key_wrap_table_length mismatch"));
+    }
+    let key_wrap_table_digest = compute_key_wrap_table_digest(computed_key_wrap_table_length, &key_wrap_table);
+    let resolved = match kdf_params {
+        KdfParams::RecipientWrap { .. } => KdfParams::RecipientWrap {
+            key_wrap_table_length: computed_key_wrap_table_length,
+            key_wrap_table_record_count: declared_record_count,
+            key_wrap_table_version,
+            key_wrap_table_digest,
+        },
+        KdfParams::Argon2idRecipientWrap { t_cost, m_cost_kib, parallelism, salt, .. } => KdfParams::Argon2idRecipientWrap {
+            t_cost: *t_cost,
+            m_cost_kib: *m_cost_kib,
+            parallelism: *parallelism,
+            salt: salt.clone(),
+            key_wrap_table_length: computed_key_wrap_table_length,
+            key_wrap_table_record_count: declared_record_count,
+            key_wrap_table_version,
+            key_wrap_table_digest,
+        },
+        _ => unreachable!("recipient wrap parameters were matched above"),
+    };
+    Ok((resolved, Some(key_wrap_table)))
 }
 
 pub(crate) fn recipient_wrap_kdf_params_for_record_count(record_count: usize) -> Result<KdfParams, FormatError> {
@@ -160,7 +172,7 @@ pub(crate) fn stabilized_key_wrap_record_source(
     kdf_params: &KdfParams,
     key_wrap_records: Option<&KeyWrapRecordSource>,
 ) -> Result<Option<KeyWrapRecordSource>, FormatError> {
-    if !matches!(kdf_params, KdfParams::RecipientWrap { .. }) {
+    if !matches!(kdf_params, KdfParams::RecipientWrap { .. } | KdfParams::Argon2idRecipientWrap { .. }) {
         return Ok(None);
     }
     let Some(records) = key_wrap_records.ok_or(FormatError::WriterUnsupported("RecipientWrap requires key-wrap records"))?.resolve()? else {
@@ -1313,13 +1325,45 @@ where
     O: ArchiveWriteSink,
 {
     let kdf_params = recipient_wrap_kdf_params_for_record_count(records.len())?;
+    write_archive_sources_to_sink_ordered_parallel_with_kdf_params_and_recipient_wrap_records_and_progress(
+        files,
+        master_key,
+        options,
+        &kdf_params,
+        records,
+        root_auth,
+        authenticator,
+        sink,
+        progress,
+    )
+}
+
+/// Writes an archive using caller-supplied KDF parameters and recipient
+/// records. The combined passphrase/recipient profile uses this seam so the
+/// same random master key is available through either unlock method.
+#[allow(clippy::too_many_arguments)]
+pub fn write_archive_sources_to_sink_ordered_parallel_with_kdf_params_and_recipient_wrap_records_and_progress<S, O>(
+    files: &[S],
+    master_key: &MasterKey,
+    options: WriterOptions,
+    kdf_params: &KdfParams,
+    records: Vec<RecipientRecordV1>,
+    root_auth: Option<RootAuthWriterConfig<'_>>,
+    authenticator: Option<&mut RootAuthAuthenticator<'_>>,
+    sink: &mut O,
+    progress: &mut dyn ArchiveWriteProgressSink,
+) -> Result<WrittenArchiveSummary, ArchiveWriteError>
+where
+    S: RegularFileSource,
+    O: ArchiveWriteSink,
+{
     let key_wrap_records = KeyWrapRecordSource::fixed(records);
     let (progress_files, progress_state) = progress_sources(files, progress);
     write_ordered_parallel_archive_to_sink(
         &progress_files,
         master_key,
         options,
-        &kdf_params,
+        kdf_params,
         root_auth,
         authenticator,
         Some(&key_wrap_records),
