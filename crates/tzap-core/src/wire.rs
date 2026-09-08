@@ -203,7 +203,7 @@ impl CryptoHeaderFixed {
         }
         match (self.aead_algo, self.kdf_algo) {
             (AeadAlgo::None, KdfAlgo::None) => {}
-            (aead_algo, KdfAlgo::Raw | KdfAlgo::Argon2id | KdfAlgo::RecipientWrap | KdfAlgo::Argon2idRecipientWrap) if aead_algo.is_encrypted() => {}
+            (aead_algo, KdfAlgo::Raw | KdfAlgo::Argon2id | KdfAlgo::RecipientWrap) if aead_algo.is_encrypted() => {}
             _ => {
                 return Err(FormatError::InvalidProtectionMode { aead_algo: self.aead_algo, kdf_algo: self.kdf_algo });
             }

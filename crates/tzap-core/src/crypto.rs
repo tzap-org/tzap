@@ -40,28 +40,8 @@ const RECIPIENT_WRAP_TABLE_VERSION: u16 = 1;
 pub enum KdfParams {
     None,
     Raw,
-    Argon2id {
-        t_cost: u32,
-        m_cost_kib: u32,
-        parallelism: u32,
-        salt: Vec<u8>,
-    },
-    RecipientWrap {
-        key_wrap_table_length: u32,
-        key_wrap_table_record_count: u32,
-        key_wrap_table_version: u16,
-        key_wrap_table_digest: [u8; 32],
-    },
-    Argon2idRecipientWrap {
-        t_cost: u32,
-        m_cost_kib: u32,
-        parallelism: u32,
-        salt: Vec<u8>,
-        key_wrap_table_length: u32,
-        key_wrap_table_record_count: u32,
-        key_wrap_table_version: u16,
-        key_wrap_table_digest: [u8; 32],
-    },
+    Argon2id { t_cost: u32, m_cost_kib: u32, parallelism: u32, salt: Vec<u8> },
+    RecipientWrap { key_wrap_table_length: u32, key_wrap_table_record_count: u32, key_wrap_table_version: u16, key_wrap_table_digest: [u8; 32] },
 }
 
 impl KdfParams {
@@ -71,7 +51,6 @@ impl KdfParams {
             KdfAlgo::Argon2id => parse_argon2id_kdf_params(bytes),
             KdfAlgo::None => parse_none_kdf_params(bytes),
             KdfAlgo::RecipientWrap => parse_recipient_wrap_kdf_params(bytes),
-            KdfAlgo::Argon2idRecipientWrap => parse_argon2id_recipient_wrap_kdf_params(bytes),
         }
     }
 }
@@ -90,11 +69,8 @@ impl MasterKey {
     }
 
     pub fn derive_from_passphrase(params: &KdfParams, passphrase: &str) -> Result<Self, FormatError> {
-        let (t_cost, m_cost_kib, parallelism, salt) = match params {
-            KdfParams::Argon2id { t_cost, m_cost_kib, parallelism, salt } | KdfParams::Argon2idRecipientWrap { t_cost, m_cost_kib, parallelism, salt, .. } => {
-                (t_cost, m_cost_kib, parallelism, salt)
-            }
-            _ => return Err(FormatError::KeyMaterialMismatch),
+        let KdfParams::Argon2id { t_cost, m_cost_kib, parallelism, salt } = params else {
+            return Err(FormatError::KeyMaterialMismatch);
         };
 
         let salt_length = u16::try_from(salt.len()).map_err(|_| FormatError::InvalidKdfParams("argon2id salt length must be 8..64 bytes"))?;
@@ -455,76 +431,6 @@ fn parse_recipient_wrap_kdf_params(bytes: &[u8]) -> Result<(KdfParams, usize), F
     Ok((
         KdfParams::RecipientWrap { key_wrap_table_length, key_wrap_table_record_count, key_wrap_table_version: table_version, key_wrap_table_digest },
         RECIPIENT_WRAP_KDF_PARAMS_LEN,
-    ))
-}
-
-fn parse_argon2id_recipient_wrap_kdf_params(bytes: &[u8]) -> Result<(KdfParams, usize), FormatError> {
-    if bytes.len() < ARGON2ID_FIXED_PARAMS_LEN {
-        return Err(FormatError::TruncatedKdfParams);
-    }
-    let algo_tag = read_u16(bytes, 0)?;
-    if algo_tag != KdfAlgo::Argon2idRecipientWrap as u16 {
-        return Err(FormatError::KdfAlgoTagMismatch { expected: KdfAlgo::Argon2idRecipientWrap as u16, actual: algo_tag });
-    }
-    let t_cost = read_u32(bytes, 2)?;
-    let m_cost_kib = read_u32(bytes, 6)?;
-    let parallelism = read_u32(bytes, 10)?;
-    let salt_length = read_u16(bytes, 14)?;
-    if !(ARGON2ID_MIN_SALT_LEN..=ARGON2ID_MAX_SALT_LEN).contains(&salt_length) {
-        return Err(FormatError::InvalidKdfParams("argon2id salt length must be 8..64 bytes"));
-    }
-    validate_argon2id_bounds(t_cost, m_cost_kib, parallelism, salt_length)?;
-    let argon_len = ARGON2ID_FIXED_PARAMS_LEN + salt_length as usize;
-    let table_offset = argon_len;
-    let table_end = table_offset.checked_add(RECIPIENT_WRAP_KDF_PARAMS_LEN).ok_or(FormatError::TruncatedKdfParams)?;
-    if bytes.len() < table_end {
-        return Err(FormatError::TruncatedKdfParams);
-    }
-    let table_tag = read_u16(bytes, table_offset)?;
-    if table_tag != KdfAlgo::RecipientWrap as u16 {
-        return Err(FormatError::KdfAlgoTagMismatch { expected: KdfAlgo::RecipientWrap as u16, actual: table_tag });
-    }
-    let key_wrap_table_length = read_u32(bytes, table_offset + 2)?;
-    let key_wrap_table_record_count = read_u32(bytes, table_offset + 6)?;
-    let table_version = read_u16(bytes, table_offset + 10)?;
-    if key_wrap_table_length == 0 {
-        return Err(FormatError::InvalidKdfParams("recipient-wrap key_wrap_table_length must be non-zero"));
-    }
-    if key_wrap_table_length > READER_MAX_KEY_WRAP_TABLE_LEN {
-        return Err(FormatError::ReaderResourceLimitExceeded {
-            field: "KeyWrapTableV1 length",
-            cap: READER_MAX_KEY_WRAP_TABLE_LEN as u64,
-            actual: key_wrap_table_length as u64,
-        });
-    }
-    if key_wrap_table_record_count > READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS {
-        return Err(FormatError::ReaderResourceLimitExceeded {
-            field: "KeyWrapTableV1 recipient_record_count",
-            cap: READER_MAX_KEY_WRAP_TABLE_RECIPIENT_RECORDS as u64,
-            actual: key_wrap_table_record_count as u64,
-        });
-    }
-    if table_version != RECIPIENT_WRAP_TABLE_VERSION {
-        return Err(FormatError::InvalidKdfParams("recipient-wrap table version must be 1"));
-    }
-    let reserved = read_u16(bytes, table_offset + 12)?;
-    if reserved != 0 {
-        return Err(FormatError::InvalidKdfParams("recipient-wrap reserved bytes must be zero"));
-    }
-    let mut key_wrap_table_digest = [0u8; 32];
-    key_wrap_table_digest.copy_from_slice(&bytes[table_offset + 14..table_end]);
-    Ok((
-        KdfParams::Argon2idRecipientWrap {
-            t_cost,
-            m_cost_kib,
-            parallelism,
-            salt: bytes[ARGON2ID_FIXED_PARAMS_LEN..argon_len].to_vec(),
-            key_wrap_table_length,
-            key_wrap_table_record_count,
-            key_wrap_table_version: table_version,
-            key_wrap_table_digest,
-        },
-        table_end,
     ))
 }
 

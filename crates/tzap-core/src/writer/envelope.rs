@@ -404,11 +404,10 @@ pub(crate) fn build_crypto_header(
         KdfParams::Raw => KdfAlgo::Raw,
         KdfParams::Argon2id { .. } => KdfAlgo::Argon2id,
         KdfParams::RecipientWrap { .. } => KdfAlgo::RecipientWrap,
-        KdfParams::Argon2idRecipientWrap { .. } => KdfAlgo::Argon2idRecipientWrap,
     };
     match (options.aead_algo, kdf_algo) {
         (AeadAlgo::None, KdfAlgo::None) => {}
-        (aead_algo, KdfAlgo::Raw | KdfAlgo::Argon2id | KdfAlgo::RecipientWrap | KdfAlgo::Argon2idRecipientWrap) if aead_algo.is_encrypted() => {}
+        (aead_algo, KdfAlgo::Raw | KdfAlgo::Argon2id | KdfAlgo::RecipientWrap) if aead_algo.is_encrypted() => {}
         _ => {
             return Err(FormatError::InvalidProtectionMode { aead_algo: options.aead_algo, kdf_algo });
         }
@@ -477,49 +476,6 @@ pub(crate) fn serialize_kdf_params(params: &KdfParams) -> Result<Vec<u8>, Format
             bytes.extend_from_slice(salt);
         }
         KdfParams::RecipientWrap { key_wrap_table_length, key_wrap_table_record_count, key_wrap_table_version, key_wrap_table_digest } => {
-            bytes.extend_from_slice(&(KdfAlgo::RecipientWrap as u16).to_le_bytes());
-            bytes.extend_from_slice(&key_wrap_table_length.to_le_bytes());
-            bytes.extend_from_slice(&key_wrap_table_record_count.to_le_bytes());
-            bytes.extend_from_slice(&key_wrap_table_version.to_le_bytes());
-            bytes.extend_from_slice(&0u16.to_le_bytes());
-            bytes.extend_from_slice(key_wrap_table_digest);
-        }
-        KdfParams::Argon2idRecipientWrap {
-            t_cost,
-            m_cost_kib,
-            parallelism,
-            salt,
-            key_wrap_table_length,
-            key_wrap_table_record_count,
-            key_wrap_table_version,
-            key_wrap_table_digest,
-        } => {
-            if *t_cost == 0 {
-                return Err(FormatError::InvalidKdfParams("t_cost must be non-zero"));
-            }
-            if *parallelism == 0 {
-                return Err(FormatError::InvalidKdfParams("parallelism must be non-zero"));
-            }
-            let min_memory = parallelism.checked_mul(8).ok_or(FormatError::InvalidKdfParams("m_cost_kib requirement overflow"))?;
-            if *m_cost_kib < min_memory {
-                return Err(FormatError::InvalidKdfParams("m_cost_kib must be at least 8 * parallelism"));
-            }
-            if !(8..=64).contains(&salt.len()) {
-                return Err(FormatError::InvalidKdfParams("argon2id salt length must be 8..64"));
-            }
-            let salt_len = u16::try_from(salt.len()).map_err(|_| FormatError::InvalidKdfParams("argon2id salt too long"))?;
-            if *key_wrap_table_version != 1 {
-                return Err(FormatError::InvalidKdfParams("recipient-wrap table version must be 1"));
-            }
-            bytes.extend_from_slice(&(KdfAlgo::Argon2idRecipientWrap as u16).to_le_bytes());
-            bytes.extend_from_slice(&t_cost.to_le_bytes());
-            bytes.extend_from_slice(&m_cost_kib.to_le_bytes());
-            bytes.extend_from_slice(&parallelism.to_le_bytes());
-            bytes.extend_from_slice(&salt_len.to_le_bytes());
-            bytes.extend_from_slice(salt);
-            // Keep the existing RecipientWrap parameter encoding as a nested
-            // fixed-width record so readers can locate the table after the
-            // variable-length Argon2 salt.
             bytes.extend_from_slice(&(KdfAlgo::RecipientWrap as u16).to_le_bytes());
             bytes.extend_from_slice(&key_wrap_table_length.to_le_bytes());
             bytes.extend_from_slice(&key_wrap_table_record_count.to_le_bytes());

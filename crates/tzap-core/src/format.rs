@@ -182,8 +182,6 @@ pub enum KdfAlgo {
     Argon2id = 1,
     None = 2,
     RecipientWrap = 3,
-    /// Argon2id passphrase protection plus recipient key-wrap records.
-    Argon2idRecipientWrap = 4,
 }
 
 impl TryFrom<u16> for KdfAlgo {
@@ -195,7 +193,6 @@ impl TryFrom<u16> for KdfAlgo {
             1 => Ok(Self::Argon2id),
             2 => Ok(Self::None),
             3 => Ok(Self::RecipientWrap),
-            4 => Ok(Self::Argon2idRecipientWrap),
             other => Err(FormatError::UnknownKdfAlgo(other)),
         }
     }
