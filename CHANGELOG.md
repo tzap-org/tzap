@@ -1,6 +1,44 @@
 # Changelog
 
-## Unreleased
+## 0.2.4 - 2026-09-12
+
+- Fixes silent sibling-volume discovery failure for bare relative archive
+  paths. `Path::parent()` on a bare file name such as `archive.vol000.tzap`
+  yields `Some("")` rather than `None`, so the fallback to `.` never fired and
+  the empty path reached `read_dir`, whose `NotFound` was read as "zero
+  volumes found". Listing, extracting, or verifying a multi-volume archive by
+  its first volume's bare name — the most common way to invoke the CLI, from
+  inside the archive's own directory — reported the archive as corrupt even
+  when every volume was present. The same fix restores `create`'s
+  pre-existing-volume collision check, which previously skipped the check for
+  bare output paths and could overwrite old volumes without warning.
+- Fixes a panic in TZAP volume-name parsing on non-ASCII archive file names.
+  Case-insensitive suffix stripping now splits on UTF-8 character boundaries
+  instead of raw byte offsets.
+- Fixes "streamed tar member metadata flags do not match FileEntry flags" on
+  real multi-volume archives written from generic Unix source OSes (FreeBSD,
+  NetBSD, OpenBSD, Solaris, other Unix). `LIBARCHIVE.creationtime` is owned by
+  the `posix-backup-v1` profile for those source OSes, so the writer now
+  declares that profile at the exact call site that attaches the key, and the
+  entry-flag prediction agrees with what the reader recomputes from the
+  written header. Hardlink aliases keep their `portable-v1`-only invariant.
+- Adds `tzap-plugin-signing::x509_chain::verify_root_auth_footer_at_time` —
+  chain validation against a caller-supplied time basis instead of the
+  verifier's own clock.
+- Adds `tzap-core::public_no_key_verify_readers_with` and
+  `public_no_key_verify_readers_with_options` — public-no-key verification for
+  callers that already hold open readers rather than volume paths.
+- Moves the embedded TZAP production and staging root certificates and their
+  pinned SHA-256 fingerprints out of `tzap-cli` into
+  `tzap-plugin-signing::trust`, so `tzap-cli` and downstream consumers import
+  one copy instead of embedding their own and letting the bytes drift.
+- Updates `chacha20` to 0.10.2; 0.10.1 was yanked from crates.io.
+- Expands test coverage substantially: property-style parser and restore-policy
+  tests, Unicode archive end-to-end coverage, platform-aware restore tests,
+  and writer-level round-trip coverage for native-metadata flag prediction.
+- Runs the fuzzing jobs on nightly Rust.
+
+## 0.2.3 - 2026-08-20
 
 - Extraction is dramatically faster: `tzap extract` no longer fsyncs each
   restored file's data and directory entry by default (pass `--fsync` to

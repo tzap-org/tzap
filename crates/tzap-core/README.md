@@ -14,7 +14,7 @@ crates when origin-authenticated signatures are part of your product.
 
 ```toml
 [dependencies]
-tzap-core = "0.2.3"
+tzap-core = "0.2.4"
 ```
 
 ## What It Provides
