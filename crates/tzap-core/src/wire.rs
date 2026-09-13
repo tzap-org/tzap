@@ -807,15 +807,18 @@ impl BlockRecord {
     }
 
     pub(crate) fn to_bytes_from_parts(block_index: u64, kind: BlockKind, flags: u8, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![0u8; payload.len() + BLOCK_RECORD_FRAMING_LEN];
-        bytes[0..4].copy_from_slice(&TZBK_MAGIC);
-        write_u64(&mut bytes, 4, block_index);
-        bytes[12] = kind as u8;
-        bytes[13] = flags;
-        bytes[16..16 + payload.len()].copy_from_slice(payload);
-        let crc = crc32c(&bytes[..16 + payload.len()]);
-        let crc_offset = 16 + payload.len();
-        write_u32(&mut bytes, crc_offset, crc);
+        // Appending leaves only bytes 14..16 (reserved) to be zeroed explicitly.
+        // `vec![0u8; len]` would instead zero-fill the payload region as well, which
+        // is one write of the whole archive before the payload overwrites it.
+        let mut bytes = Vec::with_capacity(payload.len() + BLOCK_RECORD_FRAMING_LEN);
+        bytes.extend_from_slice(&TZBK_MAGIC);
+        bytes.extend_from_slice(&block_index.to_le_bytes());
+        bytes.push(kind as u8);
+        bytes.push(flags);
+        bytes.extend_from_slice(&[0u8; 2]);
+        bytes.extend_from_slice(payload);
+        let crc = crc32c(&bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
         bytes
     }
 }

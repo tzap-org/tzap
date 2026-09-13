@@ -29,7 +29,7 @@ pub fn encode_parity_gf16(data_shards: &[Vec<u8>], parity_shard_count: usize) ->
 
     for (j, parity_shard) in parity.iter_mut().enumerate().take(parity_shard_count) {
         for (i, data_shard) in data_shards.iter().enumerate().take(data_shard_count) {
-            let coefficient = cauchy_coefficient(data_shard_count, j, i);
+            let coefficient = cauchy_coefficient_with(tables, data_shard_count, j, i);
             if coefficient == 0 {
                 continue;
             }
@@ -190,12 +190,27 @@ pub fn gf16_add(a: u16, b: u16) -> u16 {
 }
 
 pub fn gf16_mul(a: u16, b: u16) -> u16 {
+    gf16_mul_with(gf16_tables(), a, b)
+}
+
+#[inline]
+fn gf16_mul_with(tables: &Gf16Tables, a: u16, b: u16) -> u16 {
     if a == 0 || b == 0 {
         return 0;
     }
-    let tables = gf16_tables();
     let exponent = tables.log[a as usize] as usize + tables.log[b as usize] as usize;
     tables.exp[exponent]
+}
+
+/// `generator^(ORDER - log(value))`, which is one lookup pair instead of the
+/// ~32 multiplies a `gf16_pow(value, 65_534)` ladder costs. `ORDER - log(value)`
+/// lands in `1..=ORDER`, and `exp` is the doubled table, so it is always in range.
+#[inline]
+fn gf16_inverse_with(tables: &Gf16Tables, value: u16) -> Result<u16, FormatError> {
+    if value == 0 {
+        return Err(FormatError::FecSingularMatrix);
+    }
+    Ok(tables.exp[GF16_ORDER - tables.log[value as usize] as usize])
 }
 
 fn gf16_mul_slow(mut a: u16, mut b: u16) -> u16 {
@@ -245,10 +260,7 @@ pub fn gf16_pow(mut base: u16, mut exponent: u32) -> u16 {
 }
 
 pub fn gf16_inverse(value: u16) -> Result<u16, FormatError> {
-    if value == 0 {
-        return Err(FormatError::FecSingularMatrix);
-    }
-    Ok(gf16_pow(value, 65_534))
+    gf16_inverse_with(gf16_tables(), value)
 }
 
 fn validate_fec_shape(data_shard_count: usize, parity_shard_count: usize, data_shards: &[Vec<u8>]) -> Result<(), FormatError> {
@@ -281,14 +293,15 @@ fn validate_available_shard(shard: &[u8], shard_size: usize) -> Result<Vec<u8>, 
     Ok(shard.to_owned())
 }
 
-fn cauchy_coefficient(data_shard_count: usize, parity_row: usize, data_col: usize) -> u16 {
+fn cauchy_coefficient_with(tables: &Gf16Tables, data_shard_count: usize, parity_row: usize, data_col: usize) -> u16 {
     let x_i = data_col as u16;
     let y_j = (data_shard_count + parity_row) as u16;
-    gf16_inverse(x_i ^ y_j).expect("Cauchy denominator is non-zero under D + P limit")
+    gf16_inverse_with(tables, x_i ^ y_j).expect("Cauchy denominator is non-zero under D + P limit")
 }
 
 fn cauchy_row(data_shard_count: usize, parity_row: usize) -> Vec<u16> {
-    (0..data_shard_count).map(|i| cauchy_coefficient(data_shard_count, parity_row, i)).collect()
+    let tables = gf16_tables();
+    (0..data_shard_count).map(|i| cauchy_coefficient_with(tables, data_shard_count, parity_row, i)).collect()
 }
 
 fn identity_row(width: usize, one_at: usize) -> Vec<u16> {
@@ -306,18 +319,21 @@ fn invert_matrix(mut matrix: Vec<Vec<u16>>) -> Result<Vec<Vec<u16>>, FormatError
         row.extend(identity_row(n, i));
     }
 
+    let tables = gf16_tables();
+    let mut pivot_row = Vec::with_capacity(2 * n);
     for col in 0..n {
         let pivot = (col..n).find(|row| matrix[*row][col] != 0).ok_or(FormatError::FecSingularMatrix)?;
         if pivot != col {
             matrix.swap(pivot, col);
         }
 
-        let inv_pivot = gf16_inverse(matrix[col][col])?;
+        let inv_pivot = gf16_inverse_with(tables, matrix[col][col])?;
         for value in &mut matrix[col] {
-            *value = gf16_mul(*value, inv_pivot);
+            *value = gf16_mul_with(tables, *value, inv_pivot);
         }
 
-        let pivot_row = matrix[col].clone();
+        pivot_row.clear();
+        pivot_row.extend_from_slice(&matrix[col]);
         for (row_idx, row) in matrix.iter_mut().enumerate() {
             if row_idx == col {
                 continue;
@@ -326,8 +342,8 @@ fn invert_matrix(mut matrix: Vec<Vec<u16>>) -> Result<Vec<Vec<u16>>, FormatError
             if factor == 0 {
                 continue;
             }
-            for c in 0..2 * n {
-                row[c] ^= gf16_mul(factor, pivot_row[c]);
+            for (value, pivot_value) in row.iter_mut().zip(pivot_row.iter()) {
+                *value ^= gf16_mul_with(tables, factor, *pivot_value);
             }
         }
     }
@@ -338,6 +354,18 @@ fn invert_matrix(mut matrix: Vec<Vec<u16>>) -> Result<Vec<Vec<u16>>, FormatError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_inverse_matches_exponentiation_over_the_whole_field() {
+        // The O(1) log-table inverse must agree with the gf16_pow ladder it replaced
+        // for every non-zero element, and 0 must still be rejected.
+        assert_eq!(gf16_inverse(0).unwrap_err(), FormatError::FecSingularMatrix);
+        for value in 1..=u16::MAX {
+            let inverse = gf16_inverse(value).unwrap();
+            assert_eq!(inverse, gf16_pow(value, 65_534), "inverse mismatch for {value}");
+            assert_eq!(gf16_mul(value, inverse), 1, "{value} * inverse != 1");
+        }
+    }
 
     #[test]
     fn gf16_arithmetic_matches_polynomial_examples() {

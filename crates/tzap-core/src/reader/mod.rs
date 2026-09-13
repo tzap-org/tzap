@@ -1972,11 +1972,13 @@ impl OpenedArchive {
         let Some(requested) = winners.get(&normalized_path).copied() else {
             return Ok(None);
         };
-        let requested_member = self.decode_loaded_owned_tar_member(&shards[requested.shard_index], requested.file_index, false)?;
+        // Index metadata carries `kind` and `link_target`, so this decodes nothing:
+        // decoding the member here would load, decrypt and decompress its whole
+        // envelope and materialize the file data, which the restore below redoes.
+        let requested_entry = archive_index_entry_from_loaded_file(&shards[requested.shard_index], requested.file_index)?;
         let mut entries = Vec::with_capacity(2);
-        if requested_member.kind == TarEntryKind::Hardlink {
-            let target = requested_member.link_target.as_deref().ok_or(FormatError::InvalidArchive("hardlink target is missing"))?;
-            let target = std::str::from_utf8(target).map_err(|_| FormatError::UnsafeArchivePath)?.to_owned();
+        if requested_entry.kind == TarEntryKind::Hardlink {
+            let target = requested_entry.link_target.ok_or(FormatError::InvalidArchive("hardlink target is missing"))?;
             let target_entry = winners.get(&target).copied().ok_or(FormatError::InvalidArchive("hardlink target is absent from the final index"))?;
             entries.push((target, target_entry));
         }
