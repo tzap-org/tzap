@@ -30,17 +30,16 @@ mkdir -p keys corpus/nested/deep corpus/other
 "$NEW" keygen -o keys/raw.hex >/dev/null
 "$NEW" signing-keygen --secret-output keys/sign.sec --public-output keys/sign.pub >/dev/null
 head -c 65536 /dev/urandom > keys/dict.bin
-# Git Bash rewrites a leading-slash argument into a Windows path, mangling -subj.
-# Scope the opt-out to these calls: exported globally it also stops bash translating
-# /tmp/... for the native binary under test.
-( export MSYS_NO_PATHCONV=1
+# A leading-slash argument is rewritten into a Windows path by MSYS, mangling
+# -subj. Escape it with a doubled slash, which MSYS collapses back to one: setting
+# MSYS_NO_PATHCONV instead would also stop it converting the -out paths, so the
+# files would be written somewhere the native openssl cannot reach.
 openssl genpkey -algorithm X25519 -out keys/recip.key 2>/dev/null
 openssl genpkey -algorithm ed25519 -out keys/ca.key 2>/dev/null
-openssl req -new -x509 -key keys/ca.key -out keys/ca.pem -days 30 -subj "/CN=tzap-matrix-ca" 2>/dev/null
+openssl req -new -x509 -key keys/ca.key -out keys/ca.pem -days 30 -subj "//CN=tzap-matrix-ca" 2>/dev/null
 openssl pkey -in keys/recip.key -pubout -out keys/recip.pub 2>/dev/null
-openssl req -new -key keys/ca.key -out keys/dummy.csr -subj "/CN=tzap-matrix-recipient" 2>/dev/null
+openssl req -new -key keys/ca.key -out keys/dummy.csr -subj "//CN=tzap-matrix-recipient" 2>/dev/null
 openssl x509 -req -in keys/dummy.csr -CA keys/ca.pem -CAkey keys/ca.key -force_pubkey keys/recip.pub -out keys/recip.pem -days 30 >/dev/null 2>&1
-)
 
 # Corpus: nested directories, a symlink where the platform allows one, and sizes
 # that straddle frame boundaries. Portable shell -- no python, which Git Bash on

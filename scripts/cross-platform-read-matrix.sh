@@ -75,14 +75,17 @@ if [ "$MODE" = export ]; then
   "$BUILDER" keygen -o "$OUT/keys/raw.hex" >/dev/null
   "$BUILDER" signing-keygen --secret-output "$OUT/keys/sign.sec" --public-output "$OUT/keys/sign.pub" >/dev/null
   head -c 65536 /dev/urandom > "$OUT/keys/dict.bin"
-  ( export MSYS_NO_PATHCONV=1
-    openssl genpkey -algorithm X25519 -out "$OUT/keys/recip.key" 2>/dev/null
-    openssl genpkey -algorithm ed25519 -out "$OUT/keys/ca.key" 2>/dev/null
-    openssl req -new -x509 -key "$OUT/keys/ca.key" -out "$OUT/keys/ca.pem" -days 30 -subj "/CN=xplat-ca" 2>/dev/null
-    openssl pkey -in "$OUT/keys/recip.key" -pubout -out "$OUT/keys/recip.pub" 2>/dev/null
-    openssl req -new -key "$OUT/keys/ca.key" -out "$OUT/keys/d.csr" -subj "/CN=xplat-recipient" 2>/dev/null
-    openssl x509 -req -in "$OUT/keys/d.csr" -CA "$OUT/keys/ca.pem" -CAkey "$OUT/keys/ca.key" \
-      -force_pubkey "$OUT/keys/recip.pub" -out "$OUT/keys/recip.pem" -days 30 >/dev/null 2>&1 )
+  # MSYS rewrites a leading-slash argument into a Windows path, mangling -subj.
+  # Escape it with a doubled slash, which MSYS collapses back to one. Setting
+  # MSYS_NO_PATHCONV instead would also stop it converting the -out paths, so the
+  # keys would be written somewhere the native openssl cannot reach.
+  openssl genpkey -algorithm X25519 -out "$OUT/keys/recip.key" 2>/dev/null
+  openssl genpkey -algorithm ed25519 -out "$OUT/keys/ca.key" 2>/dev/null
+  openssl req -new -x509 -key "$OUT/keys/ca.key" -out "$OUT/keys/ca.pem" -days 30 -subj "//CN=xplat-ca" 2>/dev/null
+  openssl pkey -in "$OUT/keys/recip.key" -pubout -out "$OUT/keys/recip.pub" 2>/dev/null
+  openssl req -new -key "$OUT/keys/ca.key" -out "$OUT/keys/d.csr" -subj "//CN=xplat-recipient" 2>/dev/null
+  openssl x509 -req -in "$OUT/keys/d.csr" -CA "$OUT/keys/ca.pem" -CAkey "$OUT/keys/ca.key" \
+    -force_pubkey "$OUT/keys/recip.pub" -out "$OUT/keys/recip.pem" -days 30 >/dev/null 2>&1
 
   : > "$OUT/manifest.txt"
   built=0; unsupported=0
