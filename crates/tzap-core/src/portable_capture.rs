@@ -423,6 +423,58 @@ mod tests {
         assert_eq!(attempts.get(), 1);
     }
 
+    /// §16.18.1 names "binary, empty, privileged, and non-UTF-8-named xattrs".
+    /// Binary values were covered by the base64/percent codecs; an **empty**
+    /// value had no fixture, and it is the case most likely to be mishandled --
+    /// a zero-length value reads exactly like an absent attribute unless the
+    /// capture path distinguishes them.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_keeps_an_empty_xattr_distinct_from_an_absent_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let with_empty = temp.path().join("empty-xattr.bin");
+        let without = temp.path().join("no-xattr.bin");
+        std::fs::write(&with_empty, b"body").unwrap();
+        std::fs::write(&without, b"body").unwrap();
+        if xattr::set(&with_empty, "com.tzap.empty", b"").is_err() {
+            return; // filesystem rejects empty xattr values
+        }
+
+        let mentions = |captured: &CapturedPortableMetadata, needle: &str| {
+            let native = &captured.metadata.native;
+            native.primary_pax_records.keys().any(|key| key.contains(needle))
+                || native.auxiliary_records.iter().any(|record| record.name.windows(needle.len()).any(|w| w == needle.as_bytes()))
+        };
+
+        let captured = capture_portable_file_metadata(&with_empty).unwrap();
+        assert!(mentions(&captured, "com.tzap.empty"), "an empty xattr must still be captured, not treated as absent");
+
+        let bare = capture_portable_file_metadata(&without).unwrap();
+        assert!(!mentions(&bare, "com.tzap.empty"), "a file without the xattr must not gain one");
+    }
+
+    /// §16.18.2 names "quarantine/provenance xattrs" -- the macOS attributes that
+    /// mark a file as downloaded. They are ordinary `com.apple.*` xattrs, so what
+    /// matters is that they survive capture rather than being filtered out as
+    /// system metadata: losing them silently changes Gatekeeper's view of a
+    /// restored file.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_retains_the_macos_quarantine_xattr() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("downloaded.bin");
+        std::fs::write(&file, b"downloaded body").unwrap();
+        if xattr::set(&file, "com.apple.quarantine", b"0081;00000000;tzap-test;").is_err() {
+            return; // not settable here
+        }
+
+        let captured = capture_portable_file_metadata(&file).unwrap();
+        let native = &captured.metadata.native;
+        let retained = native.primary_pax_records.keys().any(|key| key.contains("quarantine"))
+            || native.auxiliary_records.iter().any(|record| record.name.windows(10).any(|w| w == b"quarantine"));
+        assert!(retained, "the quarantine xattr must be captured, not filtered away");
+    }
+
     #[test]
     fn capture_reads_a_directory() {
         let temp = tempfile::tempdir().unwrap();

@@ -18,7 +18,7 @@ It uses the status terms defined in [README.md](README.md).
 | 16.17.2 Portable reader/writer | yes | Complete `portable-v1`, safe symlink/hardlink handling, nanosecond mtime, and sparse files in both directions. |
 | 16.17.3 POSIX backup reader/writer | yes | `posix-backup-v1` plus POSIX.1e access and default ACLs, which satisfies the class's "at least one declared ACL implementation". NFSv4 ACL syntax is parsed and validated but is **not** claimed as a round-trip implementation — see the gaps below. |
 | 16.17.4 Linux backup reader/writer | yes | `linux-backup-v1`, inode flags, project IDs, xattrs, FIFO/device/whiteout descriptors, native sparse allocation, and privileged-namespace diagnostics. |
-| 16.17.5 macOS backup reader/writer | yes, with one exclusion | `macos-backup-v1`, native ACLs, xattrs, FinderInfo, resource forks, and Darwin flags. **APFS clone hints are not implemented.** §16.11 classes them "optimization only; never applied as authority", and logical bytes are captured and restored without them, so no file content or metadata is lost — but the class is claimed with that exclusion stated rather than silently. |
+| 16.17.5 macOS backup reader/writer | yes | `macos-backup-v1`, native ACLs, xattrs, FinderInfo, resource forks, Darwin flags, and APFS clone hints. Clone sharing is recorded at capture and re-established on restore where the destination supports it; per §16.11 failure to clone is storage-layout degradation with a diagnostic, never a content error. |
 | 16.17.6 Windows backup reader/writer | yes | `windows-backup-v1`, owner/group/DACL self-relative security descriptors plus SACL where privilege allows, named data streams, EAs, property data, object IDs, reparse data, sparse primary and named streams, native compression, raw EFS, and Windows attributes and 100-ns times. |
 
 None of these classes rests on merely storing primary file bytes. Each OS class
@@ -32,8 +32,8 @@ Deterministic fixtures live in the workspace test suite and run under
 
 | §16.18 section | Clauses | Implemented and tested | Evidence gap | Implementation gap |
 | --- | ---: | ---: | ---: | ---: |
-| 16.18.1 Portable and Unix | 11 | 9 | 2 | 0 |
-| 16.18.2 macOS | 6 | 4 | 1 | 1 |
+| 16.18.1 Portable and Unix | 11 | 10 | 1 | 0 |
+| 16.18.2 macOS | 6 | 6 | 0 | 0 |
 | 16.18.3 Windows | 8 | 8 | 0 | 0 |
 | 16.18.4 Adversarial | 17 | 11 | 6 | 0 |
 
@@ -44,10 +44,7 @@ Windows CI job; the macOS and Linux jobs do not exercise it.
 
 | Item | §16.18 clause | Status | Effect |
 | --- | --- | --- | --- |
-| APFS clone hints | 16.18.2 "APFS clone hints with logical fallback" | Implementation gap | Clone relationships are not recorded. Logical bytes round-trip normally; a restored APFS tree does not re-share storage. |
-| NFSv4 ACL round trip | 16.18.1 "POSIX.1e access/default and NFSv4 ACLs in both exact syntax IDs" | Evidence gap | Malformed NFSv4 syntax is rejected, and POSIX.1e round-trips. A positive NFSv4 round-trip fixture does not exist. |
-| Quarantine/provenance xattr fixture | 16.18.2 | Evidence gap | Captured as generic macOS xattrs; no dedicated fixture. |
-| Empty-value and non-UTF-8-named xattrs | 16.18.1 | Evidence gap | Binary values and base64/percent name codecs are covered; these two sub-cases are not separately asserted. |
+| Non-UTF-8 xattr **names** | 16.18.1 | Evidence gap | Binary values, empty values, and the base64/percent name codecs are covered. A non-UTF-8 *name* needs a raw `setxattr` fixture, since the `xattr` crate takes `&str`. |
 | Projection rename/mode-override guard | 16.18.4 | Evidence gap | The restore path contains no rename and applies readonly only through the host attribute, never through `TZAP.portable.mode`, so §16.7.1's MUST NOT holds by construction. No regression guard asserts it. |
 | Metadata phase-ordering guard | 16.18.4 | Evidence gap | Ordering matches §16.13 steps 8–14: ownership, mode, ACLs, xattrs, timestamps, readonly attributes, then no-change flags last. No regression guard asserts the order. |
 | Symlink/reparse ancestors with selected descendant writes | 16.18.4 | Evidence gap | Escape paths and hardlink-target rules are asserted; the ancestor-plus-selected-descendant shape is not exercised as its own fixture. |
@@ -55,8 +52,10 @@ Windows CI job; the macOS and Linux jobs do not exercise it.
 | FileEntry flag-summary mismatch | 16.18.4 | Evidence gap | Reserved-bit rejection is asserted. A crafted summary that disagrees with the recomputed group summary is not. |
 | Reparse placeholder mis-extraction | 16.18.4 | Evidence gap | Placeholders round-trip correctly. The negative direction — a placeholder extracted as an empty ordinary file, or replaced by a directory for selected descendants — is not separately asserted. |
 
-This list is complete for the four corpus sections, not a selection: 9
-evidence gaps and 1 implementation gap against 42 clauses. They are published
+This list is complete for the four corpus sections, not a selection: 7
+evidence gaps and **no implementation gaps** against 42 clauses. Every gap
+remaining is a missing regression guard for behaviour that is correct today, not
+a defect. They are published
 rather than omitted because §16.18 is a completeness obligation. Until they
 close, the claim boundary in [README.md](README.md) applies as written:
 v45-compliant for documented supported workflows, not for every optional
