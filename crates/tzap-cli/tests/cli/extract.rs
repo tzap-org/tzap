@@ -39,6 +39,38 @@ fn cli_extract_reads_unencrypted_archive_without_key_source() {
 }
 
 #[test]
+fn cli_extract_selected_hardlink_pulls_in_its_target() {
+    // The hardlink pre-scan in `extract_selected_files_to` reads `kind` and
+    // `link_target` straight from index metadata. Naming only the alias must
+    // still pull its canonical target in as a restore dependency.
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("src");
+    let archive = temp.path().join("links.tzap");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("original.txt"), b"shared inode payload\n").unwrap();
+    fs::hard_link(source.join("original.txt"), source.join("alias.txt")).unwrap();
+
+    Command::cargo_bin("tzap").unwrap().args(["create", "--no-encryption", "-o", archive.to_str().unwrap(), source.to_str().unwrap()]).assert().success();
+
+    // Whichever member the writer recorded as the alias, selecting it alone must
+    // restore readable content, and selecting both must agree with it.
+    for selected in ["src/original.txt", "src/alias.txt"] {
+        let output = temp.path().join(format!("out-{}", selected.replace('/', "-")));
+        Command::cargo_bin("tzap").unwrap().args(["extract", "-C", output.to_str().unwrap(), archive.to_str().unwrap(), selected]).assert().success();
+        assert_eq!(fs::read(output.join(selected)).unwrap(), b"shared inode payload\n", "selecting {selected} did not restore its content");
+    }
+
+    let both = temp.path().join("out-both");
+    Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["extract", "-C", both.to_str().unwrap(), archive.to_str().unwrap(), "src/original.txt", "src/alias.txt"])
+        .assert()
+        .success();
+    assert_eq!(fs::read(both.join("src/original.txt")).unwrap(), b"shared inode payload\n");
+    assert_eq!(fs::read(both.join("src/alias.txt")).unwrap(), b"shared inode payload\n");
+}
+
+#[test]
 fn cli_extract_stdout_writes_exact_single_file_payload() {
     let temp = tempdir().unwrap();
     let keyfile = temp.path().join("key.hex");

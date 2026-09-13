@@ -2622,6 +2622,38 @@ fn rejects_payload_tamper_even_with_recomputed_block_crc() {
 }
 
 #[test]
+fn batch_lookup_matches_per_path_lookup_including_duplicates_and_misses() {
+    // `lookup_index_entries` resolves the whole path set from one shard load;
+    // it must agree with `lookup_index_entry` path for path, including the
+    // final-view winner for a duplicated path and `None` for absent paths.
+    let archive = write_archive(
+        &[
+            RegularFile::new("alpha.txt", b"alpha"),
+            RegularFile { mtime: crate::ArchiveTimestamp::from_seconds(1_700_000_000), ..RegularFile::new("dup.txt", b"old") },
+            RegularFile::new("nested/beta.txt", b"beta"),
+            RegularFile { mtime: crate::ArchiveTimestamp::from_seconds(1_700_000_100), ..RegularFile::new("dup.txt", b"newer") },
+        ],
+        &master_key(),
+        single_stream_options(),
+    )
+    .unwrap();
+    let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+
+    let requested: Vec<String> = ["alpha.txt", "dup.txt", "nested/beta.txt", "missing.txt", "alpha.txt"].iter().map(|path| (*path).to_string()).collect();
+    let batched = opened.lookup_index_entries(&requested).unwrap();
+
+    assert_eq!(batched.len(), requested.len());
+    for (requested_path, (returned_path, entry)) in requested.iter().zip(batched.iter()) {
+        assert_eq!(returned_path, requested_path);
+        assert_eq!(*entry, opened.lookup_index_entry(requested_path).unwrap());
+    }
+    assert_eq!(batched[3].1, None);
+    // The duplicated path resolves to the later member, matching the final view.
+    assert_eq!(batched[1].1.as_ref().unwrap().file_data_size, 5);
+    assert_eq!(opened.lookup_index_entries(&[]).unwrap(), Vec::new());
+}
+
+#[test]
 fn list_and_extract_use_final_view_for_duplicate_paths() {
     let archive = write_archive(
         &[
