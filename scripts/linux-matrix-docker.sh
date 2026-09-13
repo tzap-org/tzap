@@ -10,7 +10,10 @@
 # Usage: scripts/linux-matrix-docker.sh [reference-tag] [rust-image]
 set -eu
 TAG="${1:-v0.2.4}"
-IMAGE="${2:-rust:1.90-bookworm}"
+# Both projects track `stable`, so the Linux gate must too. Pinning an older
+# image hid newer clippy lints here that the Windows VM (on current stable) was
+# already failing on.
+IMAGE="${2:-rust:latest}"
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 
 # The container script arrives on stdin rather than inside a quoted -c string, so
@@ -22,6 +25,8 @@ export PATH=/usr/local/cargo/bin:$PATH
 export CARGO_TERM_COLOR=never
 apt-get update -qq >/dev/null 2>&1
 apt-get install -y -qq openssl git perl >/dev/null 2>&1
+# `rust:latest` ships without clippy; the versioned images carry it.
+rustup component add clippy >/dev/null 2>&1 || true
 
 status=0
 
@@ -46,7 +51,11 @@ run_build "build (under test)" cargo build --release --workspace --all-features
 
 cp -r /src/. /work_old
 cd /work_old
-git checkout -q "$TAG"
+# `-f`: /work_old is a throwaway copy of the working tree, so uncommitted
+# changes there must be discarded rather than aborting the whole run. Without
+# it the matrix refused to start whenever anything was uncommitted -- including
+# an edit to this script.
+git checkout -q -f "$TAG"
 run_build "build (reference $TAG)" cargo build --release --bin tzap
 
 echo '=== clippy ==='
