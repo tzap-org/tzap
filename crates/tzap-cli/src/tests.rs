@@ -1618,7 +1618,7 @@ fn filesystem_scan_captures_windows_scalars_security_and_alternate_data() {
     let file = File::open(&path).unwrap();
     augment_windows_input_identity(&mut identity, &file).unwrap();
 
-    let native = capture_native_file_metadata(&path, identity).unwrap();
+    let native = capture_native_file_metadata(&path, identity).unwrap().native;
 
     assert_eq!(native.required_profiles, vec!["windows-backup-v1"]);
     for key in ["atime", "LIBARCHIVE.creationtime", "TZAP.windows.change-time", "TZAP.windows.file-attributes", "TZAP.windows.data-stream-attributes"] {

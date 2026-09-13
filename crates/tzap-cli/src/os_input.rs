@@ -153,7 +153,7 @@ pub(crate) fn collect_windows_known_reparse_input(input: &Path, archive_path: &P
     let reparse_data = query_windows_reparse_data(&file).with_context(|| format!("failed to query reparse point {}", input.display()))?;
     let known = validate_windows_known_reparse_data(&reparse_data).with_context(|| format!("unsupported Windows reparse point {}", input.display()))?;
     let archive_path = archive_path_to_string(archive_path)?;
-    let mut portable_metadata = portable_input_metadata(identity, input)?;
+    let mut portable_metadata = portable_input_metadata(identity, input)?.metadata;
     match known {
         WindowsKnownReparse::RelativeSymlink { portable_target } => {
             out.push(InputSpec {
