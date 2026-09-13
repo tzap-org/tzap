@@ -2377,6 +2377,40 @@ fn windows_directory_input_survives_a_non_resident_index() {
 
 #[cfg(windows)]
 #[test]
+fn windows_read_only_directory_still_projects_a_writable_mode() {
+    // Windows' read-only attribute does not restrict a directory: entries can still
+    // be created inside one, and Explorer uses the flag to mark customized folders.
+    // Projecting it to 0o555 would invent a restriction the source never had and
+    // hand back a tree nothing can be added to after restoring. On a regular file
+    // the attribute is real and must survive.
+    let temp = windows_test_tempdir();
+    let source = temp.path().join("corpus");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("plain.bin"), b"writable").unwrap();
+    fs::write(source.join("locked.bin"), b"read only").unwrap();
+
+    let mut file_permissions = fs::metadata(source.join("locked.bin")).unwrap().permissions();
+    file_permissions.set_readonly(true);
+    fs::set_permissions(source.join("locked.bin"), file_permissions).unwrap();
+    let mut dir_permissions = fs::metadata(&source).unwrap().permissions();
+    dir_permissions.set_readonly(true);
+    fs::set_permissions(&source, dir_permissions).unwrap();
+
+    let specs = collect_input_specs(&[source.to_string_lossy().into_owned()]).unwrap_or_else(|error| panic!("{error:#}"));
+    let by_path = |name: &str| specs.iter().find(|spec| spec.archive_path.ends_with(name)).unwrap_or_else(|| panic!("missing {name}"));
+
+    assert_eq!(by_path("corpus").mode & 0o777, 0o755, "a read-only directory must still project as traversable and writable");
+    assert_eq!(by_path("plain.bin").mode & 0o777, 0o644, "writable file");
+    assert_eq!(by_path("locked.bin").mode & 0o777, 0o444, "a read-only file must keep its read-only projection");
+
+    // Leave the directory writable so the temp dir can be removed.
+    let mut restore = fs::metadata(&source).unwrap().permissions();
+    restore.set_readonly(false);
+    fs::set_permissions(&source, restore).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_selected_hardlinks_store_data_once_and_restore_shared_file_identity() {
     let temp = windows_test_tempdir();
     let alpha = temp.path().join("alpha.bin");
