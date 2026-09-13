@@ -495,15 +495,36 @@ fn read_gnu_sparse_1_0_map<R: Read>(payload: &mut LimitedTarPayloadReader<'_, R>
     let mut extents = Vec::with_capacity(count);
     let mut previous_end = 0u64;
     let mut extent_bytes = 0u64;
-    for index in 0..count {
+    for _ in 0..count {
         let offset = read_line(payload, &mut map_bytes)?;
         let length = read_line(payload, &mut map_bytes)?;
         let end = offset.checked_add(length).ok_or(FormatError::InvalidArchive("GNU sparse extent overflow"))?;
-        if length == 0 || offset < previous_end || (index != 0 && offset == previous_end) {
-            return Err(FormatError::InvalidArchive("GNU sparse extents overlap, are empty, or are not merged").into());
-        }
         if end > logical_size {
             return Err(FormatError::InvalidArchive("GNU sparse extent exceeds logical size").into());
+        }
+        // GNU sparse 1.0 terminates its map with a zero-length entry at the logical
+        // size, and prefixes one at offset 0 when the file opens with a hole. Both
+        // are how GNU tar and libarchive actually encode a sparse member; neither
+        // carries a payload byte. Revision-45 canonical framing has no room for
+        // them -- §16.7.5 requires every stored extent length to be greater than
+        // zero -- so the rewrite this path performs drops them. Rejecting them
+        // instead refused every sparse member ending in a hole.
+        //
+        // Dropping is not a relaxation. A zero-length entry still may not appear
+        // before an extent already accepted, and it deliberately does not advance
+        // `previous_end`, so it can neither hide an overlap nor separate two real
+        // extents that the source failed to merge.
+        if length == 0 {
+            if offset < previous_end {
+                return Err(FormatError::InvalidArchive("GNU sparse extents overlap, are empty, or are not merged").into());
+            }
+            continue;
+        }
+        // Adjacency is judged against the extents actually kept, not the raw row
+        // index: after a dropped leading `0 0`, a real extent at offset 0 is the
+        // first one and must not read as unmerged against the initial zero.
+        if offset < previous_end || (!extents.is_empty() && offset == previous_end) {
+            return Err(FormatError::InvalidArchive("GNU sparse extents overlap, are empty, or are not merged").into());
         }
         extent_bytes = extent_bytes.checked_add(length).ok_or(FormatError::InvalidArchive("GNU sparse extent byte count overflow"))?;
         extents.push(SparseExtent { offset, length });
