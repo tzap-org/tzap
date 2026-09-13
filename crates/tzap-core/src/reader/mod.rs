@@ -1820,6 +1820,27 @@ impl OpenedArchive {
         self.locate_index_file(&normalized)?.map(|located| archive_index_entry_from_loaded_file(&located.shard, located.file_index)).transpose()
     }
 
+    /// Resolve many paths in one pass, loading each index shard at most once.
+    ///
+    /// `lookup_index_entry` reloads (fetches, decrypts, decompresses and parses)
+    /// every candidate shard per call, so resolving N paths that way costs N shard
+    /// loads. Callers holding a whole path set should use this instead.
+    pub fn lookup_index_entries(&self, paths: &[String]) -> Result<Vec<(String, Option<ArchiveIndexEntry>)>, FormatError> {
+        let shards = self.load_all_index_shards()?;
+        let winners = final_index_entry_winners(&shards)?;
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            let normalized = normalize_lookup_file_path(path, self.crypto_header.max_path_length)?;
+            let normalized = std::str::from_utf8(&normalized).map_err(|_| FormatError::UnsafeArchivePath)?.to_owned();
+            let entry = match winners.get(&normalized) {
+                Some(winner) => Some(archive_index_entry_from_loaded_file_with_path(normalized, &shards[winner.shard_index], winner.file_index)?),
+                None => None,
+            };
+            out.push((path.clone(), entry));
+        }
+        Ok(out)
+    }
+
     pub fn list_files(&self) -> Result<Vec<ArchiveEntry>, FormatError> {
         let shards = self.load_all_index_shards()?;
         let mut scratch = PayloadReadScratch::new(self)?;
@@ -2010,14 +2031,16 @@ impl OpenedArchive {
             selected.insert(normalized, entry);
         }
 
+        // `kind` and `link_target` both live in the shard's FileEntry, so this scan
+        // reads index metadata only. Decoding the member instead would load, decrypt
+        // and decompress the whole envelope it lives in -- once per selected path.
         let requested = selected.iter().map(|(path, entry)| (path.clone(), *entry)).collect::<Vec<_>>();
         for (_, entry) in requested {
-            let member = self.decode_loaded_owned_tar_member(&shards[entry.shard_index], entry.file_index, false)?;
-            if member.kind != TarEntryKind::Hardlink {
+            let index_entry = archive_index_entry_from_loaded_file(&shards[entry.shard_index], entry.file_index)?;
+            if index_entry.kind != TarEntryKind::Hardlink {
                 continue;
             }
-            let target = member.link_target.as_deref().ok_or(FormatError::InvalidArchive("hardlink target is missing"))?;
-            let target = std::str::from_utf8(target).map_err(|_| FormatError::UnsafeArchivePath)?.to_owned();
+            let target = index_entry.link_target.ok_or(FormatError::InvalidArchive("hardlink target is missing"))?;
             let target_entry = winners.get(&target).copied().ok_or(FormatError::InvalidArchive("hardlink target is absent from the final index"))?;
             selected.entry(target).or_insert(target_entry);
         }

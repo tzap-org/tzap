@@ -221,10 +221,10 @@ pub(crate) fn resolve_extract_index_entries(opened: &OpenedArchive, requested: &
 
     let mut resolved = Vec::with_capacity(requested.len());
     let mut missing = Vec::new();
-    for path in requested {
-        match opened.lookup_index_entry(path)? {
+    for (path, entry) in opened.lookup_index_entries(requested)? {
+        match entry {
             Some(entry) => resolved.push(entry),
-            None => missing.push(path.clone()),
+            None => missing.push(path),
         }
     }
     Ok((resolved, missing))
