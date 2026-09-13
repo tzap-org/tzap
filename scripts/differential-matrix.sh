@@ -37,15 +37,27 @@ openssl pkey -in keys/recip.key -pubout -out keys/recip.pub 2>/dev/null
 openssl req -new -key keys/ca.key -out keys/dummy.csr -subj "/CN=tzap-matrix-recipient" 2>/dev/null
 openssl x509 -req -in keys/dummy.csr -CA keys/ca.pem -CAkey keys/ca.key -force_pubkey keys/recip.pub -out keys/recip.pem -days 30 >/dev/null 2>&1
 
-# Corpus: nested directories, a symlink, and sizes that straddle frame boundaries.
-python3 - <<'PYGEN'
-import os
-for i in range(60):
-    d = ['corpus', 'corpus/nested', 'corpus/nested/deep', 'corpus/other'][i % 4]
-    open(f'{d}/f{i:03}.bin', 'wb').write(bytes((i * 7 + b) % 251 for b in range((i * 37) % 2000)))
-if not os.path.exists('corpus/link.sym'):
-    os.symlink('f000.bin', 'corpus/link.sym')
-PYGEN
+# Corpus: nested directories, a symlink where the platform allows one, and sizes
+# that straddle frame boundaries. Portable shell -- no python, which Git Bash on
+# Windows does not ship.
+i=0
+while [ $i -lt 60 ]; do
+  case $((i % 4)) in
+    0) d=corpus ;;
+    1) d=corpus/nested ;;
+    2) d=corpus/nested/deep ;;
+    *) d=corpus/other ;;
+  esac
+  size=$(( (i * 37) % 2000 ))
+  if [ "$size" -eq 0 ]; then
+    : > "$d/f$(printf '%03d' $i).bin"
+  else
+    yes "tzap-matrix-corpus-$i" | head -c "$size" > "$d/f$(printf '%03d' $i).bin"
+  fi
+  i=$((i + 1))
+done
+# Symlinks need privilege or developer mode on Windows; skip rather than fail.
+ln -s f000.bin corpus/link.sym 2>/dev/null || true
 
 PASS=0; FAIL=0; SKIP=0
 FAILED_COMBOS=()
