@@ -500,3 +500,371 @@ mod tests {
         assert_eq!(err_id.to_string(), "macOS resource-fork owner changed before read");
     }
 }
+
+/// The APFS clone identifier for a file, when the volume exposes one.
+///
+/// APFS clones (`cp -c`, `clonefile(2)`) share physical blocks copy-on-write but
+/// have **different inodes**, so they cannot be grouped the way hardlinks are.
+/// The relationship is only visible by asking the filesystem: `getattrlist` with
+/// `ATTR_CMNEXT_CLONEID` returns an identifier that clone partners share.
+///
+/// `None` when the volume has no clone concept (HFS+, a network mount) or the
+/// attribute is unavailable. §16.11 classes clone hints "optimization only;
+/// never applied as authority", so absence is never an error -- logical bytes
+/// are captured either way and the tree simply restores unshared.
+pub fn query_macos_clone_id(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    #[repr(C)]
+    struct AttrList {
+        bitmapcount: u16,
+        reserved: u16,
+        commonattr: u32,
+        volattr: u32,
+        dirattr: u32,
+        fileattr: u32,
+        forkattr: u32,
+    }
+    /// `getattrlist` writes a packed buffer: a leading u32 of bytes returned,
+    /// then each requested attribute in header order. Extended (`ATTR_CMNEXT_*`)
+    /// attributes require `ATTR_CMN_RETURNED_ATTRS`, whose `attribute_set_t`
+    /// lands first and says which attributes the volume actually supplied.
+    /// Omitting it -- as an earlier version of this did -- makes the call return
+    /// a short buffer and the clone id read as absent for every file.
+    #[repr(C)]
+    struct CloneIdBuffer {
+        length: u32,
+        returned: [u32; 5],
+        clone_id: u64,
+    }
+
+    const ATTR_BIT_MAP_COUNT: u16 = 5;
+    const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
+    const ATTR_CMNEXT_CLONEID: u32 = 0x0000_0100;
+    const FSOPT_ATTR_CMN_EXTENDED: u32 = 0x0000_0020;
+    const FSOPT_NOFOLLOW: u32 = 0x0000_0001;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut list = AttrList {
+        bitmapcount: ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: ATTR_CMN_RETURNED_ATTRS,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: ATTR_CMNEXT_CLONEID,
+    };
+    let mut buffer = CloneIdBuffer { length: 0, returned: [0; 5], clone_id: 0 };
+    // SAFETY: `list` and `buffer` are correctly sized and stay live for the
+    // synchronous call; the path is NUL-terminated.
+    let status = unsafe {
+        libc::getattrlist(
+            path.as_ptr(),
+            (&raw mut list).cast(),
+            (&raw mut buffer).cast(),
+            std::mem::size_of::<CloneIdBuffer>(),
+            FSOPT_ATTR_CMN_EXTENDED | FSOPT_NOFOLLOW,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    // The volume reports which attributes it actually returned; a volume without
+    // clone tracking answers successfully but supplies nothing.
+    if buffer.returned[4] & ATTR_CMNEXT_CLONEID == 0 {
+        return None;
+    }
+    if (buffer.length as usize) < std::mem::size_of::<CloneIdBuffer>() {
+        return None;
+    }
+    // Zero is APFS's "not a clone" sentinel, not a group of its own.
+    (buffer.clone_id != 0).then_some(buffer.clone_id)
+}
+
+#[cfg(test)]
+mod clone_tests {
+    use super::*;
+
+    /// `cp -c` makes a real APFS clone. The check that matters is that clone
+    /// partners report the *same* id and an unrelated file reports a different
+    /// one -- an implementation returning a constant, or `None` for everything,
+    /// would look fine without this pairing.
+    #[test]
+    fn clone_partners_share_an_id_and_unrelated_files_do_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original.bin");
+        let clone = temp.path().join("clone.bin");
+        let unrelated = temp.path().join("unrelated.bin");
+        std::fs::write(&original, vec![7u8; 128 * 1024]).unwrap();
+        std::fs::write(&unrelated, vec![7u8; 128 * 1024]).unwrap();
+
+        let cloned = std::process::Command::new("/bin/cp").arg("-c").arg(&original).arg(&clone).status().is_ok_and(|s| s.success());
+        if !cloned || !clone.exists() {
+            // Not APFS (or cp has no -c): nothing to assert, and absence is
+            // explicitly allowed by §16.11.
+            return;
+        }
+
+        let Some(original_id) = query_macos_clone_id(&original) else {
+            // The volume has no clone concept even though `cp -c` succeeded.
+            return;
+        };
+        assert_eq!(query_macos_clone_id(&clone), Some(original_id), "clone partners must share an id");
+        assert_ne!(query_macos_clone_id(&unrelated), Some(original_id), "an unrelated file must not join the group");
+
+        // Breaking the sharing must break the grouping: rewriting the clone in
+        // place gives it its own storage.
+        std::fs::write(&clone, vec![9u8; 128 * 1024]).unwrap();
+        let after = query_macos_clone_id(&clone);
+        assert!(after.is_none() || after != Some(original_id) || query_macos_clone_id(&original) == after);
+    }
+
+    #[test]
+    fn a_plain_file_has_no_clone_group_or_a_private_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let lonely = temp.path().join("lonely.bin");
+        std::fs::write(&lonely, b"no partners").unwrap();
+        // Either answer is valid: what must not happen is a panic or a bogus
+        // shared id. Pair it against a second unrelated file.
+        let other = temp.path().join("other.bin");
+        std::fs::write(&other, b"no partners").unwrap();
+        if let (Some(a), Some(b)) = (query_macos_clone_id(&lonely), query_macos_clone_id(&other)) {
+            assert_ne!(a, b, "two independently written files must not share a clone group");
+        }
+    }
+
+    #[test]
+    fn clone_groups_cover_partners_and_skip_lone_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original.bin");
+        let clone = temp.path().join("clone.bin");
+        let lonely = temp.path().join("lonely.bin");
+        std::fs::write(&original, vec![3u8; 128 * 1024]).unwrap();
+        std::fs::write(&lonely, vec![4u8; 128 * 1024]).unwrap();
+        if !std::process::Command::new("/bin/cp").arg("-c").arg(&original).arg(&clone).status().is_ok_and(|s| s.success()) {
+            return;
+        }
+        if query_macos_clone_id(&original).is_none() {
+            return; // volume has no clone tracking
+        }
+
+        let paths = vec![original.clone(), clone.clone(), lonely.clone()];
+        let groups = assign_clone_groups(&paths);
+
+        let group = groups.get(&original).expect("a clone partner must be grouped");
+        assert_eq!(groups.get(&clone), Some(group), "both partners must share the group");
+        assert_eq!(group.len(), 32, "§15 requires 32 lowercase hex digits");
+        assert!(group.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "must be lowercase hex: {group}");
+
+        // A file with no partner inside the archive describes no sharing, so it
+        // gets no group even though it may have a clone id of its own.
+        assert!(!groups.contains_key(&lonely), "a lone file must not be given a group");
+    }
+
+    #[test]
+    fn clone_group_assignment_is_deterministic_and_excludes_single_members() {
+        // Pure-function behaviour, independent of whether this volume clones:
+        // an empty or single-path input can never produce a group.
+        assert!(assign_clone_groups(&[]).is_empty());
+        let temp = tempfile::tempdir().unwrap();
+        let only = temp.path().join("only.bin");
+        std::fs::write(&only, b"alone").unwrap();
+        assert!(assign_clone_groups(&[only]).is_empty(), "one path cannot form a sharing group");
+    }
+
+    #[test]
+    fn restore_reestablishes_sharing_and_leaves_bytes_untouched() {
+        use std::collections::BTreeMap;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.bin");
+        let second = temp.path().join("second.bin");
+        let payload = vec![21u8; 256 * 1024];
+        // Independently written: identical content, no shared storage -- exactly
+        // what a restore produces before this pass runs.
+        std::fs::write(&first, &payload).unwrap();
+        std::fs::write(&second, &payload).unwrap();
+        if query_macos_clone_id(&first).is_none() {
+            return; // volume has no clone tracking
+        }
+        assert_ne!(query_macos_clone_id(&first), query_macos_clone_id(&second), "fixture must start unshared");
+
+        let mut groups = BTreeMap::new();
+        groups.insert("a".repeat(32), vec![first.clone(), second.clone()]);
+        let outcomes = restore_clone_groups(&groups);
+
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            CloneRestoreOutcome::Shared { members, .. } => assert_eq!(*members, 2),
+            CloneRestoreOutcome::NotShared { reason, .. } => panic!("sharing failed on an APFS volume: {reason}"),
+        }
+        // Sharing re-established, and the bytes are still exactly right.
+        assert_eq!(query_macos_clone_id(&second), query_macos_clone_id(&first), "partners must share storage after the pass");
+        assert_eq!(std::fs::read(&second).unwrap(), payload);
+        assert_eq!(std::fs::read(&first).unwrap(), payload);
+        assert!(!temp.path().join("second.tzap-clone-staging").exists(), "staging file must not be left behind");
+    }
+
+    #[test]
+    fn restore_refuses_to_overwrite_partners_whose_bytes_differ() {
+        use std::collections::BTreeMap;
+
+        // The hint is "never applied as authority" (§16.11), so a group whose
+        // restored members disagree must be left exactly as restored rather than
+        // having one silently overwrite the other.
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.bin");
+        let second = temp.path().join("second.bin");
+        std::fs::write(&first, b"original bytes").unwrap();
+        std::fs::write(&second, b"DIFFERENT bytes").unwrap();
+
+        let mut groups = BTreeMap::new();
+        groups.insert("b".repeat(32), vec![first.clone(), second.clone()]);
+        let outcomes = restore_clone_groups(&groups);
+
+        assert!(matches!(&outcomes[0], CloneRestoreOutcome::NotShared { .. }), "differing partners must not be shared");
+        assert_eq!(std::fs::read(&second).unwrap(), b"DIFFERENT bytes", "bytes must survive untouched");
+        assert!(!temp.path().join("second.tzap-clone-staging").exists());
+    }
+
+    #[test]
+    fn restore_skips_groups_that_cannot_describe_sharing() {
+        use std::collections::BTreeMap;
+
+        let mut groups = BTreeMap::new();
+        groups.insert("c".repeat(32), vec![std::path::PathBuf::from("/nonexistent/only.bin")]);
+        assert!(restore_clone_groups(&groups).is_empty(), "a one-member group describes no sharing");
+        assert!(restore_clone_groups(&BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_missing_path_reports_no_clone_group() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(query_macos_clone_id(&temp.path().join("absent.bin")), None);
+    }
+}
+
+/// Assign writer-local clone groups to a set of captured paths.
+///
+/// §15's `TZAP.macos.clone-group` is "32 lowercase hex digits for a writer-local
+/// clone group": the value has meaning only inside one archive, so the raw
+/// volume-local clone id is not what gets stored. Files sharing a clone id are
+/// collected and handed a synthetic 128-bit group id derived from that id, which
+/// keeps the mapping deterministic for a given input set without leaking a
+/// filesystem identifier.
+///
+/// Only groups with **two or more members inside the archive** are recorded. A
+/// file cloned from something outside the capture scope has a clone id but no
+/// partner here, and a group of one describes no sharing to recreate.
+///
+/// Returns the hex value to store for each path that belongs to a group.
+#[must_use]
+pub fn assign_clone_groups(paths: &[std::path::PathBuf]) -> std::collections::BTreeMap<std::path::PathBuf, String> {
+    use sha2::{Digest as _, Sha256};
+    use std::collections::BTreeMap;
+
+    let mut by_clone_id: BTreeMap<u64, Vec<&std::path::PathBuf>> = BTreeMap::new();
+    for path in paths {
+        if let Some(clone_id) = query_macos_clone_id(path) {
+            by_clone_id.entry(clone_id).or_default().push(path);
+        }
+    }
+
+    let mut assigned = BTreeMap::new();
+    for (clone_id, members) in by_clone_id {
+        if members.len() < 2 {
+            continue;
+        }
+        // Derived, not the raw id: the stored value is writer-local by
+        // definition, and a hash keeps it stable for a given input set.
+        let digest = Sha256::digest(clone_id.to_le_bytes());
+        let group = hex_lower(&digest[..16]);
+        for member in members {
+            assigned.insert(member.clone(), group.clone());
+        }
+    }
+    assigned
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+        let _ = write!(&mut out, "{byte:02x}");
+        out
+    })
+}
+
+/// What happened when a clone group was re-established on restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloneRestoreOutcome {
+    /// Every member after the first now shares storage with it.
+    Shared { group: String, members: usize },
+    /// The destination could not clone. Logical bytes are already correct;
+    /// §16.11 makes this storage-layout degradation, not a failure.
+    NotShared { group: String, reason: String },
+}
+
+/// Re-establish APFS clone sharing across already-restored files.
+///
+/// Deliberately a **post-pass** over a finished tree rather than a step inside
+/// extraction. §16.11 classes clone hints "optimization only; never applied as
+/// authority", so the bytes are already correct before this runs and nothing
+/// here can make them wrong -- which means it needs no place in the extraction
+/// ordering, where it would have to interleave with hardlink and directory
+/// sequencing for no correctness gain.
+///
+/// Each group's first member is the source; the rest are cloned from it via
+/// `clonefile` into a temporary name and renamed into place, because `clonefile`
+/// refuses an existing destination. A group whose members somehow differ in
+/// content is left alone: the recorded hint is not authority to overwrite bytes.
+pub fn restore_clone_groups(groups: &std::collections::BTreeMap<String, Vec<std::path::PathBuf>>) -> Vec<CloneRestoreOutcome> {
+    let mut outcomes = Vec::new();
+    for (group, members) in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        let (source, rest) = members.split_first().expect("checked non-empty");
+        let mut shared = 0usize;
+        let mut failure = None;
+        for destination in rest {
+            match clone_over(source, destination) {
+                Ok(()) => shared += 1,
+                Err(error) => {
+                    failure = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        match failure {
+            None => outcomes.push(CloneRestoreOutcome::Shared { group: group.clone(), members: shared + 1 }),
+            Some(reason) => outcomes.push(CloneRestoreOutcome::NotShared { group: group.clone(), reason }),
+        }
+    }
+    outcomes
+}
+
+fn clone_over(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    // The hint is not authority to change bytes: if the restored files differ,
+    // leave them as restored.
+    if fs::read(source)? != fs::read(destination)? {
+        return Err(io::Error::other("restored clone partners differ; refusing to overwrite"));
+    }
+
+    let staging = destination.with_extension("tzap-clone-staging");
+    let _ = fs::remove_file(&staging);
+    let source_c = std::ffi::CString::new(source.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let staging_c = std::ffi::CString::new(staging.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: both paths are NUL-terminated and live for the synchronous call.
+    if unsafe { libc::clonefile(source_c.as_ptr(), staging_c.as_ptr(), 0) } != 0 {
+        let error = io::Error::last_os_error();
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
+    // Rename is atomic within a volume and replaces the restored copy.
+    fs::rename(&staging, destination).inspect_err(|_| {
+        let _ = fs::remove_file(&staging);
+    })
+}

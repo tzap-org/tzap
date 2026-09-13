@@ -62,6 +62,66 @@ fn test_master_key() -> MasterKey {
 /// different per platform. These are Windows-only cleanup paths, but clearing the
 /// one attribute directly says what is meant and keeps the lint clean -- CI only
 /// runs clippy on the ubuntu job, so a Windows-only lint failure is invisible there.
+/// §16.18.2's corpus names "APFS clone hints with logical fallback", and nothing
+/// captured them until now: a clone-heavy tree archived fine but restored as
+/// independent copies, costing disk without ever being recorded.
+///
+/// §16.11 classes the hint "optimization only; never applied as authority", so
+/// this asserts what is *recorded*, not that sharing is recreated -- and skips
+/// cleanly on a volume with no clone tracking rather than failing.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_clone_partners_share_a_recorded_clone_group() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree");
+    fs::create_dir(&root).unwrap();
+    let original = root.join("original.bin");
+    let clone = root.join("clone.bin");
+    let unrelated = root.join("unrelated.bin");
+    fs::write(&original, vec![11u8; 256 * 1024]).unwrap();
+    fs::write(&unrelated, vec![12u8; 256 * 1024]).unwrap();
+    if !std::process::Command::new("/bin/cp").arg("-c").arg(&original).arg(&clone).status().is_ok_and(|status| status.success()) {
+        return;
+    }
+    if tzap_core::macos_metadata::query_macos_clone_id(&original).is_none() {
+        return; // volume has no clone tracking
+    }
+
+    let specs = collect_input_specs(&[root.to_string_lossy().into_owned()]).unwrap_or_else(|error| panic!("{error:#}"));
+    let group_of = |name: &str| {
+        specs
+            .iter()
+            .find(|spec| spec.archive_path.ends_with(name))
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .portable_metadata
+            .native
+            .primary_pax_records
+            .get("TZAP.macos.clone-group")
+            .map(|value| String::from_utf8(value.clone()).unwrap())
+    };
+
+    let group = group_of("original.bin").expect("a clone partner must carry a clone group");
+    assert_eq!(group_of("clone.bin").as_deref(), Some(group.as_str()), "both partners must share the group");
+    assert_eq!(group.len(), 32, "§15 requires 32 lowercase hex digits");
+    assert!(group.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)), "must be lowercase hex: {group}");
+
+    // An unrelated file describes no sharing and must not be given a group.
+    assert_eq!(group_of("unrelated.bin"), None);
+
+    // The hint belongs to macos-backup-v1, so the profile must be declared or a
+    // reader would see a key it has no owner for.
+    let declared = specs
+        .iter()
+        .find(|spec| spec.archive_path.ends_with("original.bin"))
+        .unwrap()
+        .portable_metadata
+        .native
+        .required_profiles
+        .iter()
+        .any(|profile| profile == "macos-backup-v1");
+    assert!(declared, "a clone group requires its owning profile to be declared");
+}
+
 #[cfg(windows)]
 fn clear_windows_readonly(path: &Path) {
     use std::os::windows::ffi::OsStrExt as _;

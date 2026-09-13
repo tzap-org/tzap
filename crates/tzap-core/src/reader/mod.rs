@@ -2846,6 +2846,10 @@ impl OpenedArchive {
                 replay_windows_descendant_metadata(root, &member.path, member.kind, metadata, options, diagnostics)?;
             }
         }
+        #[cfg(target_os = "macos")]
+        if options.restore_policy != crate::entry_metadata::RestorePolicy::Content {
+            restore_macos_clone_groups(root, &planned, &mut restored);
+        }
         Ok(restored)
     }
 
@@ -3424,4 +3428,56 @@ pub(crate) fn archive_index_entry_layout(shard: &IndexShard, file: &FileEntry) -
 
 pub(crate) fn archive_entry_name(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_owned()
+}
+
+/// Re-establish APFS clone sharing once every selected member is on disk.
+///
+/// A post-pass by design: §16.11 classes the hint "optimization only; never
+/// applied as authority", so the bytes are already correct before this runs.
+/// That keeps it out of the extraction ordering, where it would have to
+/// interleave with hardlink and directory sequencing for no correctness gain.
+///
+/// Failure is storage-layout degradation, never an error: the tree simply
+/// restores unshared, which is what happens today on every non-APFS destination.
+#[cfg(target_os = "macos")]
+fn restore_macos_clone_groups(
+    root: &std::path::Path,
+    planned: &[(String, WinningIndexEntry, OwnedTarMember)],
+    restored: &mut [(String, Vec<MetadataDiagnostic>)],
+) {
+    use std::collections::BTreeMap;
+
+    let mut groups: BTreeMap<String, Vec<std::path::PathBuf>> = BTreeMap::new();
+    for (_, _, member) in planned {
+        if member.kind != TarEntryKind::Regular || member.reparse_placeholder {
+            continue;
+        }
+        let Some(metadata) = member.v45_metadata.as_ref() else { continue };
+        let Some(value) = metadata.primary_records.get("TZAP.macos.clone-group") else { continue };
+        let Ok(group) = std::str::from_utf8(value) else { continue };
+        let Ok(relative) = std::str::from_utf8(&member.path) else { continue };
+        groups.entry(group.to_owned()).or_default().push(root.join(relative));
+    }
+    if groups.is_empty() {
+        return;
+    }
+
+    for outcome in crate::macos_metadata::restore_clone_groups(&groups) {
+        let crate::macos_metadata::CloneRestoreOutcome::NotShared { reason, .. } = outcome else {
+            continue;
+        };
+        // Attach the degradation to the first restored entry: it describes the
+        // tree's storage layout, not any single member's content.
+        if let Some((path, diagnostics)) = restored.first_mut() {
+            diagnostics.push(MetadataDiagnostic::new(
+                path.as_bytes(),
+                "macos-backup-v1",
+                "clone-group",
+                crate::tar_model::MetadataOperation::Restore,
+                crate::tar_model::MetadataDiagnosticStatus::Skipped,
+                "APFS clone sharing could not be recreated; logical bytes are unaffected",
+            ));
+            let _ = &reason;
+        }
+    }
 }

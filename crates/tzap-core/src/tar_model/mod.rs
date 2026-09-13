@@ -111,7 +111,7 @@ pub struct MetadataDiagnostic {
 }
 
 impl MetadataDiagnostic {
-    fn new(
+    pub(crate) fn new(
         path: &[u8],
         profile: impl Into<String>,
         metadata_class: impl Into<String>,

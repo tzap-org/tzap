@@ -790,7 +790,38 @@ pub(crate) fn collect_input_specs(paths: &[String]) -> Result<Vec<InputSpec>> {
     out.sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
     #[cfg(any(unix, windows))]
     apply_selected_hardlink_topology(&mut out)?;
+    #[cfg(target_os = "macos")]
+    apply_macos_clone_groups(&mut out);
     Ok(out)
+}
+
+/// Record APFS clone sharing across the selected inputs.
+///
+/// Runs after hardlink grouping so an alias -- which carries no file object of
+/// its own -- is never given a clone group. §16.11 classes the hint "optimization
+/// only; never applied as authority": if the volume has no clone tracking, or a
+/// file's partner lies outside the capture scope, nothing is recorded and the
+/// tree simply restores unshared.
+#[cfg(target_os = "macos")]
+pub(crate) fn apply_macos_clone_groups(specs: &mut [InputSpec]) {
+    let candidates = specs.iter().filter(|spec| spec.entry_kind == SourceEntryKind::Regular).map(|spec| spec.source.clone()).collect::<Vec<_>>();
+    if candidates.len() < 2 {
+        return;
+    }
+    let groups = tzap_core::macos_metadata::assign_clone_groups(&candidates);
+    if groups.is_empty() {
+        return;
+    }
+    for spec in specs.iter_mut().filter(|spec| spec.entry_kind == SourceEntryKind::Regular) {
+        if let Some(group) = groups.get(&spec.source) {
+            spec.portable_metadata.native.primary_pax_records.insert("TZAP.macos.clone-group".into(), group.clone().into_bytes());
+            if !spec.portable_metadata.native.required_profiles.iter().any(|profile| profile == "macos-backup-v1") {
+                spec.portable_metadata.native.required_profiles.push("macos-backup-v1".into());
+                spec.portable_metadata.native.required_profiles.sort();
+                spec.portable_metadata.native.required_profiles.dedup();
+            }
+        }
+    }
 }
 
 #[cfg(any(unix, windows))]
