@@ -201,7 +201,7 @@ pub fn capture_windows_security_descriptor(file: &File) -> io::Result<NativeAuxi
 
     const BASE: u32 = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
     let original = file.as_raw_handle().cast();
-    let sacl_handle = if enable_windows_privilege(windows_sys::Win32::Security::SE_SECURITY_NAME) {
+    let sacl_handle = if enable_windows_privilege(WindowsPrivilege::Security) {
         let handle = unsafe { ReOpenFile(original, READ_CONTROL | ACCESS_SYSTEM_SECURITY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0) };
         (handle != INVALID_HANDLE_VALUE).then_some(handle)
     } else {
@@ -255,15 +255,37 @@ pub fn capture_windows_security_descriptor(file: &File) -> io::Result<NativeAuxi
     Ok(record)
 }
 
+/// A privilege the capture and restore paths depend on.
+///
+/// Named rather than passed as a raw `SE_*_NAME` pointer so the public entry
+/// point is safe to call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsPrivilege {
+    /// `SE_SECURITY_NAME` -- reading and writing a SACL.
+    Security,
+    /// `SE_BACKUP_NAME` -- reading past the DACL for backup.
+    Backup,
+    /// `SE_RESTORE_NAME` -- writing past the DACL, and restoring ownership.
+    Restore,
+}
+
 /// Enable a Windows privilege on this process token, reporting whether it took.
 ///
-/// Capture and restore of several metadata classes are privilege-gated
-/// (`SE_SECURITY_NAME` for SACLs, `SE_BACKUP_NAME`/`SE_RESTORE_NAME` for backup
-/// semantics). Hosts and their tests need the same answer this module acts on,
-/// so there is one implementation rather than a copy per host.
-///
-/// `name` is one of the `SE_*_NAME` constants, which are wide string literals.
-pub fn enable_windows_privilege(name: *const u16) -> bool {
+/// Several metadata classes are privilege-gated, and hosts and their tests need
+/// the same answer this module acts on -- so there is one implementation rather
+/// than a copy per host.
+#[must_use]
+pub fn enable_windows_privilege(privilege: WindowsPrivilege) -> bool {
+    use windows_sys::Win32::Security::{SE_BACKUP_NAME, SE_RESTORE_NAME, SE_SECURITY_NAME};
+
+    enable_windows_privilege_raw(match privilege {
+        WindowsPrivilege::Security => SE_SECURITY_NAME,
+        WindowsPrivilege::Backup => SE_BACKUP_NAME,
+        WindowsPrivilege::Restore => SE_RESTORE_NAME,
+    })
+}
+
+fn enable_windows_privilege_raw(name: *const u16) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetLastError};
     use windows_sys::Win32::Security::{
         AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
@@ -600,7 +622,7 @@ unsafe extern "system" fn hash_windows_raw_efs_callback(data: *const u8, context
 pub fn windows_sacl_capture_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| enable_windows_privilege(windows_sys::Win32::Security::SE_SECURITY_NAME))
+    *ENABLED.get_or_init(|| enable_windows_privilege(WindowsPrivilege::Security))
 }
 
 pub fn hash_windows_raw_efs(path: &Path) -> io::Result<(u64, [u8; 32])> {
