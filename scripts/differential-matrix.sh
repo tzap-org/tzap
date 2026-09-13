@@ -30,6 +30,7 @@ mkdir -p keys corpus/nested/deep corpus/other
 "$NEW" keygen -o keys/raw.hex >/dev/null
 "$NEW" signing-keygen --secret-output keys/sign.sec --public-output keys/sign.pub >/dev/null
 head -c 65536 /dev/urandom > keys/dict.bin
+export MSYS_NO_PATHCONV=1   # Git Bash rewrites "/CN=..." into a Windows path
 openssl genpkey -algorithm X25519 -out keys/recip.key 2>/dev/null
 openssl genpkey -algorithm ed25519 -out keys/ca.key 2>/dev/null
 openssl req -new -x509 -key keys/ca.key -out keys/ca.pem -days 30 -subj "/CN=tzap-matrix-ca" 2>/dev/null
@@ -59,9 +60,26 @@ done
 # Symlinks need privilege or developer mode on Windows; skip rather than fail.
 ln -s f000.bin corpus/link.sym 2>/dev/null || true
 
-PASS=0; FAIL=0; SKIP=0
+PASS=0; FAIL=0; SKIP=0; FIXED=0
 FAILED_COMBOS=()
 SKIPPED_COMBOS=()
+FIXED_COMBOS=()
+
+# Reference-side errors the candidate is expected to have fixed. A combination the
+# reference rejects for one of these reasons, and the candidate accepts, counts as
+# a fix rather than a failure. Anything else the candidate newly accepts still fails,
+# so this cannot quietly hide a widening of what the writer allows.
+: "${EXPECTED_FIXES:=Windows BackupRead did not return the default data stream}"
+
+is_expected_fix() {
+  local err="$1" pattern
+  [ -n "${EXPECTED_FIXES:-}" ] || return 1
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
+    case "$err" in *"$pattern"*) return 0 ;; esac
+  done <<< "$EXPECTED_FIXES"
+  return 1
+}
 
 vols_positional() { ls "$1"/$2*.tzap 2>/dev/null | sort | xargs echo; }
 first_volume() { ls "$1"/$2*.tzap 2>/dev/null | sort | head -1; }
@@ -99,8 +117,14 @@ run_combo() {
     $NEW create "${create_args[@]}" -o "$work/probe.tzap" corpus >/dev/null 2>"$work/probe.err"
     local probe_rc=$?
     if [ $probe_rc -eq 0 ]; then
-      echo "  FAIL [$name] reference rejects this combo but the candidate accepts it"
+      if is_expected_fix "$(cat "$work/old.err")"; then
+        FIXED=$((FIXED+1)); FIXED_COMBOS+=("$name"); rm -rf "$work"; return
+      fi
+      echo "  FAIL [$name] reference rejects this combo but the candidate accepts it: $(tail -1 "$work/old.err")"
       FAIL=$((FAIL+1)); FAILED_COMBOS+=("$name:accepts-rejected-combo"); rm -rf "$work"; return
+    fi
+    if is_expected_fix "$(cat "$work/old.err")"; then
+      FIXED=$((FIXED+1)); FIXED_COMBOS+=("$name (candidate now refuses for its own reason: $(tail -1 "$work/probe.err" | cut -c1-70))"); rm -rf "$work"; return
     fi
     if [ $probe_rc -ne $old_rc ] || ! diff -q <(tail -1 "$work/old.err") <(tail -1 "$work/probe.err") >/dev/null 2>&1; then
       echo "  FAIL [$name] both reject but differently: ref=[rc=$old_rc $(tail -1 "$work/old.err")] cand=[rc=$probe_rc $(tail -1 "$work/probe.err")]"
@@ -187,8 +211,15 @@ run_combo() {
   rm -rf "$work"
 }
 
+HAVE_RECIPIENT=1
+if [ ! -s keys/recip.pem ]; then
+  HAVE_RECIPIENT=0
+  echo "note: no X25519 recipient certificate could be generated with this openssl; skipping the RecipientWrap sweep"
+fi
+
 shape_matrix() {
 for keymode in none keyfile recipient; do
+  if [ "$keymode" = recipient ] && [ "$HAVE_RECIPIENT" -eq 0 ]; then continue; fi
   case $keymode in
     none)      CREATE_KEY=(--no-encryption);                 READ_KEY="" ;;
     keyfile)   CREATE_KEY=(--keyfile keys/raw.hex);          READ_KEY="--keyfile keys/raw.hex" ;;
@@ -255,8 +286,14 @@ stream_combo() {
   if ! eval "${make//@BIN@/$OLD}" >/dev/null 2>"$work/e"; then
     rm -f "$work"/out*.tzap "$work/out.boot"
     if eval "${make//@BIN@/$NEW}" >/dev/null 2>"$work/probe.err"; then
-      echo "  FAIL [$name] reference rejects this combo but the candidate accepts it"
+      if is_expected_fix "$(cat "$work/e")"; then
+        FIXED=$((FIXED+1)); FIXED_COMBOS+=("$name"); rm -rf "$work"; return
+      fi
+      echo "  FAIL [$name] reference rejects this combo but the candidate accepts it: $(tail -1 "$work/e")"
       FAIL=$((FAIL+1)); FAILED_COMBOS+=("$name:accepts-rejected-combo"); rm -rf "$work"; return
+    fi
+    if is_expected_fix "$(cat "$work/e")"; then
+      FIXED=$((FIXED+1)); FIXED_COMBOS+=("$name (candidate now refuses for its own reason: $(tail -1 "$work/probe.err" | cut -c1-70))"); rm -rf "$work"; return
     fi
     if ! diff -q <(tail -1 "$work/e") <(tail -1 "$work/probe.err") >/dev/null 2>&1; then
       echo "  FAIL [$name] both reject but differently: ref=[$(tail -1 "$work/e")] cand=[$(tail -1 "$work/probe.err")]"
@@ -272,20 +309,25 @@ stream_combo() {
   rename_outputs "$work" new
 
   local ok=1
+  local sv_NEW sv_OLD sl_NEW sl_OLD sx_NEW sx_OLD
   for spec in "NEW:$NEW:old" "OLD:$OLD:new"; do
     local tag="${spec%%:*}"; local rest="${spec#*:}"
     local bin="${rest%%:*}"; local which="${rest##*:}"
     local pos flagged
     pos=$(vols_positional "$work" "$which"); flagged=$(vols_flagged "$work" "$which")
-    $bin verify $read_key $pos >/dev/null 2>"$work/e" || { echo "  FAIL [$name] $tag verify: $(tail -1 "$work/e")"; ok=0; }
-    $bin list $read_key $flagged >/dev/null 2>"$work/e" || { echo "  FAIL [$name] $tag list: $(tail -1 "$work/e")"; ok=0; }
+    # As in run_combo: compare outcomes between builds rather than demanding
+    # success, so a refusal both builds agree on is reported, not failed.
+    if $bin verify $read_key $pos >/dev/null 2>"$work/e"; then eval "sv_$tag=ok"; else eval "sv_$tag=\"fail:\$(tail -1 \"$work/e\")\""; fi
+    if $bin list $read_key $flagged >/dev/null 2>"$work/e"; then eval "sl_$tag=ok"; else eval "sl_$tag=\"fail:\$(tail -1 \"$work/e\")\""; fi
     rm -rf "$work/out.$tag"
     if $bin extract $read_key -C "$work/out.$tag" $flagged >/dev/null 2>"$work/e"; then
-      if [ -n "$expect_tree" ]; then
-        diff -r "$expect_tree" "$work/out.$tag/$expect_tree" >/dev/null 2>&1 || { echo "  FAIL [$name] $tag extracted tree differs"; ok=0; }
+      if [ -n "$expect_tree" ] && ! diff -r "$expect_tree" "$work/out.$tag/$expect_tree" >/dev/null 2>&1; then
+        eval "sx_$tag=tree-differs"
+      else
+        eval "sx_$tag=ok"
       fi
     else
-      echo "  FAIL [$name] $tag extract: $(tail -1 "$work/e")"; ok=0
+      eval "sx_$tag=\"fail:\$(tail -1 \"$work/e\")\""
     fi
 
     # Single-volume archives must also read from a pipe (the non-seekable reader).
@@ -309,6 +351,20 @@ stream_combo() {
       fi
     fi
   done
+  for op in sv sl sx; do
+    local n o label
+    eval "n=\$${op}_NEW"; eval "o=\$${op}_OLD"
+    case $op in sv) label=verify ;; sl) label=list ;; *) label=extract ;; esac
+    if [ "${n:-}" != "${o:-}" ]; then
+      echo "  FAIL [$name] $label disagrees: new=[${n:-unset}] old=[${o:-unset}]"; ok=0
+    elif [ "${n:-}" = "tree-differs" ]; then
+      echo "  FAIL [$name] $label: both extracted a tree that differs from the source"; ok=0
+    elif [ "${n:-ok}" != "ok" ]; then
+      echo "  note [$name] both builds refuse $label identically: ${n#fail:}"
+    fi
+  done
+  unset sv_NEW sv_OLD sl_NEW sl_OLD sx_NEW sx_OLD
+
   # Both builds must reach the same verdict on a bare pipe read, whether that is
   # success or the same refusal.
   if [ -n "${pipe_NEW:-}" ] || [ -n "${pipe_OLD:-}" ]; then
@@ -376,7 +432,12 @@ shape_matrix
 mode_matrix
 
 echo
-echo "=== differential matrix vs v0.2.4: pass=$PASS fail=$FAIL skipped(0.2.4 rejects the combo)=$SKIP ==="
+if [ $FIXED -gt 0 ]; then
+  echo "fixed relative to the reference (reference rejects, candidate accepts, for an expected reason):"
+  printf '  %s\n' "${FIXED_COMBOS[@]}" | sort -u | head -20
+  [ ${#FIXED_COMBOS[@]} -gt 20 ] && echo "  ... and $(( ${#FIXED_COMBOS[@]} - 20 )) more"
+fi
+echo "=== differential matrix vs v0.2.4: pass=$PASS fail=$FAIL skipped(both reject)=$SKIP fixed=$FIXED ==="
 if [ $SKIP -gt 0 ]; then
   echo "skipped (the reference build rejects these; the candidate must reject them the same way):"
   printf '  %s\n' "${SKIPPED_COMBOS[@]}" | sort -u
