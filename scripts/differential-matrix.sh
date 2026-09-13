@@ -114,7 +114,12 @@ run_combo() {
   fi
 
   local ok=1
-  # tag : binary : which archive it reads
+  # The assertion is that both builds BEHAVE THE SAME on the other's archive --
+  # not that every operation succeeds. Some shapes are legitimately refused on
+  # some hosts (a tar carrying Unix modes cannot be restored exactly on Windows),
+  # and a refusal both builds agree on is not a regression. So record each
+  # outcome per binary and compare, rather than demanding success.
+  local v_NEW v_OLD l_NEW l_OLD x_NEW x_OLD
   for spec in "NEW:$NEW:old" "OLD:$OLD:new"; do
     local tag="${spec%%:*}"; local rest="${spec#*:}"
     local bin="${rest%%:*}"; local which="${rest##*:}"
@@ -122,23 +127,33 @@ run_combo() {
     pos=$(vols_positional "$work" "$which")
     flagged=$(vols_flagged "$work" "$which")
 
-    if ! $bin verify $READ_KEY $pos >/dev/null 2>"$work/e"; then
-      echo "  FAIL [$name] $tag verify: $(tail -1 "$work/e")"; ok=0
-    fi
-    if ! $bin list $READ_KEY $flagged >"$work/list.$tag" 2>"$work/e"; then
-      echo "  FAIL [$name] $tag list: $(tail -1 "$work/e")"; ok=0
-    fi
+    if $bin verify $READ_KEY $pos >/dev/null 2>"$work/e"; then eval "v_$tag=ok"; else eval "v_$tag=\"fail:\$(tail -1 \"$work/e\")\""; fi
+    if $bin list $READ_KEY $flagged >"$work/list.$tag" 2>"$work/e"; then eval "l_$tag=ok"; else eval "l_$tag=\"fail:\$(tail -1 \"$work/e\")\""; fi
     rm -rf "$work/out.$tag"
-    if ! $bin extract $READ_KEY -C "$work/out.$tag" $flagged >/dev/null 2>"$work/e"; then
-      echo "  FAIL [$name] $tag extract: $(tail -1 "$work/e")"; ok=0
-    elif ! diff -r corpus "$work/out.$tag/corpus" >/dev/null 2>&1; then
-      echo "  FAIL [$name] $tag extracted tree differs from source"; ok=0
+    if $bin extract $READ_KEY -C "$work/out.$tag" $flagged >/dev/null 2>"$work/e"; then
+      if diff -r corpus "$work/out.$tag/corpus" >/dev/null 2>&1; then eval "x_$tag=ok"; else eval "x_$tag=tree-differs"; fi
+    else
+      eval "x_$tag=\"fail:\$(tail -1 \"$work/e\")\""
     fi
   done
 
-  # Both binaries must describe archives of the same shape identically.
-  if [ -f "$work/list.NEW" ] && [ -f "$work/list.OLD" ]; then
-    diff <(sort "$work/list.NEW") <(sort "$work/list.OLD") >/dev/null || { echo "  FAIL [$name] listings differ between binaries"; ok=0; }
+  for op in v l x; do
+    local n o label
+    eval "n=\$${op}_NEW"; eval "o=\$${op}_OLD"
+    case $op in v) label=verify ;; l) label=list ;; *) label=extract ;; esac
+    if [ "$n" != "$o" ]; then
+      echo "  FAIL [$name] $label disagrees: new=[$n] old=[$o]"; ok=0
+    elif [ "$n" = "tree-differs" ]; then
+      echo "  FAIL [$name] $label: both extracted a tree that differs from the source"; ok=0
+    elif [ "$n" != "ok" ]; then
+      echo "  note [$name] both builds refuse $label identically: ${n#fail:}"
+    fi
+  done
+
+  # When both listed successfully they must describe the archive identically.
+  if [ "${l_NEW:-}" = "ok" ] && [ "${l_OLD:-}" = "ok" ]; then
+    sort "$work/list.NEW" > "$work/list.NEW.s"; sort "$work/list.OLD" > "$work/list.OLD.s"
+    cmp -s "$work/list.NEW.s" "$work/list.OLD.s" || { echo "  FAIL [$name] listings differ between binaries"; ok=0; }
   fi
 
   # Naming every member must equal the full extraction -- this is the path the
@@ -156,10 +171,16 @@ run_combo() {
     echo "  FAIL [$name] selected extraction: $(tail -1 "$work/e")"; ok=0
   fi
 
-  # And a single named member through --stdout must match the file on disk.
-  local one="corpus/f000.bin"
-  if ! diff <($NEW extract $READ_KEY --stdout $old_flagged "$one" 2>/dev/null) "$one" >/dev/null; then
-    echo "  FAIL [$name] --stdout bytes differ for $one"; ok=0
+  # A single named member through --stdout must match the file on disk, byte for
+  # byte. Pick the largest corpus file: the smallest is zero bytes, which proves
+  # nothing, and compare via a temp file rather than process substitution.
+  local one; one=$(ls -S corpus/*.bin 2>/dev/null | head -1)
+  if [ -n "$one" ] && [ -s "$one" ]; then
+    if $NEW extract $READ_KEY --stdout $old_flagged "$one" > "$work/stdout.bin" 2>"$work/e"; then
+      cmp -s "$work/stdout.bin" "$one" || { echo "  FAIL [$name] --stdout bytes differ for $one"; ok=0; }
+    else
+      echo "  FAIL [$name] --stdout failed for $one: $(tail -1 "$work/e")"; ok=0
+    fi
   fi
 
   if [ $ok -eq 1 ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILED_COMBOS+=("$name"); fi
