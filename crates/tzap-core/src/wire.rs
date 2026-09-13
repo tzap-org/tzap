@@ -2483,6 +2483,64 @@ mod tests {
     }
 
     #[test]
+    fn block_record_serializes_to_an_exact_pinned_byte_layout() {
+        // `to_bytes_from_parts` builds the record by appending rather than writing
+        // into a zero-filled buffer. Pin every field position so a future rewrite
+        // cannot silently shift an offset, drop the reserved bytes at 14..16, or
+        // change what the CRC covers -- none of which a round-trip test would catch,
+        // since parse and serialize would move together.
+        let payload = [0xAAu8, 0xBB, 0xCC];
+        let bytes = BlockRecord::to_bytes_from_parts(0x0102_0304_0506_0708, BlockKind::PayloadParity, 0x01, &payload);
+
+        assert_eq!(bytes.len(), payload.len() + BLOCK_RECORD_FRAMING_LEN);
+        assert_eq!(&bytes[0..4], &TZBK_MAGIC, "magic");
+        assert_eq!(&bytes[4..12], &0x0102_0304_0506_0708u64.to_le_bytes(), "block_index is little-endian at 4..12");
+        assert_eq!(bytes[12], BlockKind::PayloadParity as u8, "kind at 12");
+        assert_eq!(bytes[13], 0x01, "flags at 13");
+        assert_eq!(&bytes[14..16], &[0u8, 0u8], "bytes 14..16 are reserved and must stay zero");
+        assert_eq!(&bytes[16..19], &payload, "payload starts at 16");
+        assert_eq!(&bytes[19..23], &crc32c(&bytes[..19]).to_le_bytes(), "crc is little-endian and covers header + payload");
+
+        // The whole record, byte for byte, so any layout drift is a diff not a guess.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&TZBK_MAGIC);
+        expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        expected.extend_from_slice(&[BlockKind::PayloadParity as u8, 0x01, 0, 0]);
+        expected.extend_from_slice(&payload);
+        expected.extend_from_slice(&crc32c(&expected).to_le_bytes());
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn block_record_serializes_an_empty_payload_as_framing_only() {
+        // The degenerate length: appending must still emit the reserved bytes and a
+        // CRC over exactly the 16 header bytes.
+        let bytes = BlockRecord::to_bytes_from_parts(0, BlockKind::PayloadData, 0, &[]);
+        assert_eq!(bytes.len(), BLOCK_RECORD_FRAMING_LEN);
+        assert_eq!(&bytes[14..16], &[0u8, 0u8]);
+        assert_eq!(&bytes[16..20], &crc32c(&bytes[..16]).to_le_bytes());
+    }
+
+    #[test]
+    fn block_record_to_bytes_agrees_with_to_bytes_from_parts_across_sizes() {
+        // The struct method must stay a pure delegation to the parts constructor,
+        // and every size must survive a parse round trip.
+        for payload_len in [0usize, 1, 2, 15, 16, 17, 255, 4096] {
+            let payload = (0..payload_len).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+            let record = BlockRecord { block_index: payload_len as u64, kind: BlockKind::PayloadData, flags: BLOCK_LAST_DATA_FLAG, payload, record_crc32c: 0 };
+            let via_method = record.to_bytes();
+            let via_parts = BlockRecord::to_bytes_from_parts(record.block_index, record.kind, record.flags, &record.payload);
+            assert_eq!(via_method, via_parts, "payload_len={payload_len}");
+
+            let parsed = BlockRecord::parse(&via_method, payload_len).unwrap();
+            assert_eq!(parsed.block_index, record.block_index, "payload_len={payload_len}");
+            assert_eq!(parsed.kind, record.kind);
+            assert_eq!(parsed.flags, record.flags);
+            assert_eq!(parsed.payload, record.payload);
+        }
+    }
+
+    #[test]
     fn block_record_round_trips_and_validates_crc() {
         let record = BlockRecord { block_index: 0, kind: BlockKind::PayloadData, flags: BLOCK_LAST_DATA_FLAG, payload: vec![7; 4096], record_crc32c: 0 };
         let bytes = record.to_bytes();

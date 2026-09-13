@@ -354,6 +354,56 @@ fn invert_matrix(mut matrix: Vec<Vec<u16>>) -> Result<Vec<Vec<u16>>, FormatError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // This crate's packaging guard allows only Cargo.toml, README.md, src and
+        // tests in a package tree, so a failing case must not drop a
+        // proptest-regressions/ file next to the source.
+        #![proptest_config(ProptestConfig { failure_persistence: None, ..ProptestConfig::default() })]
+        /// Encode parity, erase an arbitrary subset within the repair budget, and
+        /// require byte-exact recovery. This sweeps shard counts, shard sizes and
+        /// erasure positions, which is the combination the fixed-pattern tests and
+        /// the archive-level tests both leave to chance.
+        #[test]
+        fn proptest_repair_recovers_data_for_arbitrary_erasures(
+            data_shard_count in 1usize..12,
+            parity_shard_count in 1usize..5,
+            half_shard_size in 1usize..24,
+            seed in any::<u64>(),
+            erasure_bits in any::<u32>(),
+        ) {
+            let shard_size = half_shard_size * 2; // shards must hold whole GF(2^16) symbols
+            let data = (0..data_shard_count)
+                .map(|i| (0..shard_size).map(|b| (seed.wrapping_mul(i as u64 + 1).wrapping_add(b as u64 * 7) & 0xff) as u8).collect::<Vec<u8>>())
+                .collect::<Vec<_>>();
+            let parity = encode_parity_gf16(&data, parity_shard_count).unwrap();
+            prop_assert_eq!(parity.len(), parity_shard_count);
+            prop_assert!(parity.iter().all(|shard| shard.len() == shard_size));
+
+            // Erase at most `parity_shard_count` data shards: beyond that the code
+            // is not required to recover, so it would not be a fair assertion.
+            let mut shards = data.iter().cloned().map(Some).collect::<Vec<_>>();
+            let mut erased = 0usize;
+            for (index, slot) in shards.iter_mut().enumerate() {
+                if erased < parity_shard_count && (erasure_bits >> (index % 32)) & 1 == 1 {
+                    *slot = None;
+                    erased += 1;
+                }
+            }
+            let parity_available = parity.iter().cloned().map(Some).collect::<Vec<_>>();
+            let repaired = repair_data_gf16(&shards, &parity_available, shard_size).unwrap();
+            prop_assert_eq!(repaired, data);
+        }
+
+        /// The log-table inverse must invert, for any element the field contains.
+        #[test]
+        fn proptest_inverse_round_trips(value in 1u16..=u16::MAX) {
+            let inverse = gf16_inverse(value).unwrap();
+            prop_assert_eq!(gf16_mul(value, inverse), 1);
+            prop_assert_eq!(gf16_mul_slow(value, inverse), 1);
+        }
+    }
 
     #[test]
     fn table_inverse_matches_exponentiation_over_the_whole_field() {
@@ -364,6 +414,88 @@ mod tests {
             let inverse = gf16_inverse(value).unwrap();
             assert_eq!(inverse, gf16_pow(value, 65_534), "inverse mismatch for {value}");
             assert_eq!(gf16_mul(value, inverse), 1, "{value} * inverse != 1");
+        }
+    }
+
+    /// Multiply two GF(2^16) matrices with the slow polynomial multiply, so the
+    /// check does not reuse the log/exp tables the code under test depends on.
+    fn reference_matmul(left: &[Vec<u16>], right: &[Vec<u16>]) -> Vec<Vec<u16>> {
+        let n = left.len();
+        let mut out = vec![vec![0u16; n]; n];
+        for (i, out_row) in out.iter_mut().enumerate() {
+            for (j, cell) in out_row.iter_mut().enumerate() {
+                let mut acc = 0u16;
+                for k in 0..n {
+                    acc ^= gf16_mul_slow(left[i][k], right[k][j]);
+                }
+                *cell = acc;
+            }
+        }
+        out
+    }
+
+    fn identity_matrix(n: usize) -> Vec<Vec<u16>> {
+        (0..n).map(|i| identity_row(n, i)).collect()
+    }
+
+    #[test]
+    fn table_multiply_matches_polynomial_multiply_across_the_field() {
+        // `gf16_mul` now delegates to `gf16_mul_with`; pin both against the
+        // polynomial reference over a grid that includes the edges of the field.
+        let samples = [0u16, 1, 2, 3, 255, 256, 4095, 4096, 0x8000, 0xabcd, 0xfffe, 0xffff];
+        for a in samples {
+            for b in samples {
+                assert_eq!(gf16_mul(a, b), gf16_mul_slow(a, b), "{a} * {b}");
+                assert_eq!(gf16_mul_with(gf16_tables(), a, b), gf16_mul_slow(a, b), "{a} * {b} (with tables)");
+            }
+        }
+    }
+
+    #[test]
+    fn inverted_matrix_multiplies_back_to_identity() {
+        // `invert_matrix` drives the O(n^3) elimination that the table-threading
+        // change touched. A true inverse is the property that must not drift.
+        for n in [1usize, 2, 3, 5, 8, 17] {
+            let matrix = (0..n).map(|j| cauchy_row(n, j)).collect::<Vec<_>>();
+            let inverse = invert_matrix(matrix.clone()).unwrap();
+            assert_eq!(inverse.len(), n);
+            assert!(inverse.iter().all(|row| row.len() == n), "inverse row width for n={n}");
+            assert_eq!(reference_matmul(&matrix, &inverse), identity_matrix(n), "A * A^-1 != I for n={n}");
+            assert_eq!(reference_matmul(&inverse, &matrix), identity_matrix(n), "A^-1 * A != I for n={n}");
+        }
+    }
+
+    #[test]
+    fn inverting_a_singular_matrix_still_fails() {
+        // Two identical rows are linearly dependent: elimination must find no pivot
+        // rather than return a bogus inverse.
+        let matrix = vec![vec![1u16, 2, 3], vec![1u16, 2, 3], vec![4u16, 5, 6]];
+        assert_eq!(invert_matrix(matrix).unwrap_err(), FormatError::FecSingularMatrix);
+        // A zero row is the degenerate case.
+        assert_eq!(invert_matrix(vec![vec![0u16, 0], vec![0u16, 1]]).unwrap_err(), FormatError::FecSingularMatrix);
+    }
+
+    #[test]
+    fn every_single_shard_erasure_repairs_exactly() {
+        // Exhaustive over which shard is lost, so no index in the repair path is
+        // exercised only by luck of the sampled pattern.
+        let data_shard_count = 6;
+        let shard_size = 64;
+        let data = (0..data_shard_count).map(|i| (0..shard_size).map(|b| ((i * 31 + b * 17 + 3) & 0xff) as u8).collect::<Vec<u8>>()).collect::<Vec<_>>();
+        let parity = encode_parity_gf16(&data, 2).unwrap();
+        let parity_available = parity.iter().cloned().map(Some).collect::<Vec<_>>();
+
+        for lost in 0..data_shard_count {
+            let mut shards = data.iter().cloned().map(Some).collect::<Vec<_>>();
+            shards[lost] = None;
+            assert_eq!(repair_data_gf16(&shards, &parity_available, shard_size).unwrap(), data, "losing data shard {lost}");
+        }
+        // Losing parity instead must not disturb the (already complete) data.
+        for lost in 0..parity.len() {
+            let mut only_parity = parity_available.clone();
+            only_parity[lost] = None;
+            let shards = data.iter().cloned().map(Some).collect::<Vec<_>>();
+            assert_eq!(repair_data_gf16(&shards, &only_parity, shard_size).unwrap(), data, "losing parity shard {lost}");
         }
     }
 

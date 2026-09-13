@@ -2662,6 +2662,198 @@ fn batch_lookup_matches_per_path_lookup_including_duplicates_and_misses() {
 }
 
 #[test]
+fn selecting_every_member_matches_a_full_extraction() {
+    // The strongest end-to-end invariant over the optimized selection path: naming
+    // every member must produce exactly what extracting the whole archive does,
+    // byte for byte, across directories, nesting and duplicate-path final views.
+    let bodies: Vec<(String, Vec<u8>)> = (0..120)
+        .map(|i| {
+            let path = match i % 4 {
+                0 => format!("top{i:03}.bin"),
+                1 => format!("nested/a/deep{i:03}.bin"),
+                2 => format!("nested/b/other{i:03}.bin"),
+                _ => format!("dir{}/leaf{i:03}.bin", i % 7),
+            };
+            (path, (0..(i * 13 % 400)).map(|b| ((b + i) % 251) as u8).collect())
+        })
+        .collect();
+    let files: Vec<RegularFile<'_>> = bodies.iter().map(|(path, body)| RegularFile::new(path, body)).collect();
+    let archive = write_archive(&files, &master_key(), single_stream_options()).unwrap();
+    let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+
+    let every_path: Vec<String> = opened.list_index_entries().unwrap().into_iter().map(|entry| entry.path).collect();
+    assert_eq!(every_path.len(), bodies.len());
+
+    let full_root = tempfile::tempdir().unwrap();
+    let mut full = opened.extract_indexed_files_to(full_root.path(), SafeExtractionOptions::default(), 2).unwrap();
+
+    // Exercise both the serial and parallel restore shapes.
+    for jobs in [1usize, 4] {
+        let selected_root = tempfile::tempdir().unwrap();
+        let mut selected = opened.extract_selected_files_to(&every_path, selected_root.path(), SafeExtractionOptions::default(), jobs).unwrap();
+        full.sort_by(|left, right| left.0.cmp(&right.0));
+        selected.sort_by(|left, right| left.0.cmp(&right.0));
+        let full_paths = full.iter().map(|(path, _)| path.clone()).collect::<Vec<_>>();
+        let selected_paths = selected.iter().map(|(path, _)| path.clone()).collect::<Vec<_>>();
+        assert_eq!(selected_paths, full_paths, "restored path sets differ at jobs={jobs}");
+
+        for (path, body) in &bodies {
+            let from_full = std::fs::read(full_root.path().join(path)).unwrap();
+            let from_selected = std::fs::read(selected_root.path().join(path)).unwrap();
+            assert_eq!(&from_full, body, "full extraction wrote wrong bytes for {path}");
+            assert_eq!(from_selected, from_full, "selected extraction differs for {path} at jobs={jobs}");
+        }
+    }
+
+    // A selection that is a strict subset writes only that subset.
+    let subset: Vec<String> = every_path.iter().step_by(11).cloned().collect();
+    let subset_root = tempfile::tempdir().unwrap();
+    opened.extract_selected_files_to(&subset, subset_root.path(), SafeExtractionOptions::default(), 2).unwrap();
+    for path in &every_path {
+        let present = subset_root.path().join(path).exists();
+        assert_eq!(present, subset.contains(path), "unexpected presence for {path}");
+    }
+}
+
+#[test]
+fn batch_lookup_agrees_with_single_lookup_on_odd_and_rejected_paths() {
+    // The batch normalizes every path up front and resolves against the candidate
+    // shard union; the single lookup normalizes per call. Any spelling the reader
+    // accepts, and any it rejects, must land the same way through both.
+    let archive = write_archive(
+        &[RegularFile::new("dir/inner.txt", b"body"), RegularFile::new("top.txt", b"t"), RegularFile::new("uni/\u{e9}quipe.txt", b"u")],
+        &master_key(),
+        single_stream_options(),
+    )
+    .unwrap();
+    let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+
+    let spellings = [
+        "dir/inner.txt",
+        "./dir/inner.txt",
+        "dir//inner.txt",
+        "dir/./inner.txt",
+        "top.txt",
+        "uni/\u{e9}quipe.txt",
+        "uni/e\u{301}quipe.txt", // same grapheme, decomposed
+        "../escape.txt",
+        "/absolute.txt",
+        "",
+        "dir/",
+        "missing.txt",
+    ];
+
+    for spelling in spellings {
+        let single = opened.lookup_index_entry(spelling);
+        let batched = opened.lookup_index_entries(&[spelling.to_string()]);
+        match (&single, &batched) {
+            (Ok(single_entry), Ok(batched_entries)) => {
+                assert_eq!(batched_entries.len(), 1, "{spelling:?}");
+                assert_eq!(&batched_entries[0].0, spelling, "{spelling:?} must echo the requested spelling");
+                assert_eq!(&batched_entries[0].1, single_entry, "{spelling:?} resolved differently");
+            }
+            (Err(single_err), Err(batched_err)) => assert_eq!(single_err, batched_err, "{spelling:?} rejected with different errors"),
+            _ => panic!("{spelling:?}: one API errored and the other did not ({single:?} vs {batched:?})"),
+        }
+    }
+
+    // A rejected path anywhere in a batch must reject the whole batch, exactly as
+    // the per-path loop it replaced did on reaching that element.
+    let mixed = ["top.txt".to_string(), "../escape.txt".to_string(), "dir/inner.txt".to_string()];
+    assert_eq!(opened.lookup_index_entries(&mixed).unwrap_err(), opened.lookup_index_entry("../escape.txt").unwrap_err());
+}
+
+/// One archive member, with a caller-chosen kind and link target, so tests can
+/// build hardlink aliases that `RegularFile` cannot express.
+struct KindedMember<'a> {
+    path: &'a str,
+    kind: SourceEntryKind,
+    target: Option<&'a [u8]>,
+    body: &'a [u8],
+}
+
+impl RegularFileSource for KindedMember<'_> {
+    fn archive_path(&self) -> &str {
+        self.path
+    }
+    fn entry_kind(&self) -> SourceEntryKind {
+        self.kind
+    }
+    fn link_target(&self) -> Option<&[u8]> {
+        self.target
+    }
+    fn file_data_size(&self) -> u64 {
+        self.body.len() as u64
+    }
+    fn mode(&self) -> u32 {
+        0o644
+    }
+    fn mtime(&self) -> ArchiveTimestamp {
+        ArchiveTimestamp::from_seconds(1_700_000_000)
+    }
+    fn portable_metadata(&self) -> PortableFileMetadata {
+        PortableFileMetadata::default()
+    }
+    fn open(&self) -> Result<Box<dyn std::io::Read + '_>, crate::format::ArchiveWriteError> {
+        Ok(Box::new(std::io::Cursor::new(self.body)))
+    }
+}
+
+/// `original.txt` as a regular primary plus `alias.txt` as a hardlink onto it.
+fn hardlink_archive() -> Vec<u8> {
+    let sources = [
+        KindedMember { path: "original.txt", kind: SourceEntryKind::Regular, target: None, body: b"shared payload" },
+        KindedMember { path: "alias.txt", kind: SourceEntryKind::Hardlink, target: Some(b"original.txt"), body: b"" },
+    ];
+    let mut sink = MemoryArchiveSink::default();
+    write_archive_sources_to_sink_single_pass(&sources, &master_key(), single_stream_options(), &crate::crypto::KdfParams::Raw, None, None, &mut sink).unwrap();
+    sink.volumes.remove(0)
+}
+
+#[test]
+fn extract_file_to_pulls_in_the_hardlink_target_as_a_dependency() {
+    // The hardlink pre-scan reads `kind` and `link_target` from index metadata
+    // instead of decoding the member. Selecting only the alias must still restore
+    // its canonical target, or the restore-plan validation would reject the graph.
+    let archive = hardlink_archive();
+    let opened = open_archive(&archive, &master_key()).unwrap();
+    assert_eq!(opened.lookup_index_entry("alias.txt").unwrap().unwrap().kind, TarEntryKind::Hardlink);
+
+    let tmp = tempfile::tempdir().unwrap();
+    opened.extract_file_to("alias.txt", tmp.path(), SafeExtractionOptions::default()).unwrap().unwrap();
+    assert_eq!(std::fs::read(tmp.path().join("alias.txt")).unwrap(), b"shared payload");
+    assert_eq!(std::fs::read(tmp.path().join("original.txt")).unwrap(), b"shared payload", "the hardlink target must be restored as a dependency");
+
+    // Selecting the regular primary alone must NOT drag the alias in with it.
+    let only_target = tempfile::tempdir().unwrap();
+    opened.extract_file_to("original.txt", only_target.path(), SafeExtractionOptions::default()).unwrap().unwrap();
+    assert_eq!(std::fs::read(only_target.path().join("original.txt")).unwrap(), b"shared payload");
+    assert!(!only_target.path().join("alias.txt").exists(), "a regular primary must not pull in aliases pointing at it");
+}
+
+#[test]
+fn extract_selected_files_to_pulls_in_the_hardlink_target_as_a_dependency() {
+    let archive = hardlink_archive();
+    let opened = open_archive(&archive, &master_key()).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let restored = opened.extract_selected_files_to(&["alias.txt".into()], tmp.path(), SafeExtractionOptions::default(), 1).unwrap();
+    assert_eq!(std::fs::read(tmp.path().join("alias.txt")).unwrap(), b"shared payload");
+    assert_eq!(std::fs::read(tmp.path().join("original.txt")).unwrap(), b"shared payload", "the hardlink target must be restored as a dependency");
+    // The dependency is restored but the caller only asked for the alias; the target
+    // is reported too, since it was written.
+    assert!(restored.iter().any(|(path, _)| path == "alias.txt"));
+
+    // Naming both is idempotent: the target is added once, not twice.
+    let both = tempfile::tempdir().unwrap();
+    let restored_both =
+        opened.extract_selected_files_to(&["alias.txt".into(), "original.txt".into()], both.path(), SafeExtractionOptions::default(), 2).unwrap();
+    assert_eq!(restored_both.len(), 2, "target must not be scheduled twice");
+    assert_eq!(std::fs::read(both.path().join("alias.txt")).unwrap(), b"shared payload");
+    assert_eq!(std::fs::read(both.path().join("original.txt")).unwrap(), b"shared payload");
+}
+
+#[test]
 fn batch_lookup_spans_multiple_index_shards() {
     // Index shards hold DEFAULT_FILES_PER_INDEX_SHARD (10_000) files, so every other
     // lookup test in this file runs against a single shard and never exercises the

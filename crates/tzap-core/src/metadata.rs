@@ -2875,6 +2875,10 @@ mod tests {
     }
 
     proptest! {
+        // This crate's packaging guard allows only Cargo.toml, README.md, src and
+        // tests in a package tree, so a failing case must not drop a
+        // proptest-regressions/ file next to the source.
+        #![proptest_config(ProptestConfig { failure_persistence: None, ..ProptestConfig::default() })]
         #[test]
         fn proptest_unicode_component_paths_are_safe(
             components in prop::collection::vec(prop::sample::select(&["資料", "проекты", "مرحبا", "日本語", "équipe", "🙂"]), 1..5),
