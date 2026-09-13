@@ -24,12 +24,58 @@ use crate::entry_metadata::{archive_timestamp_from_system_time, host_source_os_l
 use crate::writer::{NativeFileMetadata, PortableFileMetadata, PortableModeOrigin, PortablePosixOwner};
 
 /// Portable metadata plus anything a host needs to re-open the same object.
+#[derive(Debug)]
 pub struct CapturedPortableMetadata {
     pub metadata: PortableFileMetadata,
     /// Identity of the macOS object the native capture read, so a later
     /// resource-fork open can verify it is still the same file.
     #[cfg(target_os = "macos")]
     pub macos_identity: Option<crate::macos_metadata::MacosMetadataIdentity>,
+}
+
+/// Marker shared by every capture site that loses a race with a concurrent
+/// writer, so hosts can recognise the condition without guessing at a message
+/// they do not own.
+///
+/// zmanager string-matched this from the outside and documented that "the
+/// durable fix is a typed error upstream". This is that fix: the constant lives
+/// with the code that produces it, and [`is_transient_capture_race`] is the
+/// supported way to ask.
+pub const CAPTURE_RACE_MARKER: &str = "changed during metadata capture";
+
+/// Whether an error is the transient mid-capture race worth retrying.
+///
+/// Matches on a substring: the sites qualify it (`input`, `xattr`, `symlink
+/// xattr`), and a host enriching the message with a path must not silently
+/// disable the retry.
+#[must_use]
+pub fn is_transient_capture_race(error: &io::Error) -> bool {
+    error.to_string().contains(CAPTURE_RACE_MARKER)
+}
+
+/// How many times a capture is attempted before the race is reported.
+pub const CAPTURE_ATTEMPTS: usize = 3;
+
+/// Retry a capture that lost a race with a concurrent writer.
+///
+/// Ported from zmanager's `with_metadata_capture_retry`, added there by "Fix
+/// TZAP Unicode archives and metadata capture races" -- a race hit in practice,
+/// not a hypothetical. A file changing mid-capture is ordinary during a live
+/// backup, and failing the whole archive for it is the wrong response when a
+/// re-read almost always succeeds.
+///
+/// Only the race is retried. Every other error returns on the first attempt.
+pub fn with_capture_retry<T>(mut capture: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    for attempt in 0..CAPTURE_ATTEMPTS {
+        match capture() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_transient_capture_race(&error) && attempt + 1 < CAPTURE_ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the retry loop returns from every attempt")
 }
 
 /// Assemble a `PortableFileMetadata` from the parts a host has already gathered.
@@ -56,12 +102,18 @@ pub fn assemble_portable_file_metadata(
         // A host with no POSIX mode projects one; see `projected_posix_mode`.
         mode_origin: if cfg!(unix) { PortableModeOrigin::Native } else { PortableModeOrigin::Projected },
         posix_owner: owner_ids.map(|(uid, gid)| {
+            // The lookup is POSIX-only. A non-POSIX host reaches this arm solely
+            // when a caller supplies ids explicitly, and has no name database to
+            // resolve them against -- so the numeric identity travels alone.
+            #[cfg(unix)]
             let names = match (u32::try_from(uid), u32::try_from(gid)) {
                 // Ids beyond u32 cannot be looked up through the POSIX APIs. The
                 // numeric identity still travels, which is what carries ownership.
                 (Ok(uid), Ok(gid)) => crate::entry_metadata::resolve_posix_owner_names(uid, gid),
                 _ => (None, None),
             };
+            #[cfg(not(unix))]
+            let names: (Option<String>, Option<String>) = (None, None);
             PortablePosixOwner { uid, gid, uname: names.0, gname: names.1 }
         }),
         attributes,
@@ -81,10 +133,14 @@ pub fn assemble_portable_file_metadata(
 /// dropped; `mtime` is the caller's to supply, because losing it silently is a
 /// different decision than losing an optional time.
 pub fn capture_portable_file_metadata(input: &Path) -> io::Result<CapturedPortableMetadata> {
+    with_capture_retry(|| capture_portable_file_metadata_once(input))
+}
+
+fn capture_portable_file_metadata_once(input: &Path) -> io::Result<CapturedPortableMetadata> {
     let metadata = fs::symlink_metadata(input)?;
     let symlink = metadata.file_type().is_symlink();
 
-    let created = metadata.created().ok().and_then(|time| archive_timestamp_from_system_time(time).ok());
+    let created = metadata.created().ok().and_then(archive_timestamp_from_system_time);
     // musl cannot expose birth time (statx/STATX_BTIME is unsupported there), so
     // fall back to ctime from the standard stat fields as an approximation.
     #[cfg(target_os = "linux")]
@@ -92,7 +148,7 @@ pub fn capture_portable_file_metadata(input: &Path) -> io::Result<CapturedPortab
         use std::os::unix::fs::MetadataExt as _;
         Some(crate::entry_metadata::ArchiveTimestamp::new(metadata.ctime(), u32::try_from(metadata.ctime_nsec()).unwrap_or(0)))
     });
-    let accessed = metadata.accessed().ok().and_then(|time| archive_timestamp_from_system_time(time).ok());
+    let accessed = metadata.accessed().ok().and_then(archive_timestamp_from_system_time);
 
     #[cfg(target_os = "macos")]
     let captured_macos = crate::macos_metadata::capture_macos_metadata(input, symlink)?;
@@ -141,4 +197,257 @@ fn portable_attributes(_metadata: &fs::Metadata) -> Option<u32> {
     // The four-bit projection is Windows-specific. macOS carries exact BSD flags
     // in `TZAP.macos.st-flags` instead, which the native capture handles.
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entry_metadata::ArchiveTimestamp;
+
+    fn native_with_marker() -> NativeFileMetadata {
+        let mut native = NativeFileMetadata::default();
+        native.primary_pax_records.insert("TZAP.test.marker".into(), b"1".to_vec());
+        native
+    }
+
+    #[test]
+    fn assembly_sets_the_host_source_os_and_mode_origin() {
+        let assembled = assemble_portable_file_metadata(NativeFileMetadata::default(), None, None, None, None);
+        assert_eq!(assembled.source_os, host_source_os_label(), "the label must come from the one owner of it");
+        assert_eq!(assembled.source_filesystem, "unknown");
+        // §16.7.1: a host with a native POSIX mode declares `native`; one that
+        // projects a mode declares `projected`. Getting this backwards would make
+        // a reader trust a synthesized mode as exact.
+        let expected = if cfg!(unix) { PortableModeOrigin::Native } else { PortableModeOrigin::Projected };
+        assert_eq!(assembled.mode_origin, expected);
+    }
+
+    #[test]
+    fn assembly_distinguishes_absent_ownership_from_zeroed_ownership() {
+        // §16.7.1: with owner kind `none` the PAX owner keys are absent entirely.
+        // A zeroed owner would claim the entry is owned by root.
+        let none = assemble_portable_file_metadata(NativeFileMetadata::default(), None, None, None, None);
+        assert!(none.posix_owner.is_none(), "no ownership model must mean absent, never uid 0");
+
+        let owned = assemble_portable_file_metadata(NativeFileMetadata::default(), Some((0, 0)), None, None, None);
+        let owner = owned.posix_owner.expect("owner ids were supplied");
+        assert_eq!((owner.uid, owner.gid), (0, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assembly_resolves_owner_names_and_tolerates_unknown_ids() {
+        let owner =
+            assemble_portable_file_metadata(NativeFileMetadata::default(), Some((0, 0)), None, None, None).posix_owner.expect("owner ids were supplied");
+        assert_eq!(owner.uname.as_deref(), Some("root"), "uid 0 resolves on every POSIX host");
+
+        // An id from another system has no local entry. The numeric identity must
+        // still travel -- that is what actually carries ownership on restore.
+        let unknown = assemble_portable_file_metadata(NativeFileMetadata::default(), Some((0x7fff_fffe, 0x7fff_fffe)), None, None, None)
+            .posix_owner
+            .expect("owner ids were supplied");
+        assert_eq!((unknown.uid, unknown.gid), (0x7fff_fffe, 0x7fff_fffe));
+        assert_eq!(unknown.uname, None);
+        assert_eq!(unknown.gname, None);
+    }
+
+    #[test]
+    fn assembly_passes_through_attributes_times_and_native_untouched() {
+        let created = ArchiveTimestamp::new(1_700_000_000, 123_456_789);
+        let accessed = ArchiveTimestamp::new(-2, 500_000_000);
+        let assembled = assemble_portable_file_metadata(native_with_marker(), None, Some(0b1011), Some(created), Some(accessed));
+
+        assert_eq!(assembled.attributes, Some(0b1011));
+        assert_eq!(assembled.created, Some(created));
+        assert_eq!(assembled.accessed, Some(accessed));
+        assert_eq!(assembled.native.primary_pax_records.get("TZAP.test.marker").map(Vec::as_slice), Some(b"1".as_slice()));
+    }
+
+    #[test]
+    fn capture_reads_a_regular_file_without_following_anything() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("a.bin");
+        std::fs::write(&file, b"body").unwrap();
+
+        let captured = capture_portable_file_metadata(&file).unwrap();
+        assert_eq!(captured.metadata.source_os, host_source_os_label());
+        #[cfg(unix)]
+        assert!(captured.metadata.posix_owner.is_some(), "a POSIX host must record ownership");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_describes_a_symlink_itself_not_its_target() {
+        // The load-bearing safety property. If capture followed the link, the
+        // archive would silently carry the target's metadata -- and the target
+        // can point anywhere, including outside the tree being archived.
+        //
+        // Detect it by putting a distinctive xattr on the target only: a capture
+        // that followed would pick it up. The paired assertion on the target
+        // proves the probe can actually tell the two apart, so a pass here means
+        // "did not follow", not "cannot see xattrs at all".
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.bin");
+        let link = temp.path().join("link.sym");
+        std::fs::write(&target, b"target body").unwrap();
+        std::os::unix::fs::symlink("target.bin", &link).unwrap();
+
+        // Probe on the xattr NAME, not its value: §16.7.3 stores values
+        // base64-encoded, so a raw marker never appears verbatim. The name shows
+        // up in the PAX key or the auxiliary record name.
+        const PROBE: &str = "follow-probe";
+        let tagged = xattr::set(&target, "user.tzap.follow-probe", b"target-only").is_ok();
+
+        let mentions_probe = |captured: &CapturedPortableMetadata| {
+            let native = &captured.metadata.native;
+            native.primary_pax_records.keys().any(|key| key.contains(PROBE))
+                || native.auxiliary_records.iter().any(|record| record.name.windows(PROBE.len()).any(|w| w == PROBE.as_bytes()))
+        };
+
+        let via_link = capture_portable_file_metadata(&link).unwrap();
+        assert!(!mentions_probe(&via_link), "capture followed the symlink and picked up the target's xattr");
+
+        if tagged {
+            let via_target = capture_portable_file_metadata(&target).unwrap();
+            assert!(mentions_probe(&via_target), "probe is blind -- the link assertion above would pass for the wrong reason");
+        }
+
+        // A dangling link is still a capturable object: the link is the entry,
+        // and its target need not exist.
+        let dangling = temp.path().join("dangling.sym");
+        std::os::unix::fs::symlink("does-not-exist.bin", &dangling).unwrap();
+        capture_portable_file_metadata(&dangling).expect("a dangling symlink is still a capturable object");
+    }
+
+    /// Ported from zmanager's `preserves_all_metadata_in_tzap_round_trip`, which
+    /// is the best-exercised metadata fixture across the two projects. That test
+    /// drives zmanager's manifest API end to end; this covers the same ground at
+    /// the capture layer both hosts now share, so neither host can regress it.
+    ///
+    /// The resource fork is deliberately larger than the PAX metadata limit --
+    /// §16.18.2's corpus names exactly that case, and it had no fixture here.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_collects_the_full_macos_metadata_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("data.bin");
+        let directory = temp.path().join("folder");
+        std::fs::write(&file, b"round-trip payload").unwrap();
+        std::fs::create_dir(&directory).unwrap();
+
+        xattr::set(&file, "com.tzap.test", b"file metadata").unwrap();
+        xattr::set(&directory, "com.tzap.test", b"directory metadata").unwrap();
+        xattr::set(&file, "com.apple.FinderInfo", &[0x5a; 32]).unwrap();
+        // Over the PAX metadata limit, so it must take the streamed auxiliary
+        // path rather than an inline record.
+        std::fs::write(file.join("..namedfork/rsrc"), vec![0x6b; 2 * 1024 * 1024 + 31]).unwrap();
+        let acl_set = std::process::Command::new("/bin/chmod").args(["+a", "everyone deny delete"]).arg(&file).status().is_ok_and(|s| s.success());
+        let flags_set = std::process::Command::new("/usr/bin/chflags").arg("hidden").arg(&file).status().is_ok_and(|s| s.success());
+
+        let captured = capture_portable_file_metadata(&file).unwrap();
+        let native = &captured.metadata.native;
+        let aux_kind = |kind: &str| native.auxiliary_records.iter().any(|record| record.kind == kind);
+
+        assert!(captured.macos_identity.is_some(), "the identity must come back so a later fork open can verify the same object");
+        assert!(aux_kind("macos.finder-info"), "FinderInfo must be captured as its own auxiliary kind, not a generic xattr");
+        assert!(aux_kind("macos.resource-fork"), "a fork over the PAX limit must still be captured");
+        if acl_set {
+            assert!(aux_kind("macos.acl-native"), "a native ACL must be captured");
+            assert!(native.primary_pax_records.contains_key("TZAP.acl.projection"), "the textual ACL projection must accompany the native blob");
+        }
+        if flags_set {
+            assert!(native.primary_pax_records.contains_key("TZAP.macos.st-flags"), "Darwin flags must be captured exactly");
+        }
+
+        // The ordinary xattr survives under some representation -- inline record
+        // or auxiliary -- but must not be smuggled in as FinderInfo or a fork.
+        let mentions = |needle: &str| {
+            native.primary_pax_records.keys().any(|key| key.contains(needle))
+                || native.auxiliary_records.iter().any(|record| record.name.windows(needle.len()).any(|w| w == needle.as_bytes()))
+        };
+        assert!(mentions("com.tzap.test"), "an ordinary xattr must be captured");
+
+        // A directory carries its own metadata, not the file's.
+        let directory_capture = capture_portable_file_metadata(&directory).unwrap();
+        assert!(
+            !directory_capture.metadata.native.auxiliary_records.iter().any(|record| record.kind == "macos.resource-fork"),
+            "a directory has no resource fork to capture"
+        );
+    }
+
+    #[test]
+    fn capture_retry_recovers_from_a_race_and_reports_everything_else() {
+        use std::cell::Cell;
+
+        let race = || io::Error::other("input changed during metadata capture");
+        assert!(is_transient_capture_race(&race()));
+        assert!(is_transient_capture_race(&io::Error::other("xattr changed during metadata capture")));
+        // A host that enriches the message with a path must keep matching.
+        assert!(is_transient_capture_race(&io::Error::other("input changed during metadata capture: /tmp/a.bin")));
+        assert!(!is_transient_capture_race(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(!is_transient_capture_race(&io::Error::other("input changed after scan")));
+
+        // Succeeds once the writer stops touching the file.
+        let attempts = Cell::new(0usize);
+        let value = with_capture_retry(|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < CAPTURE_ATTEMPTS {
+                Err(race())
+            } else {
+                Ok(7)
+            }
+        })
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(attempts.get(), CAPTURE_ATTEMPTS);
+
+        // A race that never settles is reported, not retried forever.
+        let attempts = Cell::new(0usize);
+        let error = with_capture_retry(|| {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(race())
+        })
+        .unwrap_err();
+        assert!(is_transient_capture_race(&error));
+        assert_eq!(attempts.get(), CAPTURE_ATTEMPTS, "must stop after the attempt budget");
+
+        // Anything else fails on the first attempt -- retrying a missing file
+        // just delays the report.
+        let attempts = Cell::new(0usize);
+        let error = with_capture_retry(|| {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn capture_reads_a_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("sub");
+        std::fs::create_dir(&directory).unwrap();
+        let captured = capture_portable_file_metadata(&directory).unwrap();
+        assert_eq!(captured.metadata.source_os, host_source_os_label());
+    }
+
+    #[test]
+    fn capture_reports_a_missing_path_as_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = capture_portable_file_metadata(&temp.path().join("absent.bin")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn capture_leaves_windows_attributes_absent_on_hosts_without_them() {
+        // The four-bit projection is Windows-specific. macOS carries exact BSD
+        // flags in `TZAP.macos.st-flags` instead, so a zeroed projection here
+        // would claim "no attributes set" rather than "not applicable".
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("a.bin");
+        std::fs::write(&file, b"body").unwrap();
+        assert_eq!(capture_portable_file_metadata(&file).unwrap().metadata.attributes, None);
+    }
 }

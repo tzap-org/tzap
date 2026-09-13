@@ -1542,7 +1542,7 @@ fn compressed_archive_round_trips_header_and_pax_portable_metadata_stores() {
         },
         RegularFile {
             mode: 0o604,
-            mtime: ArchiveTimestamp::new(-1, 500_000_000),
+            mtime: ArchiveTimestamp::new(-2, 500_000_000),
             portable_metadata: PortableFileMetadata {
                 source_os: "other-unix".into(),
                 source_filesystem: "zfs".into(),

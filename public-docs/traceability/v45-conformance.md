@@ -33,7 +33,7 @@ Deterministic fixtures live in the workspace test suite and run under
 | §16.18 section | Clauses | Implemented and tested | Evidence gap | Implementation gap |
 | --- | ---: | ---: | ---: | ---: |
 | 16.18.1 Portable and Unix | 11 | 9 | 2 | 0 |
-| 16.18.2 macOS | 6 | 3 | 2 | 1 |
+| 16.18.2 macOS | 6 | 4 | 1 | 1 |
 | 16.18.3 Windows | 8 | 8 | 0 | 0 |
 | 16.18.4 Adversarial | 17 | 11 | 6 | 0 |
 
@@ -46,7 +46,6 @@ Windows CI job; the macOS and Linux jobs do not exercise it.
 | --- | --- | --- | --- |
 | APFS clone hints | 16.18.2 "APFS clone hints with logical fallback" | Implementation gap | Clone relationships are not recorded. Logical bytes round-trip normally; a restored APFS tree does not re-share storage. |
 | NFSv4 ACL round trip | 16.18.1 "POSIX.1e access/default and NFSv4 ACLs in both exact syntax IDs" | Evidence gap | Malformed NFSv4 syntax is rejected, and POSIX.1e round-trips. A positive NFSv4 round-trip fixture does not exist. |
-| Resource fork above the PAX metadata limit | 16.18.2 | Evidence gap | The streamed resource-fork path exists; the boundary-size fixture the clause names does not. |
 | Quarantine/provenance xattr fixture | 16.18.2 | Evidence gap | Captured as generic macOS xattrs; no dedicated fixture. |
 | Empty-value and non-UTF-8-named xattrs | 16.18.1 | Evidence gap | Binary values and base64/percent name codecs are covered; these two sub-cases are not separately asserted. |
 | Projection rename/mode-override guard | 16.18.4 | Evidence gap | The restore path contains no rename and applies readonly only through the host attribute, never through `TZAP.portable.mode`, so §16.7.1's MUST NOT holds by construction. No regression guard asserts it. |
@@ -56,7 +55,7 @@ Windows CI job; the macOS and Linux jobs do not exercise it.
 | FileEntry flag-summary mismatch | 16.18.4 | Evidence gap | Reserved-bit rejection is asserted. A crafted summary that disagrees with the recomputed group summary is not. |
 | Reparse placeholder mis-extraction | 16.18.4 | Evidence gap | Placeholders round-trip correctly. The negative direction — a placeholder extracted as an empty ordinary file, or replaced by a directory for selected descendants — is not separately asserted. |
 
-This list is complete for the four corpus sections, not a selection: 10
+This list is complete for the four corpus sections, not a selection: 9
 evidence gaps and 1 implementation gap against 42 clauses. They are published
 rather than omitted because §16.18 is a completeness obligation. Until they
 close, the claim boundary in [README.md](README.md) applies as written:

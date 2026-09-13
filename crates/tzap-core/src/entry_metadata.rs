@@ -84,86 +84,33 @@ pub const fn windows_portable_attribute_projection(file_attributes: u32) -> u32 
         | (((file_attributes & FILE_ATTRIBUTE_ARCHIVE != 0) as u32) << 3)
 }
 
-/// Why a host instant has no revision-45 timestamp.
-///
-/// A typed reason rather than `None`, so a caller can report the difference:
-/// one case is a real representational limit of the format and the other is a
-/// clock far outside it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimestampConversionError {
-    /// Less than one second before the epoch, and not on it.
-    ///
-    /// §16.7.2's grammar is `-?(0|[1-9][0-9]*)(\.[0-9]{1,9})?` with `-0`
-    /// explicitly forbidden, so an instant in `(-1s, 0s)` has no encoding: its
-    /// integer part would have to be negative zero. Not a host limitation.
-    SubSecondBeforeEpoch,
-    /// The seconds component does not fit the signed 64-bit field.
-    SecondsOutOfRange,
-}
-
-impl fmt::Display for TimestampConversionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SubSecondBeforeEpoch => {
-                formatter.write_str("instants in the last second before the Unix epoch have no revision-45 encoding (\u{2212}0 is forbidden)")
-            }
-            Self::SecondsOutOfRange => formatter.write_str("timestamp seconds exceed the revision-45 i64 range"),
-        }
-    }
-}
-
-impl std::error::Error for TimestampConversionError {}
-
 /// Convert a host `SystemTime` to a revision-45 [`ArchiveTimestamp`].
 ///
-/// §16.7.2 encodes a time as a plain signed decimal, so the representation is
-/// **sign-magnitude**: `ArchiveTimestamp::new(-1, 500_000_000)` serializes to
-/// `-1.5`, meaning one and a half seconds *before* the epoch. It is not a
-/// timespec, where -1.5s would be `(-2, 500_000_000)`.
+/// Ported from zmanager's tested `system_time_to_timestamp` (`tar_metadata.rs`),
+/// which both projects now share rather than each carrying its own.
 ///
-/// That distinction is the whole reason this lives here. `tzap-cli` converted
-/// with a timespec-style borrow (`-secs - 1`, `1e9 - nanos`) and wrote `-2.5`
-/// for an instant 1.5 seconds before the epoch -- a full second off, and pinned
-/// by a test asserting the wrong value. zmanager converted correctly. Hosts now
-/// share this one.
-pub fn archive_timestamp_from_system_time(time: std::time::SystemTime) -> Result<ArchiveTimestamp, TimestampConversionError> {
+/// The result is a **timespec**: `tv_sec` plus an always-positive `tv_nsec`,
+/// matching libc and every consumer that applies a restored time. 1.25 seconds
+/// before the epoch is `(-2, 750_000_000)`. The §16.7.2 sign-and-magnitude form
+/// (`-1.25`) is produced only at the PAX boundary by
+/// [`ArchiveTimestamp::canonical_pax_value`].
+///
+/// `None` means the seconds component does not fit `i64`.
+#[must_use]
+pub fn archive_timestamp_from_system_time(time: std::time::SystemTime) -> Option<ArchiveTimestamp> {
+    const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
     match time.duration_since(std::time::UNIX_EPOCH) {
-        Ok(duration) => archive_timestamp_from_signed_parts(false, duration.as_secs(), duration.subsec_nanos()),
+        Ok(duration) => Some(ArchiveTimestamp::new(i64::try_from(duration.as_secs()).ok()?, duration.subsec_nanos())),
         Err(error) => {
             let duration = error.duration();
-            archive_timestamp_from_signed_parts(true, duration.as_secs(), duration.subsec_nanos())
+            let seconds = i64::try_from(duration.as_secs()).ok()?;
+            if duration.subsec_nanos() == 0 {
+                Some(ArchiveTimestamp::new(seconds.checked_neg()?, 0))
+            } else {
+                Some(ArchiveTimestamp::new(seconds.checked_neg()?.checked_sub(1)?, NANOSECONDS_PER_SECOND - duration.subsec_nanos()))
+            }
         }
     }
-}
-
-/// Build a timestamp from a sign and an unsigned magnitude.
-///
-/// The single place the §16.7.2 sign-magnitude rule is expressed. Every host
-/// clock reduces to this: a direction from the epoch and a distance. Keeping the
-/// rule here means a new clock source (Windows `FILETIME`, say) cannot quietly
-/// reintroduce timespec-style borrowing, which is how both hosts' conversions
-/// went wrong in different places.
-///
-/// `nanoseconds` must be under one billion; it is the fractional part of the
-/// magnitude, never a borrow from the seconds.
-pub fn archive_timestamp_from_signed_parts(negative: bool, seconds: u64, nanoseconds: u32) -> Result<ArchiveTimestamp, TimestampConversionError> {
-    if nanoseconds >= 1_000_000_000 {
-        return Err(TimestampConversionError::SecondsOutOfRange);
-    }
-    if !negative {
-        let seconds = i64::try_from(seconds).map_err(|_| TimestampConversionError::SecondsOutOfRange)?;
-        return Ok(ArchiveTimestamp::new(seconds, nanoseconds));
-    }
-    if seconds == 0 {
-        if nanoseconds == 0 {
-            return Ok(ArchiveTimestamp::UNIX_EPOCH);
-        }
-        // Would need `-0` as the integer part, which §16.7.2 forbids.
-        return Err(TimestampConversionError::SubSecondBeforeEpoch);
-    }
-    let seconds = i64::try_from(seconds).map_err(|_| TimestampConversionError::SecondsOutOfRange)?;
-    let seconds = seconds.checked_neg().ok_or(TimestampConversionError::SecondsOutOfRange)?;
-    Ok(ArchiveTimestamp::new(seconds, nanoseconds))
 }
 
 /// Resolve POSIX owner and group names for a uid/gid pair.
@@ -315,6 +262,18 @@ impl ArchiveTimestamp {
         Self { seconds, nanoseconds }
     }
 
+    /// Encode as the §16.7.2 canonical time: `-?(0|[1-9][0-9]*)(\.[0-9]{1,9})?`.
+    ///
+    /// The struct is a **timespec** -- `tv_sec` plus a always-positive `tv_nsec`,
+    /// matching libc and every consumer that applies a restored time. §16.7.2 is
+    /// a plain signed decimal, so a negative time has to be re-expressed as a
+    /// sign and a magnitude here: `(-2, 750_000_000)` is 1.25s before the epoch
+    /// and encodes as `-1.25`, not `-2.75`.
+    ///
+    /// Writing the fields out literally -- which this used to do -- produced a
+    /// value a full second early for every pre-epoch time with a fraction. The
+    /// conversion belongs at this boundary and nowhere else; zmanager's tar
+    /// backend has carried the same rule, tested, in `tar_metadata.rs`.
     pub fn canonical_pax_value(self) -> Result<Vec<u8>, FormatError> {
         if self.nanoseconds >= 1_000_000_000 {
             return Err(FormatError::WriterUnsupported("timestamp nanoseconds must be less than one billion"));
@@ -324,7 +283,22 @@ impl ArchiveTimestamp {
         }
         let mut buffer = Vec::with_capacity(32);
         use std::io::Write;
-        write!(&mut buffer, "{}.{:09}", self.seconds, self.nanoseconds).unwrap();
+        if self.seconds < 0 {
+            // Borrow back out of the seconds: the magnitude is one less whole
+            // second than `tv_sec`, and the fraction is its complement.
+            let whole = self.seconds.unsigned_abs() - 1;
+            let fraction = 1_000_000_000 - self.nanoseconds;
+            if whole == 0 {
+                // The magnitude is under one second, so the integer part would
+                // have to be `-0`, which §16.7.2 forbids outright. The last
+                // second before the epoch is simply not encodable; say so rather
+                // than emit a value the parser will reject.
+                return Err(FormatError::WriterUnsupported("times in the last second before the Unix epoch have no revision-45 encoding"));
+            }
+            write!(&mut buffer, "-{whole}.{fraction:09}").unwrap();
+        } else {
+            write!(&mut buffer, "{}.{:09}", self.seconds, self.nanoseconds).unwrap();
+        }
         while buffer.last() == Some(&b'0') {
             buffer.pop();
         }
@@ -2264,6 +2238,13 @@ pub(crate) fn parse_timestamp(value: &[u8]) -> Result<(i64, u32), FormatError> {
     } else {
         0
     };
+    // §16.7.2 is a signed decimal; the struct is a timespec. A negative value
+    // with a fraction converts back the way `canonical_pax_value` converted it
+    // out: `-1.25` is 1.25s before the epoch, i.e. `(-2, 750_000_000)`.
+    if seconds < 0 && nanos != 0 {
+        let seconds = seconds.checked_sub(1).ok_or(FormatError::InvalidArchive("timestamp seconds exceed i64"))?;
+        return Ok((seconds, 1_000_000_000 - nanos));
+    }
     Ok((seconds, nanos))
 }
 
@@ -2491,74 +2472,6 @@ fn invalid<T>(structure: &'static str, reason: &'static str) -> Result<T, Format
 mod tests {
 
     #[test]
-    fn archive_timestamp_from_system_time_encodes_pre_epoch_as_signed_decimal() {
-        use std::time::{Duration, UNIX_EPOCH};
-
-        // §16.7.2's grammar is a plain signed decimal, so the struct is
-        // sign-magnitude: 1.5s before the epoch is `-1.5`, not a timespec's
-        // `(-2, 5e8)`. tzap-cli's own converter produced `-2.5` here -- a full
-        // second wrong -- so assert the encoded bytes, not just the fields.
-        let encoded = |before: Duration| {
-            let stamp = archive_timestamp_from_system_time(UNIX_EPOCH - before).unwrap();
-            String::from_utf8(stamp.canonical_pax_value().unwrap()).unwrap()
-        };
-        assert_eq!(encoded(Duration::new(1, 500_000_000)), "-1.5");
-        assert_eq!(encoded(Duration::new(2, 0)), "-2");
-        assert_eq!(encoded(Duration::new(11_644_473_600, 0)), "-11644473600");
-
-        let after = |since: Duration| {
-            let stamp = archive_timestamp_from_system_time(UNIX_EPOCH + since).unwrap();
-            String::from_utf8(stamp.canonical_pax_value().unwrap()).unwrap()
-        };
-        assert_eq!(after(Duration::new(0, 0)), "0");
-        assert_eq!(after(Duration::new(1, 500_000_000)), "1.5");
-        assert_eq!(after(Duration::new(1_700_000_000, 123_456_789)), "1700000000.123456789");
-    }
-
-    #[test]
-    fn archive_timestamp_from_system_time_reports_the_unrepresentable_sub_second_window() {
-        use std::time::{Duration, UNIX_EPOCH};
-
-        // `-0` is forbidden by §16.7.2, so nothing in `(-1s, 0s)` can be encoded.
-        // This is a limit of the format, and the caller is told which limit it
-        // hit rather than being handed a bare `None`.
-        for nanos in [1u32, 100, 999_999_999] {
-            assert_eq!(
-                archive_timestamp_from_system_time(UNIX_EPOCH - Duration::new(0, nanos)),
-                Err(TimestampConversionError::SubSecondBeforeEpoch),
-                "{nanos}ns before the epoch must be reported, not silently rounded"
-            );
-        }
-        // Exactly the epoch is representable, from either direction.
-        assert_eq!(archive_timestamp_from_system_time(UNIX_EPOCH), Ok(ArchiveTimestamp::UNIX_EPOCH));
-    }
-
-    #[test]
-    fn archive_timestamp_from_signed_parts_never_borrows_across_the_epoch() {
-        // The rule every clock source reduces to. A borrow would show up here as
-        // a magnitude one larger than asked for, which is exactly how both the
-        // SystemTime and the Windows FILETIME conversions were wrong.
-        let encoded = |negative, secs, nanos| {
-            let stamp = archive_timestamp_from_signed_parts(negative, secs, nanos).unwrap();
-            String::from_utf8(stamp.canonical_pax_value().unwrap()).unwrap()
-        };
-        assert_eq!(encoded(true, 1, 500_000_000), "-1.5");
-        assert_eq!(encoded(true, 1, 0), "-1");
-        assert_eq!(encoded(true, 11_644_473_600, 0), "-11644473600");
-        assert_eq!(encoded(false, 1, 500_000_000), "1.5");
-        assert_eq!(encoded(false, 0, 1), "0.000000001");
-
-        assert_eq!(archive_timestamp_from_signed_parts(true, 0, 0), Ok(ArchiveTimestamp::UNIX_EPOCH));
-        assert_eq!(archive_timestamp_from_signed_parts(false, 0, 0), Ok(ArchiveTimestamp::UNIX_EPOCH));
-        assert_eq!(archive_timestamp_from_signed_parts(true, 0, 1), Err(TimestampConversionError::SubSecondBeforeEpoch));
-        assert_eq!(archive_timestamp_from_signed_parts(true, 0, 999_999_999), Err(TimestampConversionError::SubSecondBeforeEpoch));
-
-        // A nanosecond component at or above one second is a caller bug, not a
-        // borrow to absorb.
-        assert!(archive_timestamp_from_signed_parts(false, 0, 1_000_000_000).is_err());
-    }
-
-    #[test]
     fn windows_portable_attribute_projection_maps_only_the_four_defined_bits() {
         // §16.7.1: bit 0 readonly, 1 hidden, 2 system, 3 archive; 4..31 reserved
         // and MUST be zero. Every other FILE_ATTRIBUTE_* bit must be ignored.
@@ -2703,7 +2616,9 @@ mod tests {
     fn timestamp_rejects_negative_zero_integer_component() {
         assert!(parse_timestamp(b"-0").is_err());
         assert!(parse_timestamp(b"-0.5").is_err());
-        assert_eq!(parse_timestamp(b"-1.5").unwrap(), (-1, 500_000_000));
+        // `-1.5` is 1.5s before the epoch, which in timespec form borrows a
+        // second: `(-2, 500_000_000)`. zmanager asserts the same shape.
+        assert_eq!(parse_timestamp(b"-1.5").unwrap(), (-2, 500_000_000));
     }
 
     #[test]
@@ -3095,7 +3010,8 @@ mod tests {
         assert_eq!(parse_timestamp(b"123.456").unwrap(), (123, 456_000_000));
         assert_eq!(parse_timestamp(b"123.1").unwrap(), (123, 100_000_000));
         assert_eq!(parse_timestamp(b"123.000000001").unwrap(), (123, 1));
-        assert_eq!(parse_timestamp(b"-123.001").unwrap(), (-123, 1_000_000));
+        // 123.001s before the epoch borrows a second in timespec form.
+        assert_eq!(parse_timestamp(b"-123.001").unwrap(), (-124, 999_000_000));
 
         assert!(parse_timestamp(b"").is_err());
         assert!(parse_timestamp(b"+123").is_err());

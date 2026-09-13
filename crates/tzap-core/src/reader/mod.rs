@@ -2833,8 +2833,6 @@ impl OpenedArchive {
             phase_start = phase_end;
         }
         #[cfg(windows)]
-        let mut restored = restored;
-        #[cfg(windows)]
         if options.restore_policy == crate::entry_metadata::RestorePolicy::System && options.system_authorized {
             // Directory security is restored last so children can be created
             // safely. Applying an inherited DACL can update descendant

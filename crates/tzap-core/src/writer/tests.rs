@@ -592,7 +592,7 @@ fn regular_file_writer_round_trips_mode_and_mtime() {
 
 #[test]
 fn regular_file_writer_round_trips_nanosecond_and_pre_epoch_mtimes() {
-    for expected in [ArchiveTimestamp::new(1_700_000_000, 123_456_789), ArchiveTimestamp::new(-1, 500_000_000)] {
+    for expected in [ArchiveTimestamp::new(1_700_000_000, 123_456_789), ArchiveTimestamp::new(-2, 500_000_000)] {
         let group = build_regular_file_member_group(b"dated.txt", b"dated", 0o644, expected, &PortableFileMetadata::default()).unwrap();
         let parsed = parse_tar_member_group(&group, 4096).unwrap();
         assert_eq!(parsed.mtime, expected);

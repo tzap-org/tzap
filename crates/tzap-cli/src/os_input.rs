@@ -14,7 +14,6 @@ use anyhow::Result;
 use anyhow::{anyhow, bail, Context};
 #[cfg(windows)]
 use tzap_core::encode_v45_sparse_map;
-#[cfg(unix)]
 #[cfg(windows)]
 use tzap_core::SourceEntryKind;
 #[cfg(target_os = "macos")]
@@ -921,7 +920,7 @@ pub(crate) fn archive_timestamp(time: SystemTime) -> io::Result<ArchiveTimestamp
     // `mtime=-2.5` for an instant 1.5 seconds before the epoch -- a full second
     // early -- and the error grew with the fraction. tzap-core now owns the
     // conversion, so this host and zmanager cannot disagree about it.
-    tzap_core::entry_metadata::archive_timestamp_from_system_time(time).map_err(io::Error::other)
+    tzap_core::entry_metadata::archive_timestamp_from_system_time(time).ok_or_else(|| io::Error::other("input mtime exceeds revision-45 i64 range"))
 }
 
 #[cfg(windows)]
@@ -1373,16 +1372,12 @@ pub(crate) fn windows_filetime_timestamp(value_100ns: u64) -> Result<ArchiveTime
     const WINDOWS_TO_UNIX_EPOCH_100NS: i128 = 116_444_736_000_000_000;
     const TICKS_PER_SECOND: i128 = 10_000_000;
     let unix_100ns = i128::from(value_100ns) - WINDOWS_TO_UNIX_EPOCH_100NS;
-    // `div_euclid`/`rem_euclid` is timespec semantics -- floor division with a
-    // non-negative remainder -- and this format is sign-magnitude (§16.7.2), so
-    // that wrote a FILETIME 1.5s before the epoch as `-2.5`. Reduce to a sign
-    // and a magnitude and let tzap-core apply the rule, the same as every other
-    // clock source.
-    let negative = unix_100ns < 0;
-    let magnitude = unix_100ns.unsigned_abs();
-    let seconds = u64::try_from(magnitude / TICKS_PER_SECOND as u128).map_err(|_| anyhow!("Windows timestamp exceeds revision-45 i64 range"))?;
-    let nanoseconds = (magnitude % TICKS_PER_SECOND as u128) as u32 * 100;
-    tzap_core::entry_metadata::archive_timestamp_from_signed_parts(negative, seconds, nanoseconds).map_err(|error| anyhow!(error))
+    // `div_euclid`/`rem_euclid` is exactly the timespec form the struct holds:
+    // floor division with an always-positive remainder. The §16.7.2 sign-and-
+    // magnitude conversion happens once, at the PAX boundary.
+    let seconds = i64::try_from(unix_100ns.div_euclid(TICKS_PER_SECOND)).map_err(|_| anyhow!("Windows timestamp exceeds revision-45 i64 range"))?;
+    let nanoseconds = (unix_100ns.rem_euclid(TICKS_PER_SECOND) * 100) as u32;
+    Ok(ArchiveTimestamp::new(seconds, nanoseconds))
 }
 
 #[cfg(windows)]

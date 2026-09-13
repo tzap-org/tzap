@@ -1458,11 +1458,15 @@ fn archive_timestamp_canonicalizes_fractional_pre_epoch_times() {
     assert_eq!(encoded(Duration::new(1, 500_000_000)), "-1.5");
     assert_eq!(encoded(Duration::new(2, 0)), "-2");
 
-    // `-0` is forbidden by §16.7.2, so the last second before the epoch has no
-    // encoding at all. It is now reported instead of being silently written as
-    // `-1.9999999`, which claimed an instant nearly two seconds early.
-    let error = archive_timestamp(UNIX_EPOCH - Duration::new(0, 100)).unwrap_err();
-    assert!(error.to_string().contains("last second before the Unix epoch"), "unexpected error: {error}");
+    // The struct is a timespec, so an instant inside the last second before the
+    // epoch converts fine -- 100ns before is `(-1, 999_999_900)`. It has no
+    // §16.7.2 encoding though, because the integer part would be `-0`, so the
+    // refusal lands at the PAX boundary rather than being silently written as
+    // `-1.9999999` (an instant nearly two seconds early).
+    let unencodable = archive_timestamp(UNIX_EPOCH - Duration::new(0, 100)).unwrap();
+    assert_eq!(unencodable, ArchiveTimestamp::new(-1, 999_999_900));
+    let error = unencodable.canonical_pax_value().unwrap_err();
+    assert!(format!("{error:?}").contains("last second before the Unix epoch"), "unexpected error: {error:?}");
 }
 
 #[cfg(windows)]
@@ -1470,12 +1474,17 @@ fn archive_timestamp_canonicalizes_fractional_pre_epoch_times() {
 fn windows_filetime_conversion_preserves_100ns_precision() {
     const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
     assert_eq!(windows_filetime_timestamp(UNIX_EPOCH_FILETIME + 12_345_678).unwrap(), ArchiveTimestamp::new(1, 234_567_800));
-    // 1.5s before the epoch is `-1.5`, not the timespec `(-2, 5e8)` this used to
-    // produce. See `archive_timestamp_canonicalizes_fractional_pre_epoch_times`.
-    assert_eq!(windows_filetime_timestamp(UNIX_EPOCH_FILETIME - 15_000_000).unwrap(), ArchiveTimestamp::new(-1, 500_000_000));
+    // The struct is a timespec, so 1.5s before the epoch borrows a second:
+    // `(-2, 500_000_000)`. It encodes as `-1.5` at the PAX boundary.
+    let pre_epoch = windows_filetime_timestamp(UNIX_EPOCH_FILETIME - 15_000_000).unwrap();
+    assert_eq!(pre_epoch, ArchiveTimestamp::new(-2, 500_000_000));
+    assert_eq!(String::from_utf8(pre_epoch.canonical_pax_value().unwrap()).unwrap(), "-1.5");
     assert_eq!(windows_filetime_timestamp(0).unwrap(), ArchiveTimestamp::new(-11_644_473_600, 0));
-    // One tick before the epoch is inside the unrepresentable sub-second window.
-    assert!(windows_filetime_timestamp(UNIX_EPOCH_FILETIME - 1).is_err());
+    // One tick before the epoch converts fine, but has no §16.7.2 encoding: its
+    // integer part would be `-0`. The refusal lands at the PAX boundary.
+    let unencodable = windows_filetime_timestamp(UNIX_EPOCH_FILETIME - 1).unwrap();
+    assert_eq!(unencodable, ArchiveTimestamp::new(-1, 999_999_900));
+    assert!(unencodable.canonical_pax_value().is_err());
 }
 
 #[cfg(windows)]
