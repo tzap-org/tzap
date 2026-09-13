@@ -2,7 +2,9 @@ use super::*;
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::fs::{self, File};
+#[cfg(any(windows, target_os = "linux"))]
+use std::fs::File;
+use std::fs::{self};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -693,7 +695,7 @@ impl RegularFileSource for InputSpec {
             }
             return Ok(Box::new(io::empty()));
         }
-        let file = File::open(&self.source).map_err(ArchiveWriteError::Io)?;
+        let file = open_input_for_archiving(&self.source).map_err(ArchiveWriteError::Io)?;
         // A regular file that moved between the scan and this open is not a
         // reason to refuse the archive. The member is written at exactly the
         // length its header already promised -- the reader clamps a file that

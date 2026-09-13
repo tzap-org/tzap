@@ -731,6 +731,30 @@ fn record_input_changed_during_read(path: &str, declared: u64, padded: u64) {
 }
 
 /// Note a regular input that moved between the scan and the read of its bytes.
+/// Open a regular input for archiving, denying writers while it is read.
+///
+/// This is 7-Zip's default (`CArchiveUpdateCallback::GetStream2` opens with
+/// `ShareForWrite = false`; `-ssw` opts back in). Windows share modes make the
+/// race preventable rather than something to detect and paper over, which is
+/// why it is the first thing to reach for there.
+///
+/// POSIX has no equivalent -- its locks are advisory -- so on those hosts this
+/// is an ordinary open and the reader's clamp-and-pad still carries the load.
+pub(crate) fn open_input_for_archiving(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_SHARE_READ only: another reader is fine, a writer is not. Rust's
+        // `File::open` would also permit FILE_SHARE_WRITE and FILE_SHARE_DELETE.
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
 pub(crate) fn note_input_changed_before_read(path: &str, declared: u64) {
     record_input_changed_during_read(path, declared, 0);
 }
