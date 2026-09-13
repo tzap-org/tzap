@@ -55,6 +55,28 @@ fn test_master_key() -> MasterKey {
     MasterKey::from_raw_key(&[0x42; MASTER_KEY_LEN]).unwrap()
 }
 
+/// Clear `FILE_ATTRIBUTE_READONLY` so a temp directory can be removed.
+///
+/// `Permissions::set_readonly(false)` is what `clippy::permissions_set_readonly_false`
+/// warns about: on Unix it grants world-write, so the call means something quite
+/// different per platform. These are Windows-only cleanup paths, but clearing the
+/// one attribute directly says what is meant and keeps the lint clean -- CI only
+/// runs clippy on the ubuntu job, so a Windows-only lint failure is invisible there.
+#[cfg(windows)]
+fn clear_windows_readonly(path: &Path) {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_READONLY, INVALID_FILE_ATTRIBUTES};
+
+    let wide = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    // SAFETY: `wide` is NUL-terminated and live for both synchronous calls.
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return;
+    }
+    // SAFETY: as above.
+    unsafe { SetFileAttributesW(wide.as_ptr(), attributes & !FILE_ATTRIBUTE_READONLY) };
+}
+
 #[cfg(windows)]
 fn windows_test_tempdir() -> tempfile::TempDir {
     let Some(root) = std::env::var_os("TZAP_WINDOWS_TEST_ROOT") else {
@@ -2657,9 +2679,7 @@ fn windows_directory_archive_round_trips_into_a_traversable_tree() {
     fs::write(restored_root.join("added-after-restore.bin"), b"writable").unwrap();
     assert_eq!(fs::read(restored_root.join("added-after-restore.bin")).unwrap(), b"writable");
 
-    let mut restore = fs::metadata(&source).unwrap().permissions();
-    restore.set_readonly(false);
-    fs::set_permissions(&source, restore).unwrap();
+    clear_windows_readonly(&source);
 }
 
 #[cfg(windows)]
@@ -2691,9 +2711,7 @@ fn windows_read_only_directory_still_projects_a_writable_mode() {
     assert_eq!(by_path("locked.bin").mode & 0o777, 0o444, "a read-only file must keep its read-only projection");
 
     // Leave the directory writable so the temp dir can be removed.
-    let mut restore = fs::metadata(&source).unwrap().permissions();
-    restore.set_readonly(false);
-    fs::set_permissions(&source, restore).unwrap();
+    clear_windows_readonly(&source);
 }
 
 #[cfg(windows)]
@@ -3209,10 +3227,13 @@ fn test_verify_option_rejections_and_warnings() {
 #[test]
 fn test_sparse_extent_input_reader_and_macos_system_xattr() {
     use std::io::{Read, Write};
-    use tzap_core::entry_metadata::SparseExtent;
 
     #[cfg(not(windows))]
     {
+        // Scoped to the arm that uses it: at function scope this is an unused
+        // import on Windows, and clippy only runs on the ubuntu CI job.
+        use tzap_core::entry_metadata::SparseExtent;
+
         let temp = tempfile::tempdir().unwrap();
         let file_path = temp.path().join("sparse_test.bin");
         let mut f = fs::File::create(&file_path).unwrap();

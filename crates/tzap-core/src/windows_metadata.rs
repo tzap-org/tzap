@@ -47,7 +47,15 @@ pub fn capture_windows_metadata(input: &Path) -> io::Result<NativeFileMetadata> 
         None
     };
     native.auxiliary_records.push(capture_windows_security_descriptor(&file)?);
-    if basic.FileAttributes & 0x0000_0010 != 0 {
+    // An encrypted file must be captured in its raw, still-encrypted form. Read
+    // the ordinary way it would yield plaintext and silently undo the user's
+    // encryption -- see `capture_windows_efs_raw`.
+    const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x0000_4000;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    if basic.FileAttributes & FILE_ATTRIBUTE_ENCRYPTED != 0 && basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        native.auxiliary_records.push(capture_windows_efs_raw(input)?);
+    }
+    if basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
         if let Some(case_sensitive) = query_windows_directory_case_sensitive(&file)? {
             native.primary_pax_records.insert("TZAP.windows.directory-case-sensitive".into(), if case_sensitive { b"1" } else { b"0" }.to_vec());
         }
@@ -371,4 +379,93 @@ fn capture_windows_backup_streams(file: &File, expected_reparse: Option<&[u8]>) 
     let metadata = file.metadata()?;
     let data_attributes = data_attributes.unwrap_or_else(|| if metadata.file_attributes() & 0x0000_0200 != 0 { 8 } else { 0 });
     Ok((data_attributes, auxiliary))
+}
+
+/// A raw EFS export context, closed exactly once on drop.
+struct WindowsRawEfsContext(*mut std::ffi::c_void);
+
+impl Drop for WindowsRawEfsContext {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Storage::FileSystem::CloseEncryptedFileRaw;
+
+        if !self.0.is_null() {
+            // SAFETY: returned by OpenEncryptedFileRawW and closed once.
+            unsafe { CloseEncryptedFileRaw(self.0) };
+        }
+    }
+}
+
+fn open_windows_raw_efs(path: &Path, flags: u32) -> io::Result<WindowsRawEfsContext> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::ptr;
+    use windows_sys::Win32::Storage::FileSystem::OpenEncryptedFileRawW;
+
+    let wide = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let mut context = ptr::null_mut();
+    // SAFETY: the path is NUL-terminated and `context` is a valid output pointer.
+    let status = unsafe { OpenEncryptedFileRawW(wide.as_ptr(), flags, &mut context) };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(WindowsRawEfsContext(context))
+}
+
+struct WindowsRawEfsDigest {
+    hasher: sha2::Sha256,
+    size: u64,
+}
+
+unsafe extern "system" fn hash_windows_raw_efs_callback(data: *const u8, context: *const std::ffi::c_void, length: u32) -> u32 {
+    use sha2::Digest as _;
+    use windows_sys::Win32::Foundation::{ERROR_ARITHMETIC_OVERFLOW, ERROR_INVALID_PARAMETER, ERROR_SUCCESS};
+
+    if length == 0 {
+        return ERROR_SUCCESS;
+    }
+    if data.is_null() || context.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    // SAFETY: EFS supplies `length` readable bytes and the caller supplied this digest context.
+    let bytes = unsafe { std::slice::from_raw_parts(data, length as usize) };
+    // SAFETY: the context is the digest state passed to ReadEncryptedFileRaw.
+    let state = unsafe { &mut *context.cast_mut().cast::<WindowsRawEfsDigest>() };
+    let Some(size) = state.size.checked_add(u64::from(length)) else {
+        return ERROR_ARITHMETIC_OVERFLOW;
+    };
+    state.hasher.update(bytes);
+    state.size = size;
+    ERROR_SUCCESS
+}
+
+/// Size and SHA-256 of a file's raw EFS export.
+pub fn hash_windows_raw_efs(path: &Path) -> io::Result<(u64, [u8; 32])> {
+    use sha2::Digest as _;
+    use windows_sys::Win32::Storage::FileSystem::ReadEncryptedFileRaw;
+
+    let context = open_windows_raw_efs(path, 0)?;
+    let mut state = WindowsRawEfsDigest { hasher: sha2::Sha256::new(), size: 0 };
+    // SAFETY: the callback state and the raw EFS context stay live for the
+    // synchronous export.
+    let status = unsafe { ReadEncryptedFileRaw(Some(hash_windows_raw_efs_callback), (&mut state as *mut WindowsRawEfsDigest).cast(), context.0) };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok((state.size, state.hasher.finalize().into()))
+}
+
+/// Capture the raw EFS form of an encrypted file.
+///
+/// An EFS-encrypted file read the ordinary way yields **plaintext** to whoever
+/// holds the key -- so an archiver that does that silently undoes the protection
+/// the user asked for. Windows exposes `ReadEncryptedFileRaw` precisely so a
+/// backup tool can copy the still-encrypted form, and §16.18.3 requires "EFS raw
+/// capture where supported".
+///
+/// This lived only in `tzap-cli`, so archives written through any other host --
+/// zmanager included -- plaintext-substituted every encrypted file.
+fn capture_windows_efs_raw(path: &Path) -> io::Result<NativeAuxiliaryMetadata> {
+    let (size, sha256) = hash_windows_raw_efs(path)?;
+    let mut record = NativeAuxiliaryMetadata::new_streamed("windows.efs-raw", "windows-backup-v1", RestoreClass::System, size, sha256);
+    record.meta.insert("TZAP.aux.meta.efs-version".into(), b"1".to_vec());
+    Ok(record)
 }

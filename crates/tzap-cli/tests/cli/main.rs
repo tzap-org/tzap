@@ -815,6 +815,32 @@ fn cli_windows_entry_kind_restore_policy_matrix() {
         .assert()
         .success();
 
+    // Capture completeness, asserted separately from restore per §16.18 -- the
+    // same guard the Linux and macOS matrices carry. Reading the archive's index
+    // proves what capture recorded regardless of which restore policy runs, and
+    // in particular that the alternate data streams reached the archive: every
+    // restore assertion below is about the extracted tree, so a silent capture
+    // drop would look identical to a policy correctly skipping them.
+    let captured = captured_index_entries(&archive, &keyfile);
+    for path in ["matrix", "matrix/directory", "matrix/directory/file.txt", "matrix/link.txt"] {
+        assert!(captured.contains_key(path), "capture lost {path}; archive holds {:?}", captured.keys().collect::<Vec<_>>());
+    }
+    assert_eq!(captured["matrix/directory/file.txt"].kind, "file");
+    assert_eq!(captured["matrix/directory"].kind, "directory");
+    assert_eq!(captured["matrix/link.txt"].kind, "symlink");
+    assert_eq!(captured["matrix/directory/file.txt"].size, "14");
+    assert!(
+        captured["matrix/link.txt"].link_target.ends_with("file.txt"),
+        "symlink target must reach the archive: {:?}",
+        captured["matrix/link.txt"].link_target
+    );
+
+    // Windows has no POSIX mode, so one is projected. A directory must keep its
+    // traverse bit or a restore onto a POSIX host cannot descend into the tree.
+    // `list --long` prints the mode as decimal: 0o755 is 493, 0o644 is 420.
+    assert_eq!(captured["matrix/directory"].mode, "493", "directory mode projection");
+    assert_eq!(captured["matrix/directory/file.txt"].mode, "420", "regular file mode projection");
+
     let policies: &[&str] = if windows_process_is_elevated() { &["portable", "same-os", "system"] } else { &["portable", "same-os"] };
     for &policy in policies {
         let destination = temp.path().join(format!("extract-{policy}"));
