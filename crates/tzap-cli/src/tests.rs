@@ -2377,6 +2377,64 @@ fn windows_directory_input_survives_a_non_resident_index() {
 
 #[cfg(windows)]
 #[test]
+fn windows_directory_archive_round_trips_into_a_traversable_tree() {
+    // The two tests above assert the mode the capture step records. That is not the
+    // property that matters: what matters is that the archive extracts back into a
+    // tree that can actually be entered and added to. Archive a directory whose NTFS
+    // index has outgrown its MFT record, restore it, and walk the result.
+    let temp = windows_test_tempdir();
+    let source = temp.path().join("corpus");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(source.join("nested")).unwrap();
+    for i in 0..48 {
+        fs::write(source.join(format!("f{i:03}.bin")), format!("body {i}").as_bytes()).unwrap();
+        fs::write(source.join("nested").join(format!("n{i:03}.bin")), format!("nested {i}").as_bytes()).unwrap();
+    }
+    // Mark the tree read-only: on Windows that restricts nothing for a directory, so
+    // it must not travel into the archive as an unwritable mode.
+    let mut dir_permissions = fs::metadata(&source).unwrap().permissions();
+    dir_permissions.set_readonly(true);
+    fs::set_permissions(&source, dir_permissions).unwrap();
+
+    let specs = collect_input_specs(&[source.to_string_lossy().into_owned()]).unwrap_or_else(|error| panic!("{error:#}"));
+    let master_key = MasterKey::from_raw_key(&[29u8; 32]).unwrap();
+    let mut sink = MemoryArchiveSink::default();
+    write_archive_sources_to_sink(
+        &specs,
+        &master_key,
+        WriterOptions { stripe_width: 1, volume_loss_tolerance: 0, bit_rot_buffer_pct: 0, ..WriterOptions::default() },
+        None,
+        &KdfParams::Raw,
+        None,
+        None,
+        &mut sink,
+    )
+    .unwrap();
+
+    let opened = tzap_core::open_archive(&sink.volumes[0], &master_key).unwrap();
+    opened.verify().unwrap();
+    let output = temp.path().join("restored");
+    fs::create_dir(&output).unwrap();
+    opened.extract_all_to(&output, SafeExtractionOptions::default()).unwrap();
+
+    // Every member came back, through directories that had to be entered to read them.
+    let restored_root = output.join("corpus");
+    for i in 0..48 {
+        assert_eq!(fs::read(restored_root.join(format!("f{i:03}.bin"))).unwrap(), format!("body {i}").as_bytes());
+        assert_eq!(fs::read(restored_root.join("nested").join(format!("n{i:03}.bin"))).unwrap(), format!("nested {i}").as_bytes());
+    }
+    // And the restored directory still accepts new entries: a projection that dropped
+    // the write bit would leave a tree nothing could be added to.
+    fs::write(restored_root.join("added-after-restore.bin"), b"writable").unwrap();
+    assert_eq!(fs::read(restored_root.join("added-after-restore.bin")).unwrap(), b"writable");
+
+    let mut restore = fs::metadata(&source).unwrap().permissions();
+    restore.set_readonly(false);
+    fs::set_permissions(&source, restore).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_read_only_directory_still_projects_a_writable_mode() {
     // Windows' read-only attribute does not restrict a directory: entries can still
     // be created inside one, and Explorer uses the flag to mark customized folders.
