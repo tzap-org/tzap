@@ -121,10 +121,12 @@ candidate_round_trip() {
   local pos flagged
   pos=$(vols_positional "$work" "$prefix"); flagged=$(vols_flagged "$work" "$prefix")
   [ -n "$pos" ] || { echo "  FAIL [$name] candidate produced no archive"; return 1; }
-  $NEW verify $key $pos >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate verify: $(tail -1 "$work/rt.e")"; return 1; }
-  $NEW list $key $flagged >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate list: $(tail -1 "$work/rt.e")"; return 1; }
+  # --password-stdin wants the passphrase on stdin; every other key source ignores it.
+  feed_key() { case "$key" in *--password-stdin*) printf '%s\n' "$PASSPHRASE" ;; *) : ;; esac; }
+  feed_key | $NEW verify $key $pos >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate verify: $(tail -1 "$work/rt.e")"; return 1; }
+  feed_key | $NEW list $key $flagged >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate list: $(tail -1 "$work/rt.e")"; return 1; }
   rm -rf "$work/rt.out"
-  $NEW extract $key -C "$work/rt.out" $flagged >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate extract: $(tail -1 "$work/rt.e")"; return 1; }
+  feed_key | $NEW extract $key -C "$work/rt.out" $flagged >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate extract: $(tail -1 "$work/rt.e")"; return 1; }
   if [ -n "$tree" ] && ! diff -r "$tree" "$work/rt.out/$tree" >/dev/null 2>&1; then
     echo "  FAIL [$name] candidate extracted tree differs from the source"; return 1
   fi
@@ -283,8 +285,25 @@ PASSPHRASE="correct horse battery staple"
 password_combo() {
   local name="$1"; shift
   local extra=("$@")
+  local read_key="--password-stdin"
   local work; work=$(mktemp -d)
   if ! printf '%s\n' "$PASSPHRASE" | $OLD create --password-stdin "${extra[@]}" -o "$work/old.tzap" corpus >/dev/null 2>"$work/e"; then
+    # Same reference-rejects handling as run_combo: the candidate must either
+    # reject identically, or -- for a reason listed in EXPECTED_FIXES -- accept it
+    # and survive its own round trip.
+    if printf '%s\n' "$PASSPHRASE" | $NEW create --password-stdin "${extra[@]}" -o "$work/probe.tzap" corpus >/dev/null 2>"$work/probe.err"; then
+      if is_expected_fix "$(cat "$work/e")"; then
+        candidate_round_trip "$name" "$work" probe corpus "$read_key" \
+          || { FAIL=$((FAIL+1)); FAILED_COMBOS+=("$name:candidate-round-trip"); rm -rf "$work"; return; }
+        FIXED=$((FIXED+1)); FIXED_COMBOS+=("$name"); rm -rf "$work"; return
+      fi
+      echo "  FAIL [$name] reference rejects this combo but the candidate accepts it: $(tail -1 "$work/e")"
+      FAIL=$((FAIL+1)); FAILED_COMBOS+=("$name:accepts-rejected-combo"); rm -rf "$work"; return
+    fi
+    if ! diff -q <(normalise_err "$work/e" | tail -1) <(normalise_err "$work/probe.err" | tail -1) >/dev/null 2>&1; then
+      echo "  FAIL [$name] both reject but differently: ref=[$(tail -1 "$work/e")] cand=[$(tail -1 "$work/probe.err")]"
+      FAIL=$((FAIL+1)); FAILED_COMBOS+=("$name:reject-mismatch"); rm -rf "$work"; return
+    fi
     SKIP=$((SKIP+1)); SKIPPED_COMBOS+=("$name -- $(tail -1 "$work/e" | head -c 100)"); rm -rf "$work"; return
   fi
   printf '%s\n' "$PASSPHRASE" | $NEW create --password-stdin "${extra[@]}" -o "$work/new.tzap" corpus >/dev/null 2>&1
