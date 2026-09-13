@@ -2755,6 +2755,59 @@ fn assert_every_read_surface_agrees(archive: &WrittenArchive, bodies: &[(String,
 }
 
 #[test]
+fn dictionary_archives_serve_every_read_surface_across_volume_and_parity_shapes() {
+    // Dictionary archives are covered today only as single-volume archives of a few
+    // members, so the dictionary object never had to survive volume striping, a
+    // parity rebuild, or a corpus large enough to span envelopes.
+    let bodies = matrix_corpus(160);
+    let files = bodies.iter().map(|(path, body)| RegularFile::new(path, body)).collect::<Vec<_>>();
+    let dictionary = (0..32_768u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect::<Vec<u8>>();
+
+    for (shape, options) in [
+        ("dictionary, 1 volume, no parity", WriterOptions { bit_rot_buffer_pct: 0, ..single_stream_options() }),
+        ("dictionary, 1 volume, default parity", single_stream_options()),
+        ("dictionary, 2 volumes", WriterOptions { stripe_width: 2, volume_loss_tolerance: 1, ..single_stream_options() }),
+        ("dictionary, 3 volumes, high parity", WriterOptions { stripe_width: 3, volume_loss_tolerance: 1, bit_rot_buffer_pct: 30, ..single_stream_options() }),
+    ] {
+        let archive = write_archive_with_dictionary(&files, &master_key(), options, &dictionary).unwrap_or_else(|err| panic!("{shape}: write failed: {err:?}"));
+        assert_eq!(archive.volumes.len(), options.stripe_width as usize, "{shape}: volume count");
+        assert_every_read_surface_agrees(&archive, &bodies, shape);
+    }
+}
+
+#[test]
+fn root_auth_archives_serve_every_read_surface_across_volume_and_parity_shapes() {
+    // RootAuth is covered on tiny archives; the footer commits to a Merkle root over
+    // every data block, so it needs a corpus that actually produces many blocks, and
+    // volume shapes that stripe them.
+    let bodies = matrix_corpus(160);
+    let files = bodies.iter().map(|(path, body)| RegularFile::new(path, body)).collect::<Vec<_>>();
+    let config = RootAuthWriterConfig { authenticator_id: 0x7777, signer_identity_type: 1, signer_identity: b"matrix signer", authenticator_value_length: 32 };
+
+    for (shape, options) in [
+        ("root-auth, 1 volume, no parity", WriterOptions { bit_rot_buffer_pct: 0, ..single_stream_options() }),
+        ("root-auth, 1 volume, default parity", single_stream_options()),
+        ("root-auth, 2 volumes", WriterOptions { stripe_width: 2, volume_loss_tolerance: 1, ..single_stream_options() }),
+        ("root-auth, 4 volumes, high parity", WriterOptions { stripe_width: 4, volume_loss_tolerance: 1, bit_rot_buffer_pct: 30, ..single_stream_options() }),
+    ] {
+        let archive = write_archive_with_root_auth(&files, &master_key(), options, config, |request| Ok(request.archive_root.to_vec()))
+            .unwrap_or_else(|err| panic!("{shape}: write failed: {err:?}"));
+        assert_eq!(archive.volumes.len(), options.stripe_width as usize, "{shape}: volume count");
+        assert_every_read_surface_agrees(&archive, &bodies, shape);
+
+        // The signed root must still validate, not just the payload.
+        let volume_refs = archive.volumes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let opened = open_archive_volumes(&volume_refs, &master_key()).unwrap();
+        // The test authenticator echoes the archive root, so accept exactly that.
+        let verified = opened
+            .verify_root_auth_with(|footer, archive_root| Ok(footer.authenticator_value == archive_root))
+            .unwrap_or_else(|err| panic!("{shape}: root-auth verify failed: {err:?}"));
+        assert_eq!(verified.authenticator_id, 0x7777, "{shape}: authenticator id");
+        assert_eq!(verified.signer_identity_bytes, b"matrix signer".to_vec(), "{shape}: signer identity");
+    }
+}
+
+#[test]
 fn every_read_surface_agrees_across_an_index_shard_boundary() {
     // Index shards hold 10_000 files, so every other reader test in this file runs
     // against a single-shard archive: shard-table range selection, the cross-shard
