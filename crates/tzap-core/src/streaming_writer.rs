@@ -510,10 +510,11 @@ fn read_gnu_sparse_1_0_map<R: Read>(payload: &mut LimitedTarPayloadReader<'_, R>
         // zero -- so the rewrite this path performs drops them. Rejecting them
         // instead refused every sparse member ending in a hole.
         //
-        // Dropping is not a relaxation. A zero-length entry still may not appear
-        // before an extent already accepted, and it deliberately does not advance
-        // `previous_end`, so it can neither hide an overlap nor separate two real
-        // extents that the source failed to merge.
+        // Dropping is not a relaxation: a zero-length entry still may not appear
+        // before an extent already accepted. It deliberately does not advance
+        // `previous_end` either, since carrying no bytes it cannot make a later
+        // real extent overlapping or adjacent -- moving the running end to a
+        // terminator's offset would reject maps that are perfectly well formed.
         if length == 0 {
             if offset < previous_end {
                 return Err(FormatError::InvalidArchive("GNU sparse extents overlap, are empty, or are not merged").into());
@@ -1090,6 +1091,109 @@ mod tests {
         let logical = opened.extract_file("hole.bin").unwrap().unwrap();
         assert_eq!(logical.len(), 1 << 20);
         assert!(logical.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn tar_stdin_accepts_the_zero_length_terminator_gnu_tar_actually_emits() {
+        // The map GNU tar and libarchive write for a file that ends in a hole:
+        // real extents, then a zero-length entry at the logical size. bsdtar emits
+        // exactly `2\n0\n4096\n1048576\n0\n` for a 1 MiB file holding 4 KiB of data
+        // at the front, and that member used to be refused outright with "GNU
+        // sparse extents overlap, are empty, or are not merged".
+        let data = vec![b'z'; 4096];
+        let input = gnu_sparse_1_0_tar("terminated.bin", 1 << 20, b"2\n0\n4096\n1048576\n0\n", &data);
+        let archive = write_tar_stream_archive(input.as_slice(), &master_key(), options()).unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        opened.verify().unwrap();
+
+        let logical = opened.extract_file("terminated.bin").unwrap().unwrap();
+        assert_eq!(logical.len(), 1 << 20);
+        assert_eq!(&logical[..4096], data.as_slice());
+        assert!(logical[4096..].iter().all(|byte| *byte == 0), "the terminator must not materialize as stored bytes");
+    }
+
+    #[test]
+    fn tar_stdin_accepts_a_wholly_sparse_member_from_a_real_tar() {
+        // `truncate -s 1048576` then `tar cf -` produces `2\n0\n0\n1048576\n0\n`:
+        // a zero-length entry at the front because the file opens with a hole, and
+        // the terminator. Every row is zero-length, so the rewrite must leave no
+        // extents at all -- the all-hole encoding §16.7.5 allows.
+        let input = gnu_sparse_1_0_tar("all-hole.bin", 1 << 20, b"2\n0\n0\n1048576\n0\n", b"");
+        let archive = write_tar_stream_archive(input.as_slice(), &master_key(), options()).unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        opened.verify().unwrap();
+
+        let logical = opened.extract_file("all-hole.bin").unwrap().unwrap();
+        assert_eq!(logical.len(), 1 << 20);
+        assert!(logical.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn tar_stdin_drops_a_leading_zero_length_entry_without_faulting_the_first_real_extent() {
+        // A leading `0 0` followed by a real extent that also starts at 0. The
+        // dropped row must not leave the real extent looking unmerged against the
+        // initial `previous_end` of zero.
+        let data = b"payload".to_vec();
+        let map = format!("3\n0\n0\n0\n{}\n65536\n0\n", data.len());
+        let input = gnu_sparse_1_0_tar("leading-zero.bin", 1 << 16, map.as_bytes(), &data);
+        let archive = write_tar_stream_archive(input.as_slice(), &master_key(), options()).unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        opened.verify().unwrap();
+
+        let logical = opened.extract_file("leading-zero.bin").unwrap().unwrap();
+        assert_eq!(logical.len(), 1 << 16);
+        assert_eq!(&logical[..data.len()], data.as_slice());
+        assert!(logical[data.len()..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn tar_stdin_lets_a_dropped_zero_length_entry_constrain_nothing_that_follows() {
+        // A zero-length row carries no bytes, so it must not tighten the running
+        // end against a later real extent. Here the dropped row sits at 8192 while
+        // the extent after it starts at 6144: sorted output still results, because
+        // the row contributes nothing to it. Advancing the running end to a
+        // zero-length row's offset would reject this map for an overlap that does
+        // not exist, and the extents actually stored are re-validated as canonical
+        // by `sparse_extent_bytes` on the way out regardless.
+        let data = vec![b'q'; 6144];
+        let input = gnu_sparse_1_0_tar("loose-terminator.bin", 1 << 16, b"3\n0\n4096\n8192\n0\n6144\n2048\n", &data);
+        let archive = write_tar_stream_archive(input.as_slice(), &master_key(), options()).unwrap();
+        let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+        opened.verify().unwrap();
+
+        let logical = opened.extract_file("loose-terminator.bin").unwrap().unwrap();
+        assert_eq!(logical.len(), 1 << 16);
+        assert_eq!(&logical[..4096], &data[..4096]);
+        assert_eq!(&logical[6144..8192], &data[4096..]);
+        assert!(logical[4096..6144].iter().all(|byte| *byte == 0), "the gap between the two extents stays a hole");
+        assert!(logical[8192..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn tar_stdin_still_rejects_the_malformed_sparse_maps_the_zero_length_rule_used_to_catch() {
+        // Dropping zero-length rows must not become a way to smuggle a bad map
+        // past the canonicality checks, so pin each rejection that still applies.
+        let reject = |label: &str, logical_size: u64, map: &str, data: &[u8]| {
+            let input = gnu_sparse_1_0_tar("bad.bin", logical_size, map.as_bytes(), data);
+            let error = write_tar_stream_archive(input.as_slice(), &master_key(), options()).unwrap_err();
+            assert!(matches!(error, FormatError::InvalidArchive(_)), "{label}: expected a malformed-archive rejection, got {error:?}");
+        };
+
+        // Overlapping real extents.
+        reject("overlap", 1 << 16, "2\n0\n4096\n2048\n4096\n", &vec![b'x'; 8192]);
+        // Adjacent real extents the source failed to merge.
+        reject("unmerged", 1 << 16, "2\n0\n4096\n4096\n4096\n", &vec![b'x'; 8192]);
+        // A zero-length row sitting before an extent already accepted is itself
+        // out of order. The following extent is deliberately neither overlapping
+        // nor adjacent, so nothing but the ordering guard on the dropped row can
+        // reject this map.
+        reject("zero-length rewinds", 1 << 16, "3\n8192\n4096\n0\n0\n16384\n4096\n", &vec![b'x'; 8192]);
+        // A zero-length row cannot bridge two extents that are really adjacent.
+        reject("zero-length bridges", 1 << 16, "3\n0\n4096\n4096\n0\n4096\n4096\n", &vec![b'x'; 8192]);
+        // The terminator is still bounded by the logical size.
+        reject("terminator past logical size", 4096, "2\n0\n4096\n8192\n0\n", &vec![b'x'; 4096]);
+        // Stored bytes must still equal the sum of the kept extent lengths.
+        reject("stored size disagrees", 1 << 16, "2\n0\n4096\n65536\n0\n", &vec![b'x'; 2048]);
     }
 
     #[test]

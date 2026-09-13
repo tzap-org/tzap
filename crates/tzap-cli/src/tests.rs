@@ -976,6 +976,106 @@ fn format_duration_three_decimal_seconds() {
     assert_eq!(format_duration(Duration::from_nanos(42)), "0.000s");
 }
 
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_round_trips_without_resolving_its_target() {
+    // A symlink whose target does not exist must be stored and restored as a link
+    // to that same name, not followed, not skipped, and not turned into a regular
+    // file. Nothing covered this before, and a writer that resolved the target
+    // would fail outright while one that skipped it would lose the member silently.
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("corpus");
+    fs::create_dir(&source).unwrap();
+    symlink("target-that-does-not-exist.bin", source.join("dangling.sym")).unwrap();
+    symlink("../outside-the-tree.bin", source.join("dangling-escape.sym")).unwrap();
+
+    let specs = collect_input_specs(&[source.to_string_lossy().into_owned()]).unwrap_or_else(|error| panic!("{error:#}"));
+    let link = |name: &str| specs.iter().find(|spec| spec.archive_path.ends_with(name)).unwrap_or_else(|| panic!("missing {name}"));
+    assert_eq!(link("dangling.sym").entry_kind, SourceEntryKind::Symlink);
+    assert_eq!(link("dangling.sym").link_target.as_deref(), Some(b"target-that-does-not-exist.bin".as_slice()));
+    assert_eq!(link("dangling.sym").size, 0, "a symlink carries no payload");
+    assert_eq!(link("dangling-escape.sym").link_target.as_deref(), Some(b"../outside-the-tree.bin".as_slice()));
+
+    let key = MasterKey::from_raw_key(&[57u8; 32]).unwrap();
+    let mut sink = tzap_core::MemoryArchiveSink::default();
+    tzap_core::write_archive_sources_to_sink(
+        &specs,
+        &key,
+        WriterOptions { stripe_width: 1, volume_loss_tolerance: 0, bit_rot_buffer_pct: 0, ..WriterOptions::default() },
+        None,
+        &KdfParams::Raw,
+        None,
+        None,
+        &mut sink,
+    )
+    .unwrap();
+    let opened = tzap_core::open_archive(&sink.volumes[0], &key).unwrap();
+    opened.verify().unwrap();
+
+    let output = temp.path().join("restored");
+    fs::create_dir(&output).unwrap();
+    opened.extract_all_to(&output, tzap_core::SafeExtractionOptions::default()).unwrap();
+
+    // Still a symlink, still dangling, still pointing at the same name.
+    let restored = output.join("corpus/dangling.sym");
+    let restored_metadata = fs::symlink_metadata(&restored).unwrap();
+    assert!(restored_metadata.file_type().is_symlink(), "restored entry is not a symlink");
+    assert_eq!(fs::read_link(&restored).unwrap(), std::path::Path::new("target-that-does-not-exist.bin"));
+    assert!(fs::metadata(&restored).is_err(), "the target should still not resolve");
+    assert_eq!(fs::read_link(output.join("corpus/dangling-escape.sym")).unwrap(), std::path::Path::new("../outside-the-tree.bin"));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_to_a_directory_is_stored_as_a_link_not_walked_into() {
+    // A link to a directory must be archived as a link. A writer that walked it
+    // would duplicate the whole subtree under the link's name, and one that
+    // followed it into a cycle would not terminate.
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("corpus");
+    fs::create_dir_all(source.join("real-dir")).unwrap();
+    fs::write(source.join("real-dir/inner.bin"), b"inner").unwrap();
+    symlink("real-dir", source.join("link-to-dir.sym")).unwrap();
+    symlink(".", source.join("link-to-self.sym")).unwrap();
+
+    let specs = collect_input_specs(&[source.to_string_lossy().into_owned()]).unwrap_or_else(|error| panic!("{error:#}"));
+    let link = |name: &str| specs.iter().find(|spec| spec.archive_path.ends_with(name)).unwrap_or_else(|| panic!("missing {name}"));
+    assert_eq!(link("link-to-dir.sym").entry_kind, SourceEntryKind::Symlink);
+    assert_eq!(link("link-to-dir.sym").link_target.as_deref(), Some(b"real-dir".as_slice()));
+    assert_eq!(link("link-to-self.sym").entry_kind, SourceEntryKind::Symlink, "a self-referential link must not be walked");
+
+    // The subtree appears exactly once, under the real directory, never under the link.
+    assert_eq!(specs.iter().filter(|spec| spec.archive_path.ends_with("inner.bin")).count(), 1, "the subtree was duplicated through the link");
+    assert!(!specs.iter().any(|spec| spec.archive_path.contains("link-to-dir.sym/")), "the writer walked into the link");
+}
+
+#[test]
+fn archive_paths_differing_only_by_case_are_distinct_members() {
+    // tzap paths are case-sensitive, so two members differing only by case are two
+    // members. That matters on restore to a case-insensitive filesystem, where the
+    // second would otherwise silently overwrite the first.
+    let archive_paths = ["Readme.md", "README.md", "readme.md"];
+    let bodies: Vec<(String, Vec<u8>)> = archive_paths.iter().map(|path| ((*path).to_string(), format!("body of {path}").into_bytes())).collect();
+    let files: Vec<tzap_core::writer::RegularFile<'_>> = bodies.iter().map(|(path, body)| tzap_core::writer::RegularFile::new(path, body)).collect();
+
+    let key = MasterKey::from_raw_key(&[61u8; 32]).unwrap();
+    let archive = tzap_core::writer::write_archive(&files, &key, WriterOptions { stripe_width: 1, volume_loss_tolerance: 0, ..WriterOptions::default() })
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    let opened = tzap_core::open_archive(&archive.bytes, &key).unwrap();
+    opened.verify().unwrap();
+
+    // All three survive as separate members, each with its own bytes.
+    let listed = opened.list_index_entries().unwrap();
+    assert_eq!(listed.len(), archive_paths.len(), "case-different paths collapsed into one member");
+    for (path, body) in &bodies {
+        assert_eq!(opened.extract_file(path).unwrap().as_ref(), Some(body), "wrong bytes for {path}");
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn filesystem_scan_captures_linux_native_profile_and_user_xattr() {

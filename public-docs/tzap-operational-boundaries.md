@@ -673,9 +673,15 @@ Library writers expose native primary-PAX and auxiliary records through
 `ArchiveTimestamp`. The writer does not emit global PAX state, GNU long-name
 records, legacy sparse formats, or the tar two-zero-block end marker. Tar-stdin
 accepts canonical GNU sparse PAX 1.0 input and rewrites it to revision-45
-canonical sparse framing. On Unix and Windows, selected regular-file aliases
-are grouped by stable object identity: the lexicographically first selected
-path owns data/native metadata and the remaining paths are zero-data aliases.
+canonical sparse framing. That rewrite includes the zero-length map entries GNU
+tar and libarchive emit — the terminator at the logical size, and the leading
+entry a file opening with a hole carries — which revision-45 framing has no
+representation for and which are therefore dropped rather than refused. A map
+whose remaining extents overlap, are unsorted, are left unmerged, or disagree
+with the stored byte count is still rejected as malformed. On Unix and
+Windows, selected regular-file aliases are grouped by stable object identity:
+the lexicographically first selected path owns data/native metadata and the
+remaining paths are zero-data aliases.
 
 ### Windows comparison with 7-Zip 26.01
 

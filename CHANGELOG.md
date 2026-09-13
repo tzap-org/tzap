@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Fixes `create --tar-stdin` rejecting sparse members that GNU tar and
+  libarchive actually produce. A GNU sparse 1.0 map ends with a zero-length
+  entry at the logical size, and starts with one at offset 0 when the file
+  opens with a hole; the ingest path applied revision-45's own output rule
+  ("every extent length is greater than zero", §16.7.5) to that input and
+  refused the member with "GNU sparse extents overlap, are empty, or are not
+  merged". Every sparse file ending in a hole was affected, not just wholly
+  sparse ones, so `tar cf - dir | tzap create --tar-stdin -` failed on any
+  tree containing one. The zero-length entries are now dropped as part of the
+  rewrite to revision-45 canonical framing, which is what
+  `public-docs/tzap-operational-boundaries.md` already promised. Maps whose
+  remaining extents overlap, are unsorted, are left unmerged, or disagree with
+  the stored byte count are still rejected.
+
 ## 0.2.4 - 2026-09-12
 
 - Fixes silent sibling-volume discovery failure for bare relative archive
