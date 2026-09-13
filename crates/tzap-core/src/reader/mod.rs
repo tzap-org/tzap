@@ -1820,22 +1820,47 @@ impl OpenedArchive {
         self.locate_index_file(&normalized)?.map(|located| archive_index_entry_from_loaded_file(&located.shard, located.file_index)).transpose()
     }
 
-    /// Resolve many paths in one pass, loading each index shard at most once.
+    /// Resolve many paths, loading each index shard at most once.
     ///
     /// `lookup_index_entry` reloads (fetches, decrypts, decompresses and parses)
     /// every candidate shard per call, so resolving N paths that way costs N shard
-    /// loads. Callers holding a whole path set should use this instead.
+    /// loads. This loads the union of the candidate shards instead: one load per
+    /// distinct shard the request actually reaches, which is never more than the
+    /// whole shard set and is a single shard for the common one-path request.
+    /// Per-path resolution matches `lookup_index_entry` exactly, including its
+    /// rule that the highest `tar_member_group_start` wins a duplicated path.
     pub fn lookup_index_entries(&self, paths: &[String]) -> Result<Vec<(String, Option<ArchiveIndexEntry>)>, FormatError> {
-        let shards = self.load_all_index_shards()?;
-        let winners = final_index_entry_winners(&shards)?;
-        let mut out = Vec::with_capacity(paths.len());
+        let limits = self.metadata_limits();
+        let mut candidates_per_path = Vec::with_capacity(paths.len());
+        let mut needed_rows = BTreeSet::new();
         for path in paths {
             let normalized = normalize_lookup_file_path(path, self.crypto_header.max_path_length)?;
-            let normalized = std::str::from_utf8(&normalized).map_err(|_| FormatError::UnsafeArchivePath)?.to_owned();
-            let entry = match winners.get(&normalized) {
-                Some(winner) => Some(archive_index_entry_from_loaded_file_with_path(normalized, &shards[winner.shard_index], winner.file_index)?),
-                None => None,
-            };
+            let candidates = self.index_root.candidate_shards_for_path(&normalized, limits)?;
+            needed_rows.extend(candidates.iter().copied());
+            candidates_per_path.push((normalized, candidates));
+        }
+
+        let needed_rows = needed_rows.into_iter().collect::<Vec<_>>();
+        let loaded = parallel_map_ref(&needed_rows, self.options.jobs, |row| {
+            let locating = self.index_root.shards.get(*row).ok_or(FormatError::InvalidArchive("candidate shard row is out of bounds"))?;
+            self.load_index_shard(locating)
+        })?;
+        let shards_by_row = needed_rows.into_iter().zip(loaded).collect::<BTreeMap<usize, IndexShard>>();
+
+        let mut out = Vec::with_capacity(paths.len());
+        for (path, (normalized, candidates)) in paths.iter().zip(candidates_per_path) {
+            let mut winner: Option<(&IndexShard, usize, u64)> = None;
+            for row_index in candidates {
+                let shard = shards_by_row.get(&row_index).ok_or(FormatError::InvalidArchive("candidate shard row is out of bounds"))?;
+                let Some(file_index) = shard.lookup_file_index(&normalized) else {
+                    continue;
+                };
+                let start = shard.tar_member_group_start(file_index).ok_or(FormatError::InvalidArchive("FileEntry tar member start is missing"))?;
+                if winner.map(|(_, _, existing)| start > existing).unwrap_or(true) {
+                    winner = Some((shard, file_index, start));
+                }
+            }
+            let entry = winner.map(|(shard, file_index, _)| archive_index_entry_from_loaded_file(shard, file_index)).transpose()?;
             out.push((path.clone(), entry));
         }
         Ok(out)

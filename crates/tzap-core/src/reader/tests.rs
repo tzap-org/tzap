@@ -2651,6 +2651,14 @@ fn batch_lookup_matches_per_path_lookup_including_duplicates_and_misses() {
     // The duplicated path resolves to the later member, matching the final view.
     assert_eq!(batched[1].1.as_ref().unwrap().file_data_size, 5);
     assert_eq!(opened.lookup_index_entries(&[]).unwrap(), Vec::new());
+
+    // Requesting one path must agree too: the batch resolves only the candidate
+    // shards a request reaches, so the single-path shape takes a different route
+    // through the union than the many-path shape does.
+    for path in ["alpha.txt", "missing.txt"] {
+        let single = opened.lookup_index_entries(&[path.to_string()]).unwrap();
+        assert_eq!(single, vec![(path.to_string(), opened.lookup_index_entry(path).unwrap())]);
+    }
 }
 
 #[test]
