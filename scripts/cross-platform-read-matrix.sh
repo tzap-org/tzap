@@ -115,6 +115,9 @@ if [ "$MODE" = check ]; then
   # rewrote -- from ever running here. --allow-degraded proceeds and records
   # diagnostics for what it could not apply, so the bytes are still compared.
   DEGRADED="--allow-degraded"
+  # A restored tree can carry modes that leave its own directories unwritable, so
+  # clearing the previous output needs the permissions put back first.
+  scrub() { [ -e "$1" ] || return 0; chmod -R u+rwX "$1" 2>/dev/null; rm -rf "$1"; }
   while IFS='|' read -r name readkey; do
     [ -n "$name" ] || continue
     local_first=$(ls "archives/$name"/a*.tzap 2>/dev/null | sort | head -1)
@@ -127,7 +130,7 @@ if [ "$MODE" = check ]; then
       bin=$REF; [ "$tag" = CAND ] && bin=$CAND
       if $bin verify $readkey $positional >/dev/null 2>"/tmp/xr.e"; then v=ok; else v="fail:$(tail -1 /tmp/xr.e)"; fi
       if $bin list $readkey $flagged >"/tmp/xr.list.$tag" 2>"/tmp/xr.e"; then l=ok; else l="fail:$(tail -1 /tmp/xr.e)"; fi
-      rm -rf "/tmp/xr.out.$tag"
+      scrub "/tmp/xr.out.$tag"
       if $bin extract $readkey $DEGRADED -C "/tmp/xr.out.$tag" $flagged >/dev/null 2>"/tmp/xr.e"; then
         if diff -r corpus "/tmp/xr.out.$tag/corpus" >/dev/null 2>&1; then x=ok; else x=tree-differs; fi
       else x="fail:$(tail -1 /tmp/xr.e)"; fi
@@ -152,7 +155,7 @@ if [ "$MODE" = check ]; then
     # Selected extraction of every member is the path the performance work rewrote.
     if [ "${x_CAND:-}" = ok ]; then
       paths=$(cd corpus && find . -type f | sed 's|^\./|corpus/|' | sort | xargs echo)
-      rm -rf /tmp/xr.sel
+      scrub /tmp/xr.sel
       if $CAND extract $readkey $DEGRADED -C /tmp/xr.sel $flagged $paths >/dev/null 2>/tmp/xr.e; then
         diff -r corpus /tmp/xr.sel/corpus >/dev/null 2>&1 || { echo "  FAIL [$name] selected extraction differs from full"; ok=0; }
       else

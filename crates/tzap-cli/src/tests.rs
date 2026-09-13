@@ -2363,6 +2363,15 @@ fn windows_directory_input_survives_a_non_resident_index() {
         assert_eq!(specs[0].archive_path, "corpus", "{label}: first member is the directory");
         assert_eq!(specs[0].entry_kind, SourceEntryKind::Directory, "{label}: directory kind");
         assert_eq!(specs.iter().filter(|spec| spec.entry_kind == SourceEntryKind::Regular).count(), count, "{label}: regular members");
+
+        // Windows has no POSIX mode, so one is projected. A directory must keep its
+        // traverse bit or the restored tree cannot be entered on a POSIX host, and
+        // extraction there fails partway once it tries to descend.
+        assert_eq!(specs[0].mode & 0o111, 0o111, "{label}: directory mode {:o} has no traverse bit", specs[0].mode);
+        assert_eq!(specs[0].mode & 0o777, 0o755, "{label}: directory mode");
+        for spec in specs.iter().filter(|spec| spec.entry_kind == SourceEntryKind::Regular) {
+            assert_eq!(spec.mode & 0o777, 0o644, "{label}: regular file mode should keep the historical projection");
+        }
     }
 }
 
