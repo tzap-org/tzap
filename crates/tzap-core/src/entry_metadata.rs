@@ -3095,32 +3095,44 @@ mod tests {
     ///
     /// Pin the whole loop instead of any one direction: host time -> struct ->
     /// PAX bytes -> struct, plus `Display`, which renders the same decimal.
+    ///
+    /// The host-time fixtures are all multiples of 100ns, because Windows
+    /// `SystemTime` is FILETIME-backed and silently rounds anything finer --
+    /// a sub-tick fixture fails there on the host's resolution rather than on
+    /// anything this test is about. Nanosecond precision is covered below,
+    /// where no `SystemTime` is involved.
     #[test]
     fn pre_epoch_times_survive_the_full_encode_parse_round_trip() {
         use std::time::{Duration, UNIX_EPOCH};
+
+        let round_trip = |stamp: ArchiveTimestamp, expected: &str, label: &str| {
+            let encoded = stamp.canonical_pax_value().expect("encodable");
+            assert_eq!(String::from_utf8(encoded.clone()).unwrap(), expected, "encoding {label}");
+            assert_eq!(parse_timestamp(&encoded).unwrap(), (stamp.seconds, stamp.nanoseconds), "re-parsing {expected}");
+            assert_eq!(stamp.to_string(), expected, "Display must show the time the archive holds");
+        };
 
         for (before, expected) in [
             (Duration::new(2, 250_000_000), "-2.25"),
             (Duration::new(1, 500_000_000), "-1.5"),
             (Duration::new(3, 750_000_000), "-3.75"),
             (Duration::new(5, 0), "-5"),
-            (Duration::new(1, 1), "-1.000000001"),
+            (Duration::new(1, 100), "-1.0000001"),
         ] {
             let stamp = archive_timestamp_from_system_time(UNIX_EPOCH - before).expect("in i64 range");
-            let encoded = stamp.canonical_pax_value().expect("encodable");
-            assert_eq!(String::from_utf8(encoded.clone()).unwrap(), expected, "encoding {before:?} before the epoch");
-            assert_eq!(parse_timestamp(&encoded).unwrap(), (stamp.seconds, stamp.nanoseconds), "re-parsing {expected}");
-            assert_eq!(stamp.to_string(), expected, "Display must show the time the archive holds");
+            round_trip(stamp, expected, &format!("{before:?} before the epoch"));
         }
 
         // Positive times are unaffected by the borrow and must stay byte-exact.
-        for (after, expected) in [(Duration::new(1_700_000_000, 123_456_789), "1700000000.123456789"), (Duration::new(7, 0), "7")] {
+        for (after, expected) in [(Duration::new(1_700_000_000, 123_456_700), "1700000000.1234567"), (Duration::new(7, 0), "7")] {
             let stamp = archive_timestamp_from_system_time(UNIX_EPOCH + after).expect("in i64 range");
-            let encoded = stamp.canonical_pax_value().expect("encodable");
-            assert_eq!(String::from_utf8(encoded.clone()).unwrap(), expected);
-            assert_eq!(parse_timestamp(&encoded).unwrap(), (stamp.seconds, stamp.nanoseconds));
-            assert_eq!(stamp.to_string(), expected);
+            round_trip(stamp, expected, &format!("{after:?} after the epoch"));
         }
+
+        // Full nanosecond precision, straight on the struct: the format carries
+        // nine digits even where a host clock cannot produce them.
+        round_trip(ArchiveTimestamp::new(-2, 999_999_999), "-1.000000001", "one nanosecond past a second before the epoch");
+        round_trip(ArchiveTimestamp::new(1_700_000_000, 123_456_789), "1700000000.123456789", "nine significant digits after the epoch");
     }
 
     /// Host time -> archive -> host time, for the instants the two restore paths
