@@ -1684,7 +1684,7 @@ fn filesystem_scan_captures_windows_scalars_security_and_alternate_data() {
     );
     assert_eq!(fs::read(PathBuf::from(format!("{}:元数据", output.join("native.txt").display()))).unwrap(), b"unicode alternate metadata");
 
-    if !enable_windows_privilege(SE_RESTORE_NAME) {
+    if !tzap_core::windows_metadata::enable_windows_privilege(SE_RESTORE_NAME) {
         return;
     }
 
@@ -1854,7 +1854,7 @@ fn windows_object_id_backup_stream_round_trips_exactly() {
     .unwrap();
     let opened = tzap_core::open_archive(&sink.volumes[0], &master_key).unwrap();
     opened.verify().unwrap();
-    if !enable_windows_privilege(windows_sys::Win32::Security::SE_RESTORE_NAME) {
+    if !tzap_core::windows_metadata::enable_windows_privilege(windows_sys::Win32::Security::SE_RESTORE_NAME) {
         return;
     }
     // Object IDs are volume-unique. Remove the source before restoring its exact ID on the

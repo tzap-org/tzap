@@ -255,7 +255,15 @@ pub fn capture_windows_security_descriptor(file: &File) -> io::Result<NativeAuxi
     Ok(record)
 }
 
-fn enable_windows_privilege(name: *const u16) -> bool {
+/// Enable a Windows privilege on this process token, reporting whether it took.
+///
+/// Capture and restore of several metadata classes are privilege-gated
+/// (`SE_SECURITY_NAME` for SACLs, `SE_BACKUP_NAME`/`SE_RESTORE_NAME` for backup
+/// semantics). Hosts and their tests need the same answer this module acts on,
+/// so there is one implementation rather than a copy per host.
+///
+/// `name` is one of the `SE_*_NAME` constants, which are wide string literals.
+pub fn enable_windows_privilege(name: *const u16) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetLastError};
     use windows_sys::Win32::Security::{
         AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
