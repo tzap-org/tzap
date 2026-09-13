@@ -2653,6 +2653,56 @@ mod tests {
         assert!(parse_primary_metadata(&records).is_ok());
     }
 
+    /// §16.18.4's corpus names "profile-list overlap, malformed extension
+    /// namespaces, missing dependency closure, auxiliary owner-profile mismatch,
+    /// and duplicate scoped extension identities".
+    ///
+    /// Dependency closure had a fixture; the rest did not. These are parser
+    /// rules that decide which profile owns which metadata, so a gap here lets
+    /// an archive claim metadata it has no owner for -- the reason §16.4.5
+    /// forbids unregistered primary PAX keys in the first place.
+    #[test]
+    fn profile_list_overlap_reserved_and_missing_portable_are_rejected() {
+        let base = |required: &str, optional: &str| {
+            let mut records = portable_primary_pax(b"file.txt", 0o644, "linux", false).unwrap();
+            records.insert("TZAP.metadata.required-profiles".into(), required.as_bytes().to_vec());
+            records.insert("TZAP.metadata.optional-profiles".into(), optional.as_bytes().to_vec());
+            records
+        };
+
+        // The baseline must parse, or the negatives below prove nothing.
+        assert!(parse_primary_metadata(&base("portable-v1", "")).is_ok(), "baseline must be accepted");
+
+        // §16.7.1 makes portable-v1 mandatory: an entry without it declares no
+        // baseline metadata at all.
+        assert!(parse_primary_metadata(&base("posix-backup-v1", "")).is_err(), "portable-v1 must be required");
+
+        // A profile in both lists is neither required nor optional -- the two
+        // claims contradict, and a reader would have to pick one.
+        assert!(parse_primary_metadata(&base("portable-v1,posix-backup-v1", "posix-backup-v1")).is_err(), "a profile in both lists must be rejected");
+
+        // tzap-core-v1 is the reserved core profile and is never declarable by
+        // an entry: it would let an entry claim core-owned semantics.
+        assert!(parse_primary_metadata(&base("portable-v1,tzap-core-v1", "")).is_err(), "the reserved core profile must not be required");
+        assert!(parse_primary_metadata(&base("portable-v1", "tzap-core-v1")).is_err(), "the reserved core profile must not be optional");
+    }
+
+    #[test]
+    fn profile_dependency_closure_holds_for_optional_profiles_too() {
+        // The existing fixture covers a *required* native profile missing its
+        // posix dependency. The optional path is a separate arm and had none:
+        // an optional macos-backup-v1 still needs posix-backup-v1 somewhere, or
+        // its metadata has no owner when a reader elects to apply it.
+        let mut records = portable_primary_pax(b"file.txt", 0o644, "macos", false).unwrap();
+        records.insert("TZAP.metadata.required-profiles".into(), b"portable-v1".to_vec());
+        records.insert("TZAP.metadata.optional-profiles".into(), b"macos-backup-v1".to_vec());
+        assert!(parse_primary_metadata(&records).is_err(), "an optional native profile must still close its dependency");
+
+        // Satisfied either by requiring or by optionally declaring the dependency.
+        records.insert("TZAP.metadata.optional-profiles".into(), b"macos-backup-v1,posix-backup-v1".to_vec());
+        assert!(parse_primary_metadata(&records).is_ok(), "an optional dependency closes the requirement");
+    }
+
     #[test]
     fn canonical_base64_and_percent_name_codecs_round_trip_binary_values() {
         for len in 0..=512usize {

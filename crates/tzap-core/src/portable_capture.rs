@@ -475,6 +475,47 @@ mod tests {
         assert!(retained, "the quarantine xattr must be captured, not filtered away");
     }
 
+    /// §16.18.1 names "non-UTF-8-**named**" xattrs. A POSIX xattr name is a byte
+    /// string, and §16.7.3 has percent/base64 name encodings precisely because
+    /// such names exist -- but no fixture created one, because the `xattr` crate
+    /// takes `&str`. This goes through `setxattr` directly.
+    ///
+    /// The value is what must survive: a name that cannot be expressed as UTF-8
+    /// must be carried through an encoded form rather than dropping the whole
+    /// attribute.
+    ///
+    /// Linux-only by necessity. APFS refuses a non-UTF-8 xattr name outright
+    /// (`setxattr` returns -1), so the case cannot be created on macOS at all --
+    /// a macOS version of this test could only ever skip itself.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_carries_an_xattr_whose_name_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("odd-name.bin");
+        std::fs::write(&file, b"body").unwrap();
+
+        // Linux requires the `user.` namespace on a regular file; the byte after
+        // the stem cannot start a UTF-8 sequence.
+        let raw_name = b"user.tzap-odd-\xff\0";
+        let path = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        // SAFETY: both pointers are NUL-terminated and live for the call.
+        let status = unsafe { libc::setxattr(path.as_ptr(), raw_name.as_ptr().cast::<libc::c_char>(), c"odd".as_ptr().cast::<libc::c_void>(), 3, 0) };
+        if status != 0 {
+            return; // filesystem refuses the name; nothing to assert
+        }
+
+        let captured = capture_portable_file_metadata(&file).unwrap();
+        let native = &captured.metadata.native;
+        // The name cannot appear literally, so look for the distinctive stem in
+        // either an encoded PAX key or an auxiliary record name.
+        let stem = "tzap-odd-";
+        let carried = native.primary_pax_records.keys().any(|key| key.contains(stem))
+            || native.auxiliary_records.iter().any(|record| record.name.windows(stem.len()).any(|w| w == stem.as_bytes()));
+        assert!(carried, "an xattr with a non-UTF-8 name must be carried through an encoded form, not dropped");
+    }
+
     #[test]
     fn capture_reads_a_directory() {
         let temp = tempfile::tempdir().unwrap();
