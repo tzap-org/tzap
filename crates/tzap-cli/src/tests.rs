@@ -1255,7 +1255,7 @@ fn filesystem_scan_captures_linux_native_profile_and_user_xattr() {
     xattr::set(&path, "user.tzap-test", b"metadata").unwrap();
     let identity = input_identity(&fs::metadata(&path).unwrap()).unwrap();
 
-    let native = capture_native_file_metadata(&path, identity).unwrap();
+    let native = capture_native_file_metadata(&path, identity).unwrap().native;
 
     assert_eq!(native.required_profiles, vec!["linux-backup-v1", "posix-backup-v1"]);
     assert_eq!(native.primary_pax_records.get("LIBARCHIVE.xattr.user.tzap-test").map(Vec::as_slice), Some(b"bWV0YWRhdGE".as_slice()));

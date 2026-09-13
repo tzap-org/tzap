@@ -1385,3 +1385,39 @@ fn cli_list_renders_pre_epoch_times_as_the_archive_stores_them() {
     assert!(listed.contains("-1.25"), "listing must show the instant the archive holds, got: {listed}");
     assert!(!listed.contains("-2.75"), "listing must not show the raw timespec fields, got: {listed}");
 }
+
+/// Owner and group *names* reach the archive, not just the numeric ids.
+///
+/// §16.7.1 and §16.18.1 both call for them, and zmanager's round-trip test has
+/// always asserted them. This host never resolved them at all -- it passed
+/// `uname: None`/`gname: None` at every call site -- until the capture moved to
+/// tzap-core. Nothing here proved the fix reached an actual archive, so a
+/// regression to the old behaviour would have been invisible on this side.
+#[cfg(unix)]
+#[test]
+fn cli_archive_carries_resolved_owner_and_group_names() {
+    let temp = tempdir().unwrap();
+    let input = temp.path().join("owned.txt");
+    let archive = temp.path().join("owned.tzap");
+    fs::write(&input, b"owned payload\n").unwrap();
+
+    Command::cargo_bin("tzap").unwrap().args(["create", "--no-encryption", "-o", archive.to_str().unwrap(), input.to_str().unwrap()]).assert().success();
+    let listed = Command::cargo_bin("tzap").unwrap().args(["list", "--long", archive.to_str().unwrap()]).assert().success().get_output().stdout.clone();
+    let listed = String::from_utf8_lossy(&listed);
+    let row = listed.lines().find(|line| line.ends_with("owned.txt")).expect("the member must be listed");
+    let columns: Vec<&str> = row.split('\t').collect();
+
+    // size, kind, mode, mtime, created, accessed, uid, gid, uname, gname, ...
+    let (uid, gid, uname, gname) = (columns[6], columns[7], columns[8], columns[9]);
+    assert_ne!(uid, "null", "uid must be recorded");
+    assert_ne!(gid, "null", "gid must be recorded");
+    assert_ne!(uname, "null", "owner name must be resolved, not left absent: {row}");
+    assert_ne!(gname, "null", "group name must be resolved, not left absent: {row}");
+
+    // The name is a label; §16.7.1 requires it never to change the numeric
+    // identity, which is what restore actually applies.
+    use std::os::unix::fs::MetadataExt as _;
+    let source = fs::symlink_metadata(&input).unwrap();
+    assert_eq!(uid.parse::<u32>().unwrap(), source.uid());
+    assert_eq!(gid.parse::<u32>().unwrap(), source.gid());
+}
