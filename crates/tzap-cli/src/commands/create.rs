@@ -575,6 +575,10 @@ pub(crate) struct InputSpec {
     pub(crate) size: u64,
     pub(crate) sparse_extents: Option<Vec<SparseExtent>>,
     pub(crate) identity: InputIdentity,
+    /// The object tzap-core's macOS capture actually read, so the resource fork
+    /// opened later can be proven to belong to it.
+    #[cfg(target_os = "macos")]
+    pub(crate) macos_identity: Option<tzap_core::macos_metadata::MacosMetadataIdentity>,
 }
 
 impl RegularFileSource for InputSpec {
@@ -708,13 +712,9 @@ impl RegularFileSource for InputSpec {
             if record.kind != "macos.resource-fork" || record.name_encoding != NativeAuxiliaryNameEncoding::None || !record.name.is_empty() {
                 return Err(FormatError::WriterUnsupported("unsupported streamed macOS auxiliary source").into());
             }
-            let source = if self.entry_kind == SourceEntryKind::Symlink {
-                MacosResourceForkSource::Symlink(open_macos_symlink(&self.source).map_err(ArchiveWriteError::Io)?)
-            } else {
-                let file = File::open(&self.source).map_err(ArchiveWriteError::Io)?;
-                open_macos_resource_fork_for_read(file).map_err(ArchiveWriteError::Io)?
-            };
-            Ok(Box::new(MacosResourceForkReader::new(source, self.identity, Some(record.logical_size)).map_err(ArchiveWriteError::Io)?))
+            let identity = self.macos_identity.ok_or(FormatError::WriterInvariant("macOS resource fork source has no captured identity"))?;
+            tzap_core::macos_metadata::open_macos_resource_fork(&self.source, self.entry_kind == SourceEntryKind::Symlink, identity, record.logical_size)
+                .map_err(ArchiveWriteError::Io)
         }
         #[cfg(windows)]
         {
@@ -889,6 +889,7 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
         let archive_path = archive_path_to_string(archive_path)?;
         let identity = input_identity(&metadata).with_context(|| format!("failed to identify symlink {}", input.display()))?;
         let link_target = symlink_target_bytes(input).with_context(|| format!("failed to read symlink {}", input.display()))?;
+        let captured = portable_symlink_metadata(identity, input)?;
         out.push(InputSpec {
             source: input.to_owned(),
             archive_path,
@@ -896,10 +897,12 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
             link_target: Some(link_target),
             mode: readonly_mode(&metadata),
             mtime: identity.mtime,
-            portable_metadata: portable_symlink_metadata(identity, input)?,
+            portable_metadata: captured.metadata,
             size: 0,
             sparse_extents: None,
             identity,
+            #[cfg(target_os = "macos")]
+            macos_identity: captured.macos_identity,
         });
         return Ok(());
     }
@@ -920,7 +923,7 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
             augment_windows_input_identity(&mut identity, &file).with_context(|| format!("failed to identify Windows directory {}", input.display()))?;
             identity
         };
-        let portable_metadata = portable_input_metadata(identity, input)?;
+        let captured = portable_input_metadata(identity, input)?;
         out.push(InputSpec {
             source: input.to_owned(),
             archive_path: archive_path_string,
@@ -928,10 +931,12 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
             link_target: None,
             mode: readonly_mode(&metadata),
             mtime: identity.mtime,
-            portable_metadata,
+            portable_metadata: captured.metadata,
             size: 0,
             sparse_extents: None,
             identity,
+            #[cfg(target_os = "macos")]
+            macos_identity: captured.macos_identity,
         });
         let mut entries = fs::read_dir(input).with_context(|| format!("failed to read directory {}", input.display()))?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|entry| entry.file_name());
@@ -962,7 +967,10 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
         if let Some(entry_kind) = entry_kind {
             let archive_path = archive_path_to_string(archive_path)?;
             let identity = input_identity(&metadata).with_context(|| format!("failed to identify input {}", input.display()))?;
-            let mut portable_metadata = portable_input_metadata(identity, input)?;
+            let captured = portable_input_metadata(identity, input)?;
+            #[cfg(target_os = "macos")]
+            let macos_identity = captured.macos_identity;
+            let mut portable_metadata = captured.metadata;
             portable_metadata.native.required_profiles.push("posix-backup-v1".into());
             if matches!(entry_kind, SourceEntryKind::CharacterDevice | SourceEntryKind::BlockDevice) {
                 let device = libc::dev_t::try_from(metadata.st_rdev()).map_err(|_| anyhow!("device identifier exceeds host ABI"))?;
@@ -989,6 +997,8 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
                 size: 0,
                 sparse_extents: None,
                 identity,
+                #[cfg(target_os = "macos")]
+                macos_identity,
             });
             return Ok(());
         }
@@ -1024,8 +1034,11 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
     };
     #[cfg(all(not(windows), not(target_os = "linux")))]
     let sparse_extents = None;
+    let captured = portable_input_metadata(identity, input)?;
+    #[cfg(target_os = "macos")]
+    let macos_identity = captured.macos_identity;
     #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut portable_metadata = portable_input_metadata(identity, input)?;
+    let mut portable_metadata = captured.metadata;
     #[cfg(windows)]
     if sparse_layout_partial {
         add_windows_refs_sparse_layout_omission(&mut portable_metadata.native);
@@ -1041,6 +1054,8 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
         size: metadata.len(),
         sparse_extents,
         identity,
+        #[cfg(target_os = "macos")]
+        macos_identity,
     });
     Ok(())
 }

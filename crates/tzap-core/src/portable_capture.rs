@@ -43,14 +43,24 @@ pub struct CapturedPortableMetadata {
 /// supported way to ask.
 pub const CAPTURE_RACE_MARKER: &str = "changed during metadata capture";
 
+/// The same race observed one step earlier: the object was replaced between the
+/// scan that identified it and the open that pins it.
+///
+/// This is the *more* common shape of the race, not a rarer one -- a capture
+/// spends almost all of its window after the open -- and every native capture
+/// path reports it. It was not covered by [`CAPTURE_RACE_MARKER`], so the retry
+/// that exists precisely for this never fired on it.
+pub const CAPTURE_PREOPEN_RACE_MARKER: &str = "changed before metadata capture";
+
 /// Whether an error is the transient mid-capture race worth retrying.
 ///
-/// Matches on a substring: the sites qualify it (`input`, `xattr`, `symlink
-/// xattr`), and a host enriching the message with a path must not silently
-/// disable the retry.
+/// Matches on a substring: the sites qualify it (`input`, `input kind`, `xattr`,
+/// `symlink`, `symlink xattr`), and a host enriching the message with a path
+/// must not silently disable the retry.
 #[must_use]
 pub fn is_transient_capture_race(error: &io::Error) -> bool {
-    error.to_string().contains(CAPTURE_RACE_MARKER)
+    let message = error.to_string();
+    message.contains(CAPTURE_RACE_MARKER) || message.contains(CAPTURE_PREOPEN_RACE_MARKER)
 }
 
 /// How many times a capture is attempted before the race is reported.
@@ -140,15 +150,17 @@ fn capture_portable_file_metadata_once(input: &Path) -> io::Result<CapturedPorta
     let metadata = fs::symlink_metadata(input)?;
     let symlink = metadata.file_type().is_symlink();
 
-    let created = metadata.created().ok().and_then(archive_timestamp_from_system_time);
+    let created = metadata.created().ok().and_then(archive_timestamp_from_system_time).filter(encodable);
     // musl cannot expose birth time (statx/STATX_BTIME is unsupported there), so
     // fall back to ctime from the standard stat fields as an approximation.
     #[cfg(target_os = "linux")]
-    let created = created.or_else(|| {
-        use std::os::unix::fs::MetadataExt as _;
-        Some(crate::entry_metadata::ArchiveTimestamp::new(metadata.ctime(), u32::try_from(metadata.ctime_nsec()).unwrap_or(0)))
-    });
-    let accessed = metadata.accessed().ok().and_then(archive_timestamp_from_system_time);
+    let created = created
+        .or_else(|| {
+            use std::os::unix::fs::MetadataExt as _;
+            Some(crate::entry_metadata::ArchiveTimestamp::new(metadata.ctime(), u32::try_from(metadata.ctime_nsec()).unwrap_or(0)))
+        })
+        .filter(encodable);
+    let accessed = metadata.accessed().ok().and_then(archive_timestamp_from_system_time).filter(encodable);
 
     #[cfg(target_os = "macos")]
     let captured_macos = crate::macos_metadata::capture_macos_metadata(input, symlink)?;
@@ -172,6 +184,18 @@ fn capture_portable_file_metadata_once(input: &Path) -> io::Result<CapturedPorta
         #[cfg(target_os = "macos")]
         macos_identity: Some(captured_macos.identity),
     })
+}
+
+/// Whether a time survives the §16.7.2 encoding, applied where the contract to
+/// drop it is stated rather than left to the writer.
+///
+/// Only the last second before the epoch fails: its integer part would be `-0`,
+/// which the format forbids. The writer propagates that as an error, so without
+/// this an optional `atime` or birth time in that window fails the whole archive
+/// instead of being omitted -- and `mtime`, which genuinely should fail loudly,
+/// is the caller's and is untouched here.
+fn encodable(timestamp: &ArchiveTimestamp) -> bool {
+    timestamp.canonical_pax_value().is_ok()
 }
 
 #[cfg(unix)]
@@ -384,8 +408,21 @@ mod tests {
         assert!(is_transient_capture_race(&io::Error::other("xattr changed during metadata capture")));
         // A host that enriches the message with a path must keep matching.
         assert!(is_transient_capture_race(&io::Error::other("input changed during metadata capture: /tmp/a.bin")));
+        // Losing the race before the open is the same race, and is what every
+        // native capture reports when the identity check fails on the handle.
+        // Every message the capture paths actually emit must be recognised.
+        for emitted in [
+            "input changed before metadata capture",
+            "input kind changed before metadata capture",
+            "symlink changed before metadata capture: /tmp/a.sym",
+            "symlink changed during metadata capture",
+            "symlink xattr changed during metadata capture",
+        ] {
+            assert!(is_transient_capture_race(&io::Error::other(emitted)), "{emitted}");
+        }
         assert!(!is_transient_capture_race(&io::Error::from(io::ErrorKind::NotFound)));
         assert!(!is_transient_capture_race(&io::Error::other("input changed after scan")));
+        assert!(!is_transient_capture_race(&io::Error::other("failed to open /tmp/a.bin for metadata capture")));
 
         // Succeeds once the writer stops touching the file.
         let attempts = Cell::new(0usize);

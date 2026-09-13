@@ -130,20 +130,11 @@ fn identity(metadata: &fs::Metadata) -> LinuxIdentity {
         size: metadata.size(),
         mtime: (metadata.mtime(), metadata.mtime_nsec()),
         ctime: (metadata.ctime(), metadata.ctime_nsec()),
-        created: metadata.created().ok().and_then(system_time_timestamp),
-    }
-}
-
-fn system_time_timestamp(time: std::time::SystemTime) -> Option<ArchiveTimestamp> {
-    match time.duration_since(std::time::UNIX_EPOCH) {
-        Ok(duration) => Some(ArchiveTimestamp::new(i64::try_from(duration.as_secs()).ok()?, duration.subsec_nanos())),
-        Err(error) => {
-            let duration = error.duration();
-            if duration.as_secs() == 0 && duration.subsec_nanos() != 0 {
-                return None;
-            }
-            Some(ArchiveTimestamp::new(i64::try_from(-i128::from(duration.as_secs())).ok()?, duration.subsec_nanos()))
-        }
+        // The one owner of the host-time conversion. This module used to carry
+        // its own sign-magnitude copy, which `canonical_pax_value` then converted
+        // a second time: a birthtime of -2.25 was written as `-1.75`, and one
+        // inside the second before -1 failed the capture outright.
+        created: metadata.created().ok().and_then(crate::entry_metadata::archive_timestamp_from_system_time),
     }
 }
 

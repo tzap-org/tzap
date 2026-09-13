@@ -2963,9 +2963,7 @@ fn apply_regular_file_mtime(
     options: SafeExtractionOptions,
     diagnostics: &mut Vec<MetadataDiagnostic>,
 ) -> Result<(), FormatError> {
-    let duration = Duration::new(seconds.unsigned_abs(), nanoseconds);
-    let modified = if seconds < 0 { SystemTime::UNIX_EPOCH.checked_sub(duration) } else { SystemTime::UNIX_EPOCH.checked_add(duration) };
-    let Some(modified) = modified else {
+    let Some(modified) = crate::entry_metadata::system_time_from_archive_timestamp(crate::entry_metadata::ArchiveTimestamp::new(seconds, nanoseconds)) else {
         return record_metadata_application_failure(
             diagnostics,
             MetadataDiagnostic::new(

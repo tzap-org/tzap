@@ -1402,9 +1402,11 @@ fn filesystem_scan_captures_macos_native_metadata_and_writes_valid_archive() {
     assert!(acl_status.success());
     let identity = input_identity(&fs::metadata(&path).unwrap()).unwrap();
 
-    let native = capture_native_file_metadata(&path, identity).unwrap();
-    let shared = tzap_core::macos_metadata::capture_macos_metadata(&path, false).unwrap();
-    assert_eq!(shared.native, native, "CLI and reusable TZAP metadata capture must remain identical");
+    // Capture is tzap-core's; this asserts what the CLI gets back from it and
+    // then drives that through the writer, which is the part the CLI still owns.
+    let captured = capture_native_file_metadata(&path, identity).unwrap();
+    assert!(captured.macos_identity.is_some(), "the identity must come back so the resource fork can be reopened against it");
+    let native = captured.native;
 
     assert_eq!(native.required_profiles, vec!["macos-backup-v1", "posix-backup-v1"]);
     assert_eq!(native.primary_pax_records.get("LIBARCHIVE.xattr.com.tzap.test").map(Vec::as_slice), Some(b"bWV0YWRhdGE".as_slice()));
@@ -1522,17 +1524,11 @@ fn windows_capture_rejects_metadata_classes_that_are_not_exactly_supported() {
 
 #[test]
 fn archive_timestamp_canonicalizes_fractional_pre_epoch_times() {
-    // This test previously asserted a timespec-style borrow: 100ns before the
-    // epoch as `(-1, 999_999_900)` and 1.5s before as `(-2, 500_000_000)`. Both
-    // are wrong for this format. §16.7.2 encodes a time as a plain signed
-    // decimal, so `(-2, 500_000_000)` serializes to `-2.5` -- two and a half
-    // seconds before the epoch, for a file modified one and a half seconds
-    // before it. The conversion now lives in `tzap-core` and is shared with
-    // zmanager, whose implementation was already correct.
-    //
     // Assert the encoded bytes rather than the struct fields: the bytes are
-    // what a conforming reader sees, and the old expectations looked plausible
-    // precisely because the fields alone do not show the error.
+    // what a conforming reader sees, and a wrong conversion looks plausible in
+    // the fields alone -- which is how `(-2, 500_000_000)` and `(-1, 500_000_000)`
+    // were each asserted as "1.5s before the epoch" in different modules at the
+    // same time. Only the encoding distinguishes them.
     let encoded = |before: Duration| {
         let stamp = archive_timestamp(UNIX_EPOCH - before).unwrap();
         String::from_utf8(stamp.canonical_pax_value().unwrap()).unwrap()
@@ -3384,13 +3380,8 @@ fn test_sparse_extent_input_reader_and_macos_system_xattr() {
         assert!(found_1 && found_2);
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        assert!(os_input::macos_system_xattr(b"security.mac"));
-        assert!(os_input::macos_system_xattr(b"trusted.mac"));
-        assert!(os_input::macos_system_xattr(b"system.mac"));
-        assert!(!os_input::macos_system_xattr(b"user.comment"));
-    }
+    // The system-xattr classification moved to tzap-core with the rest of the
+    // macOS capture; `macos_metadata::is_system_xattr_recognition` covers it.
 }
 
 #[test]

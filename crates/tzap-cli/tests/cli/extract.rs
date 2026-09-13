@@ -1295,3 +1295,93 @@ fn cli_extract_cross_os_restore_policy_matrix() {
         assert_eq!(fs::read(out_dir.join("doc.txt")).unwrap(), b"cross-os policy content\n");
     }
 }
+
+/// A real capture -> archive -> restore round trip for times, which is what the
+/// port of zmanager's `preserves_all_metadata_in_tzap_round_trip` lost: that
+/// test drove the whole path and compared the restored tree, while the version
+/// kept here only asserted what capture produced.
+///
+/// Nothing below the capture layer was covered end to end, which is how three
+/// separate timestamp conversions disagreed at once -- a producer on one
+/// convention, a parser on another, and a restore path on a third -- while every
+/// test stayed green. Pre-epoch times are the case that distinguishes them;
+/// a positive mtime is identical under all three.
+#[cfg(unix)]
+#[test]
+fn cli_round_trip_restores_pre_epoch_times_exactly() {
+    fn set_times(path: &std::path::Path, seconds: i64, nanoseconds: i64) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        let raw = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let times = [libc::timespec { tv_sec: seconds, tv_nsec: nanoseconds }, libc::timespec { tv_sec: seconds, tv_nsec: nanoseconds }];
+        // SAFETY: `raw` is NUL-terminated and `times` holds exactly two entries.
+        let code = unsafe { libc::utimensat(libc::AT_FDCWD, raw.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(code, 0, "failed to set times on {}: {}", path.display(), std::io::Error::last_os_error());
+    }
+
+    fn observed_times(path: &std::path::Path) -> (i64, i64) {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = fs::symlink_metadata(path).unwrap();
+        (metadata.mtime(), metadata.mtime_nsec())
+    }
+
+    // `(-2, 750_000_000)` is 1.25s before the epoch and encodes as `-1.25`.
+    // A conversion applied twice lands on `-2.75`; one skipped lands on `-2.75`
+    // in the other direction. Only the exact instant passes.
+    for (seconds, nanoseconds) in [(-2i64, 750_000_000i64), (-5, 0), (-3, 250_000_000), (1_700_000_000, 123_456_789)] {
+        let temp = tempdir().unwrap();
+        let input = temp.path().join("dated.txt");
+        let archive = temp.path().join("dated.tzap");
+        let output = temp.path().join("out");
+        fs::write(&input, b"dated payload\n").unwrap();
+        set_times(&input, seconds, nanoseconds);
+
+        // Some filesystems cannot hold the exact value; compare against what the
+        // source actually ended up with, so this tests the round trip and not the
+        // host's timestamp resolution.
+        let expected = observed_times(&input);
+
+        Command::cargo_bin("tzap").unwrap().args(["create", "--no-encryption", "-o", archive.to_str().unwrap(), input.to_str().unwrap()]).assert().success();
+        Command::cargo_bin("tzap").unwrap().args(["extract", "-C", output.to_str().unwrap(), archive.to_str().unwrap()]).assert().success();
+
+        let restored = output.join("dated.txt");
+        assert_eq!(fs::read(&restored).unwrap(), b"dated payload\n");
+        assert_eq!(observed_times(&restored), expected, "mtime round trip for ({seconds}, {nanoseconds})");
+    }
+}
+
+/// The same instants through `tzap list`, which renders the stored value rather
+/// than re-reading the filesystem.
+///
+/// `Display` wrote the two struct fields literally, so a pre-epoch time listed
+/// as `-2.75` for an archive holding `-1.25`. The archive was right and the
+/// listing was wrong, which is the harder version of the bug to notice.
+#[cfg(unix)]
+#[test]
+fn cli_list_renders_pre_epoch_times_as_the_archive_stores_them() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let temp = tempdir().unwrap();
+    let input = temp.path().join("dated.txt");
+    let archive = temp.path().join("dated.tzap");
+    fs::write(&input, b"dated payload\n").unwrap();
+
+    let raw = CString::new(input.as_os_str().as_bytes()).unwrap();
+    let times = [libc::timespec { tv_sec: -2, tv_nsec: 750_000_000 }, libc::timespec { tv_sec: -2, tv_nsec: 750_000_000 }];
+    // SAFETY: `raw` is NUL-terminated and `times` holds exactly two entries.
+    assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, raw.as_ptr(), times.as_ptr(), 0) }, 0);
+
+    use std::os::unix::fs::MetadataExt as _;
+    let source = fs::symlink_metadata(&input).unwrap();
+    if (source.mtime(), source.mtime_nsec()) != (-2, 750_000_000) {
+        return; // the filesystem cannot hold the instant this test is about
+    }
+
+    Command::cargo_bin("tzap").unwrap().args(["create", "--no-encryption", "-o", archive.to_str().unwrap(), input.to_str().unwrap()]).assert().success();
+    let listed = Command::cargo_bin("tzap").unwrap().args(["list", "--long", archive.to_str().unwrap()]).assert().success().get_output().stdout.clone();
+    let listed = String::from_utf8_lossy(&listed);
+
+    assert!(listed.contains("-1.25"), "listing must show the instant the archive holds, got: {listed}");
+    assert!(!listed.contains("-2.75"), "listing must not show the raw timespec fields, got: {listed}");
+}

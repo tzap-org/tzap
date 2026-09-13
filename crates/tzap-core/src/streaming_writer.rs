@@ -794,6 +794,14 @@ fn parse_pax_mtime(bytes: &[u8]) -> Result<ArchiveTimestamp, FormatError> {
     if integer.starts_with('-') && seconds == 0 && nanoseconds != 0 {
         return Err(FormatError::WriterUnsupported("negative fractional PAX mtime between -1 and 0 has no canonical revision-45 encoding"));
     }
+    // The input is a §16.7.2 signed decimal; `ArchiveTimestamp` is a timespec.
+    // Borrow the second the same way `entry_metadata::parse_timestamp` does, or
+    // the value handed to `canonical_pax_value` gets converted a second time on
+    // the way out -- `-2.25` in, `-1.75` out.
+    if seconds < 0 && nanoseconds != 0 {
+        let seconds = seconds.checked_sub(1).ok_or(FormatError::InvalidArchive("PAX mtime exceeds i64"))?;
+        return Ok(ArchiveTimestamp::new(seconds, 1_000_000_000 - nanoseconds));
+    }
     Ok(ArchiveTimestamp::new(seconds, nanoseconds))
 }
 
@@ -1199,7 +1207,12 @@ mod tests {
     #[test]
     fn pax_mtime_preserves_fraction_and_pre_epoch_value() {
         assert_eq!(parse_pax_mtime(b"1700000000.123456789").unwrap(), ArchiveTimestamp::new(1_700_000_000, 123_456_789));
-        assert_eq!(parse_pax_mtime(b"-1.5").unwrap(), ArchiveTimestamp::new(-1, 500_000_000));
+        // A timespec, so 1.5s before the epoch borrows a second. Re-encoding it
+        // must land back on the bytes it came from.
+        assert_eq!(parse_pax_mtime(b"-1.5").unwrap(), ArchiveTimestamp::new(-2, 500_000_000));
+        for encoded in [b"-1.5".as_slice(), b"-2.25".as_slice(), b"-3".as_slice(), b"1700000000.123456789".as_slice()] {
+            assert_eq!(parse_pax_mtime(encoded).unwrap().canonical_pax_value().unwrap(), encoded, "{}", String::from_utf8_lossy(encoded));
+        }
         assert!(matches!(parse_pax_mtime(b"-0.5"), Err(FormatError::WriterUnsupported(_))));
     }
 

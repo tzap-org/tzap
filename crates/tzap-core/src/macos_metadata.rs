@@ -33,6 +33,19 @@ pub struct MacosMetadataIdentity {
     symlink: bool,
 }
 
+impl MacosMetadataIdentity {
+    /// The identity of the object `metadata` describes.
+    ///
+    /// A host that stats an input while scanning can build the identity it
+    /// *expected* and hand it to [`capture_macos_metadata_with`], so an object
+    /// replaced between the scan and the capture is refused rather than archived
+    /// with one object's index entry and another's PAX records.
+    #[must_use]
+    pub fn from_metadata(metadata: &fs::Metadata) -> Self {
+        metadata_identity(metadata)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapturedMacosMetadata {
     pub native: NativeFileMetadata,
@@ -40,12 +53,25 @@ pub struct CapturedMacosMetadata {
 }
 
 pub fn capture_macos_metadata(input: &Path, symlink: bool) -> io::Result<CapturedMacosMetadata> {
+    capture_macos_metadata_with(input, symlink, None)
+}
+
+/// As [`capture_macos_metadata`], but refusing an object that is no longer the
+/// one `expected` described.
+///
+/// This is the scan-to-capture half of the race. Without it a capture only
+/// notices a writer that acts *during* its own window, and a host that already
+/// identified the input at scan time has no way to say so.
+pub fn capture_macos_metadata_with(input: &Path, symlink: bool, expected: Option<MacosMetadataIdentity>) -> io::Result<CapturedMacosMetadata> {
     let file = if symlink { open_symlink(input)? } else { open_metadata_file(input)? };
     let metadata = file.metadata()?;
     if metadata.file_type().is_symlink() != symlink {
         return Err(io::Error::other("input kind changed before metadata capture"));
     }
     let identity = metadata_identity(&metadata);
+    if expected.is_some_and(|expected| expected != identity) {
+        return Err(io::Error::other("input changed before metadata capture"));
+    }
     let native = capture_from_file(input, &file, identity, symlink)?;
     let final_metadata = file.metadata()?;
     if metadata_identity(&final_metadata) != identity {

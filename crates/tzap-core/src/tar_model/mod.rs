@@ -4,7 +4,9 @@ use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+#[cfg(test)]
+use std::time::SystemTime;
+
 use unicode_normalization::UnicodeNormalization;
 
 #[cfg(unix)]

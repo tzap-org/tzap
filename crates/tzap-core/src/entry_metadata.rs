@@ -113,6 +113,23 @@ pub fn archive_timestamp_from_system_time(time: std::time::SystemTime) -> Option
     }
 }
 
+/// The inverse of [`archive_timestamp_from_system_time`].
+///
+/// `nanoseconds` is a forward offset from `seconds` even when `seconds` is
+/// negative, so it must never be folded into the magnitude: `(-2, 750_000_000)`
+/// is 1.25s before the epoch, not 2.75s. Both restore paths wrote that fold out
+/// by hand and both got it wrong, which is the argument for one owner.
+///
+/// `None` means the instant is outside what this host's `SystemTime` can hold.
+#[must_use]
+pub fn system_time_from_archive_timestamp(timestamp: ArchiveTimestamp) -> Option<std::time::SystemTime> {
+    use std::time::Duration;
+    let whole = Duration::new(timestamp.seconds.unsigned_abs(), 0);
+    let base =
+        if timestamp.seconds < 0 { std::time::SystemTime::UNIX_EPOCH.checked_sub(whole)? } else { std::time::SystemTime::UNIX_EPOCH.checked_add(whole)? };
+    base.checked_add(Duration::new(0, timestamp.nanoseconds))
+}
+
 /// Resolve POSIX owner and group names for a uid/gid pair.
 ///
 /// §16.18.1's corpus requires "UID/GID plus non-ASCII user/group names", and
@@ -307,9 +324,26 @@ impl ArchiveTimestamp {
 }
 
 impl fmt::Display for ArchiveTimestamp {
+    /// Renders the same signed decimal [`ArchiveTimestamp::canonical_pax_value`]
+    /// writes, so what `tzap list` prints is the time the archive holds.
+    ///
+    /// This used to print the two fields literally, which is only the same thing
+    /// for non-negative times: a timespec of `(-2, 750_000_000)` is 1.25s before
+    /// the epoch and printed as `-2.75`. The last second before the epoch has no
+    /// §16.7.2 encoding, so it renders in the unambiguous timespec form rather
+    /// than as a signed decimal `Display` cannot fail out of.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.nanoseconds == 0 {
             return write!(formatter, "{}", self.seconds);
+        }
+        if self.seconds < 0 {
+            let whole = self.seconds.unsigned_abs() - 1;
+            let fraction = 1_000_000_000 - self.nanoseconds;
+            if whole == 0 {
+                return write!(formatter, "{}s {}ns", self.seconds, self.nanoseconds);
+            }
+            let fraction = format!("{fraction:09}");
+            return write!(formatter, "-{whole}.{fraction}", fraction = fraction.trim_end_matches('0'));
         }
         let fraction = format!("{:09}", self.nanoseconds);
         write!(formatter, "{}.{fraction}", self.seconds, fraction = fraction.trim_end_matches('0'))
@@ -3050,6 +3084,82 @@ mod tests {
         let mut nul_val = PaxRecords::new();
         nul_val.insert("valid_key".into(), b"val\0with_nul".to_vec());
         assert!(encode_canonical_pax(&nul_val).is_err());
+    }
+
+    /// The bug class that slipped past every existing test: `ArchiveTimestamp`
+    /// is a timespec, §16.7.2 is a signed decimal, and each conversion between
+    /// them was written separately. A producer left on the old convention fed
+    /// `canonical_pax_value` a value it converted a second time, so a birth time
+    /// of `-2.25` was written as `-1.75` -- silently, because nothing asserted
+    /// that the bytes out match the instant in.
+    ///
+    /// Pin the whole loop instead of any one direction: host time -> struct ->
+    /// PAX bytes -> struct, plus `Display`, which renders the same decimal.
+    #[test]
+    fn pre_epoch_times_survive_the_full_encode_parse_round_trip() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        for (before, expected) in [
+            (Duration::new(2, 250_000_000), "-2.25"),
+            (Duration::new(1, 500_000_000), "-1.5"),
+            (Duration::new(3, 750_000_000), "-3.75"),
+            (Duration::new(5, 0), "-5"),
+            (Duration::new(1, 1), "-1.000000001"),
+        ] {
+            let stamp = archive_timestamp_from_system_time(UNIX_EPOCH - before).expect("in i64 range");
+            let encoded = stamp.canonical_pax_value().expect("encodable");
+            assert_eq!(String::from_utf8(encoded.clone()).unwrap(), expected, "encoding {before:?} before the epoch");
+            assert_eq!(parse_timestamp(&encoded).unwrap(), (stamp.seconds, stamp.nanoseconds), "re-parsing {expected}");
+            assert_eq!(stamp.to_string(), expected, "Display must show the time the archive holds");
+        }
+
+        // Positive times are unaffected by the borrow and must stay byte-exact.
+        for (after, expected) in [(Duration::new(1_700_000_000, 123_456_789), "1700000000.123456789"), (Duration::new(7, 0), "7")] {
+            let stamp = archive_timestamp_from_system_time(UNIX_EPOCH + after).expect("in i64 range");
+            let encoded = stamp.canonical_pax_value().expect("encodable");
+            assert_eq!(String::from_utf8(encoded.clone()).unwrap(), expected);
+            assert_eq!(parse_timestamp(&encoded).unwrap(), (stamp.seconds, stamp.nanoseconds));
+            assert_eq!(stamp.to_string(), expected);
+        }
+    }
+
+    /// Host time -> archive -> host time, for the instants the two restore paths
+    /// each reconstructed by hand and each got wrong.
+    #[test]
+    fn archive_timestamps_convert_back_to_the_instant_they_came_from() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        for before in [Duration::new(2, 750_000_000), Duration::new(1, 250_000_000), Duration::new(5, 0), Duration::new(3, 1)] {
+            let instant = UNIX_EPOCH - before;
+            let stamp = archive_timestamp_from_system_time(instant).expect("in range");
+            assert_eq!(system_time_from_archive_timestamp(stamp), Some(instant), "{before:?} before the epoch");
+        }
+        for after in [Duration::new(1_700_000_000, 123_456_789), Duration::new(0, 0), Duration::new(9, 1)] {
+            let instant = UNIX_EPOCH + after;
+            let stamp = archive_timestamp_from_system_time(instant).expect("in range");
+            assert_eq!(system_time_from_archive_timestamp(stamp), Some(instant), "{after:?} after the epoch");
+        }
+
+        // The shape that broke restore: folding the nanoseconds into the
+        // magnitude yields 2.75s before the epoch instead of 1.25s.
+        assert_eq!(system_time_from_archive_timestamp(ArchiveTimestamp::new(-2, 750_000_000)), Some(UNIX_EPOCH - Duration::new(1, 250_000_000)));
+    }
+
+    /// The one window §16.7.2 cannot express, in both directions.
+    #[test]
+    fn the_last_second_before_the_epoch_converts_but_never_encodes() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let stamp = archive_timestamp_from_system_time(UNIX_EPOCH - Duration::new(0, 100)).expect("a timespec represents it fine");
+        assert_eq!(stamp, ArchiveTimestamp::new(-1, 999_999_900));
+        // Encoding would need an integer part of `-0`. Refuse rather than write
+        // `-1.9999999`, an instant nearly two seconds early.
+        assert!(stamp.canonical_pax_value().is_err());
+        // Display cannot fail, so it falls back to the unambiguous timespec form
+        // rather than printing a decimal that would be wrong.
+        assert_eq!(stamp.to_string(), "-1s 999999900ns");
+        // No archive can contain the value, so the parser rejects it too.
+        assert!(parse_timestamp(b"-0.0000001").is_err());
     }
 
     #[test]

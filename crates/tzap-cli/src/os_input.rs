@@ -1,7 +1,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(windows)]
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -9,22 +9,18 @@ use std::time::SystemTime;
 use crate::commands::archive_path_to_string;
 #[cfg(windows)]
 use crate::commands::create::InputSpec;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 use anyhow::anyhow;
+#[cfg(windows)]
+use anyhow::bail;
+#[cfg(windows)]
+use anyhow::Context;
 use anyhow::Result;
-#[cfg(any(target_os = "macos", windows))]
-use anyhow::{bail, Context};
 #[cfg(windows)]
 use tzap_core::SourceEntryKind;
-#[cfg(target_os = "macos")]
-use tzap_core::{canonical_base64_encode, encode_percent_name};
 use tzap_core::{ArchiveTimestamp, NativeFileMetadata, PortableFileMetadata, SparseExtent};
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(windows)]
 use tzap_core::{NativeAuxiliaryMetadata, RestoreClass};
-// Only the macOS and Linux capture paths encode auxiliary names now; Windows
-// capture moved to tzap-core.
-#[cfg(not(windows))]
-use tzap_core::NativeAuxiliaryNameEncoding;
 
 #[cfg(unix)]
 pub(crate) fn readonly_mode(metadata: &fs::Metadata) -> u32 {
@@ -60,6 +56,11 @@ pub(crate) struct InputIdentity {
     pub(crate) change_time_nanoseconds: i64,
     #[cfg(unix)]
     pub(crate) creation_time: Option<ArchiveTimestamp>,
+    /// What the scan saw, in the form tzap-core's macOS capture compares against
+    /// and its resource-fork reader re-checks. Carrying core's own type keeps the
+    /// two ends of that check from drifting apart.
+    #[cfg(target_os = "macos")]
+    pub(crate) macos_identity: Option<tzap_core::macos_metadata::MacosMetadataIdentity>,
     #[cfg(unix)]
     pub(crate) dev: u64,
     #[cfg(unix)]
@@ -361,6 +362,8 @@ pub(crate) fn input_identity(metadata: &fs::Metadata) -> io::Result<InputIdentit
         },
         #[cfg(unix)]
         creation_time: metadata.created().ok().and_then(|time| archive_timestamp(time).ok()),
+        #[cfg(target_os = "macos")]
+        macos_identity: Some(tzap_core::macos_metadata::MacosMetadataIdentity::from_metadata(metadata)),
         #[cfg(unix)]
         dev: {
             use std::os::unix::fs::MetadataExt;
@@ -605,177 +608,6 @@ pub(crate) struct SparseExtentInputReader<'a> {
     pub(crate) validated: bool,
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) enum MacosResourceForkSource {
-    File { owner: File, fork: File },
-    Symlink(File),
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn open_macos_symlink(input: &Path) -> io::Result<File> {
-    use std::ffi::CString;
-    use std::os::fd::FromRawFd as _;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    const O_SYMLINK: libc::c_int = 0x0020_0000;
-    let path = CString::new(input.as_os_str().as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | O_SYMLINK) };
-    if fd < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn open_macos_resource_fork_for_read(owner: File) -> io::Result<MacosResourceForkSource> {
-    use std::ffi::OsString;
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::ffi::OsStringExt as _;
-    use std::os::unix::fs::MetadataExt as _;
-
-    let mut path = vec![0u8; libc::PATH_MAX as usize];
-    if unsafe { libc::fcntl(owner.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let length =
-        path.iter().position(|byte| *byte == 0).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "macOS returned an unterminated descriptor path"))?;
-    path.truncate(length);
-    path.extend_from_slice(b"/..namedfork/rsrc");
-    let fork = File::open(PathBuf::from(OsString::from_vec(path)))?;
-    let owner_metadata = owner.metadata()?;
-    let fork_metadata = fork.metadata()?;
-    if owner_metadata.dev() != fork_metadata.dev() || owner_metadata.ino() != fork_metadata.ino() {
-        return Err(io::Error::other("resource fork path no longer identifies the pinned file"));
-    }
-    Ok(MacosResourceForkSource::File { owner, fork })
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) struct MacosResourceForkReader {
-    pub(crate) source: MacosResourceForkSource,
-    pub(crate) expected: InputIdentity,
-    pub(crate) logical_size: u64,
-    pub(crate) offset: u64,
-    pub(crate) validated: bool,
-}
-
-#[cfg(target_os = "macos")]
-impl MacosResourceForkReader {
-    pub(crate) fn new(source: MacosResourceForkSource, expected: InputIdentity, expected_size: Option<u64>) -> io::Result<Self> {
-        let actual = Self::identity(&source)?;
-        if actual != expected {
-            return Err(io::Error::other("macOS resource-fork owner changed before read"));
-        }
-        let logical_size = macos_resource_fork_size(&source)?;
-        if expected_size.is_some_and(|size| size != logical_size) {
-            return Err(io::Error::other("macOS resource fork changed after metadata scan"));
-        }
-        if matches!(&source, MacosResourceForkSource::Symlink(_)) && logical_size > u64::from(u32::MAX) {
-            return Err(io::Error::other("macOS resource fork exceeds Darwin positional xattr limits"));
-        }
-        Ok(Self { source, expected, logical_size, offset: 0, validated: false })
-    }
-
-    fn identity(source: &MacosResourceForkSource) -> io::Result<InputIdentity> {
-        match source {
-            MacosResourceForkSource::File { owner, .. } => input_identity(&owner.metadata()?),
-            MacosResourceForkSource::Symlink(file) => {
-                let metadata = file.metadata()?;
-                if !metadata.file_type().is_symlink() {
-                    return Err(io::Error::other("macOS resource-fork owner is no longer a symlink"));
-                }
-                input_identity(&metadata)
-            }
-        }
-    }
-
-    fn validate_finished(&mut self) -> io::Result<()> {
-        if !self.validated {
-            if Self::identity(&self.source)? != self.expected || macos_resource_fork_size(&self.source)? != self.logical_size {
-                return Err(io::Error::other("macOS resource fork changed during read"));
-            }
-            self.validated = true;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Read for MacosResourceForkReader {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if out.is_empty() {
-            return Ok(0);
-        }
-        if self.offset == self.logical_size {
-            self.validate_finished()?;
-            return Ok(0);
-        }
-        let count = usize::try_from((self.logical_size - self.offset).min(out.len() as u64)).unwrap();
-        let read = macos_read_resource_fork(&self.source, self.offset, &mut out[..count])?;
-        if read == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "macOS resource fork ended before its scanned size"));
-        }
-        self.offset += read as u64;
-        if self.offset == self.logical_size {
-            self.validate_finished()?;
-        }
-        Ok(read)
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn macos_resource_fork_size(source: &MacosResourceForkSource) -> io::Result<u64> {
-    use std::ffi::{c_char, c_int, c_void};
-    use std::os::fd::AsRawFd as _;
-
-    extern "C" {
-        fn fgetxattr(fd: c_int, name: *const c_char, value: *mut c_void, size: usize, position: u32, options: c_int) -> libc::ssize_t;
-    }
-    const RESOURCE_FORK: &[u8] = b"com.apple.ResourceFork\0";
-    let size = match source {
-        MacosResourceForkSource::File { fork, .. } => return Ok(fork.metadata()?.len()),
-        MacosResourceForkSource::Symlink(file) => unsafe { fgetxattr(file.as_raw_fd(), RESOURCE_FORK.as_ptr().cast(), std::ptr::null_mut(), 0, 0, 0) },
-    };
-    if size < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(size as u64)
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn macos_read_resource_fork(source: &MacosResourceForkSource, position: u64, out: &mut [u8]) -> io::Result<usize> {
-    use std::ffi::{c_char, c_int, c_void};
-    use std::os::fd::AsRawFd as _;
-
-    extern "C" {
-        fn fgetxattr(fd: c_int, name: *const c_char, value: *mut c_void, size: usize, position: u32, options: c_int) -> libc::ssize_t;
-    }
-    const RESOURCE_FORK: &[u8] = b"com.apple.ResourceFork\0";
-    let read = match source {
-        MacosResourceForkSource::File { fork, .. } => {
-            use std::os::unix::fs::FileExt as _;
-            return fork.read_at(out, position);
-        }
-        MacosResourceForkSource::Symlink(file) => unsafe {
-            fgetxattr(
-                file.as_raw_fd(),
-                RESOURCE_FORK.as_ptr().cast(),
-                out.as_mut_ptr().cast(),
-                out.len(),
-                u32::try_from(position).map_err(|_| io::Error::other("macOS symlink resource fork exceeds Darwin positional limits"))?,
-                0,
-            )
-        },
-    };
-    if read < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(read as usize)
-    }
-}
-
 #[cfg(windows)]
 pub(crate) fn windows_alternate_stream_path(base: &Path, name: &[u8]) -> io::Result<PathBuf> {
     use std::ffi::OsString;
@@ -918,12 +750,11 @@ impl Read for IdentityCheckedInputReader {
 }
 
 pub(crate) fn archive_timestamp(time: SystemTime) -> io::Result<ArchiveTimestamp> {
-    // Previously converted with a timespec-style borrow (`-secs - 1`,
-    // `1e9 - nanos`), which is wrong for this format: §16.7.2 encodes a time as
-    // a plain signed decimal, so the struct is sign-magnitude. That wrote
-    // `mtime=-2.5` for an instant 1.5 seconds before the epoch -- a full second
-    // early -- and the error grew with the fraction. tzap-core now owns the
-    // conversion, so this host and zmanager cannot disagree about it.
+    // tzap-core owns this conversion, so this host and zmanager cannot disagree
+    // about it. `ArchiveTimestamp` is a timespec (`tv_sec` plus an always-positive
+    // `tv_nsec`), which is what the restore paths feed straight into
+    // `libc::timespec`, `fsetattrlist`, and the FILETIME math; the §16.7.2
+    // sign-and-magnitude form is produced only by `canonical_pax_value`.
     tzap_core::entry_metadata::archive_timestamp_from_system_time(time).ok_or_else(|| io::Error::other("input mtime exceeds revision-45 i64 range"))
 }
 
@@ -950,32 +781,80 @@ pub(crate) fn unsupported_windows_file_attribute_reason(attributes: u32) -> Opti
     .find_map(|(flag, reason)| (attributes & flag != 0).then_some(reason))
 }
 
-pub(crate) fn portable_input_metadata(identity: InputIdentity, input: &Path) -> Result<PortableFileMetadata> {
-    // tzap-core owns the portable assembly -- source OS, mode origin, owner-name
-    // resolution -- so this host and zmanager cannot disagree about it. The
-    // native capture and the identity check below stay here: they are this
-    // host's, and richer than core's on Windows.
-    let metadata = fs::symlink_metadata(input)?;
-    let created = metadata.created().ok().and_then(|t| archive_timestamp(t).ok());
-    let accessed = metadata.accessed().ok().and_then(|t| archive_timestamp(t).ok());
-    Ok(tzap_core::portable_capture::assemble_portable_file_metadata(
-        capture_native_file_metadata(input, identity)?,
-        portable_owner_ids(&identity),
-        identity.attributes,
-        created,
-        accessed,
-    ))
+/// A native capture plus whatever the host needs to re-open the same object.
+///
+/// Only macOS has such a handle today: its resource fork is opened separately
+/// from the capture, and must be proven to belong to the object the capture read.
+#[derive(Debug)]
+pub(crate) struct CapturedNativeMetadata {
+    pub(crate) native: NativeFileMetadata,
+    #[cfg(target_os = "macos")]
+    pub(crate) macos_identity: Option<tzap_core::macos_metadata::MacosMetadataIdentity>,
 }
 
-pub(crate) fn portable_symlink_metadata(identity: InputIdentity, _input: &Path) -> Result<PortableFileMetadata> {
+/// Portable metadata for one input, plus the same re-open handle.
+pub(crate) struct CapturedInputMetadata {
+    pub(crate) metadata: PortableFileMetadata,
+    #[cfg(target_os = "macos")]
+    pub(crate) macos_identity: Option<tzap_core::macos_metadata::MacosMetadataIdentity>,
+}
+
+pub(crate) fn portable_input_metadata(identity: InputIdentity, input: &Path) -> Result<CapturedInputMetadata> {
+    // tzap-core owns the portable assembly -- source OS, mode origin, owner-name
+    // resolution, and the optional-time rules -- so this host and zmanager cannot
+    // disagree about it. What stays here is genuinely this host's: the sparse and
+    // reparse handling layered on top, and the scan identity it captures against.
+    let metadata = fs::symlink_metadata(input)?;
+    let (created, accessed) = portable_optional_times(&metadata);
+    let captured = capture_native_file_metadata(input, identity)?;
+    Ok(CapturedInputMetadata {
+        metadata: tzap_core::portable_capture::assemble_portable_file_metadata(
+            captured.native,
+            portable_owner_ids(&identity),
+            identity.attributes,
+            created,
+            accessed,
+        ),
+        #[cfg(target_os = "macos")]
+        macos_identity: captured.macos_identity,
+    })
+}
+
+pub(crate) fn portable_symlink_metadata(identity: InputIdentity, _input: &Path) -> Result<CapturedInputMetadata> {
     // A symlink carries no creation or access time of its own worth recording.
     #[cfg(target_os = "linux")]
-    let native = capture_linux_symlink_metadata(_input, identity)?;
+    let captured = CapturedNativeMetadata { native: capture_linux_symlink_metadata(_input, identity)? };
     #[cfg(target_os = "macos")]
-    let native = capture_macos_symlink_metadata(_input, identity)?;
+    let captured = capture_macos_symlink_metadata(_input, identity)?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let native = NativeFileMetadata::default();
-    Ok(tzap_core::portable_capture::assemble_portable_file_metadata(native, portable_owner_ids(&identity), identity.attributes, None, None))
+    let captured = CapturedNativeMetadata { native: NativeFileMetadata::default() };
+    Ok(CapturedInputMetadata {
+        metadata: tzap_core::portable_capture::assemble_portable_file_metadata(captured.native, portable_owner_ids(&identity), identity.attributes, None, None),
+        #[cfg(target_os = "macos")]
+        macos_identity: captured.macos_identity,
+    })
+}
+
+/// Creation and access times for the portable record.
+///
+/// Both are optional, so a time the format cannot encode is dropped rather than
+/// failing the archive -- the rule tzap-core states and applies in
+/// `capture_portable_file_metadata`, which this host must not diverge from.
+/// `mtime` is deliberately not here: losing it silently is a different decision.
+fn portable_optional_times(metadata: &fs::Metadata) -> (Option<ArchiveTimestamp>, Option<ArchiveTimestamp>) {
+    let encodable = |time: ArchiveTimestamp| time.canonical_pax_value().is_ok().then_some(time);
+    let created = metadata.created().ok().and_then(|time| archive_timestamp(time).ok()).and_then(encodable);
+    // std cannot expose the birth time on musl (statx/STATX_BTIME is unsupported
+    // there), so fall back to ctime as core does -- otherwise this host silently
+    // drops a creation time that zmanager records on the same file.
+    #[cfg(target_os = "linux")]
+    let created = created.or_else(|| {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(ArchiveTimestamp::new(metadata.ctime(), u32::try_from(metadata.ctime_nsec()).unwrap_or(0)))
+    });
+    #[cfg(target_os = "linux")]
+    let created = created.and_then(encodable);
+    (created, metadata.accessed().ok().and_then(|time| archive_timestamp(time).ok()).and_then(encodable))
 }
 
 /// Ownership as observed when the input was first identified, not re-read here:
@@ -992,7 +871,7 @@ fn portable_owner_ids(_identity: &InputIdentity) -> Option<(u64, u64)> {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn capture_linux_symlink_metadata(input: &Path, _identity: InputIdentity) -> Result<NativeFileMetadata> {
-    tzap_core::linux_metadata::capture_linux_metadata(input, true).map_err(Into::into)
+    tzap_core::portable_capture::with_capture_retry(|| tzap_core::linux_metadata::capture_linux_metadata(input, true)).map_err(Into::into)
 }
 
 #[cfg(unix)]
@@ -1010,287 +889,56 @@ pub(crate) fn symlink_target_bytes(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn capture_native_file_metadata(input: &Path, _identity: InputIdentity) -> Result<NativeFileMetadata> {
-    tzap_core::linux_metadata::capture_linux_metadata(input, false).map_err(Into::into)
+pub(crate) fn capture_native_file_metadata(input: &Path, _identity: InputIdentity) -> Result<CapturedNativeMetadata> {
+    // A file changing mid-capture is ordinary during a live backup, and a re-read
+    // almost always succeeds. zmanager has retried this since "Fix TZAP Unicode
+    // archives and metadata capture races"; this host never did.
+    let native = tzap_core::portable_capture::with_capture_retry(|| tzap_core::linux_metadata::capture_linux_metadata(input, false))?;
+    Ok(CapturedNativeMetadata { native })
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn open_macos_metadata_file(input: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    const O_EVTONLY: libc::c_int = 0x0000_8000;
-    fs::OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK | O_EVTONLY).open(input)
+pub(crate) fn capture_native_file_metadata(input: &Path, identity: InputIdentity) -> Result<CapturedNativeMetadata> {
+    capture_macos_native_metadata(input, identity, false)
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn capture_native_file_metadata(input: &Path, identity: InputIdentity) -> Result<NativeFileMetadata> {
-    use std::os::macos::fs::MetadataExt;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::FileTypeExt as _;
-    use xattr::FileExt as _;
-
-    // Leave ample room below the 64 MiB local-PAX cap for declarations and
-    // caller-owned native records. Xattrs beyond this aggregate budget use
-    // the format's hashed auxiliary representation instead.
-    const INLINE_XATTR_BUDGET: usize = 32 * 1024 * 1024;
-
-    let file = open_macos_metadata_file(input).with_context(|| format!("failed to open {} for metadata capture", input.display()))?;
-    let opened_identity = input_identity(&file.metadata().with_context(|| format!("failed to identify opened metadata object {}", input.display()))?)?;
-    if opened_identity != identity {
-        bail!("input changed before metadata capture: {}", input.display());
-    }
-    let mut native = NativeFileMetadata::default();
-    let mut inline_xattr_bytes = 0usize;
-    let file_type = file.metadata()?.file_type();
-    let device_without_metadata_api = file_type.is_char_device() || file_type.is_block_device();
-    native.primary_pax_records.insert("TZAP.macos.st-flags".into(), format!("{:016x}", file.metadata()?.st_flags()).into_bytes());
-    native.primary_pax_records.insert(
-        "TZAP.unix.ctime-observed".into(),
-        ArchiveTimestamp::new(identity.change_time_seconds, identity.change_time_nanoseconds as u32).canonical_pax_value().map_err(|error| anyhow!(error))?,
-    );
-    if let Some(creation_time) = identity.creation_time {
-        native.primary_pax_records.insert("LIBARCHIVE.creationtime".into(), creation_time.canonical_pax_value().map_err(|error| anyhow!(error))?);
-    }
-
-    let xattr_names = match file.list_xattr() {
-        Ok(names) => names.collect::<Vec<_>>(),
-        Err(error) if device_without_metadata_api && error.raw_os_error().is_some_and(|code| code == libc::EPERM || code == libc::ENOTSUP) => Vec::new(),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to list xattrs for {}", input.display()));
-        }
-    };
-    for name in xattr_names {
-        let name_bytes = name.as_bytes();
-        if name_bytes == b"com.apple.ResourceFork" {
-            native.auxiliary_records.push(
-                capture_macos_resource_fork(open_macos_resource_fork_for_read(file.try_clone()?)?, identity)
-                    .with_context(|| format!("failed to capture resource fork for {}", input.display()))?,
-            );
-            continue;
-        }
-        let Some(value) = file.get_xattr(&name).with_context(|| format!("failed to read xattr on {}", input.display()))? else {
-            bail!("xattr changed while scanning {}", input.display());
-        };
-        match name_bytes {
-            b"com.apple.FinderInfo" => {
-                if value.len() != 32 {
-                    bail!("FinderInfo on {} is not exactly 32 bytes", input.display());
-                }
-                native.auxiliary_records.push(NativeAuxiliaryMetadata::new("macos.finder-info", "macos-backup-v1", RestoreClass::SameOs, value));
-            }
-            _ if inline_xattr_bytes.saturating_add(name_bytes.len()).saturating_add(value.len().saturating_mul(4).div_ceil(3)) > INLINE_XATTR_BUDGET => {
-                let profile = if name_bytes.starts_with(b"com.apple.") { "macos-backup-v1" } else { "posix-backup-v1" };
-                let mut record = NativeAuxiliaryMetadata::new(
-                    "generic.xattr",
-                    profile,
-                    if macos_system_xattr(name_bytes) { RestoreClass::System } else { RestoreClass::SameOs },
-                    value,
-                );
-                record.name_encoding = NativeAuxiliaryNameEncoding::Bytes;
-                record.name = name_bytes.to_vec();
-                native.auxiliary_records.push(record);
-            }
-            _ => {
-                let encoded_name = encode_percent_name(name_bytes).map_err(|error| anyhow!(error))?;
-                native.primary_pax_records.insert(format!("LIBARCHIVE.xattr.{encoded_name}"), canonical_base64_encode(&value));
-                inline_xattr_bytes = inline_xattr_bytes.saturating_add(encoded_name.len()).saturating_add(value.len().saturating_mul(4).div_ceil(3));
-            }
-        }
-    }
-
-    let acl = match capture_macos_acl(&file) {
-        Ok(acl) => acl,
-        Err(error) if device_without_metadata_api && error.raw_os_error().is_some_and(|code| code == libc::EPERM || code == libc::ENOTSUP) => None,
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to capture ACL for {}", input.display()));
-        }
-    };
-    if let Some(acl) = acl {
-        let mut record = NativeAuxiliaryMetadata::new("macos.acl-native", "macos-backup-v1", RestoreClass::SameOs, acl);
-        record.meta.insert("TZAP.aux.meta.acl-format".into(), b"darwin-acl-external-v1".to_vec());
-        native.auxiliary_records.push(record);
-        native.primary_pax_records.insert("TZAP.acl.projection".into(), b"none".to_vec());
-    }
-
-    native.auxiliary_records.sort_by(|left, right| left.kind.cmp(&right.kind).then_with(|| left.name.cmp(&right.name)));
-    native.required_profiles.push("macos-backup-v1".into());
-    native.required_profiles.push("posix-backup-v1".into());
-    native.required_profiles.sort();
-    let final_identity = input_identity(&file.metadata().with_context(|| format!("failed to reidentify metadata object {}", input.display()))?)?;
-    if final_identity != identity {
-        bail!("input changed during metadata capture: {}", input.display());
-    }
-    Ok(native)
+pub(crate) fn capture_macos_symlink_metadata(input: &Path, identity: InputIdentity) -> Result<CapturedNativeMetadata> {
+    capture_macos_native_metadata(input, identity, true)
 }
 
+/// macOS capture is tzap-core's. This host supplies only the identity it saw at
+/// scan time, so an object swapped between the scan and the capture is refused.
+///
+/// Both hosts read the same xattrs, ACL, Darwin flags, resource fork, and times
+/// through the same code now. They previously kept separate copies of all of it,
+/// which is how they came to disagree about whether `LIBARCHIVE.creationtime` is
+/// written unconditionally.
 #[cfg(target_os = "macos")]
-pub(crate) fn capture_macos_symlink_metadata(input: &Path, identity: InputIdentity) -> Result<NativeFileMetadata> {
-    use std::os::macos::fs::MetadataExt as _;
-    use std::os::unix::ffi::OsStrExt as _;
-    use xattr::FileExt as _;
-
-    const INLINE_XATTR_BUDGET: usize = 32 * 1024 * 1024;
-    let file = open_macos_symlink(input).with_context(|| format!("failed to open symlink {}", input.display()))?;
-    let current = file.metadata().with_context(|| format!("failed to identify symlink {}", input.display()))?;
-    if !current.file_type().is_symlink() || input_identity(&current)? != identity {
-        bail!("symlink changed before metadata capture: {}", input.display());
-    }
-
-    let mut native = NativeFileMetadata::default();
-    let mut inline_xattr_bytes = 0usize;
-    native.primary_pax_records.insert("TZAP.macos.st-flags".into(), format!("{:016x}", current.st_flags()).into_bytes());
-    native.primary_pax_records.insert(
-        "TZAP.unix.ctime-observed".into(),
-        ArchiveTimestamp::new(identity.change_time_seconds, identity.change_time_nanoseconds as u32).canonical_pax_value().map_err(|error| anyhow!(error))?,
-    );
-    if let Some(creation_time) = identity.creation_time {
-        native.primary_pax_records.insert("LIBARCHIVE.creationtime".into(), creation_time.canonical_pax_value().map_err(|error| anyhow!(error))?);
-    }
-
-    for name in file.list_xattr().with_context(|| format!("failed to list symlink xattrs for {}", input.display()))? {
-        let name_bytes = name.as_bytes();
-        if name_bytes == b"com.apple.ResourceFork" {
-            native.auxiliary_records.push(
-                capture_macos_resource_fork(MacosResourceForkSource::Symlink(file.try_clone()?), identity)
-                    .with_context(|| format!("failed to capture symlink resource fork for {}", input.display()))?,
-            );
-            continue;
-        }
-        let Some(value) = file.get_xattr(&name).with_context(|| format!("failed to read symlink xattr on {}", input.display()))? else {
-            bail!("symlink xattr changed while scanning {}", input.display());
-        };
-        match name_bytes {
-            b"com.apple.FinderInfo" => {
-                if value.len() != 32 {
-                    bail!("FinderInfo on {} is not exactly 32 bytes", input.display());
-                }
-                native.auxiliary_records.push(NativeAuxiliaryMetadata::new("macos.finder-info", "macos-backup-v1", RestoreClass::SameOs, value));
-            }
-            _ if inline_xattr_bytes.saturating_add(name_bytes.len()).saturating_add(value.len().saturating_mul(4).div_ceil(3)) > INLINE_XATTR_BUDGET => {
-                let profile = if name_bytes.starts_with(b"com.apple.") { "macos-backup-v1" } else { "posix-backup-v1" };
-                let mut record = NativeAuxiliaryMetadata::new(
-                    "generic.xattr",
-                    profile,
-                    if macos_system_xattr(name_bytes) { RestoreClass::System } else { RestoreClass::SameOs },
-                    value,
-                );
-                record.name_encoding = NativeAuxiliaryNameEncoding::Bytes;
-                record.name = name_bytes.to_vec();
-                native.auxiliary_records.push(record);
-            }
-            _ => {
-                let encoded_name = encode_percent_name(name_bytes).map_err(|error| anyhow!(error))?;
-                let encoded_value = canonical_base64_encode(&value);
-                inline_xattr_bytes = inline_xattr_bytes.saturating_add(encoded_name.len()).saturating_add(encoded_value.len());
-                native.primary_pax_records.insert(format!("LIBARCHIVE.xattr.{encoded_name}"), encoded_value);
-            }
-        }
-    }
-
-    if let Some(acl) = capture_macos_acl(&file)? {
-        let mut record = NativeAuxiliaryMetadata::new("macos.acl-native", "macos-backup-v1", RestoreClass::SameOs, acl);
-        record.meta.insert("TZAP.aux.meta.acl-format".into(), b"darwin-acl-external-v1".to_vec());
-        native.auxiliary_records.push(record);
-        native.primary_pax_records.insert("TZAP.acl.projection".into(), b"none".to_vec());
-    }
-    native.required_profiles = vec!["macos-backup-v1".into(), "posix-backup-v1".into()];
-    native.auxiliary_records.sort_by(|left, right| left.kind.cmp(&right.kind).then_with(|| left.name.cmp(&right.name)));
-    let final_metadata = file.metadata().with_context(|| format!("failed to reidentify symlink {}", input.display()))?;
-    if !final_metadata.file_type().is_symlink() || input_identity(&final_metadata)? != identity {
-        bail!("symlink changed during metadata capture: {}", input.display());
-    }
-    Ok(native)
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn macos_system_xattr(name: &[u8]) -> bool {
-    name.starts_with(b"security.") || name.starts_with(b"trusted.") || name.starts_with(b"system.")
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn capture_macos_resource_fork(source: MacosResourceForkSource, identity: InputIdentity) -> Result<NativeAuxiliaryMetadata> {
-    use sha2::{Digest as _, Sha256};
-
-    let mut reader = MacosResourceForkReader::new(source, identity, None)?;
-    let logical_size = reader.logical_size;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 1024 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(NativeAuxiliaryMetadata::new_streamed("macos.resource-fork", "macos-backup-v1", RestoreClass::SameOs, logical_size, hasher.finalize().into()))
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn capture_macos_acl(file: &File) -> io::Result<Option<Vec<u8>>> {
-    use std::os::fd::AsRawFd;
-    use std::ptr;
-
-    type Acl = *mut libc::c_void;
-    type AclEntry = *mut libc::c_void;
-    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
-    const ACL_FIRST_ENTRY: libc::c_int = 0;
-
-    extern "C" {
-        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> Acl;
-        fn acl_get_entry(acl: Acl, entry_id: libc::c_int, entry: *mut AclEntry) -> libc::c_int;
-        fn acl_size(acl: Acl) -> libc::ssize_t;
-        fn acl_copy_ext(buffer: *mut libc::c_void, acl: Acl, size: libc::ssize_t) -> libc::ssize_t;
-        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
-    }
-
-    // SAFETY: `file` owns a live descriptor and the returned ACL is released on every path.
-    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
-    if acl.is_null() {
-        let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::ENOENT) { Ok(None) } else { Err(error) };
-    }
-    let result = (|| {
-        let mut first: AclEntry = ptr::null_mut();
-        // SAFETY: `acl` is valid and `first` points to writable storage for one entry pointer.
-        match unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut first) } {
-            1 => return Ok(None),
-            0 => {}
-            _ => return Err(io::Error::last_os_error()),
-        }
-        // SAFETY: `acl` remains valid for the duration of this scope.
-        let size = unsafe { acl_size(acl) };
-        if size < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut external = vec![0u8; usize::try_from(size).map_err(|_| { io::Error::other("macOS ACL external form exceeds platform limits") })?];
-        // SAFETY: the destination has exactly `size` writable bytes and `acl` is valid.
-        let copied = unsafe { acl_copy_ext(external.as_mut_ptr().cast(), acl, size) };
-        if copied < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        external.truncate(usize::try_from(copied).map_err(|_| io::Error::other("macOS ACL external form exceeds platform limits"))?);
-        Ok(Some(external))
-    })();
-    // SAFETY: `acl` was returned by `acl_get_fd_np` and has not yet been freed.
-    unsafe { acl_free(acl) };
-    result
+fn capture_macos_native_metadata(input: &Path, identity: InputIdentity, symlink: bool) -> Result<CapturedNativeMetadata> {
+    let expected = identity.macos_identity;
+    let captured = tzap_core::portable_capture::with_capture_retry(|| tzap_core::macos_metadata::capture_macos_metadata_with(input, symlink, expected))
+        // Add the path, but keep core's own wording: `is_transient_capture_race`
+        // matches on it, and a context line that replaced it would leave the
+        // retry working while the message stopped saying what happened.
+        .map_err(|error| anyhow!("{error}: {}", input.display()))?;
+    Ok(CapturedNativeMetadata { native: captured.native, macos_identity: Some(captured.identity) })
 }
 
 #[cfg(windows)]
-pub(crate) fn capture_native_file_metadata(input: &Path, identity: InputIdentity) -> Result<NativeFileMetadata> {
+pub(crate) fn capture_native_file_metadata(input: &Path, identity: InputIdentity) -> Result<CapturedNativeMetadata> {
     // tzap-core owns Windows capture. This host only supplies the attributes and
     // times it already observed when the input was identified, so the archive
     // describes that observation rather than a second, later one.
-    tzap_core::windows_metadata::capture_windows_metadata_with(
-        input,
-        Some(tzap_core::windows_metadata::WindowsObservedBasicInfo {
-            file_attributes: identity.file_attributes,
-            creation_time_100ns: identity.creation_time_100ns,
-            last_access_time_100ns: identity.last_access_time_100ns,
-            change_time_100ns: identity.change_time_100ns,
-        }),
-    )
-    .with_context(|| format!("failed to capture Windows metadata for {}", input.display()))
+    let observed = tzap_core::windows_metadata::WindowsObservedBasicInfo {
+        file_attributes: identity.file_attributes,
+        creation_time_100ns: identity.creation_time_100ns,
+        last_access_time_100ns: identity.last_access_time_100ns,
+        change_time_100ns: identity.change_time_100ns,
+    };
+    let native = tzap_core::portable_capture::with_capture_retry(|| tzap_core::windows_metadata::capture_windows_metadata_with(input, Some(observed)))
+        .with_context(|| format!("failed to capture Windows metadata for {}", input.display()))?;
+    Ok(CapturedNativeMetadata { native })
 }
 
 #[cfg(windows)]
@@ -1522,8 +1170,8 @@ impl Drop for WindowsRawEfsReader {
 }
 
 #[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(windows)))]
-pub(crate) fn capture_native_file_metadata(_input: &Path, _identity: InputIdentity) -> Result<NativeFileMetadata> {
-    Ok(NativeFileMetadata::default())
+pub(crate) fn capture_native_file_metadata(_input: &Path, _identity: InputIdentity) -> Result<CapturedNativeMetadata> {
+    Ok(CapturedNativeMetadata { native: NativeFileMetadata::default() })
 }
 
 pub(crate) fn portable_attributes(metadata: &fs::Metadata) -> Option<u32> {
