@@ -2378,10 +2378,17 @@ fn windows_directory_input_survives_a_non_resident_index() {
 #[cfg(windows)]
 #[test]
 fn windows_directory_archive_round_trips_into_a_traversable_tree() {
-    // The two tests above assert the mode the capture step records. That is not the
-    // property that matters: what matters is that the archive extracts back into a
-    // tree that can actually be entered and added to. Archive a directory whose NTFS
-    // index has outgrown its MFT record, restore it, and walk the result.
+    // Archive a directory whose NTFS index has outgrown its MFT record, restore it,
+    // and walk the result.
+    //
+    // What this does NOT cover: a directory mode that has lost its traverse bit.
+    // Windows has no POSIX permissions, so restoring 0o644 here still yields a
+    // perfectly traversable directory -- verified by mutation, where this test
+    // passes and only the capture-level assertion in
+    // `windows_directory_input_survives_a_non_resident_index` fails. The mode only
+    // bites when a Windows-written archive is restored on a POSIX host, which is
+    // what scripts/cross-platform-read-matrix.sh exercises. Keep both: the capture
+    // assertion is the guard for the mode, this is the guard for the round trip.
     let temp = windows_test_tempdir();
     let source = temp.path().join("corpus");
     fs::create_dir(&source).unwrap();
