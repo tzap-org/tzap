@@ -734,6 +734,42 @@ fn other_unix_source_with_creation_time_round_trips_with_consistent_native_metad
     );
 }
 
+/// §16.7.1: "Setuid and setgid bits cause `REQUIRES_SYSTEM_RESTORE`; a sticky
+/// directory bit does not by itself require system policy." §16.18.1 names
+/// "setuid, setgid, and sticky modes" in the required conformance corpus.
+///
+/// Nothing in the tree referenced `S_ISVTX` or `0o1000`, so the sticky half of
+/// that rule had no coverage in either direction. Both escalation sites test
+/// `mode & 0o6000`, which is already correct -- this pins it, because widening
+/// the mask to `0o7000` would look like a tightening and would silently push
+/// every sticky directory (`/tmp` and any tree containing one) into a policy
+/// that a portable restore refuses to apply.
+///
+/// `posix_owner` stays `None` deliberately: owner metadata escalates on its own
+/// (`envelope.rs`), which would mask the mode bit this test is about.
+#[test]
+fn sticky_mode_does_not_require_system_restore_but_setid_modes_do() {
+    let portable_metadata = PortableFileMetadata { posix_owner: None, ..PortableFileMetadata::default() };
+    let flags = |mode: u32| v45_portable_file_entry_flags(mode, false, &portable_metadata) & REQUIRES_SYSTEM_RESTORE;
+
+    assert_eq!(flags(0o1777), 0, "a sticky directory must not require system restore");
+    assert_eq!(flags(0o1755), 0, "sticky alongside ordinary bits must not require system restore");
+    assert_ne!(flags(0o4755), 0, "setuid must require system restore");
+    assert_ne!(flags(0o2755), 0, "setgid must require system restore");
+    assert_ne!(flags(0o6755), 0, "setuid+setgid must require system restore");
+    assert_ne!(flags(0o5755), 0, "sticky must not mask setuid");
+    assert_ne!(flags(0o3755), 0, "sticky must not mask setgid");
+
+    // And the reader must recompute the same answer from a written header, or
+    // the two disagree and verification reports a flag-summary mismatch.
+    for (mode, expect_system) in [(0o1777u32, false), (0o4755, true), (0o2755, true)] {
+        let group = build_regular_file_member_group(b"entry.bin", b"body", mode, ArchiveTimestamp::UNIX_EPOCH, &portable_metadata).unwrap();
+        let parsed = parse_tar_member_group(&group, 4096).unwrap();
+        assert_eq!(parsed.v45_metadata.file_entry_flags & REQUIRES_SYSTEM_RESTORE != 0, expect_system, "reader disagrees with the writer for mode {mode:o}");
+        assert_eq!(parsed.v45_metadata.declaration.portable_mode & 0o7777, mode, "mode {mode:o} did not survive the round trip");
+    }
+}
+
 #[test]
 fn directory_writer_emits_type_and_portable_ownership_metadata() {
     let portable_metadata = PortableFileMetadata {

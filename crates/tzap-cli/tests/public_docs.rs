@@ -449,3 +449,44 @@ fn traceability_materials_live_under_requested_folder_and_cover_claim_gates() {
         assert!(runbook.contains(required), "missing runbook traceability marker {required}");
     }
 }
+
+/// §16.17 requires an implementation to publish its conformance classes, and
+/// §16.18 requires the project to publish its required-corpus fixtures before
+/// v45 is declared stable. Both are publication obligations, so they are only
+/// discharged by a tracked file: `/implementation-docs/` is gitignored, and a
+/// working document there reaches nobody.
+///
+/// This test pins the published document's load-bearing content — the six class
+/// rows, and the gap disclosure. The gap section matters most: a future edit
+/// that quietly drops it would turn a bounded claim into an unbounded one,
+/// which is exactly what the claim boundary in README.md forbids.
+#[test]
+fn published_v45_conformance_declares_classes_and_discloses_corpus_gaps() {
+    let conformance = read_workspace_file("public-docs/traceability/v45-conformance.md");
+    let index = read_workspace_file("public-docs/traceability/README.md");
+
+    assert!(index.contains("v45-conformance.md"), "the traceability index must link the conformance document");
+
+    // Every §16.17 class is named, so none is advertised only by implication.
+    for class in [
+        "16.17.1 Core reader",
+        "16.17.2 Portable reader/writer",
+        "16.17.3 POSIX backup reader/writer",
+        "16.17.4 Linux backup reader/writer",
+        "16.17.5 macOS backup reader/writer",
+        "16.17.6 Windows backup reader/writer",
+    ] {
+        assert!(conformance.contains(class), "missing §16.17 class row: {class}");
+    }
+
+    // The two obligations this document exists to discharge.
+    assert!(conformance.contains("MUST publish its conformance classes"));
+    assert!(conformance.contains("MUST publish deterministic fixtures") || conformance.contains("MUST publish"));
+
+    // Gaps stay disclosed. These are the exclusions that keep the class claims
+    // honest; dropping them silently widens the claim.
+    assert!(conformance.contains("APFS clone hints are not implemented"), "the macOS class exclusion must stay stated");
+    assert!(conformance.contains("Implementation gap"), "the gap table must survive");
+    assert!(conformance.contains("Evidence gap"), "the gap table must survive");
+    assert!(conformance.contains("None of these rows is a known defect."), "the gap disclosure must keep its calibration sentence");
+}

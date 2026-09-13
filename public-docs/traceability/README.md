@@ -26,6 +26,9 @@ unsupported profile described by every specification.
 
 ## Materials
 
+- [v45-conformance.md](v45-conformance.md): the §16.17 conformance classes this
+  implementation claims, and §16.18 required-corpus coverage with its open
+  gaps.
 - [signing-plugin-traceability.md](signing-plugin-traceability.md): Ed25519 and
   X.509 RootAuth profile map.
 - [verification-runbook.md](verification-runbook.md): required commands, fuzz
