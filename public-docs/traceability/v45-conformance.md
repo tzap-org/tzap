@@ -35,7 +35,7 @@ Deterministic fixtures live in the workspace test suite and run under
 | 16.18.1 Portable and Unix | 11 | 11 | 0 | 0 |
 | 16.18.2 macOS | 6 | 6 | 0 | 0 |
 | 16.18.3 Windows | 8 | 8 | 0 | 0 |
-| 16.18.4 Adversarial | 17 | 12 | 5 | 0 |
+| 16.18.4 Adversarial | 17 | 13 | 4 | 0 |
 
 Every §16.18.3 Windows fixture is `#[cfg(windows)]` and runs only on the
 Windows CI job; the macOS and Linux jobs do not exercise it.
@@ -46,11 +46,10 @@ Windows CI job; the macOS and Linux jobs do not exercise it.
 | --- | --- | --- | --- |
 | Projection rename/mode-override guard | 16.18.4 | Evidence gap | The restore path contains no rename and applies readonly only through the host attribute, never through `TZAP.portable.mode`, so §16.7.1's MUST NOT holds by construction. No regression guard asserts it. |
 | Metadata phase-ordering guard | 16.18.4 | Evidence gap | Ordering matches §16.13 steps 8–14: ownership, mode, ACLs, xattrs, timestamps, readonly attributes, then no-change flags last. No regression guard asserts the order. |
-| Symlink/reparse ancestors with selected descendant writes | 16.18.4 | Evidence gap | Escape paths and hardlink-target rules are asserted; the ancestor-plus-selected-descendant shape is not exercised as its own fixture. |
 | FileEntry flag-summary mismatch | 16.18.4 | Evidence gap | Reserved-bit rejection is asserted. A crafted summary that disagrees with the recomputed group summary is not. |
 | Reparse placeholder mis-extraction | 16.18.4 | Evidence gap | Placeholders round-trip correctly. The negative direction — a placeholder extracted as an empty ordinary file, or replaced by a directory for selected descendants — is not separately asserted. |
 
-This list is complete for the four corpus sections, not a selection: 5
+This list is complete for the four corpus sections, not a selection: 4
 evidence gaps and **no implementation gaps** against 42 clauses. Every gap
 remaining is a missing regression guard for behaviour that is correct today, not
 a defect. They are published

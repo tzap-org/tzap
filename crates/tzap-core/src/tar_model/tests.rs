@@ -718,6 +718,44 @@ fn member_summary(bytes: &[u8], group_start: u64) -> TarStreamMemberSummary {
     }
 }
 
+/// §16.18.4's corpus names "symlink/reparse ancestors with selected descendant
+/// writes". The rule is in `validate_v45_member_graph`: a selected path whose
+/// ancestor is a symlink or reparse placeholder must be refused, because
+/// writing through it would place bytes wherever that link points -- possibly
+/// outside the extraction root entirely.
+///
+/// Escape paths and hardlink targets had fixtures; this shape did not, even
+/// though it is the one where the archive itself looks completely well formed.
+#[test]
+fn a_selected_descendant_of_a_symlink_or_reparse_ancestor_is_refused() {
+    // Baseline: a real directory ancestor is fine, so the negatives below are
+    // about the ancestor's kind and nothing else.
+    let directory_bytes = member(b"dir", b'5', b"", b"");
+    let child_bytes = member(b"dir/file.txt", b'0', b"payload", b"");
+    let directory = member_summary(&directory_bytes, 0);
+    let child = member_summary(&child_bytes, directory_bytes.len() as u64);
+    assert!(validate_v45_member_graph(&[directory, child.clone()]).is_ok(), "a directory ancestor must be accepted");
+
+    // A symlink ancestor: writing "dir/file.txt" would follow the link.
+    let link_bytes = member(b"dir", b'2', b"", b"/etc");
+    let link = member_summary(&link_bytes, 0);
+    let error = validate_v45_member_graph(&[link, child.clone()]).unwrap_err();
+    assert!(
+        matches!(&error, FormatError::InvalidArchive(message) if message.contains("symlink or reparse ancestor")),
+        "expected a symlink-ancestor refusal, got {error:?}"
+    );
+
+    // A non-directory ancestor is refused for the same reason: the path cannot
+    // be traversed as the archive claims.
+    let file_ancestor_bytes = member(b"dir", b'0', b"not a directory", b"");
+    let file_ancestor = member_summary(&file_ancestor_bytes, 0);
+    let error = validate_v45_member_graph(&[file_ancestor, child]).unwrap_err();
+    assert!(
+        matches!(&error, FormatError::InvalidArchive(message) if message.contains("non-directory ancestor")),
+        "expected a non-directory-ancestor refusal, got {error:?}"
+    );
+}
+
 #[test]
 fn member_graph_accepts_hardlink_target_after_alias_and_rejects_mirror_mismatch() {
     let alias_bytes = member(b"alias.txt", b'1', b"", b"target.txt");
