@@ -1555,16 +1555,16 @@ fn archive_timestamp_canonicalizes_fractional_pre_epoch_times() {
 #[test]
 fn windows_filetime_conversion_preserves_100ns_precision() {
     const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
-    assert_eq!(windows_filetime_timestamp(UNIX_EPOCH_FILETIME + 12_345_678).unwrap(), ArchiveTimestamp::new(1, 234_567_800));
+    assert_eq!(tzap_core::windows_metadata::windows_filetime_timestamp(UNIX_EPOCH_FILETIME + 12_345_678).unwrap(), ArchiveTimestamp::new(1, 234_567_800));
     // The struct is a timespec, so 1.5s before the epoch borrows a second:
     // `(-2, 500_000_000)`. It encodes as `-1.5` at the PAX boundary.
-    let pre_epoch = windows_filetime_timestamp(UNIX_EPOCH_FILETIME - 15_000_000).unwrap();
+    let pre_epoch = tzap_core::windows_metadata::windows_filetime_timestamp(UNIX_EPOCH_FILETIME - 15_000_000).unwrap();
     assert_eq!(pre_epoch, ArchiveTimestamp::new(-2, 500_000_000));
     assert_eq!(String::from_utf8(pre_epoch.canonical_pax_value().unwrap()).unwrap(), "-1.5");
-    assert_eq!(windows_filetime_timestamp(0).unwrap(), ArchiveTimestamp::new(-11_644_473_600, 0));
+    assert_eq!(tzap_core::windows_metadata::windows_filetime_timestamp(0).unwrap(), ArchiveTimestamp::new(-11_644_473_600, 0));
     // One tick before the epoch converts fine, but has no §16.7.2 encoding: its
     // integer part would be `-0`. The refusal lands at the PAX boundary.
-    let unencodable = windows_filetime_timestamp(UNIX_EPOCH_FILETIME - 1).unwrap();
+    let unencodable = tzap_core::windows_metadata::windows_filetime_timestamp(UNIX_EPOCH_FILETIME - 1).unwrap();
     assert_eq!(unencodable, ArchiveTimestamp::new(-1, 999_999_900));
     assert!(unencodable.canonical_pax_value().is_err());
 }
@@ -1584,7 +1584,7 @@ fn filesystem_scan_captures_windows_scalars_security_and_alternate_data() {
     let temp = windows_test_tempdir();
     let path = temp.path().join("native.txt");
     fs::write(&path, b"payload").unwrap();
-    let sacl_available = windows_sacl_capture_enabled();
+    let sacl_available = tzap_core::windows_metadata::windows_sacl_capture_enabled();
     let sddl = if sacl_available { "D:P(A;;FA;;;SY)(A;;FA;;;BA)S:P(AU;SAFA;FW;;;WD)" } else { "D:P(A;;FA;;;SY)(A;;FA;;;BA)" }
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -1701,7 +1701,7 @@ fn filesystem_scan_captures_windows_scalars_security_and_alternate_data() {
         )
         .unwrap();
     let restored_file = File::open(system_output.join("native.txt")).unwrap();
-    let restored_security = capture_windows_security_descriptor(&restored_file).unwrap();
+    let restored_security = tzap_core::windows_metadata::capture_windows_security_descriptor(&restored_file).unwrap();
     let expected_security = specs[0].portable_metadata.native.auxiliary_records.iter().find(|record| record.kind == "windows.security-descriptor").unwrap();
     assert_eq!(restored_security.payload, expected_security.payload);
     assert_eq!(restored_security.meta, expected_security.meta);
@@ -1930,7 +1930,7 @@ fn windows_raw_efs_round_trips_without_plaintext_substitution() {
         .expect("encrypted input must retain a raw EFS record");
     assert!(raw.is_streamed());
     assert_eq!(raw.meta["TZAP.aux.meta.efs-version"], b"1");
-    let (expected_raw_size, expected_raw_hash) = hash_windows_raw_efs(&source).unwrap();
+    let (expected_raw_size, expected_raw_hash) = tzap_core::windows_metadata::hash_windows_raw_efs(&source).unwrap();
     assert_eq!(raw.stored_payload_size(), expected_raw_size);
 
     let master_key = MasterKey::from_raw_key(&[19u8; 32]).unwrap();
@@ -1960,7 +1960,7 @@ fn windows_raw_efs_round_trips_without_plaintext_substitution() {
     assert_eq!(fs::read(&restored).unwrap(), plaintext);
     assert_eq!(fs::read(PathBuf::from(format!("{}:efs-alternate", restored.display()))).unwrap(), alternate_plaintext);
     assert_ne!(fs::metadata(&restored).unwrap().file_attributes() & FILE_ATTRIBUTE_ENCRYPTED, 0);
-    assert_eq!(hash_windows_raw_efs(&restored).unwrap(), (expected_raw_size, expected_raw_hash));
+    assert_eq!(tzap_core::windows_metadata::hash_windows_raw_efs(&restored).unwrap(), (expected_raw_size, expected_raw_hash));
 
     let encrypted_directory = temp.path().join("encrypted-directory");
     fs::create_dir(&encrypted_directory).unwrap();
@@ -2037,7 +2037,7 @@ fn windows_directory_case_sensitive_state_round_trips() {
         "{}",
         io::Error::last_os_error()
     );
-    assert_eq!(query_windows_directory_case_sensitive(&source_file).unwrap(), Some(true));
+    assert_eq!(tzap_core::windows_metadata::query_windows_directory_case_sensitive(&source_file).unwrap(), Some(true));
     drop(source_file);
 
     let specs = collect_input_specs(&[source.to_string_lossy().into_owned()]).unwrap();
@@ -2070,7 +2070,7 @@ fn windows_directory_case_sensitive_state_round_trips() {
         .flat_map(|(_, diagnostics)| diagnostics)
         .any(|diagnostic| { diagnostic.metadata_class == "directory-case-sensitive" && diagnostic.status == MetadataDiagnosticStatus::Unsupported }));
     let same_os_restored = open_windows_metadata_handle(&same_os_output.join("case-sensitive-directory")).unwrap();
-    assert_eq!(query_windows_directory_case_sensitive(&same_os_restored).unwrap(), Some(false));
+    assert_eq!(tzap_core::windows_metadata::query_windows_directory_case_sensitive(&same_os_restored).unwrap(), Some(false));
     let output = temp.path().join("case-output");
     fs::create_dir(&output).unwrap();
     opened
@@ -2080,7 +2080,7 @@ fn windows_directory_case_sensitive_state_round_trips() {
         )
         .unwrap();
     let restored = open_windows_metadata_handle(&output.join("case-sensitive-directory")).unwrap();
-    assert_eq!(query_windows_directory_case_sensitive(&restored).unwrap(), Some(true));
+    assert_eq!(tzap_core::windows_metadata::query_windows_directory_case_sensitive(&restored).unwrap(), Some(true));
 }
 
 #[cfg(windows)]

@@ -8,9 +8,30 @@ use std::os::windows::io::AsRawHandle as _;
 use std::path::Path;
 use std::path::PathBuf;
 
+/// Basic file information a host may already have sampled.
+///
+/// A host that identified the input at scan time must describe *that*
+/// observation, not a fresh one: re-reading attributes and times here would let
+/// the archive's index and its PAX records disagree when a file changes between
+/// scan and capture, which surfaces later as "metadata flags do not match
+/// FileEntry flags".
+#[derive(Debug, Clone, Copy)]
+pub struct WindowsObservedBasicInfo {
+    pub file_attributes: u32,
+    pub creation_time_100ns: u64,
+    pub last_access_time_100ns: u64,
+    pub change_time_100ns: u64,
+}
+
 /// Captures Windows basic information, security, reparse data, case-sensitivity,
-/// alternate data, EA/property data, and object IDs into TZAP v45 metadata.
+/// alternate data, EA/property data, object IDs, and raw EFS into v45 metadata.
 pub fn capture_windows_metadata(input: &Path) -> io::Result<NativeFileMetadata> {
+    capture_windows_metadata_with(input, None)
+}
+
+/// As [`capture_windows_metadata`], but using attributes and times the caller
+/// already observed. See [`WindowsObservedBasicInfo`].
+pub fn capture_windows_metadata_with(input: &Path, observed: Option<WindowsObservedBasicInfo>) -> io::Result<NativeFileMetadata> {
     use std::mem::size_of;
     use windows_sys::Win32::Storage::FileSystem::{
         FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
@@ -28,6 +49,12 @@ pub fn capture_windows_metadata(input: &Path) -> io::Result<NativeFileMetadata> 
     } == 0
     {
         return Err(io::Error::last_os_error());
+    }
+    if let Some(observed) = observed {
+        basic.FileAttributes = observed.file_attributes;
+        basic.CreationTime = observed.creation_time_100ns as i64;
+        basic.LastAccessTime = observed.last_access_time_100ns as i64;
+        basic.ChangeTime = observed.change_time_100ns as i64;
     }
 
     let mut native = NativeFileMetadata::default();
@@ -50,36 +77,48 @@ pub fn capture_windows_metadata(input: &Path) -> io::Result<NativeFileMetadata> 
         None
     };
     native.auxiliary_records.push(capture_windows_security_descriptor(&file)?);
-    // An encrypted file must be captured in its raw, still-encrypted form. Read
-    // the ordinary way it would yield plaintext and silently undo the user's
-    // encryption -- see `capture_windows_efs_raw`.
     const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x0000_4000;
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
-    if basic.FileAttributes & FILE_ATTRIBUTE_ENCRYPTED != 0 && basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
-        native.auxiliary_records.push(capture_windows_efs_raw(input)?);
-    }
     if basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
         if let Some(case_sensitive) = query_windows_directory_case_sensitive(&file)? {
             native.primary_pax_records.insert("TZAP.windows.directory-case-sensitive".into(), if case_sensitive { b"1" } else { b"0" }.to_vec());
         }
     }
     let (data_stream_attributes, mut streams) = capture_windows_backup_streams(input, &file, reparse_data.as_deref())?;
-    if basic.FileAttributes & (0x0000_0010 | 0x0000_0400) == 0 {
+    if basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | 0x0000_0400) == 0 {
         native.primary_pax_records.insert("TZAP.windows.data-stream-attributes".into(), format!("{data_stream_attributes:08x}").into_bytes());
     }
     native.auxiliary_records.append(&mut streams);
+
+    // An encrypted file must be captured in its raw, still-encrypted form: read
+    // the ordinary way it yields plaintext and silently undoes the user's
+    // encryption (see `capture_windows_efs_raw`).
+    //
+    // Order matters and is not obvious. The raw EFS APIs refuse to export while
+    // an ordinary handle to the file is open, even one that permits every
+    // sharing mode -- so every registered BackupRead stream is enumerated first,
+    // then the handle is released, and only then is the raw context opened.
+    // Doing this earlier, with `file` still live, fails on every real encrypted
+    // file.
     // ReFS cannot report exact allocated ranges, so any sparse claim here is
-    // partial by construction and must say so.
+    // partial by construction and must say so. This needs the handle, so it runs
+    // before the handle is released for EFS below.
     const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
     if basic.FileAttributes & FILE_ATTRIBUTE_SPARSE_FILE != 0 && windows_file_system_is_refs(&file)? {
         add_refs_sparse_layout_omission(&mut native);
+    }
+
+    if basic.FileAttributes & FILE_ATTRIBUTE_ENCRYPTED != 0 && basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        drop(file);
+        native.auxiliary_records.push(capture_windows_efs_raw(input)?);
     }
     native.auxiliary_records.sort_by(|left, right| left.kind.cmp(&right.kind).then_with(|| left.name.cmp(&right.name)));
     native.required_profiles.push("windows-backup-v1".into());
     Ok(native)
 }
 
-fn windows_filetime_timestamp(value_100ns: u64) -> io::Result<ArchiveTimestamp> {
+/// Convert a Windows `FILETIME` tick count to a revision-45 timestamp.
+pub fn windows_filetime_timestamp(value_100ns: u64) -> io::Result<ArchiveTimestamp> {
     const WINDOWS_TO_UNIX_EPOCH_100NS: i128 = 116_444_736_000_000_000;
     const TICKS_PER_SECOND: i128 = 10_000_000;
     let unix_100ns = i128::from(value_100ns) - WINDOWS_TO_UNIX_EPOCH_100NS;
@@ -113,7 +152,8 @@ fn query_windows_reparse_data(file: &File) -> io::Result<Vec<u8>> {
     Ok(buffer)
 }
 
-fn query_windows_directory_case_sensitive(file: &File) -> io::Result<Option<bool>> {
+/// Whether a directory has the per-directory case-sensitivity flag set.
+pub fn query_windows_directory_case_sensitive(file: &File) -> io::Result<Option<bool>> {
     use std::mem::size_of;
     use windows_sys::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED};
     use windows_sys::Win32::Storage::FileSystem::{FileCaseSensitiveInfo, GetFileInformationByHandleEx, FILE_CASE_SENSITIVE_INFO};
@@ -147,7 +187,9 @@ fn query_windows_directory_case_sensitive(file: &File) -> io::Result<Option<bool
     Ok(Some(info.Flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0))
 }
 
-fn capture_windows_security_descriptor(file: &File) -> io::Result<NativeAuxiliaryMetadata> {
+/// Capture a self-relative security descriptor, including the SACL when the
+/// process can acquire `SE_SECURITY_NAME`.
+pub fn capture_windows_security_descriptor(file: &File) -> io::Result<NativeAuxiliaryMetadata> {
     use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
@@ -308,6 +350,23 @@ impl WindowsBackupReader {
         Ok(hasher.finalize().into())
     }
 
+    /// Consume a payload by reading it, not by seeking.
+    ///
+    /// `skip` uses `BackupSeek`, which cannot seek within a sparse block: it
+    /// fails with ERROR_INVALID_PARAMETER and the whole capture errors out. The
+    /// distinction is load-bearing and easy to lose when paraphrasing this loop.
+    fn discard(&mut self, mut size: u64) -> io::Result<()> {
+        let mut buffer = [0u8; 64 * 1024];
+        while size > 0 {
+            let take = size.min(buffer.len() as u64) as usize;
+            if !self.read_optional_exact(&mut buffer[..take])? {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Windows backup stream payload is missing"));
+            }
+            size -= take as u64;
+        }
+        Ok(())
+    }
+
     fn skip(&mut self, size: u64) -> io::Result<()> {
         use windows_sys::Win32::Storage::FileSystem::BackupSeek;
         let mut low = 0u32;
@@ -369,10 +428,14 @@ fn capture_windows_backup_streams(input: &Path, file: &File, expected_reparse: O
             }
             BACKUP_SECURITY_DATA | BACKUP_LINK => reader.skip(size)?,
             BACKUP_SPARSE_BLOCK => {
-                // Payload for the sparse alternate stream most recently seen.
-                // The extents are re-derived from the stream itself below, so
-                // the blocks only need consuming here.
-                reader.skip(size)?;
+                // A sparse block is an 8-byte offset followed by its data. The
+                // extents are re-derived from the stream itself below, so the
+                // block only needs consuming -- but it must be *read*, not
+                // seeked: BackupSeek fails inside a sparse block.
+                if size < 8 {
+                    return Err(io::Error::other("Windows sparse-block stream is shorter than its offset"));
+                }
+                reader.discard(size)?;
             }
             BACKUP_REPARSE_DATA => {
                 let payload = reader.read_vec(size)?;
@@ -520,6 +583,18 @@ unsafe extern "system" fn hash_windows_raw_efs_callback(data: *const u8, context
 }
 
 /// Size and SHA-256 of a file's raw EFS export.
+/// Whether this process can acquire `SE_SECURITY_NAME`, and so whether a
+/// captured security descriptor will include its SACL.
+///
+/// Tests need this to decide what to expect: without the privilege the SACL is
+/// legitimately absent, and asserting it unconditionally fails on an
+/// unprivileged runner rather than finding a defect.
+pub fn windows_sacl_capture_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| enable_windows_privilege(windows_sys::Win32::Security::SE_SECURITY_NAME))
+}
+
 pub fn hash_windows_raw_efs(path: &Path) -> io::Result<(u64, [u8; 32])> {
     use sha2::Digest as _;
     use windows_sys::Win32::Storage::FileSystem::ReadEncryptedFileRaw;
