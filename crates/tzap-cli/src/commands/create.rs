@@ -718,39 +718,16 @@ impl RegularFileSource for InputSpec {
         }
         #[cfg(windows)]
         {
-            if record.kind == "windows.efs-raw" {
-                if record.name_encoding != NativeAuxiliaryNameEncoding::None || !record.name.is_empty() {
-                    return Err(FormatError::WriterUnsupported("raw EFS auxiliary source has an unexpected name").into());
-                }
-                return Ok(Box::new(WindowsRawEfsReader::spawn(self.source.clone(), self.identity, record.stored_payload_size())));
-            }
-            if record.kind != "windows.alternate-data" || record.name_encoding != NativeAuxiliaryNameEncoding::Utf16Le || record.name.len() % 2 != 0 {
-                return Err(FormatError::WriterUnsupported("unsupported streamed Windows auxiliary source").into());
-            }
-            let metadata = fs::symlink_metadata(&self.source).map_err(ArchiveWriteError::Io)?;
-            let mut actual = input_identity(&metadata).map_err(ArchiveWriteError::Io)?;
-            let base = open_windows_metadata_handle(&self.source).map_err(ArchiveWriteError::Io)?;
-            augment_windows_input_identity(&mut actual, &base).map_err(ArchiveWriteError::Io)?;
-            if !input_identity_matches_after_read(self.identity, actual) {
-                return Err(ArchiveWriteError::Io(io::Error::other("Windows input changed before alternate-stream read")));
-            }
-            let stream_path = windows_alternate_stream_path(&self.source, &record.name).map_err(ArchiveWriteError::Io)?;
-            let stream = File::open(stream_path).map_err(ArchiveWriteError::Io)?;
-            if stream.metadata().map_err(ArchiveWriteError::Io)?.len() != record.logical_size {
-                return Err(ArchiveWriteError::Io(io::Error::other("Windows alternate stream changed after scan")));
-            }
-            if let Some(extents) = record.streamed_sparse_extents() {
-                let map = encode_v45_sparse_map(extents, record.logical_size)?;
-                return Ok(Box::new(io::Cursor::new(map).chain(WindowsSparseAlternateStreamReader {
-                    file: stream,
-                    logical_size: record.logical_size,
-                    expected_extents: extents.to_vec(),
-                    extent_index: 0,
-                    extent_remaining: 0,
-                    validated: false,
-                })));
-            }
-            Ok(Box::new(stream))
+            // The readers are tzap-core's; this host supplies only the identity
+            // check, which is its own -- see `open_windows_streamed_auxiliary`.
+            let expected = self.identity;
+            tzap_core::windows_metadata::open_windows_streamed_auxiliary(
+                &self.source,
+                record,
+                Box::new(move |path: &Path| validate_windows_input_path_identity(path, expected)),
+            )
+            .map(|reader| reader as Box<dyn Read + '_>)
+            .map_err(ArchiveWriteError::Io)
         }
         #[cfg(not(any(windows, target_os = "macos")))]
         Err(FormatError::WriterUnsupported("streamed Windows auxiliary sources require Windows").into())

@@ -2,7 +2,7 @@ use crate::entry_metadata::SparseExtent;
 use crate::{ArchiveTimestamp, NativeAuxiliaryMetadata, NativeAuxiliaryNameEncoding, NativeFileMetadata, RestoreClass};
 use std::fs::{self, File};
 use std::io;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::{Read, Seek as _, SeekFrom};
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::AsRawHandle as _;
 use std::path::Path;
@@ -681,6 +681,251 @@ fn add_refs_sparse_layout_omission(native: &mut NativeFileMetadata) {
     let mut report = NativeAuxiliaryMetadata::new("tzap.capture-report", "tzap-core-v1", RestoreClass::None, payload);
     report.native = false;
     native.auxiliary_records.push(report);
+}
+
+/// Open a streamed Windows auxiliary for the writer to pull its payload from.
+///
+/// The counterpart to [`crate::macos_metadata::open_macos_resource_fork`], and
+/// the piece that was missing when Windows capture moved here: core began
+/// *emitting* streamed `windows.efs-raw` and `windows.alternate-data` records
+/// while the readers that serve them stayed in `tzap-cli`. Any other host --
+/// zmanager -- then failed every encrypted or ADS-bearing file with "streamed
+/// auxiliary source is unsupported on this platform".
+///
+/// `validate` is the host's own "is this still the object I scanned?" check. It
+/// stays with the host because each one identifies inputs differently, and it
+/// runs before any bytes are read.
+pub fn open_windows_streamed_auxiliary(
+    input: &Path,
+    record: &NativeAuxiliaryMetadata,
+    validate: Box<dyn FnOnce(&Path) -> io::Result<()> + Send>,
+) -> io::Result<Box<dyn Read + Send>> {
+    match record.kind.as_str() {
+        "windows.efs-raw" => {
+            if record.name_encoding != NativeAuxiliaryNameEncoding::None || !record.name.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "raw EFS auxiliary source has an unexpected name"));
+            }
+            Ok(Box::new(WindowsRawEfsReader::spawn(input.to_path_buf(), record.stored_payload_size(), validate)))
+        }
+        "windows.alternate-data" => {
+            if record.name_encoding != NativeAuxiliaryNameEncoding::Utf16Le || record.name.len() % 2 != 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Windows alternate-data auxiliary source has a malformed name"));
+            }
+            validate(input)?;
+            let stream_path = windows_alternate_stream_path(input, &record.name)?;
+            let mut stream = File::open(stream_path)?;
+            if stream.metadata()?.len() != record.logical_size {
+                return Err(io::Error::other("Windows alternate stream changed after scan"));
+            }
+            let Some(extents) = record.streamed_sparse_extents() else {
+                return Ok(Box::new(stream));
+            };
+            // A sparse stream is stored as the v45 sparse map followed by the
+            // allocated extents only.
+            let map = crate::encode_v45_sparse_map(extents, record.logical_size).map_err(io::Error::other)?;
+            let expected_extents = extents.to_vec();
+            stream.seek(SeekFrom::Start(0))?;
+            Ok(Box::new(io::Cursor::new(map).chain(WindowsSparseAlternateStreamReader {
+                file: stream,
+                logical_size: record.logical_size,
+                expected_extents,
+                extent_index: 0,
+                extent_remaining: 0,
+                validated: false,
+            })))
+        }
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported streamed Windows auxiliary source")),
+    }
+}
+
+struct WindowsSparseAlternateStreamReader {
+    file: File,
+    logical_size: u64,
+    expected_extents: Vec<SparseExtent>,
+    extent_index: usize,
+    extent_remaining: u64,
+    validated: bool,
+}
+
+impl WindowsSparseAlternateStreamReader {
+    fn validate_finished(&mut self) -> io::Result<()> {
+        if !self.validated {
+            if self.file.metadata()?.len() != self.logical_size || query_windows_allocated_ranges(&self.file, self.logical_size)? != self.expected_extents {
+                return Err(io::Error::other("sparse Windows alternate stream changed after scan"));
+            }
+            self.validated = true;
+        }
+        Ok(())
+    }
+}
+
+impl Read for WindowsSparseAlternateStreamReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        while written < out.len() {
+            if self.extent_remaining == 0 {
+                let Some(extent) = self.expected_extents.get(self.extent_index) else {
+                    self.validate_finished()?;
+                    break;
+                };
+                self.file.seek(SeekFrom::Start(extent.offset))?;
+                self.extent_remaining = extent.length;
+            }
+            let count = (out.len() - written).min(usize::try_from(self.extent_remaining).unwrap_or(usize::MAX));
+            let read = self.file.read(&mut out[written..written + count])?;
+            if read == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "sparse Windows alternate extent ended before its scanned size"));
+            }
+            written += read;
+            self.extent_remaining -= read as u64;
+            if self.extent_remaining == 0 {
+                self.extent_index += 1;
+            }
+        }
+        if self.extent_index == self.expected_extents.len() && self.extent_remaining == 0 {
+            self.validate_finished()?;
+        }
+        Ok(written)
+    }
+}
+
+enum WindowsRawEfsMessage {
+    Data(Vec<u8>),
+    Done(io::Result<()>),
+}
+
+struct WindowsRawEfsExport {
+    sender: std::sync::mpsc::SyncSender<WindowsRawEfsMessage>,
+}
+
+unsafe extern "system" fn send_windows_raw_efs_callback(data: *const u8, context: *const std::ffi::c_void, length: u32) -> u32 {
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_OPERATION_ABORTED, ERROR_SUCCESS};
+
+    if length == 0 {
+        return ERROR_SUCCESS;
+    }
+    if data.is_null() || context.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    // SAFETY: EFS supplies `length` readable bytes and the caller supplied this export context.
+    let chunk = unsafe { std::slice::from_raw_parts(data, length as usize) };
+    // SAFETY: the context is the export state passed to ReadEncryptedFileRaw.
+    let state = unsafe { &mut *context.cast_mut().cast::<WindowsRawEfsExport>() };
+    if state.sender.send(WindowsRawEfsMessage::Data(chunk.to_vec())).is_err() {
+        return ERROR_OPERATION_ABORTED;
+    }
+    ERROR_SUCCESS
+}
+
+fn export_windows_raw_efs_to_sender(
+    path: &Path,
+    validate: Box<dyn FnOnce(&Path) -> io::Result<()> + Send>,
+    sender: std::sync::mpsc::SyncSender<WindowsRawEfsMessage>,
+) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::ReadEncryptedFileRaw;
+
+    validate(path)?;
+    let context = open_windows_raw_efs(path, 0)?;
+    let mut state = WindowsRawEfsExport { sender };
+    // SAFETY: the callback state and the raw EFS context stay live for the
+    // synchronous export.
+    let status = unsafe { ReadEncryptedFileRaw(Some(send_windows_raw_efs_callback), (&mut state as *mut WindowsRawEfsExport).cast(), context.0) };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(())
+}
+
+/// Streams a file's raw EFS export, which Windows only delivers through a
+/// callback: a worker thread runs the export and this reader drains it.
+struct WindowsRawEfsReader {
+    receiver: Option<std::sync::mpsc::Receiver<WindowsRawEfsMessage>>,
+    current: Vec<u8>,
+    current_offset: usize,
+    remaining: u64,
+    finished: bool,
+    pending_error: Option<io::Error>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WindowsRawEfsReader {
+    fn spawn(path: PathBuf, size: u64, validate: Box<dyn FnOnce(&Path) -> io::Result<()> + Send>) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        let completion = sender.clone();
+        let thread = std::thread::spawn(move || {
+            let result = export_windows_raw_efs_to_sender(&path, validate, sender);
+            let _ = completion.send(WindowsRawEfsMessage::Done(result));
+        });
+        Self { receiver: Some(receiver), current: Vec::new(), current_offset: 0, remaining: size, finished: false, pending_error: None, thread: Some(thread) }
+    }
+}
+
+impl Read for WindowsRawEfsReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
+        let mut written = 0usize;
+        while written < out.len() {
+            if self.current_offset < self.current.len() {
+                let count = (self.current.len() - self.current_offset).min(out.len() - written);
+                if count as u64 > self.remaining {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "raw EFS export exceeded its declared size"));
+                }
+                out[written..written + count].copy_from_slice(&self.current[self.current_offset..self.current_offset + count]);
+                self.current_offset += count;
+                self.remaining -= count as u64;
+                written += count;
+                continue;
+            }
+            if self.finished {
+                break;
+            }
+            let message = self
+                .receiver
+                .as_ref()
+                .ok_or_else(|| io::Error::other("raw EFS export channel is closed"))?
+                .recv()
+                .map_err(|_| io::Error::other("raw EFS export terminated unexpectedly"))?;
+            match message {
+                WindowsRawEfsMessage::Data(bytes) => {
+                    self.current = bytes;
+                    self.current_offset = 0;
+                }
+                WindowsRawEfsMessage::Done(result) => {
+                    self.finished = true;
+                    if let Err(error) = result {
+                        if written == 0 {
+                            return Err(error);
+                        }
+                        self.pending_error = Some(error);
+                    } else if self.remaining != 0 {
+                        let error = io::Error::new(io::ErrorKind::UnexpectedEof, "raw EFS export ended before its declared size");
+                        if written == 0 {
+                            return Err(error);
+                        }
+                        self.pending_error = Some(error);
+                    }
+                }
+            }
+        }
+        Ok(written)
+    }
+}
+
+impl Drop for WindowsRawEfsReader {
+    fn drop(&mut self) {
+        self.receiver.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 fn windows_alternate_stream_path(base: &Path, name: &[u8]) -> io::Result<PathBuf> {
