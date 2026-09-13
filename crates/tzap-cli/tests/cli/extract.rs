@@ -1457,6 +1457,9 @@ fn build_metadata_fixture(root: &Path) -> MetadataFixture {
     fs::write(&file, &payload).unwrap();
     fs::create_dir(&directory).unwrap();
     fs::write(directory.join("child.txt"), b"child payload").unwrap();
+    // A hardlink pair: the archive must store the data once and restore both
+    // names as the same underlying object, on every platform that has links.
+    fs::hard_link(&file, root.join("hardlink.bin")).unwrap();
 
     #[cfg(unix)]
     {
@@ -1596,6 +1599,46 @@ fn cli_comprehensive_metadata_round_trip_preserves_every_supported_class() {
         assert_eq!((restored.mtime(), restored.mtime_nsec()), (source_metadata.mtime(), source_metadata.mtime_nsec()), "restored mtime must match exactly");
         let _ = &fixture.link;
     }
+    // Times on every entry kind, source versus restored. The directory is the
+    // interesting one: its metadata is applied only after its children, so a
+    // regression in that ordering shows up here as a directory time that was
+    // overwritten by the child writes.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let same_mtime = |relative: &str, source: &Path| {
+            let restored = fs::symlink_metadata(restored_root.join(relative)).unwrap();
+            let expected = fs::symlink_metadata(source).unwrap();
+            assert_eq!((restored.mtime(), restored.mtime_nsec()), (expected.mtime(), expected.mtime_nsec()), "{relative} mtime");
+        };
+        same_mtime("folder", &fixture.directory);
+        same_mtime("link.txt", &fixture.link);
+    }
+
+    // Hardlinks restore as one object under two names, not two copies.
+    {
+        let first = restored_root.join("data.bin");
+        let second = restored_root.join("hardlink.bin");
+        assert_eq!(fs::read(&second).unwrap(), fixture.payload, "hardlink content");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let (a, b) = (fs::symlink_metadata(&first).unwrap(), fs::symlink_metadata(&second).unwrap());
+            assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()), "hardlink must restore as the same inode, not a copy");
+        }
+        #[cfg(windows)]
+        {
+            // Proving shared identity without raw handles: a write through one
+            // name must be visible through the other.
+            let mut handle = fs::OpenOptions::new().write(true).open(&first).unwrap();
+            use std::io::Write as _;
+            handle.write_all(b"Z").unwrap();
+            drop(handle);
+            assert_eq!(fs::read(&second).unwrap()[0], b'Z', "hardlink must restore as the same file, not a copy");
+            fs::write(&first, &fixture.payload).unwrap();
+        }
+    }
+
     // Portable restore must not apply native metadata.
     #[cfg(target_os = "linux")]
     assert_eq!(xattr::get(restored_root.join("data.bin"), "user.tzap.test").unwrap(), None, "portable restore must not apply native xattrs");
