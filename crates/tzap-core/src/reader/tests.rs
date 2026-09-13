@@ -31,7 +31,7 @@ use crate::writer::{
     write_archive, write_archive_sources_to_sink, write_archive_sources_to_sink_single_pass, write_archive_unencrypted, write_archive_with_dictionary,
     write_archive_with_kdf, write_archive_with_recipient_wrap_records, write_archive_with_root_auth, write_archive_with_root_auth_and_kdf,
     write_archive_with_root_auth_and_recipient_wrap_records, MemoryArchiveSink, PortableFileMetadata, PortableModeOrigin, PortablePosixOwner, RegularFile,
-    RegularFileSource, RootAuthSigningRequest, RootAuthWriterConfig, SourceEntryKind, WriterOptions,
+    RegularFileSource, RootAuthSigningRequest, RootAuthWriterConfig, SourceEntryKind, WriterOptions, WrittenArchive,
 };
 #[cfg(target_os = "linux")]
 use crate::writer::{NativeAuxiliaryMetadata, NativeAuxiliaryNameEncoding};
@@ -2658,6 +2658,279 @@ fn batch_lookup_matches_per_path_lookup_including_duplicates_and_misses() {
     for path in ["alpha.txt", "missing.txt"] {
         let single = opened.lookup_index_entries(&[path.to_string()]).unwrap();
         assert_eq!(single, vec![(path.to_string(), opened.lookup_index_entry(path).unwrap())]);
+    }
+}
+
+/// A corpus large enough to span many payload envelopes, nested directories and
+/// duplicate-path final views, so scale-sensitive paths are actually reached.
+fn matrix_corpus(count: usize) -> Vec<(String, Vec<u8>)> {
+    let mut bodies: Vec<(String, Vec<u8>)> = (0..count)
+        .map(|i| {
+            let path = match i % 5 {
+                0 => format!("top{i:04}.bin"),
+                1 => format!("nested/a/deep{i:04}.bin"),
+                2 => format!("nested/a/b/deeper{i:04}.bin"),
+                3 => format!("nested/b/other{i:04}.bin"),
+                _ => format!("dir{}/leaf{i:04}.bin", i % 9),
+            };
+            // Sizes straddle the frame/envelope boundaries rather than all being tiny.
+            let len = (i * 37) % 3000;
+            (path, (0..len).map(|b| ((b * 7 + i) % 251) as u8).collect())
+        })
+        .collect();
+    // A duplicated path so the final-view winner logic is exercised at scale.
+    bodies.push(("top0000.bin".to_string(), b"final view winner".to_vec()));
+    bodies
+}
+
+/// Every read surface, cross-checked against the others on one archive shape.
+fn assert_every_read_surface_agrees(archive: &WrittenArchive, bodies: &[(String, Vec<u8>)], shape: &str) {
+    let volume_refs = archive.volumes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let opened = open_archive_volumes(&volume_refs, &master_key()).unwrap();
+
+    // The final view: later members win a duplicated path.
+    let mut expected = std::collections::BTreeMap::new();
+    for (path, body) in bodies {
+        expected.insert(path.clone(), body.clone());
+    }
+
+    // verify must accept a well-formed archive at any shape.
+    opened.verify().unwrap_or_else(|err| panic!("{shape}: verify failed: {err:?}"));
+    opened.verify_content_fast().unwrap_or_else(|err| panic!("{shape}: fast verify failed: {err:?}"));
+
+    // list_files and list_index_entries must describe the same final view.
+    let listed = opened.list_files().unwrap();
+    let indexed = opened.list_index_entries().unwrap();
+    assert_eq!(listed.len(), expected.len(), "{shape}: list_files count");
+    assert_eq!(indexed.len(), expected.len(), "{shape}: list_index_entries count");
+    let listed_paths = listed.iter().map(|entry| entry.path.clone()).collect::<std::collections::BTreeSet<_>>();
+    let indexed_paths = indexed.iter().map(|entry| entry.path.clone()).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(listed_paths, indexed_paths, "{shape}: list surfaces disagree");
+    assert_eq!(listed_paths, expected.keys().cloned().collect::<std::collections::BTreeSet<_>>(), "{shape}: listed paths");
+
+    for entry in &indexed {
+        assert_eq!(entry.file_data_size as usize, expected[&entry.path].len(), "{shape}: size for {}", entry.path);
+    }
+
+    // Single and batch lookup must agree with each other and with the listing.
+    let every_path = expected.keys().cloned().collect::<Vec<_>>();
+    let batched = opened.lookup_index_entries(&every_path).unwrap();
+    assert_eq!(batched.len(), every_path.len(), "{shape}: batch lookup count");
+    for (path, entry) in &batched {
+        let single = opened.lookup_index_entry(path).unwrap();
+        assert_eq!(entry, &single, "{shape}: lookup disagreement for {path}");
+        assert_eq!(entry.as_ref().unwrap().file_data_size as usize, expected[path].len(), "{shape}: looked-up size for {path}");
+    }
+
+    // extract_file must return the final-view bytes for every member.
+    for (path, body) in &expected {
+        assert_eq!(opened.extract_file(path).unwrap().as_ref(), Some(body), "{shape}: extract_file for {path}");
+    }
+
+    // Full extraction and naming every member must produce identical trees.
+    let full_root = tempfile::tempdir().unwrap();
+    opened.extract_indexed_files_to(full_root.path(), SafeExtractionOptions::default(), 2).unwrap();
+    let selected_root = tempfile::tempdir().unwrap();
+    opened.extract_selected_files_to(&every_path, selected_root.path(), SafeExtractionOptions::default(), 2).unwrap();
+    for (path, body) in &expected {
+        let from_full = std::fs::read(full_root.path().join(path)).unwrap_or_else(|err| panic!("{shape}: missing {path} in full extract: {err}"));
+        let from_selected = std::fs::read(selected_root.path().join(path)).unwrap();
+        assert_eq!(&from_full, body, "{shape}: full extract bytes for {path}");
+        assert_eq!(from_selected, from_full, "{shape}: selected extract differs for {path}");
+    }
+
+    // Directory listings must agree with the flat listing, including nested levels.
+    let mut from_directories = std::collections::BTreeSet::new();
+    let mut pending = vec![String::new()];
+    while let Some(dir) = pending.pop() {
+        for entry in opened.list_directory_contents(&dir).unwrap() {
+            if entry.kind == TarEntryKind::Directory {
+                pending.push(entry.path.clone());
+            } else {
+                from_directories.insert(entry.path.clone());
+            }
+        }
+    }
+    assert_eq!(from_directories, listed_paths, "{shape}: directory walk does not match the flat listing");
+}
+
+#[test]
+fn every_read_surface_agrees_across_an_index_shard_boundary() {
+    // Index shards hold 10_000 files, so every other reader test in this file runs
+    // against a single-shard archive: shard-table range selection, the cross-shard
+    // final-view merge, the parallel shard load and directory-hint shard ranges are
+    // all reached only past that boundary. Cross it, over multiple volumes.
+    let bodies: Vec<(String, Vec<u8>)> = (0..10_400).map(|i| (format!("d{}/f{i:05}.bin", i % 23), format!("body-{i}").into_bytes())).collect();
+    let files = bodies.iter().map(|(path, body)| RegularFile::new(path, body)).collect::<Vec<_>>();
+    let options = WriterOptions { stripe_width: 2, volume_loss_tolerance: 1, ..single_stream_options() };
+    let archive = write_archive(&files, &master_key(), options).unwrap();
+
+    let volume_refs = archive.volumes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let opened = open_archive_volumes(&volume_refs, &master_key()).unwrap();
+    assert!(opened.index_root.shards.len() > 1, "expected a multi-shard index, got {}", opened.index_root.shards.len());
+
+    opened.verify().unwrap();
+    assert_eq!(opened.list_index_entries().unwrap().len(), bodies.len());
+    assert_eq!(opened.list_files().unwrap().len(), bodies.len());
+
+    // Sample across the whole key space so the request spans every shard, and pin
+    // the batch against the per-path lookup on a multi-shard, multi-volume archive.
+    let sampled = bodies.iter().step_by(89).map(|(path, _)| path.clone()).collect::<Vec<_>>();
+    for (path, entry) in opened.lookup_index_entries(&sampled).unwrap() {
+        assert_eq!(entry, opened.lookup_index_entry(&path).unwrap(), "lookup disagreement for {path}");
+        let expected = bodies.iter().find(|(candidate, _)| *candidate == path).map(|(_, body)| body).unwrap();
+        assert_eq!(entry.unwrap().file_data_size as usize, expected.len(), "size for {path}");
+        assert_eq!(opened.extract_file(&path).unwrap().as_ref(), Some(expected), "bytes for {path}");
+    }
+
+    // Selected extraction over a shard-spanning subset must match the source.
+    let root = tempfile::tempdir().unwrap();
+    opened.extract_selected_files_to(&sampled, root.path(), SafeExtractionOptions::default(), 4).unwrap();
+    for path in &sampled {
+        let expected = bodies.iter().find(|(candidate, _)| candidate == path).map(|(_, body)| body).unwrap();
+        assert_eq!(&std::fs::read(root.path().join(path)).unwrap(), expected, "restored {path}");
+    }
+    // Nothing outside the selection is written.
+    let selected_set = sampled.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+    for (path, _) in bodies.iter().step_by(97) {
+        assert_eq!(root.path().join(path).exists(), selected_set.contains(path), "unexpected presence for {path}");
+    }
+
+    // Directory-hint shards carry first/last hash ranges that only span rows once
+    // there is more than one shard; every directory must still list its members.
+    let mut from_directories = std::collections::BTreeSet::new();
+    for dir in 0..23 {
+        let dir = format!("d{dir}");
+        for entry in opened.list_directory_contents(&dir).unwrap() {
+            if entry.kind != TarEntryKind::Directory {
+                from_directories.insert(entry.path.clone());
+            }
+        }
+    }
+    assert_eq!(from_directories.len(), bodies.len(), "directory listings must cover every member across shards");
+
+    // The sequential reader is single-volume by contract: handing it one stripe of a
+    // multi-volume archive must be refused, not silently half-read.
+    assert_eq!(
+        list_non_seekable_stream(std::io::Cursor::new(archive.volumes[0].clone()), &master_key(), NonSeekableReaderOptions::default()).unwrap_err(),
+        FormatError::ReaderUnsupported("sequential reader supports only single-volume archive input")
+    );
+
+    // On a single-volume archive of the same shape it must reach the same view
+    // without seeking, still across the shard boundary.
+    let single = write_archive(&files, &master_key(), single_stream_options()).unwrap();
+    let streamed = list_non_seekable_stream(std::io::Cursor::new(single.volumes[0].clone()), &master_key(), NonSeekableReaderOptions::default()).unwrap();
+    assert_eq!(streamed.verification.file_count as usize, bodies.len(), "streamed file_count across shards");
+    let streamed_paths = streamed.index_entries.iter().map(|entry| entry.path.clone()).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(streamed_paths.len(), bodies.len(), "streamed listing across shards");
+    let seekable_single = open_archive(&single.volumes[0], &master_key()).unwrap();
+    assert!(seekable_single.index_root.shards.len() > 1, "single-volume control archive should also be multi-shard");
+    assert_eq!(
+        streamed_paths,
+        seekable_single.list_index_entries().unwrap().into_iter().map(|entry| entry.path).collect::<std::collections::BTreeSet<_>>(),
+        "streamed and seekable listings disagree across shards"
+    );
+    verify_non_seekable_stream(std::io::Cursor::new(single.volumes[0].clone()), &master_key()).unwrap();
+}
+
+#[test]
+fn every_read_surface_agrees_across_volume_and_parity_shapes() {
+    // Existing multi-volume tests carry a single member, so striping, parity and
+    // the volume-loss paths are never exercised with enough data to span multiple
+    // envelopes or block stripes. Run the whole read surface over each shape.
+    let bodies = matrix_corpus(220);
+    let files = bodies.iter().map(|(path, body)| RegularFile::new(path, body)).collect::<Vec<_>>();
+
+    let shapes: [(&str, WriterOptions); 5] = [
+        ("1 volume, no parity", WriterOptions { bit_rot_buffer_pct: 0, ..single_stream_options() }),
+        ("1 volume, default parity", single_stream_options()),
+        ("2 volumes, tolerance 1", WriterOptions { stripe_width: 2, volume_loss_tolerance: 1, ..single_stream_options() }),
+        ("3 volumes, tolerance 1", WriterOptions { stripe_width: 3, volume_loss_tolerance: 1, ..single_stream_options() }),
+        ("4 volumes, no tolerance", WriterOptions { stripe_width: 4, volume_loss_tolerance: 0, ..single_stream_options() }),
+    ];
+
+    for (shape, options) in shapes {
+        let archive = write_archive(&files, &master_key(), options).unwrap_or_else(|err| panic!("{shape}: write failed: {err:?}"));
+        assert_eq!(archive.volumes.len(), options.stripe_width as usize, "{shape}: volume count");
+        assert_every_read_surface_agrees(&archive, &bodies, shape);
+    }
+}
+
+#[test]
+fn losing_a_tolerated_volume_still_serves_every_read_surface() {
+    // Volume-loss recovery is covered today by a one-member archive. With a real
+    // corpus the parity rebuild has to span many stripes and envelopes.
+    let bodies = matrix_corpus(150);
+    let files = bodies.iter().map(|(path, body)| RegularFile::new(path, body)).collect::<Vec<_>>();
+    let options = WriterOptions { stripe_width: 3, volume_loss_tolerance: 1, ..single_stream_options() };
+    let archive = write_archive(&files, &master_key(), options).unwrap();
+
+    let expected = bodies.iter().cloned().collect::<std::collections::BTreeMap<_, _>>();
+    for dropped in 0..archive.volumes.len() {
+        let surviving = archive.volumes.iter().enumerate().filter(|(index, _)| *index != dropped).map(|(_, volume)| volume.as_slice()).collect::<Vec<_>>();
+        let opened = open_archive_volumes(&surviving, &master_key()).unwrap_or_else(|err| panic!("dropping volume {dropped}: open failed: {err:?}"));
+
+        opened.verify().unwrap_or_else(|err| panic!("dropping volume {dropped}: verify failed: {err:?}"));
+        assert_eq!(opened.list_index_entries().unwrap().len(), expected.len(), "dropping volume {dropped}: listing");
+        for (path, body) in &expected {
+            assert_eq!(opened.extract_file(path).unwrap().as_ref(), Some(body), "dropping volume {dropped}: {path}");
+        }
+        let root = tempfile::tempdir().unwrap();
+        opened.extract_indexed_files_to(root.path(), SafeExtractionOptions::default(), 2).unwrap();
+        for (path, body) in &expected {
+            assert_eq!(&std::fs::read(root.path().join(path)).unwrap(), body, "dropping volume {dropped}: restored {path}");
+        }
+    }
+}
+
+#[test]
+fn non_seekable_stream_agrees_with_the_seekable_reader_at_scale() {
+    // The sequential reader reconstructs the same view without seeking. Today that
+    // is checked on tiny archives; with a real corpus it must walk many envelopes
+    // and agree with the random-access reader member for member.
+    let bodies = matrix_corpus(180);
+    let files = bodies.iter().map(|(path, body)| RegularFile::new(path, body)).collect::<Vec<_>>();
+
+    for (shape, options) in [("no parity", WriterOptions { bit_rot_buffer_pct: 0, ..single_stream_options() }), ("default parity", single_stream_options())] {
+        let archive = write_archive(&files, &master_key(), options).unwrap();
+        let bytes = archive.volumes[0].clone();
+        let expected = bodies.iter().cloned().collect::<std::collections::BTreeMap<_, _>>();
+
+        let seekable = open_archive(&bytes, &master_key()).unwrap();
+        let seekable_paths = seekable.list_index_entries().unwrap().into_iter().map(|entry| entry.path).collect::<std::collections::BTreeSet<_>>();
+
+        let streamed = list_non_seekable_stream(std::io::Cursor::new(bytes.clone()), &master_key(), NonSeekableReaderOptions::default()).unwrap();
+        let streamed_paths = streamed.index_entries.iter().map(|entry| entry.path.clone()).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(streamed_paths, seekable_paths, "{shape}: streamed listing differs from seekable");
+        // The sequential report counts physical members, so the duplicated path is
+        // counted twice here while the final view collapses it to one.
+        assert_eq!(streamed.verification.file_count as usize, bodies.len(), "{shape}: streamed file_count");
+        assert_eq!(expected.len(), bodies.len() - 1, "corpus should carry exactly one duplicated path");
+        assert_eq!(streamed.verification.content_sha256, seekable.index_root.header.content_sha256, "{shape}: streamed content digest");
+
+        let verified = verify_non_seekable_stream(std::io::Cursor::new(bytes.clone()), &master_key()).unwrap();
+        assert_eq!(verified.content_sha256, streamed.verification.content_sha256, "{shape}: verify digest");
+        assert_eq!(verified.tar_total_size, streamed.verification.tar_total_size, "{shape}: verify tar size");
+
+        // A stream fed in small chunks must land in the same place as one big read.
+        let chunked = list_non_seekable_stream(ChunkedReader::new(bytes.clone(), 97), &master_key(), NonSeekableReaderOptions::default()).unwrap();
+        assert_eq!(chunked.index_entries.len(), streamed.index_entries.len(), "{shape}: chunked listing");
+        assert_eq!(chunked.verification.content_sha256, streamed.verification.content_sha256, "{shape}: chunked digest");
+
+        // And sequential extraction must reproduce the same tree the seekable path does.
+        let streamed_root = tempfile::tempdir().unwrap();
+        let report = extract_non_seekable_stream_to_dir(
+            std::io::Cursor::new(bytes),
+            &master_key(),
+            streamed_root.path(),
+            NonSeekableReaderOptions::default(),
+            SafeExtractionOptions::default(),
+        )
+        .unwrap();
+        assert!(report.extracted_member_count >= expected.len() as u64, "{shape}: streamed extract count");
+        for (path, body) in &expected {
+            assert_eq!(&std::fs::read(streamed_root.path().join(path)).unwrap(), body, "{shape}: streamed extract {path}");
+        }
     }
 }
 
