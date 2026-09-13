@@ -1,9 +1,12 @@
+use crate::entry_metadata::SparseExtent;
 use crate::{ArchiveTimestamp, NativeAuxiliaryMetadata, NativeAuxiliaryNameEncoding, NativeFileMetadata, RestoreClass};
 use std::fs::{self, File};
 use std::io;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::AsRawHandle as _;
 use std::path::Path;
+use std::path::PathBuf;
 
 /// Captures Windows basic information, security, reparse data, case-sensitivity,
 /// alternate data, EA/property data, and object IDs into TZAP v45 metadata.
@@ -60,11 +63,17 @@ pub fn capture_windows_metadata(input: &Path) -> io::Result<NativeFileMetadata> 
             native.primary_pax_records.insert("TZAP.windows.directory-case-sensitive".into(), if case_sensitive { b"1" } else { b"0" }.to_vec());
         }
     }
-    let (data_stream_attributes, mut streams) = capture_windows_backup_streams(&file, reparse_data.as_deref())?;
+    let (data_stream_attributes, mut streams) = capture_windows_backup_streams(input, &file, reparse_data.as_deref())?;
     if basic.FileAttributes & (0x0000_0010 | 0x0000_0400) == 0 {
         native.primary_pax_records.insert("TZAP.windows.data-stream-attributes".into(), format!("{data_stream_attributes:08x}").into_bytes());
     }
     native.auxiliary_records.append(&mut streams);
+    // ReFS cannot report exact allocated ranges, so any sparse claim here is
+    // partial by construction and must say so.
+    const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
+    if basic.FileAttributes & FILE_ATTRIBUTE_SPARSE_FILE != 0 && windows_file_system_is_refs(&file)? {
+        add_refs_sparse_layout_omission(&mut native);
+    }
     native.auxiliary_records.sort_by(|left, right| left.kind.cmp(&right.kind).then_with(|| left.name.cmp(&right.name)));
     native.required_profiles.push("windows-backup-v1".into());
     Ok(native)
@@ -277,6 +286,28 @@ impl WindowsBackupReader {
         Ok(payload)
     }
 
+    /// Hash a stream payload without retaining it.
+    ///
+    /// An alternate data stream can be arbitrarily large. Reading it into memory
+    /// -- which this module used to do, capped at 64 MiB -- turns a big ADS into
+    /// a hard capture failure. §16.4.6 requires readers to hash an auxiliary
+    /// payload without allocating its full size, and the same applies here.
+    fn read_sha256(&mut self, mut size: u64) -> io::Result<[u8; 32]> {
+        use sha2::{Digest as _, Sha256};
+
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        while size > 0 {
+            let count = buffer.len().min(usize::try_from(size).unwrap_or(usize::MAX));
+            if !self.read_optional_exact(&mut buffer[..count])? {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Windows backup stream payload is missing"));
+            }
+            hasher.update(&buffer[..count]);
+            size -= count as u64;
+        }
+        Ok(hasher.finalize().into())
+    }
+
     fn skip(&mut self, size: u64) -> io::Result<()> {
         use windows_sys::Win32::Storage::FileSystem::BackupSeek;
         let mut low = 0u32;
@@ -301,7 +332,7 @@ impl Drop for WindowsBackupReader {
     }
 }
 
-fn capture_windows_backup_streams(file: &File, expected_reparse: Option<&[u8]>) -> io::Result<(u32, Vec<NativeAuxiliaryMetadata>)> {
+fn capture_windows_backup_streams(input: &Path, file: &File, expected_reparse: Option<&[u8]>) -> io::Result<(u32, Vec<NativeAuxiliaryMetadata>)> {
     use std::os::windows::fs::MetadataExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
         BACKUP_ALTERNATE_DATA, BACKUP_DATA, BACKUP_EA_DATA, BACKUP_LINK, BACKUP_OBJECT_ID, BACKUP_PROPERTY_DATA, BACKUP_REPARSE_DATA, BACKUP_SECURITY_DATA,
@@ -313,6 +344,7 @@ fn capture_windows_backup_streams(file: &File, expected_reparse: Option<&[u8]>) 
     let mut reader = WindowsBackupReader::new(file);
     let mut data_attributes = None;
     let mut auxiliary = Vec::new();
+    let mut sparse_alternate: Vec<(Vec<u8>, u32, RestoreClass)> = Vec::new();
     loop {
         let mut header = [0u8; HEADER_LEN];
         if !reader.read_optional_exact(&mut header)? {
@@ -335,35 +367,57 @@ fn capture_windows_backup_streams(file: &File, expected_reparse: Option<&[u8]>) 
                 data_attributes = Some(attributes);
                 reader.skip(size)?;
             }
-            BACKUP_SECURITY_DATA | BACKUP_LINK | BACKUP_SPARSE_BLOCK => reader.skip(size)?,
+            BACKUP_SECURITY_DATA | BACKUP_LINK => reader.skip(size)?,
+            BACKUP_SPARSE_BLOCK => {
+                // Payload for the sparse alternate stream most recently seen.
+                // The extents are re-derived from the stream itself below, so
+                // the blocks only need consuming here.
+                reader.skip(size)?;
+            }
             BACKUP_REPARSE_DATA => {
                 let payload = reader.read_vec(size)?;
                 if expected_reparse != Some(payload.as_slice()) {
                     return Err(io::Error::other("Windows reparse stream disagrees with the pinned handle"));
                 }
             }
-            BACKUP_ALTERNATE_DATA | BACKUP_EA_DATA | BACKUP_PROPERTY_DATA | BACKUP_OBJECT_ID => {
+            BACKUP_ALTERNATE_DATA => {
+                // Streamed, not retained: an alternate stream has no size bound,
+                // and reading it into memory turned a large ADS into a capture
+                // failure.
+                let restore_class = if attributes & 2 != 0 { RestoreClass::System } else { RestoreClass::SameOs };
+                const STREAM_ATTRIBUTE_SPARSE: u32 = 0x0000_0008;
+                if attributes & STREAM_ATTRIBUTE_SPARSE != 0 {
+                    // The payload arrives as following BACKUP_SPARSE_BLOCK
+                    // records; the stream itself is re-read by path below so the
+                    // v45 sparse map covers exactly the allocated ranges.
+                    reader.skip(size)?;
+                    sparse_alternate.push((name, attributes, restore_class));
+                    continue;
+                }
+                let sha256 = reader.read_sha256(size)?;
+                let mut record = NativeAuxiliaryMetadata::new_streamed("windows.alternate-data", "windows-backup-v1", restore_class, size, sha256);
+                record.name_encoding = NativeAuxiliaryNameEncoding::Utf16Le;
+                record.name = name;
+                record.meta.insert("TZAP.aux.meta.stream-type".into(), b"00000004".to_vec());
+                record.meta.insert("TZAP.aux.meta.stream-attributes".into(), format!("{attributes:08x}").into_bytes());
+                auxiliary.push(record);
+            }
+            BACKUP_EA_DATA | BACKUP_PROPERTY_DATA | BACKUP_OBJECT_ID => {
                 if size > RETAINED_CAP {
                     return Err(io::Error::other("Windows metadata stream exceeds the retained payload cap"));
                 }
                 let payload = reader.read_vec(size)?;
                 let (kind, stream_type, restore_class) = match stream_id {
-                    BACKUP_ALTERNATE_DATA => {
-                        ("windows.alternate-data", "00000004", if attributes & 2 != 0 { RestoreClass::System } else { RestoreClass::SameOs })
-                    }
                     BACKUP_EA_DATA => ("windows.ea-data", "00000002", if attributes & 2 != 0 { RestoreClass::System } else { RestoreClass::SameOs }),
                     BACKUP_PROPERTY_DATA => {
                         ("windows.property-data", "00000006", if attributes & 2 != 0 { RestoreClass::System } else { RestoreClass::SameOs })
                     }
                     _ => ("windows.object-id", "00000007", RestoreClass::System),
                 };
-                let mut record = NativeAuxiliaryMetadata::new(kind, "windows-backup-v1", restore_class, payload);
-                if stream_id == BACKUP_ALTERNATE_DATA {
-                    record.name_encoding = NativeAuxiliaryNameEncoding::Utf16Le;
-                    record.name = name;
-                } else if !name.is_empty() {
+                if !name.is_empty() {
                     return Err(io::Error::other("unnamed Windows metadata stream had a name"));
                 }
+                let mut record = NativeAuxiliaryMetadata::new(kind, "windows-backup-v1", restore_class, payload);
                 record.meta.insert("TZAP.aux.meta.stream-type".into(), stream_type.as_bytes().to_vec());
                 record.meta.insert("TZAP.aux.meta.stream-attributes".into(), format!("{attributes:08x}").into_bytes());
                 auxiliary.push(record);
@@ -378,6 +432,34 @@ fn capture_windows_backup_streams(file: &File, expected_reparse: Option<&[u8]>) 
     }
     let metadata = file.metadata()?;
     let data_attributes = data_attributes.unwrap_or_else(|| if metadata.file_attributes() & 0x0000_0200 != 0 { 8 } else { 0 });
+
+    // Sparse alternate streams are re-opened by path so the stored v45 map
+    // describes exactly the allocated ranges. ReFS cannot report those, so there
+    // the whole logical extent is materialized and the omission recorded.
+    let layout_partial = !sparse_alternate.is_empty() && windows_file_system_is_refs(file)?;
+    for (name, attributes, restore_class) in sparse_alternate {
+        let stream_path = windows_alternate_stream_path(input, &name)?;
+        let mut stream = File::open(stream_path)?;
+        let logical_size = stream.metadata()?.len();
+        let extents = if layout_partial && logical_size != 0 {
+            vec![SparseExtent { offset: 0, length: logical_size }]
+        } else {
+            query_windows_allocated_ranges(&stream, logical_size)?
+        };
+        if extents.last().is_some_and(|extent| extent.offset + extent.length > logical_size) {
+            return Err(io::Error::other("Windows sparse-block stream exceeds its logical stream size"));
+        }
+        let map = crate::writer::encode_v45_sparse_map(&extents, logical_size).map_err(io::Error::other)?;
+        let sha256 = hash_windows_sparse_alternate_stream(&mut stream, &map, &extents, logical_size)?;
+        let mut record =
+            NativeAuxiliaryMetadata::new_streamed_sparse("windows.alternate-data", "windows-backup-v1", restore_class, logical_size, extents, sha256)
+                .map_err(io::Error::other)?;
+        record.name_encoding = NativeAuxiliaryNameEncoding::Utf16Le;
+        record.name = name;
+        record.meta.insert("TZAP.aux.meta.stream-type".into(), b"00000004".to_vec());
+        record.meta.insert("TZAP.aux.meta.stream-attributes".into(), format!("{attributes:08x}").into_bytes());
+        auxiliary.push(record);
+    }
     Ok((data_attributes, auxiliary))
 }
 
@@ -468,4 +550,185 @@ fn capture_windows_efs_raw(path: &Path) -> io::Result<NativeAuxiliaryMetadata> {
     let mut record = NativeAuxiliaryMetadata::new_streamed("windows.efs-raw", "windows-backup-v1", RestoreClass::System, size, sha256);
     record.meta.insert("TZAP.aux.meta.efs-version".into(), b"1".to_vec());
     Ok(record)
+}
+
+/// Whether the volume holding this handle is ReFS.
+///
+/// ReFS does not expose an authoritative allocated-range map, so sparse layout
+/// there is preserved logically but must be authenticated as partial.
+fn windows_file_system_is_refs(file: &File) -> io::Result<bool> {
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
+
+    let mut name = [0u16; 32];
+    // SAFETY: the handle is live, the optional outputs are null, and `name` is
+    // writable for exactly the capacity supplied to this synchronous query.
+    if unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle().cast(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let length = name.iter().position(|unit| *unit == 0).unwrap_or(name.len());
+    Ok(String::from_utf16_lossy(&name[..length]).eq_ignore_ascii_case("refs"))
+}
+
+/// Record that sparse layout could not be captured exactly on this filesystem.
+///
+/// §16.6's `unsupported-filesystem` reason: the class could exist here, but the
+/// writer cannot enumerate it or prove its absence. The archive stays honest --
+/// logical bytes are complete and the omission is authenticated -- rather than
+/// silently claiming an exact sparse layout it did not observe.
+fn add_refs_sparse_layout_omission(native: &mut NativeFileMetadata) {
+    const HEADER: &str = "tzap-capture-report-v1\n";
+    const ROW: &str = "windows-backup-v1\tsparse-layout\tunsupported-filesystem\tReFS%20does%20not%20expose%20exact%20sparse%20ranges";
+
+    if let Some(report) = native.auxiliary_records.iter_mut().find(|record| record.kind == "tzap.capture-report") {
+        let Ok(text) = std::str::from_utf8(&report.payload) else { return };
+        let Some(body) = text.strip_prefix(HEADER) else { return };
+        let mut rows = body.split_terminator('\n').collect::<Vec<_>>();
+        rows.push(ROW);
+        rows.sort_unstable();
+        rows.dedup();
+        report.payload = format!("{HEADER}{}\n", rows.join("\n")).into_bytes();
+        report.logical_size = report.payload.len() as u64;
+        return;
+    }
+    let payload = format!("{HEADER}{ROW}\n").into_bytes();
+    let mut report = NativeAuxiliaryMetadata::new("tzap.capture-report", "tzap-core-v1", RestoreClass::None, payload);
+    report.native = false;
+    native.auxiliary_records.push(report);
+}
+
+fn windows_alternate_stream_path(base: &Path, name: &[u8]) -> io::Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    if name.len() % 2 != 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Windows alternate stream name is not UTF-16LE"));
+    }
+    let mut stream_path = base.as_os_str().encode_wide().collect::<Vec<_>>();
+    stream_path.extend(name.chunks_exact(2).map(|unit| u16::from_le_bytes([unit[0], unit[1]])));
+    Ok(PathBuf::from(OsString::from_wide(&stream_path)))
+}
+
+fn query_windows_allocated_ranges(file: &File, logical_size: u64) -> io::Result<Vec<SparseExtent>> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
+    use windows_sys::Win32::System::Ioctl::{FILE_ALLOCATED_RANGE_BUFFER, FSCTL_QUERY_ALLOCATED_RANGES};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const QUERY_BATCH: usize = 1024;
+    const MAX_EXTENTS: usize = 1_048_576;
+    if logical_size == 0 {
+        return Ok(Vec::new());
+    }
+    // FSCTL_QUERY_ALLOCATED_RANGES is not supported by ReFS. Retrieval pointers do not resolve
+    // the ambiguity: ReFS reports LCN -1 for a run that may be either a hole or partially
+    // allocated. Materialize the logical bytes and pair this fallback with an authenticated
+    // sparse-layout omission so the archive cannot claim exact storage-layout fidelity.
+    if windows_file_system_is_refs(file)? {
+        return Ok(vec![SparseExtent { offset: 0, length: logical_size }]);
+    }
+    let logical_size_i64 = i64::try_from(logical_size).map_err(|_| io::Error::other("sparse logical size exceeds Windows range API"))?;
+    let mut query_start = 0u64;
+    let mut extents = Vec::<SparseExtent>::new();
+    while query_start < logical_size {
+        let mut query = FILE_ALLOCATED_RANGE_BUFFER {
+            FileOffset: i64::try_from(query_start).map_err(|_| io::Error::other("sparse query offset exceeds Windows range API"))?,
+            Length: logical_size_i64 - query_start as i64,
+        };
+        let mut output = [FILE_ALLOCATED_RANGE_BUFFER::default(); QUERY_BATCH];
+        let mut bytes_returned = 0u32;
+        // SAFETY: the live file handle and fixed-size input/output buffers remain valid for the
+        // synchronous DeviceIoControl call, and the byte lengths exactly match those buffers.
+        let success = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle().cast(),
+                FSCTL_QUERY_ALLOCATED_RANGES,
+                (&mut query as *mut FILE_ALLOCATED_RANGE_BUFFER).cast(),
+                size_of::<FILE_ALLOCATED_RANGE_BUFFER>() as u32,
+                output.as_mut_ptr().cast(),
+                size_of::<[FILE_ALLOCATED_RANGE_BUFFER; QUERY_BATCH]>() as u32,
+                &mut bytes_returned,
+                ptr::null_mut(),
+            )
+        };
+        let error = io::Error::last_os_error();
+        if success == 0 && error.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
+            return Err(error);
+        }
+        if bytes_returned as usize % size_of::<FILE_ALLOCATED_RANGE_BUFFER>() != 0 {
+            return Err(io::Error::other("Windows returned a truncated allocated-range row"));
+        }
+        let count = bytes_returned as usize / size_of::<FILE_ALLOCATED_RANGE_BUFFER>();
+        if count > QUERY_BATCH || (success == 0 && count == 0) {
+            return Err(io::Error::other("Windows allocated-range query made no progress"));
+        }
+        let mut next_query_start = query_start;
+        for range in &output[..count] {
+            if range.FileOffset < 0 || range.Length <= 0 {
+                return Err(io::Error::other("Windows returned an invalid allocated range"));
+            }
+            let offset = range.FileOffset as u64;
+            let end = offset.checked_add(range.Length as u64).ok_or_else(|| io::Error::other("Windows allocated range overflow"))?.min(logical_size);
+            if offset >= logical_size || end <= offset {
+                return Err(io::Error::other("Windows returned an out-of-bounds allocated range"));
+            }
+            if let Some(previous) = extents.last_mut() {
+                let previous_end = previous.offset + previous.length;
+                if offset <= previous_end {
+                    previous.length = previous_end.max(end) - previous.offset;
+                } else {
+                    extents.push(SparseExtent { offset, length: end - offset });
+                }
+            } else {
+                extents.push(SparseExtent { offset, length: end - offset });
+            }
+            if extents.len() > MAX_EXTENTS {
+                return Err(io::Error::other("sparse extent count exceeds revision-45 limit"));
+            }
+            next_query_start = next_query_start.max(end);
+        }
+        if success != 0 {
+            break;
+        }
+        if next_query_start <= query_start {
+            return Err(io::Error::other("Windows allocated-range query did not advance"));
+        }
+        query_start = next_query_start;
+    }
+    Ok(extents)
+}
+
+fn hash_windows_sparse_alternate_stream(stream: &mut File, map: &[u8], extents: &[SparseExtent], logical_size: u64) -> io::Result<[u8; 32]> {
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(map);
+    let mut buffer = [0u8; 64 * 1024];
+    for extent in extents {
+        stream.seek(SeekFrom::Start(extent.offset))?;
+        let mut remaining = extent.length;
+        while remaining > 0 {
+            let count = buffer.len().min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            stream.read_exact(&mut buffer[..count])?;
+            hasher.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+    }
+    if stream.metadata()?.len() != logical_size || query_windows_allocated_ranges(stream, logical_size)? != extents {
+        return Err(io::Error::other("Windows sparse alternate stream changed while hashing"));
+    }
+    Ok(hasher.finalize().into())
 }
