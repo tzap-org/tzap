@@ -683,6 +683,13 @@ fn add_refs_sparse_layout_omission(native: &mut NativeFileMetadata) {
     native.auxiliary_records.push(report);
 }
 
+/// A host's "is this still the object I scanned?" check, run before any bytes
+/// of a streamed auxiliary are read.
+///
+/// Each host identifies inputs its own way, so the check stays with the host
+/// while tzap-core owns the reading.
+pub type WindowsStreamValidator = Box<dyn FnOnce(&Path) -> io::Result<()> + Send>;
+
 /// Open a streamed Windows auxiliary for the writer to pull its payload from.
 ///
 /// The counterpart to [`crate::macos_metadata::open_macos_resource_fork`], and
@@ -695,11 +702,7 @@ fn add_refs_sparse_layout_omission(native: &mut NativeFileMetadata) {
 /// `validate` is the host's own "is this still the object I scanned?" check. It
 /// stays with the host because each one identifies inputs differently, and it
 /// runs before any bytes are read.
-pub fn open_windows_streamed_auxiliary(
-    input: &Path,
-    record: &NativeAuxiliaryMetadata,
-    validate: Box<dyn FnOnce(&Path) -> io::Result<()> + Send>,
-) -> io::Result<Box<dyn Read + Send>> {
+pub fn open_windows_streamed_auxiliary(input: &Path, record: &NativeAuxiliaryMetadata, validate: WindowsStreamValidator) -> io::Result<Box<dyn Read + Send>> {
     match record.kind.as_str() {
         "windows.efs-raw" => {
             if record.name_encoding != NativeAuxiliaryNameEncoding::None || !record.name.is_empty() {
@@ -822,7 +825,7 @@ unsafe extern "system" fn send_windows_raw_efs_callback(data: *const u8, context
 
 fn export_windows_raw_efs_to_sender(
     path: &Path,
-    validate: Box<dyn FnOnce(&Path) -> io::Result<()> + Send>,
+    validate: WindowsStreamValidator,
     sender: std::sync::mpsc::SyncSender<WindowsRawEfsMessage>,
 ) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::ReadEncryptedFileRaw;
@@ -852,7 +855,7 @@ struct WindowsRawEfsReader {
 }
 
 impl WindowsRawEfsReader {
-    fn spawn(path: PathBuf, size: u64, validate: Box<dyn FnOnce(&Path) -> io::Result<()> + Send>) -> Self {
+    fn spawn(path: PathBuf, size: u64, validate: WindowsStreamValidator) -> Self {
         let (sender, receiver) = std::sync::mpsc::sync_channel(2);
         let completion = sender.clone();
         let thread = std::thread::spawn(move || {
