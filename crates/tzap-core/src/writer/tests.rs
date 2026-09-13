@@ -1989,6 +1989,128 @@ impl Read for GeneratedReader {
     }
 }
 
+/// A sink that fails on a chosen write, so the writer's behaviour on a mid-archive
+/// failure can be observed.
+struct FailingArchiveSink {
+    writes_before_failure: usize,
+    writes_seen: usize,
+    begin_calls: usize,
+    volumes: Vec<Vec<u8>>,
+}
+
+impl FailingArchiveSink {
+    fn new(writes_before_failure: usize) -> Self {
+        Self { writes_before_failure, writes_seen: 0, begin_calls: 0, volumes: Vec::new() }
+    }
+}
+
+impl ArchiveWriteSink for FailingArchiveSink {
+    fn begin_archive(&mut self, volume_count: usize) -> Result<(), ArchiveWriteError> {
+        self.begin_calls += 1;
+        self.volumes = vec![Vec::new(); volume_count];
+        Ok(())
+    }
+
+    fn write_volume(&mut self, volume_index: usize, bytes: &[u8]) -> Result<(), ArchiveWriteError> {
+        if self.writes_seen >= self.writes_before_failure {
+            return Err(ArchiveWriteError::Io(std::io::Error::other("simulated storage failure mid-archive")));
+        }
+        self.writes_seen += 1;
+        self.volumes[volume_index].extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn write_bootstrap_sidecar(&mut self, _bytes: &[u8]) -> Result<(), ArchiveWriteError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_write_failure_mid_archive_surfaces_and_leaves_no_usable_archive() {
+    // Storage can fail part way through. The writer must surface that rather than
+    // returning a summary, and whatever reached the sink must not open as a valid
+    // archive -- a truncated archive that still opened would be the dangerous case,
+    // since the caller would believe the backup succeeded.
+    let bodies: Vec<(String, Vec<u8>)> = (0..40).map(|i| (format!("f{i:03}.bin"), vec![b'x'; 5000])).collect();
+    let files: Vec<RegularFile<'_>> = bodies.iter().map(|(path, body)| RegularFile::new(path, body)).collect();
+    let key = MasterKey::from_raw_key(&[71u8; 32]).unwrap();
+    let options = WriterOptions { stripe_width: 1, volume_loss_tolerance: 0, ..WriterOptions::default() };
+
+    // Learn how many sink writes this archive actually makes, so the failure points
+    // are real rather than guessed: the writer batches, and a threshold above the
+    // total would simply never fire.
+    let total_writes = {
+        let mut counting = FailingArchiveSink::new(usize::MAX);
+        write_archive_sources_to_sink(&files, &key, options, None, &KdfParams::Raw, None, None, &mut counting).unwrap();
+        counting.writes_seen
+    };
+    assert!(total_writes > 0, "the writer made no sink writes to fail");
+
+    // Fail on the first write, the last, and the middle.
+    let failure_points = if total_writes == 1 { vec![0usize] } else { vec![0, total_writes / 2, total_writes - 1] };
+    for writes_before_failure in failure_points {
+        let mut sink = FailingArchiveSink::new(writes_before_failure);
+        let result = write_archive_sources_to_sink(&files, &key, options, None, &KdfParams::Raw, None, None, &mut sink);
+        let error = result.expect_err("a failing sink must not produce a successful summary");
+        assert!(matches!(error, ArchiveWriteError::Io(_)), "unexpected error at {writes_before_failure}: {error:?}");
+
+        // Whatever reached the sink is a prefix of an archive. Opening one may well
+        // succeed -- the header is written first -- but it must not also verify,
+        // or a partially written archive would look like a complete backup.
+        if let Some(volume) = sink.volumes.first() {
+            eprintln!("DEBUG fail@{writes_before_failure}/{total_writes}: truncated={} bytes, begin_calls={}", volume.len(), sink.begin_calls);
+            if let Ok(opened) = crate::reader::open_archive(volume, &key) {
+                assert!(
+                    opened.verify().is_err(),
+                    "a truncated archive both opened and verified after failing at write {writes_before_failure}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn many_threads_reading_one_archive_agree_with_a_single_reader() {
+    // Readers are independent, so concurrent opens of the same bytes must each see
+    // the same listing and the same payload. Nothing covered concurrent readers.
+    use std::sync::Arc;
+
+    let bodies: Vec<(String, Vec<u8>)> =
+        (0..60).map(|i| (format!("dir{}/f{i:03}.bin", i % 4), format!("body {i}").repeat(i + 1).into_bytes())).collect();
+    let files: Vec<RegularFile<'_>> = bodies.iter().map(|(path, body)| RegularFile::new(path, body)).collect();
+    let key = MasterKey::from_raw_key(&[73u8; 32]).unwrap();
+    let archive = write_archive(&files, &key, WriterOptions { stripe_width: 1, volume_loss_tolerance: 0, ..WriterOptions::default() }).unwrap();
+
+    let baseline = {
+        let opened = crate::reader::open_archive(&archive.bytes, &key).unwrap();
+        opened.list_index_entries().unwrap().into_iter().map(|entry| (entry.path, entry.file_data_size)).collect::<Vec<_>>()
+    };
+
+    let shared = Arc::new(archive.bytes.clone());
+    let key = Arc::new(key);
+    let bodies = Arc::new(bodies);
+    let baseline = Arc::new(baseline);
+    let mut handles = Vec::new();
+    for worker in 0..8 {
+        let shared = Arc::clone(&shared);
+        let bodies = Arc::clone(&bodies);
+        let baseline = Arc::clone(&baseline);
+        let key = Arc::clone(&key);
+        handles.push(std::thread::spawn(move || {
+            let opened = crate::reader::open_archive(&shared, &key).unwrap_or_else(|error| panic!("worker {worker}: open failed: {error:?}"));
+            opened.verify().unwrap_or_else(|error| panic!("worker {worker}: verify failed: {error:?}"));
+            let listed = opened.list_index_entries().unwrap().into_iter().map(|entry| (entry.path, entry.file_data_size)).collect::<Vec<_>>();
+            assert_eq!(listed, *baseline, "worker {worker} saw a different listing");
+            for (path, body) in bodies.iter() {
+                assert_eq!(opened.extract_file(path).unwrap().as_ref(), Some(body), "worker {worker}: wrong bytes for {path}");
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("a reader thread panicked");
+    }
+}
+
 #[derive(Default)]
 struct TrackingArchiveSink {
     volume_bytes: Vec<u64>,
