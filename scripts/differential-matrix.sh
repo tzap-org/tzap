@@ -115,14 +115,16 @@ rename_outputs() {
 # Still require the candidate's own archive to verify, list and extract back to
 # the source, so the combination is covered rather than merely counted.
 candidate_round_trip() {
-  local name="$1" work="$2" prefix="$3" tree="$4"
+  # The key source is passed explicitly: stream_combo carries its own, which is not
+  # the global one the shape sweep sets.
+  local name="$1" work="$2" prefix="$3" tree="$4" key="$5"
   local pos flagged
   pos=$(vols_positional "$work" "$prefix"); flagged=$(vols_flagged "$work" "$prefix")
   [ -n "$pos" ] || { echo "  FAIL [$name] candidate produced no archive"; return 1; }
-  $NEW verify $READ_KEY $pos >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate verify: $(tail -1 "$work/rt.e")"; return 1; }
-  $NEW list $READ_KEY $flagged >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate list: $(tail -1 "$work/rt.e")"; return 1; }
+  $NEW verify $key $pos >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate verify: $(tail -1 "$work/rt.e")"; return 1; }
+  $NEW list $key $flagged >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate list: $(tail -1 "$work/rt.e")"; return 1; }
   rm -rf "$work/rt.out"
-  $NEW extract $READ_KEY -C "$work/rt.out" $flagged >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate extract: $(tail -1 "$work/rt.e")"; return 1; }
+  $NEW extract $key -C "$work/rt.out" $flagged >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate extract: $(tail -1 "$work/rt.e")"; return 1; }
   if [ -n "$tree" ] && ! diff -r "$tree" "$work/rt.out/$tree" >/dev/null 2>&1; then
     echo "  FAIL [$name] candidate extracted tree differs from the source"; return 1
   fi
@@ -143,7 +145,7 @@ run_combo() {
     local probe_rc=$?
     if [ $probe_rc -eq 0 ]; then
       if is_expected_fix "$(cat "$work/old.err")"; then
-        candidate_round_trip "$name" "$work" probe corpus || { FAIL=$((FAIL+1)); FAILED_COMBOS+=("$name:candidate-round-trip"); rm -rf "$work"; return; }
+        candidate_round_trip "$name" "$work" probe corpus "$READ_KEY" || { FAIL=$((FAIL+1)); FAILED_COMBOS+=("$name:candidate-round-trip"); rm -rf "$work"; return; }
         FIXED=$((FIXED+1)); FIXED_COMBOS+=("$name"); rm -rf "$work"; return
       fi
       echo "  FAIL [$name] reference rejects this combo but the candidate accepts it: $(tail -1 "$work/old.err")"
@@ -314,7 +316,7 @@ stream_combo() {
     if eval "${make//@BIN@/$NEW}" >/dev/null 2>"$work/probe.err"; then
       if is_expected_fix "$(cat "$work/e")"; then
         rename_outputs "$work" probe
-        candidate_round_trip "$name" "$work" probe "$expect_tree" || { FAIL=$((FAIL+1)); FAILED_COMBOS+=("$name:candidate-round-trip"); rm -rf "$work"; return; }
+        candidate_round_trip "$name" "$work" probe "$expect_tree" "$read_key" || { FAIL=$((FAIL+1)); FAILED_COMBOS+=("$name:candidate-round-trip"); rm -rf "$work"; return; }
         FIXED=$((FIXED+1)); FIXED_COMBOS+=("$name"); rm -rf "$work"; return
       fi
       echo "  FAIL [$name] reference rejects this combo but the candidate accepts it: $(tail -1 "$work/e")"
