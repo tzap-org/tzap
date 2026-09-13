@@ -515,8 +515,12 @@ fn published_v45_conformance_declares_classes_and_discloses_corpus_gaps() {
     // exclusion. What must not regress is the disclosure itself: a conformance
     // page that quietly drops its gap table turns a bounded claim into an
     // unbounded one, which the claim boundary in README.md forbids.
-    assert!(conformance.contains("Evidence gap"), "the gap table must survive");
-    assert!(conformance.contains("no implementation gaps"), "the implementation-gap count must stay stated");
+    // The corpus is fully covered now, so there is no gap table to protect.
+    // What must not regress is the calibration around that: clearing §16.18 is a
+    // floor, not a claim of total conformance, and the page has to keep saying
+    // so or "no open gaps" reads as "fully conformant".
+    assert!(conformance.contains("Open gaps"), "the disclosure section must survive even when empty");
+    assert!(conformance.contains("§16.18 is a floor") || conformance.contains("16.18\nis a floor"), "the floor caveat must stay stated");
+    assert!(conformance.contains("external conformance program"), "the page must keep deferring total conformance to an external program");
     assert!(conformance.contains("clone hints"), "the macOS class must still account for clone hints one way or the other");
-    assert!(conformance.contains("None of these rows is a known defect."), "the gap disclosure must keep its calibration sentence");
 }

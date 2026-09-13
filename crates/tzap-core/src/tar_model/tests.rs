@@ -726,6 +726,106 @@ fn member_summary(bytes: &[u8], group_start: u64) -> TarStreamMemberSummary {
 ///
 /// Escape paths and hardlink targets had fixtures; this shape did not, even
 /// though it is the one where the archive itself looks completely well formed.
+/// §16.18.4's corpus names "symlink/reparse ancestors with selected descendant
+/// writes". The rule is in `validate_v45_member_graph`: a selected path whose
+/// ancestor is a symlink or reparse placeholder must be refused, because
+/// writing through it would place bytes wherever that link points -- possibly
+/// outside the extraction root entirely.
+///
+/// Escape paths and hardlink targets had fixtures; this shape did not, even
+/// though it is the one where the archive itself looks completely well formed.
+/// §16.18.4's corpus names "reparse placeholders incorrectly extracted as empty
+/// ordinary files". §16.12.2 is explicit that portable extraction "does not …
+/// create reparse placeholders".
+///
+/// The dangerous outcome is not an error but a *plausible* one: a zero-length
+/// regular file where a junction or mount point used to be. It looks like a
+/// successful restore, and the directory the placeholder pointed at is simply
+/// gone. Nothing asserted the file is absent rather than empty.
+///
+/// The companion case -- a placeholder silently replaced by a directory when a
+/// descendant is selected -- is covered by
+/// `a_selected_descendant_of_a_symlink_or_reparse_ancestor_is_refused`, which
+/// rejects the graph outright.
+/// §15.6 requires a reader decoding a member to compare it against the index
+/// "before writing primary or auxiliary payload bytes", and §16.18.4's corpus
+/// names "FileEntry flag-summary mismatches".
+///
+/// Three sites enforce it, and a round-trip test guards writer/reader agreement,
+/// but nothing crafted a mismatch to prove any of them fires. The member here is
+/// a *real* parsed one with its flags altered afterwards, so the fixture cannot
+/// drift from what the parser actually produces.
+#[test]
+fn a_member_whose_flags_disagree_with_the_index_never_reaches_the_restore_observer() {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    struct CountingObserver {
+        started: Rc<Cell<usize>>,
+    }
+
+    impl TarStreamObserver for CountingObserver {
+        fn on_member_start(&mut self, _member: &StreamedTarMemberMetadata) -> Result<(), FormatError> {
+            self.started.set(self.started.get() + 1);
+            Ok(())
+        }
+    }
+
+    let bytes = member(b"file.bin", b'0', b"payload", b"");
+    let streamed = |flags: u32, size: u64| {
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+        StreamedTarMemberMetadata {
+            path: parsed.path,
+            kind: parsed.kind,
+            link_target: parsed.link_target,
+            mode: parsed.mode,
+            mtime: parsed.mtime,
+            logical_size: size,
+            file_entry_flags: flags,
+            reparse_placeholder: parsed.reparse_placeholder,
+            v45_metadata: parsed.v45_metadata,
+            diagnostics: parsed.diagnostics,
+        }
+    };
+
+    let honest = parse_tar_member_group(&bytes, 4096).unwrap();
+    let (true_flags, true_size) = (honest.v45_metadata.file_entry_flags, honest.logical_size);
+
+    let mut index = HashMap::new();
+    index.insert(b"file.bin".to_vec(), ExpectedMember { file_data_size: true_size, flags: true_flags });
+
+    let run = |member: StreamedTarMemberMetadata| {
+        let started = Rc::new(Cell::new(0usize));
+        let mut observer = ValidatingRestoreObserver::new(&index, CountingObserver { started: Rc::clone(&started) });
+        let result = observer.on_member_start(&member);
+        (result, started.get())
+    };
+
+    // The honest member is delegated, so the negatives below are about the
+    // disagreement and nothing else.
+    let (ok, started) = run(streamed(true_flags, true_size));
+    assert!(ok.is_ok(), "a matching member must be accepted: {ok:?}");
+    assert_eq!(started, 1);
+
+    // A crafted flag summary is refused, and the restore observer never sees the
+    // member -- that is what "before writing bytes" means.
+    let (result, started) = run(streamed(true_flags ^ 0b1000_0000, true_size));
+    assert!(
+        matches!(&result, Err(FormatError::InvalidArchive(message)) if message.contains("flags do not match")),
+        "expected a flag-summary rejection, got {result:?}"
+    );
+    assert_eq!(started, 0, "a mismatched member must not reach the restore observer");
+
+    // The size arm shares the call site and must behave the same way.
+    let (result, started) = run(streamed(true_flags, true_size + 1));
+    assert!(
+        matches!(&result, Err(FormatError::InvalidArchive(message)) if message.contains("size does not match")),
+        "expected a size rejection, got {result:?}"
+    );
+    assert_eq!(started, 0);
+}
+
 #[test]
 fn a_selected_descendant_of_a_symlink_or_reparse_ancestor_is_refused() {
     // Baseline: a real directory ancestor is fine, so the negatives below are

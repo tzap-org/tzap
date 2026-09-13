@@ -35,32 +35,28 @@ Deterministic fixtures live in the workspace test suite and run under
 | 16.18.1 Portable and Unix | 11 | 11 | 0 | 0 |
 | 16.18.2 macOS | 6 | 6 | 0 | 0 |
 | 16.18.3 Windows | 8 | 8 | 0 | 0 |
-| 16.18.4 Adversarial | 17 | 13 | 4 | 0 |
+| 16.18.4 Adversarial | 17 | 17 | 0 | 0 |
 
 Every §16.18.3 Windows fixture is `#[cfg(windows)]` and runs only on the
 Windows CI job; the macOS and Linux jobs do not exercise it.
 
 ### Open gaps
 
-| Item | §16.18 clause | Status | Effect |
-| --- | --- | --- | --- |
-| Projection rename/mode-override guard | 16.18.4 | Evidence gap | The restore path contains no rename and applies readonly only through the host attribute, never through `TZAP.portable.mode`, so §16.7.1's MUST NOT holds by construction. No regression guard asserts it. |
-| Metadata phase-ordering guard | 16.18.4 | Evidence gap | Ordering matches §16.13 steps 8–14: ownership, mode, ACLs, xattrs, timestamps, readonly attributes, then no-change flags last. No regression guard asserts the order. |
-| FileEntry flag-summary mismatch | 16.18.4 | Evidence gap | Reserved-bit rejection is asserted. A crafted summary that disagrees with the recomputed group summary is not. |
-| Reparse placeholder mis-extraction | 16.18.4 | Evidence gap | Placeholders round-trip correctly. The negative direction — a placeholder extracted as an empty ordinary file, or replaced by a directory for selected descendants — is not separately asserted. |
+**None.** Every §16.18 row is covered, with no implementation gaps, no missing
+fixtures and no missing regression guards.
 
-This list is complete for the four corpus sections, not a selection: 4
-evidence gaps and **no implementation gaps** against 42 clauses. Every gap
-remaining is a missing regression guard for behaviour that is correct today, not
-a defect. They are published
-rather than omitted because §16.18 is a completeness obligation. Until they
-close, the claim boundary in [README.md](README.md) applies as written:
-v45-compliant for documented supported workflows, not for every optional
-profile.
+That is a statement about the corpus, not a claim of total conformance. §16.18
+is a floor: it names the cases the project must publish fixtures for. Clearing
+it does not substitute for the external conformance program the claim boundary
+in [README.md](README.md) calls for, and the wording there still applies —
+v45-conformant for documented supported workflows, not for every optional,
+future, historical or unsupported profile.
 
-An evidence gap means the behavior may well be correct — in several rows above
-it is correct by construction — but the corpus does not yet pin it, so a
-regression would be silent. None of these rows is a known defect.
+Two rows were closed by withdrawal rather than by new tests, after reading test
+bodies instead of names: NFSv4 ACLs already carried positive and negative cases
+for both exact syntax IDs, and the reparse-placeholder negative direction was
+already asserted against a real Windows junction. Both had been recorded as gaps
+by an earlier name-led pass.
 
 ## Reproducing
 

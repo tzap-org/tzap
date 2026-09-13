@@ -1615,6 +1615,160 @@ fn compressed_archive_round_trips_header_and_pax_portable_metadata_stores() {
     }
 }
 
+/// §16.7.1: a portable restore "MUST NOT rename a path to synthesize hidden
+/// state, override `TZAP.portable.mode` to synthesize readonly, or map
+/// system/archive bits to unrelated semantics."
+///
+/// The rule holds by construction today -- no restore path contains a rename,
+/// and the projection is applied only through a host attribute -- but nothing
+/// guarded it, so a future restore path gaining a rename would go unnoticed.
+/// §16.18.4's corpus names exactly this case.
+/// §16.13 orders metadata application so that "readonly states that would block
+/// earlier writes" are applied last, and finalizes directory mode "from deepest
+/// directory to the root after all children". §16.18.4's corpus names
+/// "readonly/immutable flags attempting to block later restoration phases".
+///
+/// On POSIX the case that actually bites is a directory with no write bit: if
+/// its mode were applied before its children, creating them would fail with
+/// EACCES. Extraction succeeding with the directory still at its archived mode
+/// is the observable proof the ordering holds.
+#[cfg(unix)]
+#[test]
+fn a_write_blocking_directory_mode_is_applied_after_its_children() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct Member {
+        path: &'static str,
+        kind: SourceEntryKind,
+        mode: u32,
+    }
+
+    impl RegularFileSource for Member {
+        fn archive_path(&self) -> &str {
+            self.path
+        }
+        fn entry_kind(&self) -> SourceEntryKind {
+            self.kind
+        }
+        fn link_target(&self) -> Option<&[u8]> {
+            None
+        }
+        fn file_data_size(&self) -> u64 {
+            0
+        }
+        fn mode(&self) -> u32 {
+            self.mode
+        }
+        fn mtime(&self) -> ArchiveTimestamp {
+            ArchiveTimestamp::from_seconds(1_700_000_000)
+        }
+        fn portable_metadata(&self) -> PortableFileMetadata {
+            PortableFileMetadata {
+                source_os: "other-unix".into(),
+                source_filesystem: "ext4".into(),
+                mode_origin: PortableModeOrigin::Native,
+                posix_owner: None,
+                attributes: None,
+                created: None,
+                accessed: None,
+                native: Default::default(),
+            }
+        }
+        fn open(&self) -> Result<Box<dyn std::io::Read + '_>, crate::format::ArchiveWriteError> {
+            Ok(Box::new(std::io::Cursor::new(b"")))
+        }
+    }
+
+    // 0o555: readable and traversable, but not writable. Children cannot be
+    // created inside it once the mode is applied.
+    const LOCKED_DIRECTORY_MODE: u32 = 0o555;
+    let sources = [
+        Member { path: "locked", kind: SourceEntryKind::Directory, mode: LOCKED_DIRECTORY_MODE },
+        Member { path: "locked/inner.txt", kind: SourceEntryKind::Regular, mode: 0o644 },
+        Member { path: "locked/deeper", kind: SourceEntryKind::Directory, mode: LOCKED_DIRECTORY_MODE },
+        Member { path: "locked/deeper/leaf.txt", kind: SourceEntryKind::Regular, mode: 0o644 },
+    ];
+
+    let mut sink = MemoryArchiveSink::default();
+    write_archive_sources_to_sink_single_pass(&sources, &master_key(), single_stream_options(), &crate::crypto::KdfParams::Raw, None, None, &mut sink).unwrap();
+    let opened = open_archive(&sink.volumes.remove(0), &master_key()).unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    opened.extract_indexed_files_to(root.path(), SafeExtractionOptions { allow_degraded: true, ..SafeExtractionOptions::default() }, 1).unwrap();
+
+    // Every child exists: the directory mode did not block their creation.
+    assert!(root.path().join("locked/inner.txt").is_file(), "a child of a non-writable directory must still be restored");
+    assert!(root.path().join("locked/deeper/leaf.txt").is_file(), "a nested child must be restored through two non-writable directories");
+
+    // And the directories still carry the archived mode, so the ordering did not
+    // simply skip applying it.
+    for directory in ["locked", "locked/deeper"] {
+        let mode = std::fs::metadata(root.path().join(directory)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, LOCKED_DIRECTORY_MODE, "{directory} must end at its archived mode");
+    }
+
+    // Leave the tree writable so the temp dir can be removed.
+    for directory in ["locked/deeper", "locked"] {
+        let path = root.path().join(directory);
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+    }
+}
+
+#[test]
+fn a_portable_attribute_projection_never_renames_a_path_or_rewrites_the_mode() {
+    // Every projection bit set: readonly, hidden, system, archive. On a POSIX
+    // host none of them can be applied, which is the point -- the entry must
+    // still land at its archived path with its archived mode.
+    const ALL_PROJECTION_BITS: u32 = 0b1111;
+    let archived_mode = 0o640;
+    let archive = write_archive(
+        &[RegularFile {
+            mode: archived_mode,
+            mtime: ArchiveTimestamp::from_seconds(1_700_000_000),
+            portable_metadata: PortableFileMetadata {
+                source_os: "other-unix".into(),
+                source_filesystem: "ext4".into(),
+                mode_origin: PortableModeOrigin::Native,
+                posix_owner: None,
+                attributes: Some(ALL_PROJECTION_BITS),
+                created: None,
+                accessed: None,
+                native: Default::default(),
+            },
+            ..RegularFile::new("visible.txt", b"not hidden")
+        }],
+        &master_key(),
+        single_stream_options(),
+    )
+    .unwrap();
+
+    let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    opened.extract_file_to("visible.txt", root.path(), SafeExtractionOptions { allow_degraded: true, ..SafeExtractionOptions::default() }).unwrap().unwrap();
+
+    // The hidden bit must not have produced a dot-prefixed name, and no other
+    // name may appear: a rename would leave the archived path missing.
+    let restored = root.path().join("visible.txt");
+    assert!(restored.is_file(), "the entry must land at its archived path");
+    assert!(!root.path().join(".visible.txt").exists(), "a hidden projection must never rename the path");
+    let names = std::fs::read_dir(root.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect::<Vec<_>>();
+    assert_eq!(names.len(), 1, "exactly one entry must be restored, got {names:?}");
+
+    assert_eq!(std::fs::read(&restored).unwrap(), b"not hidden");
+
+    // The readonly bit must not have been folded into the mode: §16.7.1 keeps
+    // the projection and the mode as separate channels, and the mode is the one
+    // that carries permissions.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let restored_mode = std::fs::metadata(&restored).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(restored_mode, archived_mode, "a readonly projection must not override TZAP.portable.mode");
+    }
+}
+
 #[test]
 fn compressed_archive_extraction_applies_portable_mode_and_pax_mtime() {
     let archived_mtime = ArchiveTimestamp::new(946_684_800, 123_456_700);
