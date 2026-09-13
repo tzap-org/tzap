@@ -595,6 +595,8 @@ pub(crate) struct IdentityCheckedInputReader {
     pub(crate) expected: InputIdentity,
     pub(crate) remaining: u64,
     pub(crate) validated: bool,
+    /// The archive path, so a note can name what the person recognises.
+    pub(crate) path: String,
 }
 
 pub(crate) struct SparseExtentInputReader<'a> {
@@ -654,26 +656,104 @@ impl Read for SparseExtentInputReader<'_> {
     }
 }
 
+impl IdentityCheckedInputReader {
+    /// Note that this member's bytes are as of the moment archiving started.
+    ///
+    /// A file being appended to or truncated while it is archived is ordinary on
+    /// a live system -- a log rotating, a database checkpointing, a build still
+    /// running -- so the archive is completed and the person is told, rather than
+    /// the whole run being refused over a file they do not control. The size was
+    /// promised in the member header before its bytes were written, so honouring
+    /// that promise exactly is also the only way to keep the archive readable.
+    fn note_changed(&mut self, padded: u64) {
+        if self.validated {
+            return;
+        }
+        self.validated = true;
+        record_input_changed_during_read(&self.path, self.expected.len, padded);
+    }
+}
+
 impl Read for IdentityCheckedInputReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if self.remaining == 0 {
-            if !self.validated {
-                validate_opened_input_identity(&self.file, self.expected)?;
-                self.validated = true;
+            if !self.validated && validate_opened_input_identity(&self.file, self.expected).is_err() {
+                self.note_changed(0);
             }
+            self.validated = true;
             return Ok(0);
         }
         let max_read = out.len().min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
         let count = self.file.read(&mut out[..max_read])?;
         if count == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "input ended before its scanned size"));
+            // The file was shortened mid-archive. Fill the rest of the promised
+            // length with zeros: a short member would leave every later member
+            // unreadable. GNU tar and libarchive both pad here.
+            out[..max_read].fill(0);
+            self.remaining -= max_read as u64;
+            self.note_changed(max_read as u64);
+            return Ok(max_read);
         }
         self.remaining -= count as u64;
         if self.remaining == 0 {
-            validate_opened_input_identity(&self.file, self.expected)?;
+            if validate_opened_input_identity(&self.file, self.expected).is_err() {
+                self.note_changed(0);
+            }
             self.validated = true;
         }
         Ok(count)
+    }
+}
+
+/// Inputs that moved while they were being archived, for the run to report.
+///
+/// Collected here rather than threaded through every source because the reader
+/// is handed to the writer as a `dyn Read` with no channel back, and one archive
+/// run is one process.
+static CHANGED_DURING_READ: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn record_input_changed_during_read(path: &str, declared: u64, padded: u64) {
+    let note = if padded > 0 {
+        let kept = declared.saturating_sub(padded);
+        format!(
+            "{path} was shortened while being archived; kept the {} still there and filled the remaining {} with zeros",
+            human_bytes(kept),
+            human_bytes(padded)
+        )
+    } else {
+        format!("{path} was still being written while being archived; stored the {} it had when archiving started", human_bytes(declared))
+    };
+    if let Ok(mut notes) = CHANGED_DURING_READ.lock() {
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+}
+
+/// Note a regular input that moved between the scan and the read of its bytes.
+pub(crate) fn note_input_changed_before_read(path: &str, declared: u64) {
+    record_input_changed_during_read(path, declared, 0);
+}
+
+/// Everything that moved during this run, in the order it was noticed.
+pub(crate) fn take_inputs_changed_during_read() -> Vec<String> {
+    CHANGED_DURING_READ.lock().map(|mut notes| std::mem::take(&mut *notes)).unwrap_or_default()
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
+    let mut scaled = bytes;
+    let mut remainder = 0u64;
+    let mut unit = 0;
+    while scaled >= 1024 && unit + 1 < UNITS.len() {
+        remainder = scaled % 1024;
+        scaled /= 1024;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{scaled}.{} {}", remainder * 10 / 1024, UNITS[unit])
     }
 }
 

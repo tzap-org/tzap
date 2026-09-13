@@ -3897,3 +3897,41 @@ fn one_observation_of_an_input_describes_a_single_object() {
         assert_eq!((owner.uid, owner.gid), (u64::from(observation.metadata.uid()), u64::from(observation.metadata.gid())));
     }
 }
+
+/// A file shortened mid-archive must still fill the length its header promised,
+/// and must say so.
+///
+/// The size is written into the member header before its bytes are, so a short
+/// member would leave every later member unreadable. GNU tar ("File shrank by N
+/// bytes; padding with zeros") and libarchive both pad here; refusing the whole
+/// archive because one file moved is not a reasonable thing to do to someone
+/// backing up a live system.
+#[test]
+fn a_file_shortened_mid_archive_is_padded_and_reported() {
+    use crate::os_input::{take_inputs_changed_during_read, IdentityCheckedInputReader};
+    use std::io::Read as _;
+
+    let _ = take_inputs_changed_during_read(); // start from a clean slate
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("shrinking.bin");
+    fs::write(&path, vec![0xab; 4096]).unwrap();
+    let identity = os_input::input_identity(&fs::symlink_metadata(&path).unwrap()).unwrap();
+
+    // The scan saw 4096 bytes; by the time the bytes are read only 1024 remain.
+    fs::write(&path, vec![0xab; 1024]).unwrap();
+    let file = fs::File::open(&path).unwrap();
+    let mut reader = IdentityCheckedInputReader { file, expected: identity, remaining: 4096, validated: false, path: "shrinking.bin".to_owned() };
+
+    let mut out = Vec::new();
+    reader.read_to_end(&mut out).unwrap();
+
+    assert_eq!(out.len(), 4096, "the member must be exactly the length its header promised");
+    assert_eq!(&out[..1024], &[0xab; 1024], "the bytes that were still there must be kept");
+    assert!(out[1024..].iter().all(|byte| *byte == 0), "the missing tail must be zeros, not a short member");
+
+    let notes = take_inputs_changed_during_read();
+    assert_eq!(notes.len(), 1, "the change must be reported exactly once: {notes:?}");
+    assert!(notes[0].contains("shrinking.bin"), "{}", notes[0]);
+    assert!(notes[0].contains("shortened"), "the note must say plainly what happened: {}", notes[0]);
+}

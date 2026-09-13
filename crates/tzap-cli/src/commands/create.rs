@@ -252,6 +252,14 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
         }
         let write_outputs = write_outputs_started.elapsed();
         emit_success_summary(quiet, &summary_text)?;
+        // Files that moved while they were archived. The archive is complete and
+        // readable; these members hold what was there when archiving started.
+        // Said plainly and never suppressed by --quiet: it changes what the
+        // archive contains, so the person needs to know even in a scripted run.
+        let changed = take_inputs_changed_during_read();
+        for note in &changed {
+            eprintln!("note: {note}");
+        }
         if let Some(profile) = root_auth_profile.as_ref() {
             emit_success_summary(quiet, &format!("  root auth: {} signed", profile.label()))?;
         }
@@ -686,7 +694,13 @@ impl RegularFileSource for InputSpec {
             return Ok(Box::new(io::empty()));
         }
         let file = File::open(&self.source).map_err(ArchiveWriteError::Io)?;
-        validate_opened_input_identity(&file, self.identity).map_err(ArchiveWriteError::Io)?;
+        // A regular file that moved between the scan and this open is not a
+        // reason to refuse the archive. The member is written at exactly the
+        // length its header already promised -- the reader clamps a file that
+        // grew and zero-fills one that shrank -- and the run reports it.
+        if validate_opened_input_identity(&file, self.identity).is_err() {
+            note_input_changed_before_read(&self.archive_path, self.size);
+        }
         if let Some(extents) = self.sparse_extents.as_deref() {
             return Ok(Box::new(SparseExtentInputReader {
                 file,
@@ -697,7 +711,8 @@ impl RegularFileSource for InputSpec {
                 validated: false,
             }) as Box<dyn Read + '_>);
         }
-        Ok(Box::new(IdentityCheckedInputReader { file, expected: self.identity, remaining: self.size, validated: false }) as Box<dyn Read + '_>)
+        Ok(Box::new(IdentityCheckedInputReader { file, expected: self.identity, remaining: self.size, validated: false, path: self.archive_path.clone() })
+            as Box<dyn Read + '_>)
     }
 
     fn open_auxiliary(&self, ordinal: usize) -> std::result::Result<Box<dyn Read + '_>, ArchiveWriteError> {
