@@ -1640,9 +1640,18 @@ fn cli_comprehensive_metadata_round_trip_preserves_every_supported_class() {
     }
     #[cfg(windows)]
     {
-        let mut stream = native_root.join("data.bin").into_os_string();
-        stream.push(":tzap-test");
-        assert_eq!(fs::read(PathBuf::from(stream)).unwrap(), b"alternate stream payload", "alternate data stream must be restored");
+        let alternate = |base: &Path| {
+            let mut stream = base.to_path_buf().into_os_string();
+            stream.push(":tzap-test");
+            PathBuf::from(stream)
+        };
+        // Against the source, not a literal: this is the streamed-auxiliary path
+        // that had no reader outside tzap-cli, so it must survive byte for byte.
+        assert_eq!(
+            fs::read(alternate(&native_root.join("data.bin"))).unwrap(),
+            fs::read(alternate(&fixture.file)).unwrap(),
+            "alternate data stream must be restored"
+        );
     }
 
     let _ = &fixture.directory;

@@ -1,8 +1,6 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
-#[cfg(windows)]
-use std::path::PathBuf;
 use std::time::SystemTime;
 
 #[cfg(windows)]
@@ -869,46 +867,6 @@ pub(crate) fn capture_native_file_metadata(input: &Path, identity: InputIdentity
     let native = tzap_core::portable_capture::with_capture_retry(|| tzap_core::windows_metadata::capture_windows_metadata_with(input, Some(observed)))
         .with_context(|| format!("failed to capture Windows metadata for {}", input.display()))?;
     Ok(CapturedNativeMetadata { native })
-}
-
-#[cfg(windows)]
-pub(crate) fn windows_backup_capture_enabled() -> bool {
-    use std::sync::OnceLock;
-    use windows_sys::Win32::Security::SE_BACKUP_NAME;
-
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| enable_windows_privilege(SE_BACKUP_NAME))
-}
-
-#[cfg(windows)]
-pub(crate) fn enable_windows_privilege(name: *const u16) -> bool {
-    use std::ptr;
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, ERROR_SUCCESS};
-    use windows_sys::Win32::Security::{
-        AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
-    };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    let mut token = ptr::null_mut();
-    // SAFETY: `token` is a valid output pointer and the pseudo process handle is always live.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &mut token) } == 0 {
-        return false;
-    }
-    let enabled = {
-        let mut privileges = TOKEN_PRIVILEGES { PrivilegeCount: 1, ..Default::default() };
-        // SAFETY: the one-element privilege array provides a valid LUID output slot.
-        if unsafe { LookupPrivilegeValueW(ptr::null(), name, &mut privileges.Privileges[0].Luid) } == 0 {
-            false
-        } else {
-            privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-            unsafe { SetLastError(ERROR_SUCCESS) };
-            // SAFETY: `token` is live and `privileges` is a valid one-entry input structure.
-            unsafe { AdjustTokenPrivileges(token, 0, &privileges, 0, ptr::null_mut(), ptr::null_mut()) != 0 && GetLastError() == ERROR_SUCCESS }
-        }
-    };
-    // SAFETY: `token` was returned by OpenProcessToken and is closed exactly once.
-    unsafe { CloseHandle(token) };
-    enabled
 }
 
 #[cfg(windows)]

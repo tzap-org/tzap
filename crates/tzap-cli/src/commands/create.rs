@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 #[cfg(windows)]
-use tzap_core::encode_v45_sparse_map;
 use tzap_core::format::FormatError;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 use tzap_core::NativeAuxiliaryNameEncoding;
+#[cfg(any(target_os = "macos", windows))]
 use tzap_core::{
     volume_file, write_archive_sources_to_sink, write_archive_sources_to_sink_ordered_parallel,
     write_archive_sources_to_sink_ordered_parallel_with_recipient_wrap_records, write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth,
