@@ -43,34 +43,17 @@ recip-1vol|--recipient-cert KEYS/recip.pem|--recipient-key KEYS/recip.key
 EOF
 }
 
-# A corpus with nesting, a deep path, many small members and sizes that straddle
-# frame boundaries, so extraction has real work to do on every shape.
-make_corpus() {
-  local root="$1"
-  mkdir -p "$root/corpus/nested/deep/deeper" "$root/corpus/other"
-  local i=0
-  while [ $i -lt 120 ]; do
-    local d
-    case $((i % 5)) in
-      0) d="$root/corpus" ;;
-      1) d="$root/corpus/nested" ;;
-      2) d="$root/corpus/nested/deep" ;;
-      3) d="$root/corpus/nested/deep/deeper" ;;
-      *) d="$root/corpus/other" ;;
-    esac
-    local size=$(( (i * 97) % 4000 ))
-    if [ "$size" -eq 0 ]; then : > "$d/f$(printf '%03d' $i).bin"
-    else yes "cross-platform-corpus-$i" | head -c "$size" > "$d/f$(printf '%03d' $i).bin"; fi
-    i=$((i + 1))
-  done
-}
+# The corpus generator is shared with the differential matrix so the two cannot
+# drift apart on what they consider a representative tree.
+# shellcheck source=lib/make-test-corpus.sh
+. "$(dirname "$0")/lib/make-test-corpus.sh"
 
 if [ "$MODE" = export ]; then
   BUILDER=$(abspath "${2:?builder binary}")
   OUT="${3:?output directory}"
   mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)
   rm -rf "$OUT/corpus" "$OUT/keys" "$OUT/archives"; mkdir -p "$OUT/keys" "$OUT/archives"
-  make_corpus "$OUT"
+  make_test_corpus "$OUT"
 
   "$BUILDER" keygen -o "$OUT/keys/raw.hex" >/dev/null
   "$BUILDER" signing-keygen --secret-output "$OUT/keys/sign.sec" --public-output "$OUT/keys/sign.pub" >/dev/null
@@ -135,7 +118,7 @@ if [ "$MODE" = check ]; then
       if $bin list $readkey $flagged >"/tmp/xr.list.$tag" 2>"/tmp/xr.e"; then l=ok; else l="fail:$(tail -1 /tmp/xr.e)"; fi
       scrub "/tmp/xr.out.$tag"
       if $bin extract $readkey $DEGRADED -C "/tmp/xr.out.$tag" $flagged >/dev/null 2>"/tmp/xr.e"; then
-        if diff -r corpus "/tmp/xr.out.$tag/corpus" >/dev/null 2>&1; then x=ok; else x=tree-differs; fi
+        if compare_restored_tree corpus "/tmp/xr.out.$tag/corpus" "$name/$tag" >/dev/null 2>&1; then x=ok; else x=tree-differs; fi
       else x="fail:$(tail -1 /tmp/xr.e)"; fi
       eval "v_$tag=\$v"; eval "l_$tag=\$l"; eval "x_$tag=\$x"
     done
@@ -157,10 +140,16 @@ if [ "$MODE" = check ]; then
     fi
     # Selected extraction of every member is the path the performance work rewrote.
     if [ "${x_CAND:-}" = ok ]; then
-      paths=$(cd corpus && find . -type f | sed 's|^\./|corpus/|' | sort | xargs echo)
+      # Names contain spaces, so build an array rather than relying on word splitting.
+      paths=(); rel=""
+      while IFS= read -r rel; do paths+=("corpus/$rel"); done < <(cd corpus && find . -type f | sed 's|^\./||' | sort)
       scrub /tmp/xr.sel
-      if $CAND extract $readkey $DEGRADED -C /tmp/xr.sel $flagged $paths >/dev/null 2>/tmp/xr.e; then
-        diff -r corpus /tmp/xr.sel/corpus >/dev/null 2>&1 || { echo "  FAIL [$name] selected extraction differs from full"; ok=0; }
+      if $CAND extract $readkey $DEGRADED -C /tmp/xr.sel $flagged "${paths[@]}" >/dev/null 2>/tmp/xr.e; then
+        # Only regular files were requested, so compare exactly those rather than
+        # the whole tree, which still holds symlinks and directories.
+        for p in "${paths[@]}"; do
+          cmp -s "$p" "/tmp/xr.sel/$p" || { echo "  FAIL [$name] selected extraction differs for $p"; ok=0; break; }
+        done
       else
         echo "  FAIL [$name] selected extraction: $(tail -1 /tmp/xr.e)"; ok=0
       fi

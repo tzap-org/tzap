@@ -16,6 +16,8 @@
 #
 # Needs the openssl CLI for the X25519 recipient certificate.
 set -u
+# Resolve the script's own directory before cd'ing into the work root.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 OLD="${1:?usage: differential-matrix.sh <reference-tzap> [candidate-tzap]}"
 NEW="${2:-target/release/tzap}"
 OLD=$(cd "$(dirname "$OLD")" && pwd)/$(basename "$OLD")
@@ -26,7 +28,7 @@ cd "$WORKROOT"
 
 # Key material. X25519 cannot self-sign, so an Ed25519 CA issues the recipient
 # certificate with -force_pubkey.
-mkdir -p keys corpus/nested/deep corpus/other
+mkdir -p keys
 "$NEW" keygen -o keys/raw.hex >/dev/null
 "$NEW" signing-keygen --secret-output keys/sign.sec --public-output keys/sign.pub >/dev/null
 head -c 65536 /dev/urandom > keys/dict.bin
@@ -41,27 +43,11 @@ openssl pkey -in keys/recip.key -pubout -out keys/recip.pub 2>/dev/null
 openssl req -new -key keys/ca.key -out keys/dummy.csr -subj "//CN=tzap-matrix-recipient" 2>/dev/null
 openssl x509 -req -in keys/dummy.csr -CA keys/ca.pem -CAkey keys/ca.key -force_pubkey keys/recip.pub -out keys/recip.pem -days 30 >/dev/null 2>&1
 
-# Corpus: nested directories, a symlink where the platform allows one, and sizes
-# that straddle frame boundaries. Portable shell -- no python, which Git Bash on
-# Windows does not ship.
-i=0
-while [ $i -lt 60 ]; do
-  case $((i % 4)) in
-    0) d=corpus ;;
-    1) d=corpus/nested ;;
-    2) d=corpus/nested/deep ;;
-    *) d=corpus/other ;;
-  esac
-  size=$(( (i * 37) % 2000 ))
-  if [ "$size" -eq 0 ]; then
-    : > "$d/f$(printf '%03d' $i).bin"
-  else
-    yes "tzap-matrix-corpus-$i" | head -c "$size" > "$d/f$(printf '%03d' $i).bin"
-  fi
-  i=$((i + 1))
-done
-# Symlinks need privilege or developer mode on Windows; skip rather than fail.
-ln -s f000.bin corpus/link.sym 2>/dev/null || true
+# Corpus generation is shared with the cross-platform matrix so the two cannot
+# drift apart on what they consider a representative tree.
+# shellcheck source=lib/make-test-corpus.sh
+. "$SCRIPT_DIR/lib/make-test-corpus.sh"
+make_test_corpus "$WORKROOT"
 
 PASS=0; FAIL=0; SKIP=0; FIXED=0
 FAILED_COMBOS=()
@@ -126,7 +112,7 @@ candidate_round_trip() {
   feed_key | $NEW list $key $flagged >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate list: $(tail -1 "$work/rt.e")"; return 1; }
   rm -rf "$work/rt.out"
   feed_key | $NEW extract $key -C "$work/rt.out" $flagged >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate extract: $(tail -1 "$work/rt.e")"; return 1; }
-  if [ -n "$tree" ] && ! diff -r "$tree" "$work/rt.out/$tree" >/dev/null 2>&1; then
+  if [ -n "$tree" ] && ! compare_restored_tree "$tree" "$work/rt.out/$tree" "$name" >/dev/null 2>&1; then
     echo "  FAIL [$name] candidate extracted tree differs from the source"; return 1
   fi
   return 0
@@ -184,7 +170,7 @@ run_combo() {
     if $bin list $READ_KEY $flagged >"$work/list.$tag" 2>"$work/e"; then eval "l_$tag=ok"; else eval "l_$tag=\"fail:\$(tail -1 \"$work/e\")\""; fi
     rm -rf "$work/out.$tag"
     if $bin extract $READ_KEY -C "$work/out.$tag" $flagged >/dev/null 2>"$work/e"; then
-      if diff -r corpus "$work/out.$tag/corpus" >/dev/null 2>&1; then eval "x_$tag=ok"; else eval "x_$tag=tree-differs"; fi
+      if compare_restored_tree corpus "$work/out.$tag/corpus" "$name/$tag" >/dev/null 2>&1; then eval "x_$tag=ok"; else eval "x_$tag=tree-differs"; fi
     else
       eval "x_$tag=\"fail:\$(tail -1 \"$work/e\")\""
     fi
@@ -211,11 +197,13 @@ run_combo() {
 
   # Naming every member must equal the full extraction -- this is the path the
   # performance work rewrote, so it is checked against 0.2.4's own archive.
-  local paths; paths=$(cd corpus && find . -type f | sed 's|^\./|corpus/|' | sort | tr '\n' ' ')
+  # Names contain spaces, so build an array rather than relying on word splitting.
+  local paths=(); local rel
+  while IFS= read -r rel; do paths+=("corpus/$rel"); done < <(cd corpus && find . -type f | sed 's|^\./||' | sort)
   local old_flagged; old_flagged=$(vols_flagged "$work" old)
   rm -rf "$work/sel"
-  if $NEW extract $READ_KEY -C "$work/sel" $old_flagged $paths >/dev/null 2>"$work/e"; then
-    for p in $paths; do
+  if $NEW extract $READ_KEY -C "$work/sel" $old_flagged "${paths[@]}" >/dev/null 2>"$work/e"; then
+    for p in "${paths[@]}"; do
       if ! diff -q "$p" "$work/sel/$p" >/dev/null 2>&1; then
         echo "  FAIL [$name] selected extraction differs for $p"; ok=0; break
       fi
@@ -315,7 +303,7 @@ password_combo() {
     printf '%s\n' "$PASSPHRASE" | $bin verify --password-stdin $pos >/dev/null 2>"$work/e" || { echo "  FAIL [$name] $tag verify: $(tail -1 "$work/e")"; ok=0; }
     rm -rf "$work/out.$tag"
     if printf '%s\n' "$PASSPHRASE" | $bin extract --password-stdin -C "$work/out.$tag" $flagged >/dev/null 2>"$work/e"; then
-      diff -r corpus "$work/out.$tag/corpus" >/dev/null 2>&1 || { echo "  FAIL [$name] $tag extracted tree differs"; ok=0; }
+      compare_restored_tree corpus "$work/out.$tag/corpus" "$name/$tag" >/dev/null 2>&1 || { echo "  FAIL [$name] $tag extracted tree differs"; ok=0; }
     else
       echo "  FAIL [$name] $tag extract: $(tail -1 "$work/e")"; ok=0
     fi
@@ -369,7 +357,7 @@ stream_combo() {
     if $bin list $read_key $flagged >/dev/null 2>"$work/e"; then eval "sl_$tag=ok"; else eval "sl_$tag=\"fail:\$(tail -1 \"$work/e\")\""; fi
     rm -rf "$work/out.$tag"
     if $bin extract $read_key -C "$work/out.$tag" $flagged >/dev/null 2>"$work/e"; then
-      if [ -n "$expect_tree" ] && ! diff -r "$expect_tree" "$work/out.$tag/$expect_tree" >/dev/null 2>&1; then
+      if [ -n "$expect_tree" ] && ! compare_restored_tree "$expect_tree" "$work/out.$tag/$expect_tree" "$name/$tag" >/dev/null 2>&1; then
         eval "sx_$tag=tree-differs"
       else
         eval "sx_$tag=ok"
