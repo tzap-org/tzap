@@ -813,7 +813,12 @@ pub(crate) fn apply_selected_hardlink_topology(specs: &mut [InputSpec]) -> Resul
         let identity = (spec.identity.volume_serial, spec.identity.file_index);
         if let Some(&canonical_index) = selected_objects.get(&identity) {
             let canonical = &specs[canonical_index];
-            if canonical.identity != spec.identity {
+            // Compare the way the read path does, not with a bare `!=`. Two
+            // names for one object differ in `LastAccessTime` as soon as the
+            // scan opens either of them -- Windows updates it on the shared
+            // inode -- so a raw comparison rejected any directory containing a
+            // hardlink pair, on the strength of a field the scan changed itself.
+            if !input_identity_matches_after_read(canonical.identity, spec.identity) {
                 bail!("selected hardlink identity changed while grouping inputs");
             }
             let (canonical_target, mode, mtime, mut portable_metadata) =
