@@ -470,3 +470,49 @@ fn random_serial_number() -> openssl::asn1::Asn1Integer {
     serial.rand(159, MsbOption::MAYBE_ZERO, false).unwrap();
     serial.to_asn1_integer().unwrap()
 }
+
+/// §16.18 closes with: "Round-trip tests compare logical bytes and every
+/// metadata item promised by the selected profile. Tests MUST **separately**
+/// assert capture completeness and restore completeness."
+///
+/// The entry-kind restore-policy matrices asserted only the restore half: every
+/// metadata check ran against the extracted tree, and capture was inferred from
+/// `create` exiting zero. That conflates the two. The clearest case is the
+/// `portable` policy, which asserts an xattr is absent and a FIFO was not
+/// restored -- assertions that pass whether the writer captured them and the
+/// reader correctly skipped them, or the writer silently dropped them at capture
+/// and there was never anything to skip.
+///
+/// This reads the archive's own index through `list --long`, which resolves
+/// entries from index metadata without extracting and without a restore policy,
+/// so what it reports is what capture actually recorded. Returns each entry's
+/// fields keyed by archive path.
+///
+/// `list --long` field order (see `commands/list.rs`): size, kind, mode, mtime,
+/// created, accessed, uid, gid, uname, gname, attributes, link_target, path.
+pub struct CapturedEntry {
+    pub size: String,
+    pub kind: String,
+    pub mode: String,
+    pub link_target: String,
+}
+
+pub fn captured_index_entries(archive: &Path, keyfile: &Path) -> std::collections::BTreeMap<String, CapturedEntry> {
+    let output =
+        Command::cargo_bin("tzap").unwrap().args(["list", "--long", "--keyfile", keyfile.to_str().unwrap(), archive.to_str().unwrap()]).output().unwrap();
+    assert!(output.status.success(), "list --long failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 13, "unexpected `list --long` field count in: {line}");
+            (
+                fields[12].to_owned(),
+                CapturedEntry { size: fields[0].to_owned(), kind: fields[1].to_owned(), mode: fields[2].to_owned(), link_target: fields[11].to_owned() },
+            )
+        })
+        .collect()
+}

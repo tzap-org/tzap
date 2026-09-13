@@ -34,6 +34,239 @@ pub fn projected_posix_mode(is_directory: bool, readonly: bool) -> u32 {
     }
 }
 
+/// The `TZAP.portable.source-os` label for the host a writer is running on.
+///
+/// Same ownership argument as [`projected_posix_mode`]: the label selects which
+/// native profile a reader applies, so two hosts labelling the same OS
+/// differently produce archives that restore differently. It lived in both
+/// `tzap-cli` and zmanager as identical nine-branch copies, and they had already
+/// drifted once -- zmanager carries a commit titled "Fix generic-Unix source-os
+/// label to match tzap-core's accepted value".
+#[must_use]
+pub fn host_source_os_label() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else if cfg!(target_os = "netbsd") {
+        "netbsd"
+    } else if cfg!(target_os = "openbsd") {
+        "openbsd"
+    } else if cfg!(target_os = "solaris") {
+        "solaris"
+    } else if cfg!(target_family = "unix") {
+        "other-unix"
+    } else {
+        "other"
+    }
+}
+
+/// The §16.7.1 four-bit `TZAP.portable.attributes` projection of a Windows
+/// `FILE_ATTRIBUTE_*` mask.
+///
+/// Bit 0 readonly, 1 hidden, 2 system, 3 archive; bits 4..31 reserved and zero.
+/// Takes the raw mask rather than `fs::Metadata` so it is a pure function every
+/// host can test, not just Windows.
+#[must_use]
+pub const fn windows_portable_attribute_projection(file_attributes: u32) -> u32 {
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0000_0004;
+    const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
+
+    (file_attributes & FILE_ATTRIBUTE_READONLY != 0) as u32
+        | (((file_attributes & FILE_ATTRIBUTE_HIDDEN != 0) as u32) << 1)
+        | (((file_attributes & FILE_ATTRIBUTE_SYSTEM != 0) as u32) << 2)
+        | (((file_attributes & FILE_ATTRIBUTE_ARCHIVE != 0) as u32) << 3)
+}
+
+/// Why a host instant has no revision-45 timestamp.
+///
+/// A typed reason rather than `None`, so a caller can report the difference:
+/// one case is a real representational limit of the format and the other is a
+/// clock far outside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampConversionError {
+    /// Less than one second before the epoch, and not on it.
+    ///
+    /// §16.7.2's grammar is `-?(0|[1-9][0-9]*)(\.[0-9]{1,9})?` with `-0`
+    /// explicitly forbidden, so an instant in `(-1s, 0s)` has no encoding: its
+    /// integer part would have to be negative zero. Not a host limitation.
+    SubSecondBeforeEpoch,
+    /// The seconds component does not fit the signed 64-bit field.
+    SecondsOutOfRange,
+}
+
+impl fmt::Display for TimestampConversionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SubSecondBeforeEpoch => {
+                formatter.write_str("instants in the last second before the Unix epoch have no revision-45 encoding (\u{2212}0 is forbidden)")
+            }
+            Self::SecondsOutOfRange => formatter.write_str("timestamp seconds exceed the revision-45 i64 range"),
+        }
+    }
+}
+
+impl std::error::Error for TimestampConversionError {}
+
+/// Convert a host `SystemTime` to a revision-45 [`ArchiveTimestamp`].
+///
+/// §16.7.2 encodes a time as a plain signed decimal, so the representation is
+/// **sign-magnitude**: `ArchiveTimestamp::new(-1, 500_000_000)` serializes to
+/// `-1.5`, meaning one and a half seconds *before* the epoch. It is not a
+/// timespec, where -1.5s would be `(-2, 500_000_000)`.
+///
+/// That distinction is the whole reason this lives here. `tzap-cli` converted
+/// with a timespec-style borrow (`-secs - 1`, `1e9 - nanos`) and wrote `-2.5`
+/// for an instant 1.5 seconds before the epoch -- a full second off, and pinned
+/// by a test asserting the wrong value. zmanager converted correctly. Hosts now
+/// share this one.
+pub fn archive_timestamp_from_system_time(time: std::time::SystemTime) -> Result<ArchiveTimestamp, TimestampConversionError> {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => archive_timestamp_from_signed_parts(false, duration.as_secs(), duration.subsec_nanos()),
+        Err(error) => {
+            let duration = error.duration();
+            archive_timestamp_from_signed_parts(true, duration.as_secs(), duration.subsec_nanos())
+        }
+    }
+}
+
+/// Build a timestamp from a sign and an unsigned magnitude.
+///
+/// The single place the §16.7.2 sign-magnitude rule is expressed. Every host
+/// clock reduces to this: a direction from the epoch and a distance. Keeping the
+/// rule here means a new clock source (Windows `FILETIME`, say) cannot quietly
+/// reintroduce timespec-style borrowing, which is how both hosts' conversions
+/// went wrong in different places.
+///
+/// `nanoseconds` must be under one billion; it is the fractional part of the
+/// magnitude, never a borrow from the seconds.
+pub fn archive_timestamp_from_signed_parts(negative: bool, seconds: u64, nanoseconds: u32) -> Result<ArchiveTimestamp, TimestampConversionError> {
+    if nanoseconds >= 1_000_000_000 {
+        return Err(TimestampConversionError::SecondsOutOfRange);
+    }
+    if !negative {
+        let seconds = i64::try_from(seconds).map_err(|_| TimestampConversionError::SecondsOutOfRange)?;
+        return Ok(ArchiveTimestamp::new(seconds, nanoseconds));
+    }
+    if seconds == 0 {
+        if nanoseconds == 0 {
+            return Ok(ArchiveTimestamp::UNIX_EPOCH);
+        }
+        // Would need `-0` as the integer part, which §16.7.2 forbids.
+        return Err(TimestampConversionError::SubSecondBeforeEpoch);
+    }
+    let seconds = i64::try_from(seconds).map_err(|_| TimestampConversionError::SecondsOutOfRange)?;
+    let seconds = seconds.checked_neg().ok_or(TimestampConversionError::SecondsOutOfRange)?;
+    Ok(ArchiveTimestamp::new(seconds, nanoseconds))
+}
+
+/// Resolve POSIX owner and group names for a uid/gid pair.
+///
+/// §16.18.1's corpus requires "UID/GID plus non-ASCII user/group names", and
+/// §16.7.1 requires any name present to be valid NFC UTF-8 that never changes
+/// the stored numeric identity. `tzap-cli` recorded `uname: None` / `gname:
+/// None` at every call site and never resolved names at all; zmanager did.
+/// Either name is `None` when the host has no entry for the id, which is normal
+/// for an id from another system.
+#[cfg(unix)]
+#[must_use]
+pub fn resolve_posix_owner_names(uid: u32, gid: u32) -> (Option<String>, Option<String>) {
+    (resolve_posix_name(uid, lookup_user_name), resolve_posix_name(gid, lookup_group_name))
+}
+
+#[cfg(unix)]
+fn resolve_posix_name(id: u32, lookup: PosixNameLookup) -> Option<String> {
+    use std::ffi::CStr;
+
+    // getpwuid_r/getgrgid_r fill a caller-supplied buffer and report ERANGE
+    // when it is too small, so grow rather than truncate a long name.
+    let mut capacity = 1024usize;
+    loop {
+        let mut buffer = vec![0u8; capacity];
+        let outcome = lookup(id, &mut buffer);
+        match outcome {
+            PosixNameOutcome::TooSmall if capacity < 64 * 1024 => {
+                capacity *= 2;
+                continue;
+            }
+            PosixNameOutcome::TooSmall | PosixNameOutcome::Missing => return None,
+            PosixNameOutcome::Found(name) => {
+                // SAFETY: `name` points into `buffer`, which is still alive here.
+                let bytes = unsafe { CStr::from_ptr(name) }.to_bytes();
+                if bytes.is_empty() {
+                    return None;
+                }
+                // Decode lossily, then normalize to the NFC §16.7.1 requires.
+                //
+                // A POSIX name is a byte string with no encoding guarantee, so a
+                // legacy or network-directory account can hold bytes that are not
+                // UTF-8. Lossy decoding is the right answer rather than dropping
+                // the name: U+FFFD is Unicode's designated "this byte would not
+                // decode" marker, so `fr\u{fffd}nk` is self-documenting partial
+                // information, not a fabricated name -- and partial information
+                // is what someone reading a listing actually wants.
+                //
+                // Nothing downstream is put at risk by it either: restore applies
+                // ownership from the numeric uid/gid alone and never reads this
+                // field (`os_restore::apply_regular_file_ownership`), which is why
+                // §16.7.1 says names "never change the stored numeric identity".
+                // The name is a display label, so a readable-but-partial label
+                // beats an empty one.
+                return Some(String::from_utf8_lossy(bytes).nfc().collect::<String>());
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+enum PosixNameOutcome {
+    Found(*const libc::c_char),
+    Missing,
+    TooSmall,
+}
+
+#[cfg(unix)]
+type PosixNameLookup = fn(u32, &mut [u8]) -> PosixNameOutcome;
+
+#[cfg(unix)]
+fn lookup_user_name(uid: u32, buffer: &mut [u8]) -> PosixNameOutcome {
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `entry` and `buffer` stay live for the call; `result` receives
+    // null or a pointer to `entry`.
+    let code = unsafe { libc::getpwuid_r(uid as libc::uid_t, entry.as_mut_ptr(), buffer.as_mut_ptr().cast::<libc::c_char>(), buffer.len(), &mut result) };
+    if code == libc::ERANGE {
+        return PosixNameOutcome::TooSmall;
+    }
+    if code != 0 || result.is_null() {
+        return PosixNameOutcome::Missing;
+    }
+    // SAFETY: a non-null `result` means `entry` was initialized.
+    PosixNameOutcome::Found(unsafe { entry.assume_init() }.pw_name.cast_const())
+}
+
+#[cfg(unix)]
+fn lookup_group_name(gid: u32, buffer: &mut [u8]) -> PosixNameOutcome {
+    let mut entry = std::mem::MaybeUninit::<libc::group>::uninit();
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: as in `lookup_user_name`.
+    let code = unsafe { libc::getgrgid_r(gid as libc::gid_t, entry.as_mut_ptr(), buffer.as_mut_ptr().cast::<libc::c_char>(), buffer.len(), &mut result) };
+    if code == libc::ERANGE {
+        return PosixNameOutcome::TooSmall;
+    }
+    if code != 0 || result.is_null() {
+        return PosixNameOutcome::Missing;
+    }
+    // SAFETY: as in `lookup_user_name`.
+    PosixNameOutcome::Found(unsafe { entry.assume_init() }.gr_name.cast_const())
+}
+
 pub const EXTENDED_METADATA_V1: u32 = 1 << 0;
 pub const HAS_AUXILIARY_STREAMS: u32 = 1 << 1;
 pub const HAS_NATIVE_METADATA: u32 = 1 << 2;
@@ -2256,6 +2489,150 @@ fn invalid<T>(structure: &'static str, reason: &'static str) -> Result<T, Format
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn archive_timestamp_from_system_time_encodes_pre_epoch_as_signed_decimal() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // §16.7.2's grammar is a plain signed decimal, so the struct is
+        // sign-magnitude: 1.5s before the epoch is `-1.5`, not a timespec's
+        // `(-2, 5e8)`. tzap-cli's own converter produced `-2.5` here -- a full
+        // second wrong -- so assert the encoded bytes, not just the fields.
+        let encoded = |before: Duration| {
+            let stamp = archive_timestamp_from_system_time(UNIX_EPOCH - before).unwrap();
+            String::from_utf8(stamp.canonical_pax_value().unwrap()).unwrap()
+        };
+        assert_eq!(encoded(Duration::new(1, 500_000_000)), "-1.5");
+        assert_eq!(encoded(Duration::new(2, 0)), "-2");
+        assert_eq!(encoded(Duration::new(11_644_473_600, 0)), "-11644473600");
+
+        let after = |since: Duration| {
+            let stamp = archive_timestamp_from_system_time(UNIX_EPOCH + since).unwrap();
+            String::from_utf8(stamp.canonical_pax_value().unwrap()).unwrap()
+        };
+        assert_eq!(after(Duration::new(0, 0)), "0");
+        assert_eq!(after(Duration::new(1, 500_000_000)), "1.5");
+        assert_eq!(after(Duration::new(1_700_000_000, 123_456_789)), "1700000000.123456789");
+    }
+
+    #[test]
+    fn archive_timestamp_from_system_time_reports_the_unrepresentable_sub_second_window() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // `-0` is forbidden by §16.7.2, so nothing in `(-1s, 0s)` can be encoded.
+        // This is a limit of the format, and the caller is told which limit it
+        // hit rather than being handed a bare `None`.
+        for nanos in [1u32, 100, 999_999_999] {
+            assert_eq!(
+                archive_timestamp_from_system_time(UNIX_EPOCH - Duration::new(0, nanos)),
+                Err(TimestampConversionError::SubSecondBeforeEpoch),
+                "{nanos}ns before the epoch must be reported, not silently rounded"
+            );
+        }
+        // Exactly the epoch is representable, from either direction.
+        assert_eq!(archive_timestamp_from_system_time(UNIX_EPOCH), Ok(ArchiveTimestamp::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn archive_timestamp_from_signed_parts_never_borrows_across_the_epoch() {
+        // The rule every clock source reduces to. A borrow would show up here as
+        // a magnitude one larger than asked for, which is exactly how both the
+        // SystemTime and the Windows FILETIME conversions were wrong.
+        let encoded = |negative, secs, nanos| {
+            let stamp = archive_timestamp_from_signed_parts(negative, secs, nanos).unwrap();
+            String::from_utf8(stamp.canonical_pax_value().unwrap()).unwrap()
+        };
+        assert_eq!(encoded(true, 1, 500_000_000), "-1.5");
+        assert_eq!(encoded(true, 1, 0), "-1");
+        assert_eq!(encoded(true, 11_644_473_600, 0), "-11644473600");
+        assert_eq!(encoded(false, 1, 500_000_000), "1.5");
+        assert_eq!(encoded(false, 0, 1), "0.000000001");
+
+        assert_eq!(archive_timestamp_from_signed_parts(true, 0, 0), Ok(ArchiveTimestamp::UNIX_EPOCH));
+        assert_eq!(archive_timestamp_from_signed_parts(false, 0, 0), Ok(ArchiveTimestamp::UNIX_EPOCH));
+        assert_eq!(archive_timestamp_from_signed_parts(true, 0, 1), Err(TimestampConversionError::SubSecondBeforeEpoch));
+        assert_eq!(archive_timestamp_from_signed_parts(true, 0, 999_999_999), Err(TimestampConversionError::SubSecondBeforeEpoch));
+
+        // A nanosecond component at or above one second is a caller bug, not a
+        // borrow to absorb.
+        assert!(archive_timestamp_from_signed_parts(false, 0, 1_000_000_000).is_err());
+    }
+
+    #[test]
+    fn windows_portable_attribute_projection_maps_only_the_four_defined_bits() {
+        // §16.7.1: bit 0 readonly, 1 hidden, 2 system, 3 archive; 4..31 reserved
+        // and MUST be zero. Every other FILE_ATTRIBUTE_* bit must be ignored.
+        assert_eq!(windows_portable_attribute_projection(0x0000_0001), 0b0001);
+        assert_eq!(windows_portable_attribute_projection(0x0000_0002), 0b0010);
+        assert_eq!(windows_portable_attribute_projection(0x0000_0004), 0b0100);
+        assert_eq!(windows_portable_attribute_projection(0x0000_0020), 0b1000);
+        assert_eq!(windows_portable_attribute_projection(0x0000_0027), 0b1111);
+        assert_eq!(windows_portable_attribute_projection(0), 0);
+
+        // DIRECTORY | COMPRESSED | ENCRYPTED | SPARSE | REPARSE_POINT | OFFLINE:
+        // all real attributes, none of them projected.
+        assert_eq!(windows_portable_attribute_projection(0x0000_0010 | 0x0000_0800 | 0x0000_4000 | 0x0000_0200 | 0x0000_0400 | 0x0000_1000), 0);
+        assert_eq!(windows_portable_attribute_projection(u32::MAX) & !0x0f, 0, "reserved bits must never be set");
+    }
+
+    #[test]
+    fn host_source_os_label_is_one_of_the_accepted_values() {
+        // The label selects which native profile a reader applies, so it must be
+        // a value the parser accepts. zmanager shipped a fix for exactly this
+        // drifting out of range on generic Unix.
+        const ACCEPTED: [&str; 9] = ["linux", "macos", "windows", "freebsd", "netbsd", "openbsd", "solaris", "other-unix", "other"];
+        assert!(ACCEPTED.contains(&host_source_os_label()), "unexpected label {}", host_source_os_label());
+    }
+
+    #[test]
+    fn owner_name_decoding_keeps_partial_information_and_normalizes_to_nfc() {
+        // Mirrors what `resolve_posix_name` does to the bytes the OS returns.
+        // Exercised directly because a host with a non-UTF-8 or NFD account name
+        // cannot be conjured in a test.
+        let decode = |bytes: &[u8]| String::from_utf8_lossy(bytes).nfc().collect::<String>();
+
+        // Undecodable bytes become U+FFFD rather than dropping the whole name:
+        // restore never reads this field, so a partial label beats none.
+        let mangled = decode(b"fr\xffnk");
+        assert_eq!(mangled, "fr\u{fffd}nk");
+        assert!(mangled.contains('\u{fffd}'), "the undecodable byte must stay visible as U+FFFD");
+
+        // A legacy GB2312-encoded Chinese name (张伟). Worth pinning exactly,
+        // because it shows the honest limit of lossy decoding: two bytes become
+        // U+FFFD, but `ce b0` happens to be a *valid* UTF-8 sequence for an
+        // unrelated Greek letter, so it decodes silently rather than flagging
+        // itself. Lossy decoding can therefore yield plausible-looking wrong
+        // characters, not only visible markers.
+        //
+        // Still the better trade: restore reads the numeric uid, never this
+        // field, and a partial label beats an empty one for whoever is reading a
+        // listing trying to work out whose files these were.
+        assert_eq!(decode(b"\xd5\xc5\xce\xb0"), "\u{fffd}\u{fffd}\u{3b0}");
+
+        // Valid UTF-8 is untouched, whatever the script.
+        assert_eq!(decode("张伟".as_bytes()), "张伟");
+        assert_eq!(decode(b"frankzhu"), "frankzhu");
+
+        // NFD input is normalized to the NFC §16.7.1 requires. Han is unaffected
+        // by normalization; Hangul and accented Latin are not.
+        assert_eq!(decode("jose\u{301}".as_bytes()), "jos\u{e9}");
+        assert_eq!(decode("\u{1100}\u{1161}\u{11ab}".as_bytes()), "\u{ac04}");
+        assert_eq!(decode("张伟".as_bytes()), "张伟", "Han does not decompose, so NFC is a no-op");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_posix_owner_names_resolves_root_and_tolerates_an_unknown_id() {
+        // uid/gid 0 exists on every POSIX host this builds for.
+        let (uname, _) = resolve_posix_owner_names(0, 0);
+        assert_eq!(uname.as_deref(), Some("root"), "uid 0 must resolve");
+
+        // An id with no entry is normal for an archive from another system, and
+        // must yield None rather than an error or a fabricated name.
+        let (missing_user, missing_group) = resolve_posix_owner_names(0x7fff_fffe, 0x7fff_fffe);
+        assert_eq!(missing_user, None);
+        assert_eq!(missing_group, None);
+    }
 
     #[test]
     fn projected_posix_mode_keeps_directories_traversable_and_writable() {

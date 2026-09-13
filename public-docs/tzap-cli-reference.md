@@ -126,6 +126,11 @@ Notes:
 - `--tar-stdin` rejects `--password`, `--password-stdin`, `--dictionary`,
   `--volume-size`, and `--volume-loss-tolerance > 0` before reading payload
   stdin.
+- `--tar-stdin` accepts regular files, directories, and symlinks only. A tar
+  stream carrying a hardlink, FIFO, or device entry exits `16`
+  (`unsupported-feature`) and publishes no archive. Archive the directory
+  directly (`tzap create -o out.tzap ./project`) to capture those kinds; see
+  `public-docs/tzap-operational-boundaries.md` for the typeflag table.
 - `--raw-stdin --stdin-size SIZE` streams exactly `SIZE` bytes into one
   regular-file member in the standard tar-member v45 profile. Add `--volumes N`
   for fixed-count multi-volume output. Short or overlong stdin is rejected and

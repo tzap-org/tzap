@@ -1440,8 +1440,29 @@ fn windows_capture_rejects_metadata_classes_that_are_not_exactly_supported() {
 
 #[test]
 fn archive_timestamp_canonicalizes_fractional_pre_epoch_times() {
-    assert_eq!(archive_timestamp(UNIX_EPOCH - Duration::new(0, 100)).unwrap(), ArchiveTimestamp::new(-1, 999_999_900));
-    assert_eq!(archive_timestamp(UNIX_EPOCH - Duration::new(1, 500_000_000)).unwrap(), ArchiveTimestamp::new(-2, 500_000_000));
+    // This test previously asserted a timespec-style borrow: 100ns before the
+    // epoch as `(-1, 999_999_900)` and 1.5s before as `(-2, 500_000_000)`. Both
+    // are wrong for this format. §16.7.2 encodes a time as a plain signed
+    // decimal, so `(-2, 500_000_000)` serializes to `-2.5` -- two and a half
+    // seconds before the epoch, for a file modified one and a half seconds
+    // before it. The conversion now lives in `tzap-core` and is shared with
+    // zmanager, whose implementation was already correct.
+    //
+    // Assert the encoded bytes rather than the struct fields: the bytes are
+    // what a conforming reader sees, and the old expectations looked plausible
+    // precisely because the fields alone do not show the error.
+    let encoded = |before: Duration| {
+        let stamp = archive_timestamp(UNIX_EPOCH - before).unwrap();
+        String::from_utf8(stamp.canonical_pax_value().unwrap()).unwrap()
+    };
+    assert_eq!(encoded(Duration::new(1, 500_000_000)), "-1.5");
+    assert_eq!(encoded(Duration::new(2, 0)), "-2");
+
+    // `-0` is forbidden by §16.7.2, so the last second before the epoch has no
+    // encoding at all. It is now reported instead of being silently written as
+    // `-1.9999999`, which claimed an instant nearly two seconds early.
+    let error = archive_timestamp(UNIX_EPOCH - Duration::new(0, 100)).unwrap_err();
+    assert!(error.to_string().contains("last second before the Unix epoch"), "unexpected error: {error}");
 }
 
 #[cfg(windows)]
@@ -1449,8 +1470,12 @@ fn archive_timestamp_canonicalizes_fractional_pre_epoch_times() {
 fn windows_filetime_conversion_preserves_100ns_precision() {
     const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
     assert_eq!(windows_filetime_timestamp(UNIX_EPOCH_FILETIME + 12_345_678).unwrap(), ArchiveTimestamp::new(1, 234_567_800));
-    assert_eq!(windows_filetime_timestamp(UNIX_EPOCH_FILETIME - 1).unwrap(), ArchiveTimestamp::new(-1, 999_999_900));
+    // 1.5s before the epoch is `-1.5`, not the timespec `(-2, 5e8)` this used to
+    // produce. See `archive_timestamp_canonicalizes_fractional_pre_epoch_times`.
+    assert_eq!(windows_filetime_timestamp(UNIX_EPOCH_FILETIME - 15_000_000).unwrap(), ArchiveTimestamp::new(-1, 500_000_000));
     assert_eq!(windows_filetime_timestamp(0).unwrap(), ArchiveTimestamp::new(-11_644_473_600, 0));
+    // One tick before the epoch is inside the unrepresentable sub-second window.
+    assert!(windows_filetime_timestamp(UNIX_EPOCH_FILETIME - 1).is_err());
 }
 
 #[cfg(windows)]

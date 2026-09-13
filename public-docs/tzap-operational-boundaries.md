@@ -544,6 +544,46 @@ the same member is striped across the fixed output volume set. Short stdin or
 extra bytes after the declared size reject the create and remove the temporary
 archive output or volume set.
 
+### Entry kinds `--tar-stdin` accepts
+
+Streamed tar input accepts **regular files, directories, and symlinks only**. A
+tar stream carrying any other entry kind is rejected before any archive is
+published:
+
+| tar typeflag | Entry kind | `--tar-stdin` |
+| --- | --- | --- |
+| `0` / `\0` | regular file | accepted |
+| `5` | directory | accepted |
+| `2` | symlink | accepted |
+| `1` | hardlink | rejected |
+| `6` | FIFO | rejected |
+| `3` / `4` | character / block device | rejected |
+
+```sh
+$ tar cf - ./project | tzap create --tar-stdin --keyfile project.key -o project.tzap -
+tzap: unsupported-feature: writer unsupported case: streaming tar stdin supports
+regular files, directories, and symlinks only: use a supported archive shape or
+upgrade tzap
+$ echo $?
+16
+```
+
+The failure is closed: exit `16` (`unsupported-feature`), no archive file and no
+volume set is left behind, and nothing is silently dropped from the stream.
+
+**What to do instead.** Archive the directory directly rather than piping tar
+through stdin:
+
+```sh
+tzap create --keyfile project.key -o project.tzap ./project
+```
+
+The file-list path captures hardlinks, FIFOs, and character and block devices,
+and is also faster for later selected-file workflows because a file-backed
+archive supports random access. Use `--tar-stdin` when the tar stream is the
+only available input — for example when it arrives over a pipe from another
+host — and when the tree holds none of the rejected kinds.
+
 Unknown-size raw stdin is supported only with explicit `--spool-stdin`. That
 mode writes plaintext stdin to a restrictive temporary file, then archives that
 file as a regular tar-member v45 member. With `--volumes N`, tzap waits for EOF,

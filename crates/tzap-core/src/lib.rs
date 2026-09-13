@@ -15,6 +15,7 @@ pub mod macos_metadata;
 pub mod metadata;
 pub mod non_seekable_reader;
 pub mod padding;
+pub mod portable_capture;
 pub mod reader;
 pub mod root_auth;
 pub mod tar_model;

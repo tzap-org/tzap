@@ -460,6 +460,32 @@ fn traceability_materials_live_under_requested_folder_and_cover_claim_gates() {
 /// rows, and the gap disclosure. The gap section matters most: a future edit
 /// that quietly drops it would turn a bounded claim into an unbounded one,
 /// which is exactly what the claim boundary in README.md forbids.
+/// `AGENTS.md` requires unsupported-feature behavior to be documented in
+/// `public-docs/` with concrete examples, expected exit labels, and user
+/// actions. `--tar-stdin` accepts regular files, directories, and symlinks only
+/// (`streaming_writer.rs`), and that boundary went undocumented while every
+/// sibling `--tar-stdin` limit — flag conflicts, `-o -`, volume options — was
+/// written down, with the headline example piping an arbitrary project tree.
+#[test]
+fn tar_stdin_entry_kind_boundary_is_documented_with_its_exit_label_and_remedy() {
+    let boundaries = read_workspace_file("public-docs/tzap-operational-boundaries.md");
+    let reference = read_workspace_file("public-docs/tzap-cli-reference.md");
+
+    assert!(boundaries.contains("Entry kinds `--tar-stdin` accepts"));
+    assert!(boundaries.contains("regular files, directories, and symlinks only"));
+    for kind in ["hardlink", "FIFO", "character / block device"] {
+        assert!(boundaries.contains(kind), "the typeflag table must name {kind}");
+    }
+    // The exit label and the remedy are what make this actionable rather than
+    // merely true.
+    assert!(boundaries.contains("unsupported-feature"));
+    assert!(boundaries.contains("exit `16`"));
+    assert!(boundaries.contains("tzap create --keyfile project.key -o project.tzap ./project"));
+
+    assert!(reference.contains("`--tar-stdin` accepts regular files, directories, and symlinks only"));
+    assert!(reference.contains("`unsupported-feature`"));
+}
+
 #[test]
 fn published_v45_conformance_declares_classes_and_discloses_corpus_gaps() {
     let conformance = read_workspace_file("public-docs/traceability/v45-conformance.md");

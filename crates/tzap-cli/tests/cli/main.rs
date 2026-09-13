@@ -699,6 +699,28 @@ fn cli_linux_entry_kind_restore_policy_matrix() {
         .assert()
         .success();
 
+    // Capture completeness, asserted separately from restore per §16.18. This
+    // reads the archive's index, so it holds regardless of which restore policy
+    // runs below -- in particular it proves the FIFO and the source modes reached
+    // the archive at all, which the `portable` branch's "was not restored"
+    // assertions cannot distinguish from a silent capture drop.
+    let captured = captured_index_entries(&archive, &keyfile);
+    for path in ["matrix", "matrix/directory", "matrix/directory/file.txt", "matrix/link.txt", "matrix/events.fifo"] {
+        assert!(captured.contains_key(path), "capture lost {path}; archive holds {:?}", captured.keys().collect::<Vec<_>>());
+    }
+    assert_eq!(captured["matrix/directory/file.txt"].kind, "file");
+    assert_eq!(captured["matrix/directory"].kind, "directory");
+    assert_eq!(captured["matrix/link.txt"].kind, "symlink");
+    assert_eq!(captured["matrix/events.fifo"].kind, "fifo", "the FIFO must be captured even though a portable restore skips it");
+    assert_eq!(captured["matrix/link.txt"].link_target, "directory/file.txt");
+    assert_eq!(captured["matrix/directory/file.txt"].size, "14");
+    assert_eq!(captured["matrix/events.fifo"].size, "0");
+    // `list --long` prints the mode as decimal, so compare in the same base
+    // rather than eyeballing octal.
+    assert_eq!(captured["matrix/directory/file.txt"].mode, (source_file.mode() & 0o7777).to_string());
+    assert_eq!(captured["matrix/directory"].mode, (source_directory.mode() & 0o7777).to_string());
+    assert_eq!(captured["matrix/events.fifo"].mode, (source_fifo.mode() & 0o7777).to_string());
+
     let policies: &[&str] = if unsafe { libc::geteuid() } == 0 { &["portable", "same-os", "system"] } else { &["portable", "same-os"] };
     for &policy in policies {
         let destination = temp.path().join(format!("extract-{policy}"));
@@ -959,6 +981,28 @@ fn cli_macos_entry_kind_restore_policy_matrix() {
         .args(["create", "--keyfile", keyfile.to_str().unwrap(), "-o", archive.to_str().unwrap(), input_root.to_str().unwrap()])
         .assert()
         .success();
+
+    // Capture completeness, asserted separately from restore per §16.18. This
+    // reads the archive's index, so it holds regardless of which restore policy
+    // runs below -- in particular it proves the FIFO and the source modes reached
+    // the archive at all, which the `portable` branch's "was not restored"
+    // assertions cannot distinguish from a silent capture drop.
+    let captured = captured_index_entries(&archive, &keyfile);
+    for path in ["matrix", "matrix/directory", "matrix/directory/file.txt", "matrix/link.txt", "matrix/events.fifo"] {
+        assert!(captured.contains_key(path), "capture lost {path}; archive holds {:?}", captured.keys().collect::<Vec<_>>());
+    }
+    assert_eq!(captured["matrix/directory/file.txt"].kind, "file");
+    assert_eq!(captured["matrix/directory"].kind, "directory");
+    assert_eq!(captured["matrix/link.txt"].kind, "symlink");
+    assert_eq!(captured["matrix/events.fifo"].kind, "fifo", "the FIFO must be captured even though a portable restore skips it");
+    assert_eq!(captured["matrix/link.txt"].link_target, "directory/file.txt");
+    assert_eq!(captured["matrix/directory/file.txt"].size, "14");
+    assert_eq!(captured["matrix/events.fifo"].size, "0");
+    // `list --long` prints the mode as decimal, so compare in the same base
+    // rather than eyeballing octal.
+    assert_eq!(captured["matrix/directory/file.txt"].mode, (source_file.mode() & 0o7777).to_string());
+    assert_eq!(captured["matrix/directory"].mode, (source_directory.mode() & 0o7777).to_string());
+    assert_eq!(captured["matrix/events.fifo"].mode, (source_fifo.mode() & 0o7777).to_string());
 
     let policies: &[&str] = if unsafe { libc::geteuid() } == 0 { &["portable", "same-os", "system"] } else { &["portable", "same-os"] };
     for &policy in policies {

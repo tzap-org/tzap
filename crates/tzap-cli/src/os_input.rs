@@ -3,7 +3,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 #[cfg(any(target_os = "macos", windows))]
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 #[cfg(windows)]
 use crate::commands::archive_path_to_string;
@@ -15,12 +15,11 @@ use anyhow::{anyhow, bail, Context};
 #[cfg(windows)]
 use tzap_core::encode_v45_sparse_map;
 #[cfg(unix)]
-use tzap_core::PortablePosixOwner;
 #[cfg(windows)]
 use tzap_core::SourceEntryKind;
 #[cfg(target_os = "macos")]
 use tzap_core::{canonical_base64_encode, encode_percent_name};
-use tzap_core::{ArchiveTimestamp, NativeFileMetadata, PortableFileMetadata, PortableModeOrigin, SparseExtent};
+use tzap_core::{ArchiveTimestamp, NativeFileMetadata, PortableFileMetadata, SparseExtent};
 #[cfg(any(target_os = "macos", windows))]
 use tzap_core::{NativeAuxiliaryMetadata, NativeAuxiliaryNameEncoding, RestoreClass};
 
@@ -916,22 +915,13 @@ impl Read for IdentityCheckedInputReader {
 }
 
 pub(crate) fn archive_timestamp(time: SystemTime) -> io::Result<ArchiveTimestamp> {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => Ok(ArchiveTimestamp::new(
-            i64::try_from(duration.as_secs()).map_err(|_| io::Error::other("input mtime exceeds revision-45 i64 range"))?,
-            duration.subsec_nanos(),
-        )),
-        Err(error) => {
-            let duration = error.duration();
-            let (seconds, nanoseconds) = if duration.subsec_nanos() == 0 {
-                (-i128::from(duration.as_secs()), 0)
-            } else {
-                (-i128::from(duration.as_secs()) - 1, 1_000_000_000 - duration.subsec_nanos())
-            };
-            let seconds = i64::try_from(seconds).map_err(|_| io::Error::other("input mtime exceeds revision-45 i64 range"))?;
-            Ok(ArchiveTimestamp::new(seconds, nanoseconds))
-        }
-    }
+    // Previously converted with a timespec-style borrow (`-secs - 1`,
+    // `1e9 - nanos`), which is wrong for this format: §16.7.2 encodes a time as
+    // a plain signed decimal, so the struct is sign-magnitude. That wrote
+    // `mtime=-2.5` for an instant 1.5 seconds before the epoch -- a full second
+    // early -- and the error grew with the fraction. tzap-core now owns the
+    // conversion, so this host and zmanager cannot disagree about it.
+    tzap_core::entry_metadata::archive_timestamp_from_system_time(time).map_err(io::Error::other)
 }
 
 #[cfg(windows)]
@@ -958,43 +948,43 @@ pub(crate) fn unsupported_windows_file_attribute_reason(attributes: u32) -> Opti
 }
 
 pub(crate) fn portable_input_metadata(identity: InputIdentity, input: &Path) -> Result<PortableFileMetadata> {
+    // tzap-core owns the portable assembly -- source OS, mode origin, owner-name
+    // resolution -- so this host and zmanager cannot disagree about it. The
+    // native capture and the identity check below stay here: they are this
+    // host's, and richer than core's on Windows.
     let metadata = fs::symlink_metadata(input)?;
     let created = metadata.created().ok().and_then(|t| archive_timestamp(t).ok());
     let accessed = metadata.accessed().ok().and_then(|t| archive_timestamp(t).ok());
-    Ok(PortableFileMetadata {
-        source_os: source_os_label().into(),
-        source_filesystem: "unknown".into(),
-        mode_origin: if cfg!(unix) { PortableModeOrigin::Native } else { PortableModeOrigin::Projected },
-        #[cfg(unix)]
-        posix_owner: Some(PortablePosixOwner { uid: identity.uid, gid: identity.gid, uname: None, gname: None }),
-        #[cfg(not(unix))]
-        posix_owner: None,
-        attributes: identity.attributes,
+    Ok(tzap_core::portable_capture::assemble_portable_file_metadata(
+        capture_native_file_metadata(input, identity)?,
+        portable_owner_ids(&identity),
+        identity.attributes,
         created,
         accessed,
-        native: capture_native_file_metadata(input, identity)?,
-    })
+    ))
 }
 
 pub(crate) fn portable_symlink_metadata(identity: InputIdentity, _input: &Path) -> Result<PortableFileMetadata> {
-    Ok(PortableFileMetadata {
-        source_os: source_os_label().into(),
-        source_filesystem: "unknown".into(),
-        mode_origin: if cfg!(unix) { PortableModeOrigin::Native } else { PortableModeOrigin::Projected },
-        #[cfg(unix)]
-        posix_owner: Some(PortablePosixOwner { uid: identity.uid, gid: identity.gid, uname: None, gname: None }),
-        #[cfg(not(unix))]
-        posix_owner: None,
-        attributes: identity.attributes,
-        created: None,
-        accessed: None,
-        #[cfg(target_os = "linux")]
-        native: capture_linux_symlink_metadata(_input, identity)?,
-        #[cfg(target_os = "macos")]
-        native: capture_macos_symlink_metadata(_input, identity)?,
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        native: NativeFileMetadata::default(),
-    })
+    // A symlink carries no creation or access time of its own worth recording.
+    #[cfg(target_os = "linux")]
+    let native = capture_linux_symlink_metadata(_input, identity)?;
+    #[cfg(target_os = "macos")]
+    let native = capture_macos_symlink_metadata(_input, identity)?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let native = NativeFileMetadata::default();
+    Ok(tzap_core::portable_capture::assemble_portable_file_metadata(native, portable_owner_ids(&identity), identity.attributes, None, None))
+}
+
+/// Ownership as observed when the input was first identified, not re-read here:
+/// the archive must describe the object the scan saw.
+#[cfg(unix)]
+fn portable_owner_ids(identity: &InputIdentity) -> Option<(u64, u64)> {
+    Some((identity.uid, identity.gid))
+}
+
+#[cfg(not(unix))]
+fn portable_owner_ids(_identity: &InputIdentity) -> Option<(u64, u64)> {
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -1383,9 +1373,16 @@ pub(crate) fn windows_filetime_timestamp(value_100ns: u64) -> Result<ArchiveTime
     const WINDOWS_TO_UNIX_EPOCH_100NS: i128 = 116_444_736_000_000_000;
     const TICKS_PER_SECOND: i128 = 10_000_000;
     let unix_100ns = i128::from(value_100ns) - WINDOWS_TO_UNIX_EPOCH_100NS;
-    let seconds = i64::try_from(unix_100ns.div_euclid(TICKS_PER_SECOND)).map_err(|_| anyhow!("Windows timestamp exceeds revision-45 i64 range"))?;
-    let nanoseconds = (unix_100ns.rem_euclid(TICKS_PER_SECOND) * 100) as u32;
-    Ok(ArchiveTimestamp::new(seconds, nanoseconds))
+    // `div_euclid`/`rem_euclid` is timespec semantics -- floor division with a
+    // non-negative remainder -- and this format is sign-magnitude (§16.7.2), so
+    // that wrote a FILETIME 1.5s before the epoch as `-2.5`. Reduce to a sign
+    // and a magnitude and let tzap-core apply the rule, the same as every other
+    // clock source.
+    let negative = unix_100ns < 0;
+    let magnitude = unix_100ns.unsigned_abs();
+    let seconds = u64::try_from(magnitude / TICKS_PER_SECOND as u128).map_err(|_| anyhow!("Windows timestamp exceeds revision-45 i64 range"))?;
+    let nanoseconds = (magnitude % TICKS_PER_SECOND as u128) as u32 * 100;
+    tzap_core::entry_metadata::archive_timestamp_from_signed_parts(negative, seconds, nanoseconds).map_err(|error| anyhow!(error))
 }
 
 #[cfg(windows)]
@@ -2128,39 +2125,12 @@ pub(crate) fn capture_native_file_metadata(_input: &Path, _identity: InputIdenti
     Ok(NativeFileMetadata::default())
 }
 
-pub(crate) fn source_os_label() -> &'static str {
-    if cfg!(target_os = "linux") {
-        "linux"
-    } else if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "windows") {
-        "windows"
-    } else if cfg!(target_os = "freebsd") {
-        "freebsd"
-    } else if cfg!(target_os = "netbsd") {
-        "netbsd"
-    } else if cfg!(target_os = "openbsd") {
-        "openbsd"
-    } else if cfg!(target_os = "solaris") {
-        "solaris"
-    } else if cfg!(target_family = "unix") {
-        "other-unix"
-    } else {
-        "other"
-    }
-}
-
 pub(crate) fn portable_attributes(metadata: &fs::Metadata) -> Option<u32> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        let attributes = metadata.file_attributes();
-        let mut projection = 0u32;
-        projection |= u32::from(attributes & 0x0000_0001 != 0);
-        projection |= u32::from(attributes & 0x0000_0002 != 0) << 1;
-        projection |= u32::from(attributes & 0x0000_0004 != 0) << 2;
-        projection |= u32::from(attributes & 0x0000_0020 != 0) << 3;
-        Some(projection)
+        // The bit projection is tzap-core's; this host only supplies the mask.
+        Some(tzap_core::entry_metadata::windows_portable_attribute_projection(metadata.file_attributes()))
     }
 
     #[cfg(target_os = "macos")]
