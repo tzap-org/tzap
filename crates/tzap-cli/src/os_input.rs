@@ -31,23 +31,11 @@ pub(crate) fn readonly_mode(metadata: &fs::Metadata) -> u32 {
 }
 #[cfg(not(unix))]
 pub(crate) fn readonly_mode(metadata: &fs::Metadata) -> u32 {
-    // Windows has no POSIX mode, so one is projected.
-    //
-    // A directory is always 0o755. It must keep its traverse bit, or the restored
-    // tree cannot be entered on a POSIX host and extraction fails partway with
-    // "failed to inspect destination" once it tries to descend. It must also
-    // ignore the read-only attribute: on a directory that attribute does not
-    // restrict writes -- Windows still allows creating entries inside it, and uses
-    // the flag to mark customized folders -- so projecting it to 0o555 would invent
-    // a restriction the source never had and hand back a tree nothing can be added
-    // to. On a regular file the attribute is real, and keeps its projection.
-    if metadata.is_dir() {
-        0o755
-    } else if metadata.permissions().readonly() {
-        0o444
-    } else {
-        0o644
-    }
+    // Hosts without a POSIX mode project one, and tzap-core owns that convention so
+    // the CLI and other hosts cannot drift apart on it. See
+    // `entry_metadata::projected_posix_mode` for why a directory ignores the
+    // read-only attribute while a regular file keeps it.
+    tzap_core::entry_metadata::projected_posix_mode(metadata.is_dir(), metadata.permissions().readonly())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

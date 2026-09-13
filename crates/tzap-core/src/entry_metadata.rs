@@ -8,6 +8,32 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::format::FormatError;
 
+/// The POSIX mode a host that has none should record for an archive entry.
+///
+/// Windows carries no POSIX mode, so a writer running there has to project one.
+/// This module is the single owner of that convention: hosts (the CLI, zmanager,
+/// and any other) project through this helper rather than re-implementing it,
+/// because two hosts disagreeing means the same input produces archives that
+/// restore differently.
+///
+/// A directory is always `0o755`. It must keep its traverse bit, or the restored
+/// tree cannot be entered on a POSIX host and extraction fails partway once it
+/// tries to descend. It must also ignore the read-only attribute: on a directory
+/// that attribute restricts nothing -- Windows still allows creating entries
+/// inside one, and uses the flag to mark customized folders -- so projecting it
+/// to `0o555` would invent a restriction the source never had.
+///
+/// On a regular file the attribute is real, and projects to `0o444`.
+pub fn projected_posix_mode(is_directory: bool, readonly: bool) -> u32 {
+    if is_directory {
+        0o755
+    } else if readonly {
+        0o444
+    } else {
+        0o644
+    }
+}
+
 pub const EXTENDED_METADATA_V1: u32 = 1 << 0;
 pub const HAS_AUXILIARY_STREAMS: u32 = 1 << 1;
 pub const HAS_NATIVE_METADATA: u32 = 1 << 2;
@@ -2230,6 +2256,25 @@ fn invalid<T>(structure: &'static str, reason: &'static str) -> Result<T, Format
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn projected_posix_mode_keeps_directories_traversable_and_writable() {
+        // A directory must stay traversable or the restored tree cannot be entered,
+        // and the read-only attribute must not follow it: on Windows that flag does
+        // not restrict a directory, so projecting it would invent a restriction.
+        assert_eq!(projected_posix_mode(true, false), 0o755);
+        assert_eq!(projected_posix_mode(true, true), 0o755);
+        assert_eq!(projected_posix_mode(true, false) & 0o111, 0o111);
+        assert_eq!(projected_posix_mode(true, true) & 0o111, 0o111);
+    }
+
+    #[test]
+    fn projected_posix_mode_keeps_the_read_only_attribute_for_files() {
+        // On a regular file the attribute is real and must survive the projection.
+        assert_eq!(projected_posix_mode(false, false), 0o644);
+        assert_eq!(projected_posix_mode(false, true), 0o444);
+        assert_eq!(projected_posix_mode(false, true) & 0o222, 0, "a read-only file must project no write bits");
+    }
     use super::*;
 
     #[test]
