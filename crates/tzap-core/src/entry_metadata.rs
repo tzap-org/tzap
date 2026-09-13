@@ -2248,7 +2248,16 @@ pub fn schily_posix_acl_to_linux_xattr(value: &[u8]) -> Result<Vec<u8>, FormatEr
     Ok(out)
 }
 
-pub(crate) fn parse_timestamp(value: &[u8]) -> Result<(i64, u32), FormatError> {
+/// Decode a §16.7.2 canonical time into a timespec `(tv_sec, tv_nsec)`.
+///
+/// The inverse of [`ArchiveTimestamp::canonical_pax_value`], and public for the
+/// same reason: the encoding is part of the format surface, so a conformance
+/// corpus has to be able to exercise the grammar in both directions.
+///
+/// Rejects every non-canonical spelling the revision forbids -- a leading `+`,
+/// a leading zero, `-0`, a trailing separator, a trailing zero in the fraction,
+/// and more than nine fractional digits.
+pub fn parse_timestamp(value: &[u8]) -> Result<(i64, u32), FormatError> {
     let text = std::str::from_utf8(value).map_err(|_| FormatError::InvalidArchive("timestamp is not ASCII"))?;
     if text.is_empty() || text.starts_with('+') {
         return invalid("Timestamp", "timestamp is not canonical");

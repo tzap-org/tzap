@@ -1,6 +1,6 @@
 use tzap_core::compression::{compress_zstd_frame, decompress_exact_zstd_frame};
 use tzap_core::crypto::{aead_decrypt, aead_encrypt, build_aad, derive_nonce, KdfParams, MasterKey, Subkeys};
-use tzap_core::entry_metadata::EXTENDED_METADATA_V1;
+use tzap_core::entry_metadata::{parse_timestamp, ArchiveTimestamp, EXTENDED_METADATA_V1};
 use tzap_core::fec::encode_parity_gf16;
 use tzap_core::format::{
     AeadAlgo, FormatError, CRITICAL_RECOVERY_LOCATOR_LEN, CRYPTO_HEADER_HMAC_LEN, FORMAT_VERSION, MASTER_KEY_LEN, READER_MAX_SUPPORTED_VOLUME_FORMAT_REV,
@@ -647,6 +647,69 @@ fn cross_platform_path_rejections_are_host_independent() {
 
     assert_eq!(normalize_lookup_file_path("dir/e\u{301}.txt", 4096).unwrap(), "dir/é.txt".as_bytes());
     assert_eq!(normalize_lookup_directory_path("dir/e\u{301}/", 4096).unwrap(), "dir/é".as_bytes());
+}
+
+/// §16.7.2 canonical time grammar: `-?(0|[1-9][0-9]*)(\.[0-9]{1,9})?`.
+///
+/// The corpus had no timestamp row at all, which is how four separate defects
+/// against this one rule shipped together -- a producer, a parser, an encoder
+/// and two restore paths each disagreeing about whether the struct is a
+/// sign-magnitude pair or a timespec. Host-independent vectors, so every
+/// platform proves the same grammar.
+#[test]
+fn canonical_timestamp_grammar_accepts_and_rejects_host_independently() {
+    // (encoded, timespec) -- `ArchiveTimestamp` is tv_sec plus an always-positive
+    // tv_nsec, so a negative time borrows a second across the boundary.
+    for (encoded, seconds, nanoseconds) in [
+        ("0", 0i64, 0u32),
+        ("7", 7, 0),
+        ("-5", -5, 0),
+        ("1700000000.123456789", 1_700_000_000, 123_456_789),
+        ("123.1", 123, 100_000_000),
+        ("123.000000001", 123, 1),
+        ("-1.25", -2, 750_000_000),
+        ("-1.5", -2, 500_000_000),
+        ("-2.25", -3, 750_000_000),
+        ("-123.001", -124, 999_000_000),
+    ] {
+        let parsed = parse_timestamp(encoded.as_bytes()).unwrap_or_else(|error| panic!("{encoded} must parse: {error:?}"));
+        assert_eq!(parsed, (seconds, nanoseconds), "{encoded}");
+        // The encoding is canonical, so re-encoding must reproduce it byte for byte.
+        let reencoded = ArchiveTimestamp::new(seconds, nanoseconds).canonical_pax_value().unwrap_or_else(|error| panic!("{encoded}: {error:?}"));
+        assert_eq!(String::from_utf8(reencoded).unwrap(), encoded, "round trip for {encoded}");
+    }
+
+    // Non-canonical spellings a conforming reader must reject.
+    for rejected in [
+        "",               // empty
+        "+123",           // explicit plus
+        "0123",           // leading zero
+        "-0123",          // leading zero, negative
+        "-0",             // negative zero
+        "-0.5",           // integer part would be -0: unrepresentable, not merely unusual
+        "123.",           // trailing separator
+        "123.0",          // trailing zero in the fraction
+        "123.10",         // trailing zero in the fraction
+        "123.1234567890", // more than nine fractional digits
+        "123.abc",        // non-digit fraction
+        "abc",            // not a number
+        " 1",             // leading space
+        "1 ",             // trailing space
+    ] {
+        assert!(parse_timestamp(rejected.as_bytes()).is_err(), "must reject {rejected:?}");
+    }
+
+    // The last second before the epoch is representable as a timespec but has no
+    // §16.7.2 encoding, so the refusal lands at the boundary rather than writing
+    // a value nearly two seconds early.
+    assert!(ArchiveTimestamp::new(-1, 500_000_000).canonical_pax_value().is_err());
+    assert!(ArchiveTimestamp::new(-1, 1).canonical_pax_value().is_err());
+    // One nanosecond earlier than that window is encodable again.
+    assert_eq!(ArchiveTimestamp::new(-2, 999_999_999).canonical_pax_value().unwrap(), b"-1.000000001");
+
+    // Nanoseconds must be under one billion; the writer refuses rather than
+    // silently carrying the overflow into the seconds field.
+    assert!(ArchiveTimestamp::new(1, 1_000_000_000).canonical_pax_value().is_err());
 }
 
 #[test]
