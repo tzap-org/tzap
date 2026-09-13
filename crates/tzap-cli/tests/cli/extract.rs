@@ -1421,3 +1421,229 @@ fn cli_archive_carries_resolved_owner_and_group_names() {
     assert_eq!(uid.parse::<u32>().unwrap(), source.uid());
     assert_eq!(gid.parse::<u32>().unwrap(), source.gid());
 }
+
+// ---------------------------------------------------------------------------
+// Comprehensive metadata round trip, ported from zmanager's
+// `preserves_all_metadata_in_tzap_round_trip`.
+//
+// That test is the best-exercised metadata fixture across the two projects and
+// it drives the whole path: build a tree carrying every metadata class the host
+// supports, archive it, read the listing back, extract under each restore
+// policy, and compare the restored tree against the source on disk.
+//
+// The version that reached tzap-core asserted only what *capture* produced, on
+// macOS alone. Nothing compared the restored tree, which is why an encode bug, a
+// parse bug and two separate restore bugs all coexisted with a green suite.
+// These drive the real binary, so the writer, the reader and the OS restore
+// paths are all in scope on every platform.
+// ---------------------------------------------------------------------------
+
+/// The metadata the host under test can actually set, so each platform asserts
+/// what it supports rather than skipping wholesale.
+struct MetadataFixture {
+    root: PathBuf,
+    file: PathBuf,
+    directory: PathBuf,
+    #[cfg(unix)]
+    link: PathBuf,
+    payload: Vec<u8>,
+}
+
+fn build_metadata_fixture(root: &Path) -> MetadataFixture {
+    let file = root.join("data.bin");
+    let directory = root.join("folder");
+    let payload = b"round-trip payload".to_vec();
+    fs::create_dir_all(root).unwrap();
+    fs::write(&file, &payload).unwrap();
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join("child.txt"), b"child payload").unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o750)).unwrap();
+    }
+    #[cfg(unix)]
+    let link = {
+        let link = root.join("link.txt");
+        std::os::unix::fs::symlink("data.bin", &link).unwrap();
+        link
+    };
+
+    // Extended attributes, where the host has them. A `user.`/`com.` name is
+    // restorable without privilege on both platforms that support xattrs.
+    #[cfg(target_os = "linux")]
+    {
+        xattr::set(&file, "user.tzap.test", b"file metadata").unwrap();
+        xattr::set(&directory, "user.tzap.test", b"directory metadata").unwrap();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        xattr::set(&file, "com.tzap.test", b"file metadata").unwrap();
+        xattr::set(&directory, "com.tzap.test", b"directory metadata").unwrap();
+        xattr::set(&file, "com.apple.FinderInfo", &[0x5a; 32]).unwrap();
+        xattr::set(&directory, "com.apple.FinderInfo", &[0x5b; 32]).unwrap();
+        // Deliberately larger than the inline PAX budget, so the resource fork
+        // takes the streamed auxiliary path. §16.18.2's corpus names this case.
+        fs::write(file.join("..namedfork/rsrc"), vec![0x6b; 2 * 1024 * 1024 + 31]).unwrap();
+        let _ = std::process::Command::new("/bin/chmod").args(["+a", "everyone deny delete"]).arg(&file).status();
+        let _ = std::process::Command::new("/usr/bin/chflags").arg("hidden").arg(&file).status();
+    }
+    #[cfg(windows)]
+    {
+        // An alternate data stream is the Windows metadata class that travels as
+        // a streamed auxiliary, which is exactly the path that had no host-side
+        // reader outside tzap-cli.
+        let mut stream = file.clone().into_os_string();
+        stream.push(":tzap-test");
+        fs::write(PathBuf::from(stream), b"alternate stream payload").unwrap();
+    }
+
+    MetadataFixture {
+        root: root.to_path_buf(),
+        file,
+        directory,
+        #[cfg(unix)]
+        link,
+        payload,
+    }
+}
+
+fn create_archive(source: &Path, archive: &Path) {
+    Command::cargo_bin("tzap").unwrap().args(["create", "--no-encryption", "-o", archive.to_str().unwrap(), source.to_str().unwrap()]).assert().success();
+}
+
+fn extract_archive(archive: &Path, destination: &Path, policy: &str, allow_degraded: bool) -> bool {
+    let mut command = Command::cargo_bin("tzap").unwrap();
+    command.args(["extract", "-C", destination.to_str().unwrap(), "--restore", policy]);
+    if allow_degraded {
+        command.arg("--allow-degraded");
+    }
+    command.arg(archive.to_str().unwrap()).assert().try_success().is_ok()
+}
+
+/// Every metadata class the host supports, captured, listed, restored, compared.
+#[test]
+fn cli_comprehensive_metadata_round_trip_preserves_every_supported_class() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("tree");
+    let archive = temp.path().join("tree.tzap");
+    let fixture = build_metadata_fixture(&source);
+
+    create_archive(&fixture.root, &archive);
+
+    // --- the listing describes what was captured -------------------------
+    let listed = Command::cargo_bin("tzap").unwrap().args(["list", "--long", archive.to_str().unwrap()]).assert().success().get_output().stdout.clone();
+    let listed = String::from_utf8_lossy(&listed);
+    let row = |suffix: &str| -> Vec<String> {
+        listed
+            .lines()
+            .find(|line| line.ends_with(suffix))
+            .unwrap_or_else(|| panic!("no listing row for {suffix}; listing was:\n{listed}"))
+            .split('\t')
+            .map(str::to_owned)
+            .collect()
+    };
+    // size, kind, mode, mtime, created, accessed, uid, gid, uname, gname, attributes, link_target, path
+    let file_row = row("data.bin");
+    assert_eq!(file_row[0].parse::<u64>().unwrap(), fixture.payload.len() as u64, "file size");
+    assert_eq!(file_row[1], "file", "file kind");
+    assert_ne!(file_row[3], "null", "mtime must be recorded");
+    assert_ne!(file_row[4], "null", "creation time must be recorded (ctime fallback where there is no birth time)");
+    assert_ne!(file_row[5], "null", "access time must be recorded");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let source_metadata = fs::symlink_metadata(&fixture.file).unwrap();
+        // `tzap list --long` prints the mode as a decimal u32.
+        assert_eq!(file_row[2].parse::<u32>().unwrap() & 0o7777, 0o640, "file mode");
+        assert_eq!(file_row[6].parse::<u32>().unwrap(), source_metadata.uid(), "uid");
+        assert_eq!(file_row[7].parse::<u32>().unwrap(), source_metadata.gid(), "gid");
+        assert_ne!(file_row[8], "null", "owner name must be resolved from the uid");
+        assert_ne!(file_row[9], "null", "group name must be resolved from the gid");
+
+        let directory_row = row("folder");
+        assert_eq!(directory_row[1], "directory", "directory kind");
+        assert_eq!(directory_row[6], file_row[6], "directory uid");
+        assert_eq!(directory_row[8], file_row[8], "directory owner name");
+
+        let link_row = row("link.txt");
+        assert_eq!(link_row[1], "symlink", "symlink kind");
+        assert_eq!(link_row[11], "data.bin", "symlink target");
+    }
+
+    // --- portable restore: payload, modes, times, and NO native metadata --
+    let portable = temp.path().join("portable-extract");
+    assert!(extract_archive(&archive, &portable, "portable", false), "portable extraction must accept native metadata it will not apply");
+    let restored_root = portable.join("tree");
+    assert_eq!(fs::read(restored_root.join("data.bin")).unwrap(), fixture.payload);
+    assert!(restored_root.join("folder").is_dir());
+    assert_eq!(fs::read(restored_root.join("folder/child.txt")).unwrap(), b"child payload");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        assert_eq!(fs::symlink_metadata(restored_root.join("data.bin")).unwrap().permissions().mode() & 0o7777, 0o640, "restored file mode");
+        assert_eq!(fs::symlink_metadata(restored_root.join("folder")).unwrap().permissions().mode() & 0o7777, 0o750, "restored directory mode");
+        assert_eq!(fs::read_link(restored_root.join("link.txt")).unwrap(), Path::new("data.bin"), "restored symlink target");
+
+        // The bug class that had no coverage: the restored instant must equal
+        // the source instant, nanoseconds included.
+        let restored = fs::symlink_metadata(restored_root.join("data.bin")).unwrap();
+        let source_metadata = fs::symlink_metadata(&fixture.file).unwrap();
+        assert_eq!((restored.mtime(), restored.mtime_nsec()), (source_metadata.mtime(), source_metadata.mtime_nsec()), "restored mtime must match exactly");
+        let _ = &fixture.link;
+    }
+    // Portable restore must not apply native metadata.
+    #[cfg(target_os = "linux")]
+    assert_eq!(xattr::get(restored_root.join("data.bin"), "user.tzap.test").unwrap(), None, "portable restore must not apply native xattrs");
+    #[cfg(target_os = "macos")]
+    assert_eq!(xattr::get(restored_root.join("data.bin"), "com.tzap.test").unwrap(), None, "portable restore must not apply native xattrs");
+
+    // --- same-OS restore: the native classes come back --------------------
+    let native = temp.path().join("native-extract");
+    // Linux birth time is captured where available but is not assignable by the
+    // kernel, so that platform needs the degraded allowance to restore natively.
+    let allow_degraded = cfg!(target_os = "linux");
+    assert!(extract_archive(&archive, &native, "same-os", allow_degraded), "same-OS extraction must succeed");
+    let native_root = native.join("tree");
+    assert_eq!(fs::read(native_root.join("data.bin")).unwrap(), fixture.payload);
+
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(xattr::get(native_root.join("data.bin"), "user.tzap.test").unwrap().as_deref(), Some(b"file metadata".as_slice()));
+        assert_eq!(xattr::get(native_root.join("folder"), "user.tzap.test").unwrap().as_deref(), Some(b"directory metadata".as_slice()));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt as _;
+        assert_eq!(xattr::get(native_root.join("data.bin"), "com.tzap.test").unwrap().as_deref(), Some(b"file metadata".as_slice()));
+        assert_eq!(xattr::get(native_root.join("folder"), "com.tzap.test").unwrap().as_deref(), Some(b"directory metadata".as_slice()));
+        assert_eq!(xattr::get(native_root.join("data.bin"), "com.apple.FinderInfo").unwrap().as_deref(), Some([0x5a; 32].as_slice()));
+        assert_eq!(xattr::get(native_root.join("folder"), "com.apple.FinderInfo").unwrap().as_deref(), Some([0x5b; 32].as_slice()));
+        // The streamed auxiliary path, end to end.
+        assert_eq!(fs::read(native_root.join("data.bin").join("..namedfork/rsrc")).unwrap(), vec![0x6b; 2 * 1024 * 1024 + 31], "resource fork");
+        assert_eq!(fs::metadata(native_root.join("data.bin")).unwrap().st_flags(), fs::metadata(&fixture.file).unwrap().st_flags(), "Darwin flags");
+        assert_eq!(
+            (fs::metadata(native_root.join("data.bin")).unwrap().st_birthtime(), fs::metadata(native_root.join("data.bin")).unwrap().st_birthtime_nsec()),
+            (fs::metadata(&fixture.file).unwrap().st_birthtime(), fs::metadata(&fixture.file).unwrap().st_birthtime_nsec()),
+            "birth time"
+        );
+        let acl = std::process::Command::new("/bin/ls").args(["-lde"]).arg(native_root.join("data.bin")).output().unwrap();
+        if String::from_utf8_lossy(&std::process::Command::new("/bin/ls").args(["-lde"]).arg(&fixture.file).output().unwrap().stdout)
+            .contains("everyone deny delete")
+        {
+            assert!(String::from_utf8_lossy(&acl.stdout).contains("everyone deny delete"), "native ACL must be restored");
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut stream = native_root.join("data.bin").into_os_string();
+        stream.push(":tzap-test");
+        assert_eq!(fs::read(PathBuf::from(stream)).unwrap(), b"alternate stream payload", "alternate data stream must be restored");
+    }
+
+    let _ = &fixture.directory;
+}
