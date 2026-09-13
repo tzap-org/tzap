@@ -2014,3 +2014,40 @@ fn restore_policy_matrix_keeps_content_restore_free_of_native_metadata_requireme
     .unwrap();
     assert!(degraded_native.iter().any(|diagnostic| diagnostic.status == MetadataDiagnosticStatus::Skipped));
 }
+
+#[test]
+fn a_member_named_close_to_the_component_limit_restores() {
+    // Restoring writes to a temporary sibling built from the member's own leaf plus
+    // a 46-byte unique suffix, then renames it. A leaf over 209 bytes pushed that
+    // temporary name past the 255-byte component limit, so the create failed and the
+    // member could never be restored -- despite archiving cleanly and despite every
+    // mainstream filesystem accepting the name. The error blamed archive integrity,
+    // which sends you looking in the wrong place.
+    for leaf_len in [200usize, 209, 210, 240, 255] {
+        let temp = tempfile::tempdir().unwrap();
+        let name = format!("{}.bin", "n".repeat(leaf_len - 4));
+        assert_eq!(name.len(), leaf_len);
+        let body = format!("payload for a {leaf_len}-byte name");
+
+        let files = [crate::writer::RegularFile::new(&name, body.as_bytes())];
+        let key = crate::crypto::MasterKey::from_raw_key(&[97u8; 32]).unwrap();
+        let archive = crate::writer::write_archive(
+            &files,
+            &key,
+            crate::writer::WriterOptions { stripe_width: 1, volume_loss_tolerance: 0, ..crate::writer::WriterOptions::default() },
+        )
+        .unwrap_or_else(|error| panic!("{leaf_len}-byte name failed to archive: {error:?}"));
+
+        let opened = crate::reader::open_archive(&archive.bytes, &key).unwrap();
+        let output = temp.path().join("restored");
+        std::fs::create_dir(&output).unwrap();
+        opened
+            .extract_all_to(&output, crate::tar_model::SafeExtractionOptions::default())
+            .unwrap_or_else(|error| panic!("{leaf_len}-byte name failed to restore: {error:?}"));
+
+        // The name is restored in full, not shortened to fit the temporary form.
+        let restored = output.join(&name);
+        assert!(restored.exists(), "{leaf_len}-byte name is missing from the restored tree");
+        assert_eq!(std::fs::read(&restored).unwrap(), body.as_bytes(), "{leaf_len}-byte name restored the wrong bytes");
+    }
+}

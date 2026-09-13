@@ -978,6 +978,94 @@ fn format_duration_three_decimal_seconds() {
 
 #[cfg(unix)]
 #[test]
+fn names_and_paths_at_the_filesystem_limits_round_trip() {
+    // Filesystem limits differ by host -- macOS caps a path at 1024 bytes while
+    // Linux allows 4096, and both cap one component at 255 -- and tzap caps an
+    // archive path at 4096 independently. Build right up to what this host accepts
+    // rather than assuming a number, so the test is meaningful on each.
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("corpus");
+    fs::create_dir(&source).unwrap();
+
+    // A component at the 255-byte maximum, which every host here allows.
+    let max_component = format!("{}.bin", "n".repeat(251));
+    assert_eq!(max_component.len(), 255);
+    fs::write(source.join(&max_component), b"max component").unwrap();
+
+    // Nest until the host refuses, but leave headroom: restoring adds a root prefix,
+    // so a source path at the host's exact limit cannot be written back. That is a
+    // real constraint on any host, not a tzap limit, so stop short of it by the
+    // amount the restore root will add, plus margin for the staging directory the
+    // restore uses before committing.
+    let output = temp.path().join("restored");
+    fs::create_dir(&output).unwrap();
+    let restore_overhead = output.as_os_str().len().saturating_sub(source.as_os_str().len()) + "/deep.bin".len();
+    let mut deep = source.clone();
+    let mut depth = 0;
+    loop {
+        let candidate = deep.join("d".repeat(60));
+        if depth >= 40 || candidate.as_os_str().len() + restore_overhead >= 700 || fs::create_dir(&candidate).is_err() {
+            break;
+        }
+        deep = candidate;
+        depth += 1;
+    }
+    assert!(depth > 0, "the host refused even one nested directory");
+    fs::write(deep.join("deep.bin"), b"deep payload").unwrap();
+
+    let specs = collect_input_specs(&[source.to_string_lossy().into_owned()]).unwrap_or_else(|error| panic!("{error:#}"));
+    let longest = specs.iter().map(|spec| spec.archive_path.len()).max().unwrap_or(0);
+    assert!(longest > 255, "the corpus did not produce a long archive path (longest was {longest})");
+
+    let key = MasterKey::from_raw_key(&[79u8; 32]).unwrap();
+    let mut sink = tzap_core::MemoryArchiveSink::default();
+    tzap_core::write_archive_sources_to_sink(
+        &specs,
+        &key,
+        WriterOptions { stripe_width: 1, volume_loss_tolerance: 0, bit_rot_buffer_pct: 0, ..WriterOptions::default() },
+        None,
+        &KdfParams::Raw,
+        None,
+        None,
+        &mut sink,
+    )
+    .unwrap_or_else(|error| panic!("writing a {longest}-byte archive path failed: {error:?}"));
+
+    let opened = tzap_core::open_archive(&sink.volumes[0], &key).unwrap();
+    opened.verify().unwrap();
+
+    opened.extract_all_to(&output, tzap_core::SafeExtractionOptions::default()).unwrap_or_else(|error| panic!("restoring long paths failed: {error:?}"));
+
+    assert_eq!(fs::read(output.join("corpus").join(&max_component)).unwrap(), b"max component");
+    let restored_deep = output.join("corpus").join(deep.strip_prefix(&source).unwrap()).join("deep.bin");
+    assert_eq!(fs::read(&restored_deep).unwrap(), b"deep payload", "deepest member did not restore at {}", restored_deep.display());
+}
+
+#[test]
+fn an_archive_path_beyond_the_configured_maximum_is_refused() {
+    // The writer caps an archive path independently of the filesystem. Exceeding it
+    // must be refused rather than truncated, which would silently rename a member.
+    let long_path = "a".repeat(200);
+    let files = [tzap_core::writer::RegularFile::new(&long_path, b"body")];
+    let key = MasterKey::from_raw_key(&[83u8; 32]).unwrap();
+
+    let within = tzap_core::writer::write_archive(
+        &files,
+        &key,
+        WriterOptions { stripe_width: 1, volume_loss_tolerance: 0, max_path_length: 256, ..WriterOptions::default() },
+    );
+    assert!(within.is_ok(), "a 200-byte path under a 256-byte cap should be accepted");
+
+    let beyond = tzap_core::writer::write_archive(
+        &files,
+        &key,
+        WriterOptions { stripe_width: 1, volume_loss_tolerance: 0, max_path_length: 100, ..WriterOptions::default() },
+    );
+    assert!(beyond.is_err(), "a 200-byte path over a 100-byte cap must be refused, not truncated");
+}
+
+#[cfg(unix)]
+#[test]
 fn dangling_symlink_round_trips_without_resolving_its_target() {
     // A symlink whose target does not exist must be stored and restored as a link
     // to that same name, not followed, not skipped, and not turned into a regular

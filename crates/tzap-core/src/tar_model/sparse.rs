@@ -111,10 +111,31 @@ pub(crate) fn write_zero_run<H: TarMemberStreamHandler>(handler: &mut H, zeros: 
     Ok(())
 }
 
+/// Longest single path component a mainstream filesystem accepts. The temporary
+/// name is built from the member's own leaf plus a unique suffix, so a leaf close
+/// to this limit has to give ground to the suffix or the create fails outright --
+/// which it silently did for every member named more than 209 bytes, since the
+/// suffix is 46.
+const MAX_COMPONENT_BYTES: usize = 255;
+
 pub(crate) fn create_temp_regular_file(destination: &PreparedDestination) -> Result<(PathBuf, fs::File), FormatError> {
     for _ in 0..1000u32 {
-        let mut candidate = destination.leaf.as_os_str().to_os_string();
-        candidate.push(format!(".tzap-tmp-{}", uuid::Uuid::new_v4()));
+        let suffix = format!(".tzap-tmp-{}", uuid::Uuid::new_v4());
+        // Keep as much of the real name as fits: the temp file is renamed to the
+        // member's actual leaf by `publish_regular_file`, so a shortened stem here
+        // never reaches the restored tree. Truncate on a byte boundary of the raw
+        // OS name, which is what the filesystem measures.
+        let leaf_bytes = destination.leaf.as_os_str().as_encoded_bytes();
+        let keep = MAX_COMPONENT_BYTES.saturating_sub(suffix.len()).min(leaf_bytes.len());
+        let mut candidate = if keep == leaf_bytes.len() {
+            destination.leaf.as_os_str().to_os_string()
+        } else {
+            // SAFETY: the bytes come straight from `as_encoded_bytes` on this same
+            // name, and truncation keeps a prefix of that encoding, which is what
+            // `from_encoded_bytes_unchecked` requires.
+            unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(leaf_bytes[..keep].to_vec()) }
+        };
+        candidate.push(suffix);
         let leaf = PathBuf::from(candidate);
         match destination.parent.open_with(&leaf, &create_new_file_options()) {
             Ok(file) => return Ok((leaf, file.into_std())),
