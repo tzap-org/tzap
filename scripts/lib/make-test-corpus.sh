@@ -75,6 +75,22 @@ make_test_corpus() {
 
   # FIFO, POSIX-only and root-free.
   mkfifo "$c/fifo.pipe" 2>/dev/null || true
+
+  # A second tree holding only regular files and directories. Streaming tar input
+  # supports those kinds and nothing else, so feeding it the full corpus makes two
+  # builds refuse for different reasons -- whichever unsupported kind each notices
+  # first -- which is noise rather than a difference worth reporting.
+  local plain="$root/corpus-plain"
+  rm -rf "$plain"
+  mkdir -p "$plain/nested/deep"
+  local n=0
+  while [ $n -lt 24 ]; do
+    local pd="$plain"
+    [ $((n % 3)) -eq 1 ] && pd="$plain/nested"
+    [ $((n % 3)) -eq 2 ] && pd="$plain/nested/deep"
+    yes "plain-body-$n" | head -c $(( (n * 211) % 3000 + 1 )) > "$pd/p$(printf '%02d' $n).bin"
+    n=$((n + 1))
+  done
 }
 
 # Compare a restored tree against the source without letting `diff -r` touch an

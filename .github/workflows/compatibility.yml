@@ -1,0 +1,109 @@
+name: Compatibility
+
+# The differential matrix builds the previous release alongside the current tree
+# and has each read the other's archives across the shape cross product: key mode,
+# volume count, recovery percentage, dictionary, signing, and the streaming and
+# geometry modes. It catches a behaviour change the unit tests cannot see, because
+# it compares against a binary that predates the change rather than against an
+# expectation written at the same time as the code.
+#
+# It builds a second binary, so it does not run on every pull request. Push to
+# main, a weekly schedule, and manual dispatch are enough to catch drift early
+# while keeping pull requests fast.
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      reference:
+        description: "Reference tag to compare against (default: newest release tag reachable from HEAD)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  differential:
+    name: Differential matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - macos-14
+          - windows-2022
+
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@v6.0.2
+        with:
+          # The reference is built from a release tag, so the tags and the commits
+          # they point at have to be present.
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve the reference tag
+        id: reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          requested='${{ inputs.reference }}'
+          if [ -n "$requested" ]; then
+            tag="$requested"
+          else
+            # Newest release tag reachable from HEAD, skipping a tag on HEAD itself:
+            # comparing a release against itself would assert nothing.
+            tag=""
+            while read -r candidate; do
+              [ -n "$candidate" ] || continue
+              if [ "$(git rev-parse "$candidate^{commit}")" = "$(git rev-parse HEAD)" ]; then
+                continue
+              fi
+              tag="$candidate"
+              break
+            done < <(git tag -l 'v*' --sort=-creatordate --merged HEAD)
+          fi
+          if [ -z "$tag" ]; then
+            echo "no release tag reachable from HEAD; nothing to compare against" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Comparing against $tag ($(git log -1 --format=%h "$tag"))"
+
+      - name: Build the candidate
+        shell: bash
+        run: cargo build --release --bin tzap --locked
+
+      - name: Build the reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add ../tzap-reference '${{ steps.reference.outputs.tag }}'
+          # --locked would fail if the reference's lockfile disagrees with its
+          # manifests, which is not what this job is testing.
+          cargo build --release --bin tzap --manifest-path ../tzap-reference/Cargo.toml
+
+      - name: Run the differential matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [ "$RUNNER_OS" = "Windows" ]; then suffix=".exe"; fi
+          ./scripts/differential-matrix.sh \
+            "../tzap-reference/target/release/tzap$suffix" \
+            "target/release/tzap$suffix"

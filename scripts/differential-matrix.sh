@@ -436,9 +436,9 @@ mode_matrix() {
 
   # Streamed tar input.
   stream_combo "tar-stdin plaintext" \
-    'tar cf - corpus 2>/dev/null | @BIN@ create --no-encryption -o "$work/out.tzap" --tar-stdin -' "" ""
+    'tar cf - corpus-plain 2>/dev/null | @BIN@ create --no-encryption -o "$work/out.tzap" --tar-stdin -' "" ""
   stream_combo "tar-stdin keyfile parity" \
-    'tar cf - corpus 2>/dev/null | @BIN@ create --keyfile keys/raw.hex --bit-rot-buffer-pct 30 -o "$work/out.tzap" --tar-stdin -' "--keyfile keys/raw.hex" ""
+    'tar cf - corpus-plain 2>/dev/null | @BIN@ create --keyfile keys/raw.hex --bit-rot-buffer-pct 30 -o "$work/out.tzap" --tar-stdin -' "--keyfile keys/raw.hex" ""
 
   # Streamed raw input, with a declared size and spooled.
   stream_combo "raw-stdin declared size" \
