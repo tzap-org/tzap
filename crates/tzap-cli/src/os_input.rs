@@ -725,6 +725,19 @@ pub(crate) struct CapturedInputMetadata {
     pub(crate) metadata: PortableFileMetadata,
     #[cfg(target_os = "macos")]
     pub(crate) macos_identity: Option<tzap_core::macos_metadata::MacosMetadataIdentity>,
+    /// ReFS cannot report exact allocated ranges, so a sparse claim from it is
+    /// partial by construction and must be declared as such.
+    #[cfg(windows)]
+    pub(crate) sparse_layout_partial: bool,
+}
+
+/// Whether a capture failure is the transient race worth re-observing for.
+///
+/// The host sees `anyhow::Error`, so it matches on the message tzap-core owns
+/// rather than on a type it cannot see through the context chain.
+pub(crate) fn is_capture_race_error(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains(tzap_core::portable_capture::CAPTURE_RACE_MARKER) || text.contains(tzap_core::portable_capture::CAPTURE_PREOPEN_RACE_MARKER)
 }
 
 pub(crate) fn portable_input_metadata(identity: InputIdentity, input: &Path) -> Result<CapturedInputMetadata> {
@@ -745,6 +758,8 @@ pub(crate) fn portable_input_metadata(identity: InputIdentity, input: &Path) -> 
         ),
         #[cfg(target_os = "macos")]
         macos_identity: captured.macos_identity,
+        #[cfg(windows)]
+        sparse_layout_partial: false,
     })
 }
 
@@ -760,6 +775,8 @@ pub(crate) fn portable_symlink_metadata(identity: InputIdentity, _input: &Path) 
         metadata: tzap_core::portable_capture::assemble_portable_file_metadata(captured.native, portable_owner_ids(&identity), identity.attributes, None, None),
         #[cfg(target_os = "macos")]
         macos_identity: captured.macos_identity,
+        #[cfg(windows)]
+        sparse_layout_partial: false,
     })
 }
 

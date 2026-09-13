@@ -989,38 +989,33 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
     #[cfg(windows)]
     reject_unsupported_windows_regular_file(&metadata, input)?;
     let archive_path = archive_path_to_string(archive_path)?;
-    let identity = input_identity(&metadata).with_context(|| format!("failed to identify input {}", input.display()))?;
-    #[cfg(windows)]
-    let (identity, sparse_extents, sparse_layout_partial) = {
-        let mut identity = identity;
-        let file = File::open(input).with_context(|| format!("failed to open {} for identity capture", input.display()))?;
-        augment_windows_input_identity(&mut identity, &file).with_context(|| format!("failed to identify Windows input {}", input.display()))?;
-        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
-        let sparse_extents = if identity.file_attributes & FILE_ATTRIBUTE_SPARSE_FILE != 0 {
-            Some(
-                query_windows_allocated_ranges(&file, identity.len)
-                    .with_context(|| format!("failed to query sparse ranges for Windows input {}", input.display()))?,
-            )
-        } else {
-            None
-        };
-        let sparse_layout_partial = sparse_extents.is_some() && windows_file_system_is_refs(&file)?;
-        (identity, sparse_extents, sparse_layout_partial)
+    // Re-observe on a lost race instead of retrying against the scan's identity.
+    //
+    // The capture is pinned to the identity the scan sampled, so once the file
+    // has genuinely changed, re-running the capture alone can never succeed: it
+    // spends the retry budget and fails anyway, which made archiving any file
+    // under active write fail outright. Redo the whole observation instead --
+    // stat, identity, sparse ranges and capture all come from one fresh look, so
+    // the index entry and the PAX records still describe a single object. A file
+    // that never settles is still caught, by the identity check the reader runs
+    // while streaming the data.
+    let observation = {
+        let mut attempt = 1usize;
+        loop {
+            match observe_regular_input(input) {
+                Ok(observation) => break observation,
+                Err(error) if is_capture_race_error(&error) && attempt < tzap_core::portable_capture::CAPTURE_ATTEMPTS => attempt += 1,
+                Err(error) => return Err(error),
+            }
+        }
     };
-    #[cfg(target_os = "linux")]
-    let sparse_extents = {
-        let file = File::open(input).with_context(|| format!("failed to open {} for sparse-range capture", input.display()))?;
-        query_linux_sparse_extents(&file, identity.len).with_context(|| format!("failed to query sparse ranges for Linux input {}", input.display()))?
-    };
-    #[cfg(all(not(windows), not(target_os = "linux")))]
-    let sparse_extents = None;
-    let captured = portable_input_metadata(identity, input)?;
+    let RegularInputObservation { metadata, identity, sparse_extents, captured } = observation;
     #[cfg(target_os = "macos")]
     let macos_identity = captured.macos_identity;
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut portable_metadata = captured.metadata;
     #[cfg(windows)]
-    if sparse_layout_partial {
+    if captured.sparse_layout_partial {
         add_windows_refs_sparse_layout_omission(&mut portable_metadata.native);
     }
     out.push(InputSpec {
@@ -1038,6 +1033,57 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
         macos_identity,
     });
     Ok(())
+}
+
+/// One complete observation of a regular input: everything the spec records
+/// about it, all sampled from the same stat.
+pub(crate) struct RegularInputObservation {
+    pub(crate) metadata: fs::Metadata,
+    pub(crate) identity: InputIdentity,
+    pub(crate) sparse_extents: Option<Vec<SparseExtent>>,
+    pub(crate) captured: CapturedInputMetadata,
+}
+
+/// Stat, identify, measure and capture one regular file as a single unit.
+///
+/// Grouped so a lost race can be retried as a whole. Splitting it -- sampling
+/// the identity once and retrying only the capture against it -- is what made
+/// the retry unable to succeed.
+pub(crate) fn observe_regular_input(input: &Path) -> Result<RegularInputObservation> {
+    let metadata = fs::symlink_metadata(input).with_context(|| format!("failed to identify input {}", input.display()))?;
+    let identity = input_identity(&metadata).with_context(|| format!("failed to identify input {}", input.display()))?;
+    #[cfg(windows)]
+    let (identity, sparse_extents) = {
+        let mut identity = identity;
+        let file = File::open(input).with_context(|| format!("failed to open {} for identity capture", input.display()))?;
+        augment_windows_input_identity(&mut identity, &file).with_context(|| format!("failed to identify Windows input {}", input.display()))?;
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
+        let sparse_extents = if identity.file_attributes & FILE_ATTRIBUTE_SPARSE_FILE != 0 {
+            Some(
+                query_windows_allocated_ranges(&file, identity.len)
+                    .with_context(|| format!("failed to query sparse ranges for Windows input {}", input.display()))?,
+            )
+        } else {
+            None
+        };
+        if sparse_extents.is_some() && windows_file_system_is_refs(&file)? {
+            // ReFS cannot report exact allocated ranges, so the layout is
+            // partial by construction and the capture must say so.
+            let mut captured = portable_input_metadata(identity, input)?;
+            captured.sparse_layout_partial = true;
+            return Ok(RegularInputObservation { metadata, identity, sparse_extents, captured });
+        }
+        (identity, sparse_extents)
+    };
+    #[cfg(target_os = "linux")]
+    let sparse_extents = {
+        let file = File::open(input).with_context(|| format!("failed to open {} for sparse-range capture", input.display()))?;
+        query_linux_sparse_extents(&file, identity.len).with_context(|| format!("failed to query sparse ranges for Linux input {}", input.display()))?
+    };
+    #[cfg(all(not(windows), not(target_os = "linux")))]
+    let sparse_extents = None;
+    let captured = portable_input_metadata(identity, input)?;
+    Ok(RegularInputObservation { metadata, identity, sparse_extents, captured })
 }
 
 pub(crate) fn write_archive_outputs(output: &str, volumes: &[Vec<u8>], force: bool) -> Result<()> {

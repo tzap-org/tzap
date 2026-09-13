@@ -2275,3 +2275,80 @@ fn cli_create_and_verify_all_zstd_compression_levels() {
         assert_eq!(fs::read(&extracted_file2).unwrap(), fs::read(&file2).unwrap());
     }
 }
+
+/// A file changing mid-archive must never yield an archive that does not verify.
+///
+/// This is the invariant worth pinning at this level. Under sustained write
+/// contention `tzap create` legitimately refuses -- most often at the streaming
+/// reader's identity check, which is a *data* race and must stay fatal, because
+/// the alternative is an archive whose bytes disagree with its recorded size and
+/// digest. What must never happen is a written archive that fails verification,
+/// or a refusal that does not say what went wrong.
+///
+/// Deliberately not asserted here: that the metadata-capture retry recovers. The
+/// capture window is microseconds wide while the data-read window spans the whole
+/// operation, so any writer aggressive enough to lose the first almost always
+/// loses the second -- a test claiming otherwise passes for the wrong reason.
+/// `metadata_capture.rs` in tzap-core pins the retry deterministically instead.
+#[test]
+fn cli_create_under_a_concurrent_writer_never_produces_an_unverifiable_archive() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("tree");
+    fs::create_dir(&source).unwrap();
+    for index in 0..12 {
+        fs::write(source.join(format!("stable-{index}.bin")), vec![b's'; 4096]).unwrap();
+    }
+    let contended = source.join("contended.bin");
+    fs::write(&contended, vec![b'c'; 4096]).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let stop = Arc::clone(&stop);
+        let path = contended.clone();
+        std::thread::spawn(move || {
+            let mut round = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                round = round.wrapping_add(1);
+                let _ = fs::write(&path, vec![b'c'; 1 + (round % 8192)]);
+            }
+        })
+    };
+
+    let mut succeeded = 0usize;
+    let mut refusals = Vec::new();
+    for attempt in 0..4 {
+        let archive = temp.path().join(format!("contended-{attempt}.tzap"));
+        let output = Command::cargo_bin("tzap")
+            .unwrap()
+            .args(["create", "--no-encryption", "-o", archive.to_str().unwrap(), source.to_str().unwrap()])
+            .output()
+            .unwrap();
+
+        if output.status.success() {
+            succeeded += 1;
+            // A successful create must produce an archive that verifies. A race
+            // absorbed by the retry must not leave the member's index entry and
+            // its PAX records describing two different observations.
+            Command::cargo_bin("tzap").unwrap().args(["verify", archive.to_str().unwrap()]).assert().success();
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("metadata capture") || stderr.contains("changed") || stderr.contains("ended before"),
+                "a create refused under contention must say the input changed; got: {stderr}"
+            );
+            assert!(!stderr.contains("panicked"), "a losing race must be reported, not panic: {stderr}");
+            refusals.push(stderr.trim().to_owned());
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = writer.join();
+
+    // Every outcome was either a verified archive or a refusal naming a cause;
+    // both are asserted in the loop. A run where nothing happened at all would
+    // mean the fixture stopped exercising anything.
+    assert_eq!(succeeded + refusals.len(), 4, "every attempt must either produce a verified archive or explain itself");
+}

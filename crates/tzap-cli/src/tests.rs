@@ -3855,3 +3855,45 @@ fn bare_relative_path_detects_output_collision_for_multi_volume() {
     let err_msg = result.unwrap_err().to_string();
     assert!(err_msg.contains("already exists"), "expected collision error, got: {err_msg}");
 }
+
+/// One observation of an input must describe one object.
+///
+/// The spec's index fields (size, mode, mtime) and its PAX records used to come
+/// from two different looks at the file: the scan sampled an identity, and the
+/// capture was retried against that stale identity afterwards. That split had
+/// two consequences -- the retry could never succeed once the file had really
+/// changed, and a file that changed mid-scan could produce an index entry and a
+/// metadata record describing different states. `observe_regular_input` exists
+/// to keep them together, so assert they actually agree.
+#[test]
+fn one_observation_of_an_input_describes_a_single_object() {
+    use crate::commands::create::observe_regular_input;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("observed.bin");
+    fs::write(&path, vec![0xa5; 5000]).unwrap();
+
+    let observation = observe_regular_input(&path).unwrap();
+
+    assert_eq!(observation.identity.len, observation.metadata.len(), "identity and stat must agree on size");
+    assert_eq!(observation.identity.len, 5000);
+    assert_eq!(
+        observation.identity.mtime,
+        os_input::archive_timestamp(observation.metadata.modified().unwrap()).unwrap(),
+        "identity and stat must agree on mtime"
+    );
+    assert_eq!(observation.captured.metadata.source_os, tzap_core::entry_metadata::host_source_os_label());
+
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        observation.captured.macos_identity,
+        Some(tzap_core::macos_metadata::MacosMetadataIdentity::from_metadata(&observation.metadata)),
+        "the capture must have read the same object the stat described"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let owner = observation.captured.metadata.posix_owner.as_ref().expect("a POSIX host records ownership");
+        assert_eq!((owner.uid, owner.gid), (u64::from(observation.metadata.uid()), u64::from(observation.metadata.gid())));
+    }
+}

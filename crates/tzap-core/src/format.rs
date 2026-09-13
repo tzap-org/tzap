@@ -63,7 +63,11 @@ pub enum ArchiveWriteError {
     #[error(transparent)]
     Format(#[from] FormatError),
 
-    #[error("archive I/O failed")]
+    // The cause belongs in the message, not only in `source()`. Rendered through
+    // the CLI's diagnostic this read as "archive I/O failed: check filesystem
+    // state", which told the user nothing -- the real cause, "input X changed
+    // during read", was there but never shown.
+    #[error("archive I/O failed: {0}")]
     Io(#[source] std::io::Error),
 }
 pub const READER_MAX_ARGON2ID_T_COST: u32 = 100;
