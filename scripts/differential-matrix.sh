@@ -30,13 +30,17 @@ mkdir -p keys corpus/nested/deep corpus/other
 "$NEW" keygen -o keys/raw.hex >/dev/null
 "$NEW" signing-keygen --secret-output keys/sign.sec --public-output keys/sign.pub >/dev/null
 head -c 65536 /dev/urandom > keys/dict.bin
-export MSYS_NO_PATHCONV=1   # Git Bash rewrites "/CN=..." into a Windows path
+# Git Bash rewrites a leading-slash argument into a Windows path, mangling -subj.
+# Scope the opt-out to these calls: exported globally it also stops bash translating
+# /tmp/... for the native binary under test.
+( export MSYS_NO_PATHCONV=1
 openssl genpkey -algorithm X25519 -out keys/recip.key 2>/dev/null
 openssl genpkey -algorithm ed25519 -out keys/ca.key 2>/dev/null
 openssl req -new -x509 -key keys/ca.key -out keys/ca.pem -days 30 -subj "/CN=tzap-matrix-ca" 2>/dev/null
 openssl pkey -in keys/recip.key -pubout -out keys/recip.pub 2>/dev/null
 openssl req -new -key keys/ca.key -out keys/dummy.csr -subj "/CN=tzap-matrix-recipient" 2>/dev/null
 openssl x509 -req -in keys/dummy.csr -CA keys/ca.pem -CAkey keys/ca.key -force_pubkey keys/recip.pub -out keys/recip.pem -days 30 >/dev/null 2>&1
+)
 
 # Corpus: nested directories, a symlink where the platform allows one, and sizes
 # that straddle frame boundaries. Portable shell -- no python, which Git Bash on
@@ -71,6 +75,9 @@ FIXED_COMBOS=()
 # so this cannot quietly hide a widening of what the writer allows.
 : "${EXPECTED_FIXES:=Windows BackupRead did not return the default data stream}"
 
+# Strip the volatile parts of an error before comparing two builds' refusals.
+normalise_err() { sed -E 's/[A-Za-z0-9_.-]*\.tzap-create-[A-Za-z0-9]+\.partial/<tmp>/g; s#tmp\.[A-Za-z0-9]{8,}#<tmpdir>#g' "$1"; }
+
 is_expected_fix() {
   local err="$1" pattern
   [ -n "${EXPECTED_FIXES:-}" ] || return 1
@@ -104,6 +111,24 @@ rename_outputs() {
   return 0
 }
 
+# The reference cannot build this shape, so there is nothing to compare against.
+# Still require the candidate's own archive to verify, list and extract back to
+# the source, so the combination is covered rather than merely counted.
+candidate_round_trip() {
+  local name="$1" work="$2" prefix="$3" tree="$4"
+  local pos flagged
+  pos=$(vols_positional "$work" "$prefix"); flagged=$(vols_flagged "$work" "$prefix")
+  [ -n "$pos" ] || { echo "  FAIL [$name] candidate produced no archive"; return 1; }
+  $NEW verify $READ_KEY $pos >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate verify: $(tail -1 "$work/rt.e")"; return 1; }
+  $NEW list $READ_KEY $flagged >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate list: $(tail -1 "$work/rt.e")"; return 1; }
+  rm -rf "$work/rt.out"
+  $NEW extract $READ_KEY -C "$work/rt.out" $flagged >/dev/null 2>"$work/rt.e" || { echo "  FAIL [$name] candidate extract: $(tail -1 "$work/rt.e")"; return 1; }
+  if [ -n "$tree" ] && ! diff -r "$tree" "$work/rt.out/$tree" >/dev/null 2>&1; then
+    echo "  FAIL [$name] candidate extracted tree differs from the source"; return 1
+  fi
+  return 0
+}
+
 run_combo() {
   local name="$1"; shift
   local create_args=("$@")
@@ -118,6 +143,7 @@ run_combo() {
     local probe_rc=$?
     if [ $probe_rc -eq 0 ]; then
       if is_expected_fix "$(cat "$work/old.err")"; then
+        candidate_round_trip "$name" "$work" probe corpus || { FAIL=$((FAIL+1)); FAILED_COMBOS+=("$name:candidate-round-trip"); rm -rf "$work"; return; }
         FIXED=$((FIXED+1)); FIXED_COMBOS+=("$name"); rm -rf "$work"; return
       fi
       echo "  FAIL [$name] reference rejects this combo but the candidate accepts it: $(tail -1 "$work/old.err")"
@@ -126,7 +152,7 @@ run_combo() {
     if is_expected_fix "$(cat "$work/old.err")"; then
       FIXED=$((FIXED+1)); FIXED_COMBOS+=("$name (candidate now refuses for its own reason: $(tail -1 "$work/probe.err" | cut -c1-70))"); rm -rf "$work"; return
     fi
-    if [ $probe_rc -ne $old_rc ] || ! diff -q <(tail -1 "$work/old.err") <(tail -1 "$work/probe.err") >/dev/null 2>&1; then
+    if [ $probe_rc -ne $old_rc ] || ! diff -q <(normalise_err "$work/old.err" | tail -1) <(normalise_err "$work/probe.err" | tail -1) >/dev/null 2>&1; then
       echo "  FAIL [$name] both reject but differently: ref=[rc=$old_rc $(tail -1 "$work/old.err")] cand=[rc=$probe_rc $(tail -1 "$work/probe.err")]"
       FAIL=$((FAIL+1)); FAILED_COMBOS+=("$name:reject-mismatch"); rm -rf "$work"; return
     fi
@@ -287,6 +313,8 @@ stream_combo() {
     rm -f "$work"/out*.tzap "$work/out.boot"
     if eval "${make//@BIN@/$NEW}" >/dev/null 2>"$work/probe.err"; then
       if is_expected_fix "$(cat "$work/e")"; then
+        rename_outputs "$work" probe
+        candidate_round_trip "$name" "$work" probe "$expect_tree" || { FAIL=$((FAIL+1)); FAILED_COMBOS+=("$name:candidate-round-trip"); rm -rf "$work"; return; }
         FIXED=$((FIXED+1)); FIXED_COMBOS+=("$name"); rm -rf "$work"; return
       fi
       echo "  FAIL [$name] reference rejects this combo but the candidate accepts it: $(tail -1 "$work/e")"
@@ -295,7 +323,7 @@ stream_combo() {
     if is_expected_fix "$(cat "$work/e")"; then
       FIXED=$((FIXED+1)); FIXED_COMBOS+=("$name (candidate now refuses for its own reason: $(tail -1 "$work/probe.err" | cut -c1-70))"); rm -rf "$work"; return
     fi
-    if ! diff -q <(tail -1 "$work/e") <(tail -1 "$work/probe.err") >/dev/null 2>&1; then
+    if ! diff -q <(normalise_err "$work/e" | tail -1) <(normalise_err "$work/probe.err" | tail -1) >/dev/null 2>&1; then
       echo "  FAIL [$name] both reject but differently: ref=[$(tail -1 "$work/e")] cand=[$(tail -1 "$work/probe.err")]"
       FAIL=$((FAIL+1)); FAILED_COMBOS+=("$name:reject-mismatch"); rm -rf "$work"; return
     fi
