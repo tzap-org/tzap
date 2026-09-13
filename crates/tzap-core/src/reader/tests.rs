@@ -2662,6 +2662,34 @@ fn batch_lookup_matches_per_path_lookup_including_duplicates_and_misses() {
 }
 
 #[test]
+fn batch_lookup_spans_multiple_index_shards() {
+    // Index shards hold DEFAULT_FILES_PER_INDEX_SHARD (10_000) files, so every other
+    // lookup test in this file runs against a single shard and never exercises the
+    // candidate-union path across shards. Cross that boundary deliberately.
+    let contents: Vec<(String, Vec<u8>)> = (0..10_050).map(|i| (format!("f{i:05}.txt"), format!("c{i}").into_bytes())).collect();
+    let files: Vec<RegularFile<'_>> = contents.iter().map(|(path, body)| RegularFile::new(path, body)).collect();
+    let archive = write_archive(&files, &master_key(), single_stream_options()).unwrap();
+    let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+    assert!(opened.index_root.shards.len() > 1, "expected a multi-shard index, got {}", opened.index_root.shards.len());
+
+    // Sample across the whole key space so the request spans every shard, and check
+    // the batch against the per-path lookup it replaced.
+    let sampled: Vec<String> = (0..10_050).step_by(97).map(|i| format!("f{i:05}.txt")).collect();
+    let batched = opened.lookup_index_entries(&sampled).unwrap();
+    assert_eq!(batched.len(), sampled.len());
+    for (path, (returned_path, entry)) in sampled.iter().zip(batched.iter()) {
+        assert_eq!(returned_path, path);
+        assert_eq!(*entry, opened.lookup_index_entry(path).unwrap());
+        assert!(entry.is_some(), "{path} should resolve");
+    }
+
+    // A single path must still resolve correctly when the archive has many shards.
+    let one = opened.lookup_index_entries(&["f09999.txt".to_string()]).unwrap();
+    assert_eq!(one, vec![("f09999.txt".to_string(), opened.lookup_index_entry("f09999.txt").unwrap())]);
+    assert!(one[0].1.is_some());
+}
+
+#[test]
 fn list_and_extract_use_final_view_for_duplicate_paths() {
     let archive = write_archive(
         &[
