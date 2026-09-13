@@ -2336,6 +2336,38 @@ fn windows_opaque_reparse_tag_round_trips_as_skipped_placeholder_and_exact_data(
 
 #[cfg(windows)]
 #[test]
+fn windows_directory_input_survives_a_non_resident_index() {
+    // A directory has no default data stream. That was only tolerated while the
+    // NTFS index stayed resident in the MFT record, because a resident directory
+    // reports length 0 and fell through the zero-length arm. Once the index grew
+    // the length went non-zero and collection failed with "BackupRead did not
+    // return the default data stream", so `tzap create <dir>` broke on any
+    // directory holding more than a handful of entries.
+    //
+    // Both shapes below push the index out of the record: many short names, and
+    // few very long ones.
+    for (label, count, name_len) in [("many short names", 64usize, 8usize), ("few long names", 6, 200)] {
+        let temp = windows_test_tempdir();
+        let source = temp.path().join("corpus");
+        fs::create_dir(&source).unwrap();
+        for i in 0..count {
+            let stem = format!("{i:0width$}", width = name_len);
+            fs::write(source.join(format!("{stem}.bin")), format!("body {i}").as_bytes()).unwrap();
+        }
+
+        let specs = collect_input_specs(&[source.to_string_lossy().into_owned()])
+            .unwrap_or_else(|error| panic!("{label}: collecting a directory with a non-resident index failed: {error:#}"));
+
+        // The directory itself plus every file under it.
+        assert_eq!(specs.len(), count + 1, "{label}: member count");
+        assert_eq!(specs[0].archive_path, "corpus", "{label}: first member is the directory");
+        assert_eq!(specs[0].entry_kind, SourceEntryKind::Directory, "{label}: directory kind");
+        assert_eq!(specs.iter().filter(|spec| spec.entry_kind == SourceEntryKind::Regular).count(), count, "{label}: regular members");
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_selected_hardlinks_store_data_once_and_restore_shared_file_identity() {
     let temp = windows_test_tempdir();
     let alpha = temp.path().join("alpha.bin");

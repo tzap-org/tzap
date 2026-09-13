@@ -2031,6 +2031,13 @@ pub(crate) fn capture_windows_backup_streams(input: &Path, file: &File, expected
                 0
             }
         }
+        // A directory has no default data stream, so BackupRead never emits BACKUP_DATA for
+        // one. That used to be covered only by accident, through the zero-length arm below:
+        // an NTFS directory reports length 0 only while its index is resident in the MFT
+        // record, so as soon as the index grew -- more entries, or longer names -- the length
+        // went non-zero and enumeration failed. Small directories already resolved to 0 here,
+        // so this changes nothing for the shapes that worked.
+        None if file_metadata.is_dir() => 0,
         // BackupRead may omit BACKUP_DATA entirely for a zero-length unnamed stream. Successful
         // enumeration still proves there are no stream attributes to preserve in that case.
         None if file_metadata.len() == 0 => 0,
