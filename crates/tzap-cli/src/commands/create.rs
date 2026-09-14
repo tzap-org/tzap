@@ -35,6 +35,30 @@ fn create_summary_fec_fragment(options: &WriterOptions, tolerance: u8) -> String
     format!("data:parity {}:{}, {resilience}", options.fec_data_shards, options.fec_parity_shards)
 }
 
+/// Report what this run could not archive, after the summary of what it did.
+///
+/// Called from every success path: an input can be skipped or change underneath
+/// us in any create mode, and wiring this into one of them is how it silently
+/// did nothing for the others.
+fn report_inputs_not_fully_archived(quiet: bool) -> Result<()> {
+    // Files that moved while they were archived. The archive is complete and
+    // readable; these members hold what was there when archiving started.
+    for note in take_inputs_changed_during_read() {
+        eprintln!("note: {note}");
+    }
+    // Inputs left out entirely. Stated after the summary so what was produced
+    // comes first, then what it is missing.
+    let skipped = take_skipped_inputs();
+    for note in &skipped {
+        eprintln!("warning: {note}");
+    }
+    if !skipped.is_empty() {
+        emit_success_summary(quiet, &format!("{} input(s) skipped; the archive contains everything else", skipped.len()))?;
+        mark_archive_incomplete();
+    }
+    Ok(())
+}
+
 pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
     let CreateArgs {
         output,
@@ -254,14 +278,7 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
         }
         let write_outputs = write_outputs_started.elapsed();
         emit_success_summary(quiet, &summary_text)?;
-        // Files that moved while they were archived. The archive is complete and
-        // readable; these members hold what was there when archiving started.
-        // Said plainly and never suppressed by --quiet: it changes what the
-        // archive contains, so the person needs to know even in a scripted run.
-        let changed = take_inputs_changed_during_read();
-        for note in &changed {
-            eprintln!("note: {note}");
-        }
+        report_inputs_not_fully_archived(quiet)?;
         if let Some(profile) = root_auth_profile.as_ref() {
             emit_success_summary(quiet, &format!("  root auth: {} signed", profile.label()))?;
         }
@@ -337,6 +354,8 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
             bit_rot_buffer_pct
         );
         emit_success_summary(quiet, &summary)?;
+        report_inputs_not_fully_archived(quiet)?;
+        report_inputs_not_fully_archived(quiet)?;
         emit_success_summary(quiet, "  key wrap: recipient certificate")?;
         if let Some(path) = bootstrap_output {
             emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
@@ -387,6 +406,8 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
             bit_rot_buffer_pct
         );
         emit_success_summary(quiet, &summary)?;
+        report_inputs_not_fully_archived(quiet)?;
+        report_inputs_not_fully_archived(quiet)?;
         if let Some(profile) = root_auth_profile.as_ref() {
             emit_success_summary(quiet, &format!("  root auth: {} signed", profile.label()))?;
         }
@@ -451,6 +472,7 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
         bit_rot_buffer_pct
     );
     emit_success_summary(quiet, &summary)?;
+    report_inputs_not_fully_archived(quiet)?;
     if let Some(profile) = root_auth_profile.as_ref() {
         emit_success_summary(quiet, &format!("  root auth: {} signed", profile.label()))?;
     }
@@ -866,6 +888,30 @@ pub(crate) fn input_specs_total_size(specs: &[InputSpec]) -> Result<u64> {
     specs.iter().try_fold(0u64, |sum, entry| sum.checked_add(entry.size).ok_or_else(|| anyhow!("input byte count overflow")))
 }
 
+/// Collect an input found while walking a directory, skipping it rather than
+/// failing the run when it cannot be read.
+///
+/// Matches GNU tar, bsdtar and 7-Zip: a file the archiver cannot open is
+/// reported and passed over, and the archive is still produced from everything
+/// else. The run exits non-zero so a script still learns something was left out.
+///
+/// Only for inputs *discovered* during the walk. An input the caller named on
+/// the command line still fails the run -- a typo should say so rather than
+/// quietly produce an archive missing the thing that was asked for.
+fn collect_child_input_spec(input: &Path, archive_path: &Path, out: &mut Vec<InputSpec>) -> Result<()> {
+    let before = out.len();
+    match collect_one_input_spec(input, archive_path, out) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Anything already pushed for this input describes a half-read
+            // object; drop it so the archive never carries a partial entry.
+            out.truncate(before);
+            note_input_skipped(input, &format!("{error:#}"));
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mut Vec<InputSpec>) -> Result<()> {
     #[cfg(windows)]
     use std::os::windows::fs::MetadataExt as _;
@@ -939,7 +985,7 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
             let child_name = entry.file_name().into_string().map_err(|_| anyhow!("input path is not valid UTF-8"))?;
-            collect_one_input_spec(&entry.path(), &archive_path.join(child_name), out)?;
+            collect_child_input_spec(&entry.path(), &archive_path.join(child_name), out)?;
         }
         return Ok(());
     }

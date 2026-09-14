@@ -733,6 +733,45 @@ fn record_input_changed_during_read(path: &str, declared: u64, padded: u64) {
     }
 }
 
+/// Note an input this run could not archive, so the rest still can be.
+///
+/// Refusing the whole archive because one file is unreadable is not what an
+/// archiver should do, and is not what any of the established ones do: GNU tar
+/// warns and exits 2, bsdtar warns and exits 1, 7-Zip warns and exits 1 -- all
+/// three still write the archive with everything they could read. A backup that
+/// produces nothing because one file had the wrong permissions is worse than a
+/// backup that is honest about what it skipped.
+pub(crate) fn note_input_skipped(path: &Path, reason: &str) {
+    let note = format!("skipped {}: {reason}", path.display());
+    if let Ok(mut notes) = SKIPPED_INPUTS.lock() {
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+}
+
+static SKIPPED_INPUTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether this run left something out of the archive it produced.
+///
+/// Separate from the error path because the archive exists and is valid: the
+/// caller gets it, and the exit code says it is not the whole story. This is the
+/// distinction GNU tar draws with exit 2 and 7-Zip with exit 1.
+static ARCHIVE_INCOMPLETE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn mark_archive_incomplete() {
+    ARCHIVE_INCOMPLETE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn archive_was_incomplete() -> bool {
+    ARCHIVE_INCOMPLETE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Everything this run could not archive, in the order it was noticed.
+pub(crate) fn take_skipped_inputs() -> Vec<String> {
+    SKIPPED_INPUTS.lock().map(|mut notes| std::mem::take(&mut *notes)).unwrap_or_default()
+}
+
 /// Note a regular input that moved between the scan and the read of its bytes.
 /// Open a regular input for archiving, denying writers while it is read.
 ///

@@ -2354,3 +2354,47 @@ fn cli_create_under_a_concurrent_writer_never_produces_an_unverifiable_archive()
     // mean the fixture stopped exercising anything.
     assert_eq!(succeeded + refusals.len(), 4, "every attempt must either produce a verified archive or explain itself");
 }
+
+/// One unreadable file must not cost the whole archive.
+///
+/// GNU tar warns and exits 2, bsdtar warns and exits 1, 7-Zip warns and exits 1
+/// -- all three still write the archive containing everything they could read.
+/// tzap used to refuse outright, which for a backup of a live system means one
+/// wrongly-permissioned file produces nothing at all. The archive is delivered,
+/// the skip is named, and the exit code lets a script tell it was incomplete.
+#[cfg(unix)]
+#[test]
+fn cli_create_skips_an_unreadable_input_and_still_writes_the_archive() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("tree");
+    let archive = temp.path().join("tree.tzap");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("readable.txt"), b"kept\n").unwrap();
+    fs::write(source.join("locked.txt"), b"unreadable\n").unwrap();
+    fs::set_permissions(source.join("locked.txt"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Running as root defeats the fixture: everything is readable, so there is
+    // nothing to skip and the test would assert on the wrong thing.
+    if fs::File::open(source.join("locked.txt")).is_ok() {
+        return;
+    }
+
+    let output =
+        Command::cargo_bin("tzap").unwrap().args(["create", "--no-encryption", "-o", archive.to_str().unwrap(), source.to_str().unwrap()]).output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "an incomplete archive must not report plain success: {stderr}");
+    assert!(stderr.contains("locked.txt"), "the skipped file must be named: {stderr}");
+    assert!(stderr.contains("skipped"), "the skip must be stated plainly: {stderr}");
+
+    // The point of the whole exercise: the archive exists, verifies, and holds
+    // everything that could be read.
+    assert!(archive.exists(), "the archive must still be written");
+    Command::cargo_bin("tzap").unwrap().args(["verify", archive.to_str().unwrap()]).assert().success();
+    let listed = Command::cargo_bin("tzap").unwrap().args(["list", archive.to_str().unwrap()]).assert().success().get_output().stdout.clone();
+    let listed = String::from_utf8_lossy(&listed);
+    assert!(listed.contains("readable.txt"), "the readable member must be archived: {listed}");
+    assert!(!listed.contains("locked.txt"), "the unreadable member must not be claimed: {listed}");
+}
