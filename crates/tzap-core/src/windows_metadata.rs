@@ -270,7 +270,7 @@ pub fn validate_windows_known_reparse_data(data: &[u8]) -> io::Result<WindowsKno
         }
         Ok(WindowsKnownReparse::RelativeSymlink { portable_target: target })
     } else {
-        if !substitute.starts_with("\\\\??\\") || print.is_empty() {
+        if !substitute.starts_with("\\??\\") || print.is_empty() {
             return Err(invalid("junction path fields are not canonical"));
         }
         Ok(WindowsKnownReparse::Junction)
