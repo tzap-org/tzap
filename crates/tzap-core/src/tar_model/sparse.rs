@@ -240,107 +240,14 @@ pub(crate) fn prepare_windows_sparse_file(file: &fs::File, logical_size: u64) ->
 
 #[cfg(windows)]
 pub(crate) fn query_windows_sparse_ranges(file: &fs::File, logical_size: u64) -> Result<Vec<SparseExtent>, FormatError> {
-    use std::mem::size_of;
-    use std::os::windows::io::AsRawHandle;
-    use std::ptr;
-    use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
-    use windows_sys::Win32::System::Ioctl::{FILE_ALLOCATED_RANGE_BUFFER, FSCTL_QUERY_ALLOCATED_RANGES};
-    use windows_sys::Win32::System::IO::DeviceIoControl;
-
-    const QUERY_BATCH: usize = 1024;
-    if logical_size == 0 {
-        return Ok(Vec::new());
-    }
-    let logical_size_i64 = i64::try_from(logical_size).map_err(|_| FormatError::FilesystemExtractionFailed("sparse logical size exceeds Windows range API"))?;
-    let mut query_start = 0u64;
-    let mut extents = Vec::<SparseExtent>::new();
-    while query_start < logical_size {
-        let mut query = FILE_ALLOCATED_RANGE_BUFFER { FileOffset: query_start as i64, Length: logical_size_i64 - query_start as i64 };
-        let mut output = [FILE_ALLOCATED_RANGE_BUFFER::default(); QUERY_BATCH];
-        let mut bytes_returned = 0u32;
-        // SAFETY: the live handle and fixed-size buffers remain valid for this synchronous call.
-        let success = unsafe {
-            DeviceIoControl(
-                file.as_raw_handle().cast(),
-                FSCTL_QUERY_ALLOCATED_RANGES,
-                (&mut query as *mut FILE_ALLOCATED_RANGE_BUFFER).cast(),
-                size_of::<FILE_ALLOCATED_RANGE_BUFFER>() as u32,
-                output.as_mut_ptr().cast(),
-                size_of::<[FILE_ALLOCATED_RANGE_BUFFER; QUERY_BATCH]>() as u32,
-                &mut bytes_returned,
-                ptr::null_mut(),
-            )
-        };
-        let error = std::io::Error::last_os_error();
-        if success == 0 && error.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
-            return Err(FormatError::FilesystemExtractionFailed("failed to query restored sparse ranges"));
-        }
-        if bytes_returned as usize % size_of::<FILE_ALLOCATED_RANGE_BUFFER>() != 0 {
-            return Err(FormatError::FilesystemExtractionFailed("Windows returned a truncated restored sparse range"));
-        }
-        let count = bytes_returned as usize / size_of::<FILE_ALLOCATED_RANGE_BUFFER>();
-        if count > QUERY_BATCH || (success == 0 && count == 0) {
-            return Err(FormatError::FilesystemExtractionFailed("restored sparse range query made no progress"));
-        }
-        let mut next_query_start = query_start;
-        for range in &output[..count] {
-            if range.FileOffset < 0 || range.Length <= 0 {
-                return Err(FormatError::FilesystemExtractionFailed("Windows returned an invalid restored sparse range"));
-            }
-            let offset = range.FileOffset as u64;
-            let end =
-                offset.checked_add(range.Length as u64).ok_or(FormatError::FilesystemExtractionFailed("restored sparse range overflow"))?.min(logical_size);
-            if offset >= logical_size || end <= offset {
-                return Err(FormatError::FilesystemExtractionFailed("Windows returned an out-of-bounds restored sparse range"));
-            }
-            if let Some(previous) = extents.last_mut() {
-                let previous_end = previous.offset + previous.length;
-                if offset <= previous_end {
-                    previous.length = previous_end.max(end) - previous.offset;
-                } else {
-                    extents.push(SparseExtent { offset, length: end - offset });
-                }
-            } else {
-                extents.push(SparseExtent { offset, length: end - offset });
-            }
-            next_query_start = next_query_start.max(end);
-        }
-        if success != 0 {
-            break;
-        }
-        if next_query_start <= query_start {
-            return Err(FormatError::FilesystemExtractionFailed("restored sparse range query did not advance"));
-        }
-        query_start = next_query_start;
-    }
-    Ok(extents)
+    crate::windows_metadata::query_windows_allocated_ranges(file, logical_size)
+        .map_err(|_| FormatError::FilesystemExtractionFailed("failed to query restored sparse ranges"))
 }
 
 #[cfg(windows)]
 pub(crate) fn windows_file_system_is_refs(file: &fs::File) -> Result<bool, FormatError> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
-
-    let mut name = [0u16; 32];
-    // SAFETY: the file handle is live, optional outputs are null, and `name` is a writable buffer
-    // whose capacity is passed exactly to the synchronous query.
-    if unsafe {
-        GetVolumeInformationByHandleW(
-            file.as_raw_handle().cast(),
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            name.as_mut_ptr(),
-            name.len() as u32,
-        )
-    } == 0
-    {
-        return Err(FormatError::FilesystemExtractionFailed("failed to identify Windows destination filesystem"));
-    }
-    let length = name.iter().position(|unit| *unit == 0).unwrap_or(name.len());
-    Ok(String::from_utf16_lossy(&name[..length]).eq_ignore_ascii_case("refs"))
+    crate::windows_metadata::windows_file_system_is_refs(file)
+        .map_err(|_| FormatError::FilesystemExtractionFailed("failed to identify Windows destination filesystem"))
 }
 
 #[cfg(windows)]

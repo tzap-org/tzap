@@ -17,8 +17,13 @@ use anyhow::Result;
 #[cfg(windows)]
 use tzap_core::SourceEntryKind;
 use tzap_core::{ArchiveTimestamp, NativeFileMetadata, PortableFileMetadata, SparseExtent};
+
 #[cfg(windows)]
-use tzap_core::{NativeAuxiliaryMetadata, RestoreClass};
+pub(crate) use tzap_core::windows_metadata::{
+    add_refs_sparse_layout_omission as add_windows_refs_sparse_layout_omission, open_windows_metadata_handle, query_windows_allocated_ranges,
+    query_windows_reparse_data, unsupported_windows_file_attribute_reason, validate_windows_known_reparse_data, windows_file_system_is_refs,
+    WindowsKnownReparse,
+};
 
 #[cfg(unix)]
 pub(crate) fn readonly_mode(metadata: &fs::Metadata) -> u32 {
@@ -77,26 +82,6 @@ pub(crate) struct InputIdentity {
     pub(crate) volume_serial: u64,
     #[cfg(windows)]
     pub(crate) file_index: u64,
-}
-
-#[cfg(windows)]
-pub(crate) fn add_windows_refs_sparse_layout_omission(native: &mut NativeFileMetadata) {
-    const HEADER: &str = "tzap-capture-report-v1\n";
-    const ROW: &str = "windows-backup-v1\tsparse-layout\tunsupported-filesystem\tReFS%20does%20not%20expose%20exact%20sparse%20ranges";
-    if let Some(report) = native.auxiliary_records.iter_mut().find(|record| record.kind == "tzap.capture-report") {
-        let text = std::str::from_utf8(&report.payload).expect("internally generated capture reports are UTF-8");
-        let mut rows = text.strip_prefix(HEADER).expect("internally generated capture report has canonical header").split_terminator('\n').collect::<Vec<_>>();
-        rows.push(ROW);
-        rows.sort_unstable();
-        rows.dedup();
-        report.payload = format!("{HEADER}{}\n", rows.join("\n")).into_bytes();
-        report.logical_size = report.payload.len() as u64;
-        return;
-    }
-    let payload = format!("{HEADER}{ROW}\n").into_bytes();
-    let mut report = NativeAuxiliaryMetadata::new("tzap.capture-report", "tzap-core-v1", RestoreClass::None, payload);
-    report.native = false;
-    native.auxiliary_records.push(report);
 }
 
 #[cfg(target_os = "linux")]
@@ -199,127 +184,6 @@ pub(crate) fn collect_windows_known_reparse_input(input: &Path, archive_path: &P
         }
     }
     Ok(())
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WindowsKnownReparse {
-    RelativeSymlink { portable_target: Vec<u8> },
-    Junction,
-    Opaque,
-}
-
-#[cfg(windows)]
-pub(crate) fn query_windows_reparse_data(file: &File) -> io::Result<Vec<u8>> {
-    use std::os::windows::io::AsRawHandle;
-    use std::ptr;
-    use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
-    use windows_sys::Win32::System::IO::DeviceIoControl;
-
-    const MAX_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
-    let mut buffer = vec![0u8; MAX_REPARSE_DATA_BUFFER_SIZE];
-    let mut bytes_returned = 0u32;
-    // SAFETY: the handle is live and the fixed output allocation remains valid for this
-    // synchronous call. FSCTL_GET_REPARSE_POINT has no input buffer.
-    if unsafe {
-        DeviceIoControl(
-            file.as_raw_handle().cast(),
-            FSCTL_GET_REPARSE_POINT,
-            ptr::null(),
-            0,
-            buffer.as_mut_ptr().cast(),
-            buffer.len() as u32,
-            &mut bytes_returned,
-            ptr::null_mut(),
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    buffer.truncate(bytes_returned as usize);
-    if buffer.len() < 8 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "reparse buffer is truncated"));
-    }
-    let tag = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
-    let declared = usize::from(u16::from_le_bytes([buffer[4], buffer[5]]));
-    let header_len = if tag & 0x8000_0000 == 0 { 24 } else { 8 };
-    if declared + header_len != buffer.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "reparse buffer length is inconsistent"));
-    }
-    Ok(buffer)
-}
-
-#[cfg(windows)]
-pub(crate) fn validate_windows_known_reparse_data(data: &[u8]) -> io::Result<WindowsKnownReparse> {
-    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
-    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
-    const SYMLINK_FLAG_RELATIVE: u32 = 1;
-
-    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
-    if data.len() < 8 {
-        return Err(invalid("reparse buffer is truncated"));
-    }
-    let tag = u32::from_le_bytes(data[0..4].try_into().unwrap());
-    let payload_len = usize::from(u16::from_le_bytes(data[4..6].try_into().unwrap()));
-    let header_len = if tag & 0x8000_0000 == 0 { 24 } else { 8 };
-    if payload_len + header_len != data.len() {
-        return Err(invalid("reparse buffer length is inconsistent"));
-    }
-    let (fixed_len, flags) = match tag {
-        IO_REPARSE_TAG_SYMLINK => {
-            if payload_len < 12 {
-                return Err(invalid("symbolic-link reparse payload is truncated"));
-            }
-            (12usize, u32::from_le_bytes(data[16..20].try_into().unwrap()))
-        }
-        IO_REPARSE_TAG_MOUNT_POINT => {
-            if payload_len < 8 {
-                return Err(invalid("mount-point reparse payload is truncated"));
-            }
-            (8usize, 0)
-        }
-        _ => return Ok(WindowsKnownReparse::Opaque),
-    };
-    let substitute_offset = usize::from(u16::from_le_bytes(data[8..10].try_into().unwrap()));
-    let substitute_len = usize::from(u16::from_le_bytes(data[10..12].try_into().unwrap()));
-    let print_offset = usize::from(u16::from_le_bytes(data[12..14].try_into().unwrap()));
-    let print_len = usize::from(u16::from_le_bytes(data[14..16].try_into().unwrap()));
-    if substitute_offset % 2 != 0 || substitute_len % 2 != 0 || print_offset % 2 != 0 || print_len % 2 != 0 {
-        return Err(invalid("reparse path fields are not UTF-16 aligned"));
-    }
-    let path_buffer = &data[8 + fixed_len..];
-    let decode_name = |offset: usize, len: usize| -> io::Result<String> {
-        let end = offset.checked_add(len).ok_or_else(|| invalid("reparse path range overflows"))?;
-        let bytes = path_buffer.get(offset..end).ok_or_else(|| invalid("reparse path range exceeds the payload"))?;
-        let units = bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect::<Vec<_>>();
-        let text = String::from_utf16(&units).map_err(|_| invalid("reparse path is not valid UTF-16"))?;
-        if text.contains('\0') {
-            return Err(invalid("reparse path contains NUL"));
-        }
-        Ok(text)
-    };
-    let substitute = decode_name(substitute_offset, substitute_len)?;
-    let print = decode_name(print_offset, print_len)?;
-    if substitute.is_empty() {
-        return Err(invalid("reparse substitute name is empty"));
-    }
-
-    if tag == IO_REPARSE_TAG_SYMLINK {
-        if flags != SYMLINK_FLAG_RELATIVE {
-            return Err(invalid("only relative Windows symbolic links are supported"));
-        }
-        let target = if print.is_empty() { substitute } else { print };
-        let target = target.replace('\\', "/").into_bytes();
-        if target.is_empty() || target[0] == b'/' || target.contains(&b':') {
-            return Err(invalid("Windows symbolic-link target is absolute"));
-        }
-        Ok(WindowsKnownReparse::RelativeSymlink { portable_target: target })
-    } else {
-        if !substitute.starts_with("\\??\\") || print.is_empty() {
-            return Err(invalid("junction path fields are not canonical"));
-        }
-        Ok(WindowsKnownReparse::Junction)
-    }
 }
 
 pub(crate) fn input_identity(metadata: &fs::Metadata) -> io::Result<InputIdentity> {
@@ -435,159 +299,18 @@ pub(crate) fn input_identity_matches_after_read(expected: InputIdentity, actual:
 }
 
 #[cfg(windows)]
+// The CLI only maps core's platform identity into its scan model; Windows API
+// queries and metadata policy remain owned by tzap-core.
 pub(crate) fn augment_windows_input_identity(identity: &mut InputIdentity, file: &File) -> io::Result<()> {
-    use std::mem::size_of;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO,
-    };
-
-    let handle = file.as_raw_handle().cast();
-    let mut basic = FILE_BASIC_INFO::default();
-    // SAFETY: `handle` is live and both output pointers reference correctly sized structures.
-    if unsafe { GetFileInformationByHandleEx(handle, FileBasicInfo, (&mut basic as *mut FILE_BASIC_INFO).cast(), size_of::<FILE_BASIC_INFO>() as u32) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut by_handle = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `handle` is live and `by_handle` is a valid writable output structure.
-    if unsafe { GetFileInformationByHandle(handle, &mut by_handle) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    identity.creation_time_100ns = basic.CreationTime as u64;
-    identity.last_access_time_100ns = basic.LastAccessTime as u64;
-    identity.change_time_100ns = basic.ChangeTime as u64;
-    identity.file_attributes = basic.FileAttributes;
-    identity.link_count = u64::from(by_handle.nNumberOfLinks);
-    identity.volume_serial = u64::from(by_handle.dwVolumeSerialNumber);
-    identity.file_index = (u64::from(by_handle.nFileIndexHigh) << 32) | u64::from(by_handle.nFileIndexLow);
+    let observed = tzap_core::windows_metadata::query_windows_input_identity(file)?;
+    identity.creation_time_100ns = observed.creation_time_100ns;
+    identity.last_access_time_100ns = observed.last_access_time_100ns;
+    identity.change_time_100ns = observed.change_time_100ns;
+    identity.file_attributes = observed.file_attributes;
+    identity.link_count = observed.link_count;
+    identity.volume_serial = observed.volume_serial;
+    identity.file_index = observed.file_index;
     Ok(())
-}
-
-#[cfg(windows)]
-pub(crate) fn query_windows_allocated_ranges(file: &File, logical_size: u64) -> io::Result<Vec<SparseExtent>> {
-    use std::mem::size_of;
-    use std::os::windows::io::AsRawHandle;
-    use std::ptr;
-    use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
-    use windows_sys::Win32::System::Ioctl::{FILE_ALLOCATED_RANGE_BUFFER, FSCTL_QUERY_ALLOCATED_RANGES};
-    use windows_sys::Win32::System::IO::DeviceIoControl;
-
-    const QUERY_BATCH: usize = 1024;
-    const MAX_EXTENTS: usize = 1_048_576;
-    if logical_size == 0 {
-        return Ok(Vec::new());
-    }
-    // FSCTL_QUERY_ALLOCATED_RANGES is not supported by ReFS. Retrieval pointers do not resolve
-    // the ambiguity: ReFS reports LCN -1 for a run that may be either a hole or partially
-    // allocated. Materialize the logical bytes and pair this fallback with an authenticated
-    // sparse-layout omission so the archive cannot claim exact storage-layout fidelity.
-    if windows_file_system_is_refs(file)? {
-        return Ok(vec![SparseExtent { offset: 0, length: logical_size }]);
-    }
-    let logical_size_i64 = i64::try_from(logical_size).map_err(|_| io::Error::other("sparse logical size exceeds Windows range API"))?;
-    let mut query_start = 0u64;
-    let mut extents = Vec::<SparseExtent>::new();
-    while query_start < logical_size {
-        let mut query = FILE_ALLOCATED_RANGE_BUFFER {
-            FileOffset: i64::try_from(query_start).map_err(|_| io::Error::other("sparse query offset exceeds Windows range API"))?,
-            Length: logical_size_i64 - query_start as i64,
-        };
-        let mut output = [FILE_ALLOCATED_RANGE_BUFFER::default(); QUERY_BATCH];
-        let mut bytes_returned = 0u32;
-        // SAFETY: the live file handle and fixed-size input/output buffers remain valid for the
-        // synchronous DeviceIoControl call, and the byte lengths exactly match those buffers.
-        let success = unsafe {
-            DeviceIoControl(
-                file.as_raw_handle().cast(),
-                FSCTL_QUERY_ALLOCATED_RANGES,
-                (&mut query as *mut FILE_ALLOCATED_RANGE_BUFFER).cast(),
-                size_of::<FILE_ALLOCATED_RANGE_BUFFER>() as u32,
-                output.as_mut_ptr().cast(),
-                size_of::<[FILE_ALLOCATED_RANGE_BUFFER; QUERY_BATCH]>() as u32,
-                &mut bytes_returned,
-                ptr::null_mut(),
-            )
-        };
-        let error = io::Error::last_os_error();
-        if success == 0 && error.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
-            return Err(error);
-        }
-        if bytes_returned as usize % size_of::<FILE_ALLOCATED_RANGE_BUFFER>() != 0 {
-            return Err(io::Error::other("Windows returned a truncated allocated-range row"));
-        }
-        let count = bytes_returned as usize / size_of::<FILE_ALLOCATED_RANGE_BUFFER>();
-        if count > QUERY_BATCH || (success == 0 && count == 0) {
-            return Err(io::Error::other("Windows allocated-range query made no progress"));
-        }
-        let mut next_query_start = query_start;
-        for range in &output[..count] {
-            if range.FileOffset < 0 || range.Length <= 0 {
-                return Err(io::Error::other("Windows returned an invalid allocated range"));
-            }
-            let offset = range.FileOffset as u64;
-            let end = offset.checked_add(range.Length as u64).ok_or_else(|| io::Error::other("Windows allocated range overflow"))?.min(logical_size);
-            if offset >= logical_size || end <= offset {
-                return Err(io::Error::other("Windows returned an out-of-bounds allocated range"));
-            }
-            if let Some(previous) = extents.last_mut() {
-                let previous_end = previous.offset + previous.length;
-                if offset <= previous_end {
-                    previous.length = previous_end.max(end) - previous.offset;
-                } else {
-                    extents.push(SparseExtent { offset, length: end - offset });
-                }
-            } else {
-                extents.push(SparseExtent { offset, length: end - offset });
-            }
-            if extents.len() > MAX_EXTENTS {
-                return Err(io::Error::other("sparse extent count exceeds revision-45 limit"));
-            }
-            next_query_start = next_query_start.max(end);
-        }
-        if success != 0 {
-            break;
-        }
-        if next_query_start <= query_start {
-            return Err(io::Error::other("Windows allocated-range query did not advance"));
-        }
-        query_start = next_query_start;
-    }
-    Ok(extents)
-}
-
-#[cfg(windows)]
-pub(crate) fn windows_file_system_is_refs(file: &File) -> io::Result<bool> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
-
-    let mut name = [0u16; 32];
-    // SAFETY: the file handle is live, optional outputs are null, and `name` is writable for the
-    // exact capacity supplied to this synchronous query.
-    if unsafe {
-        GetVolumeInformationByHandleW(
-            file.as_raw_handle().cast(),
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            name.as_mut_ptr(),
-            name.len() as u32,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let length = name.iter().position(|unit| *unit == 0).unwrap_or(name.len());
-    Ok(String::from_utf16_lossy(&name[..length]).eq_ignore_ascii_case("refs"))
-}
-
-#[cfg(windows)]
-pub(crate) fn open_windows_metadata_handle(path: &Path) -> io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT};
-
-    fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).open(path)
 }
 
 pub(crate) struct IdentityCheckedInputReader {
@@ -1050,18 +773,6 @@ pub(crate) fn reject_unsupported_windows_regular_file(metadata: &fs::Metadata, i
         bail!("Windows metadata capture does not support {}: {reason}", input.display());
     }
     Ok(())
-}
-
-#[cfg(windows)]
-pub(crate) fn unsupported_windows_file_attribute_reason(attributes: u32) -> Option<&'static str> {
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
-    [
-        (FILE_ATTRIBUTE_REPARSE_POINT, "reparse points require exact reparse-data capture"),
-        (FILE_ATTRIBUTE_OFFLINE, "offline/cloud placeholders require an explicit hydration policy"),
-    ]
-    .into_iter()
-    .find_map(|(flag, reason)| (attributes & flag != 0).then_some(reason))
 }
 
 /// A native capture plus whatever the host needs to re-open the same object.
