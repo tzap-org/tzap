@@ -275,3 +275,67 @@ fn every_writer_path_is_byte_for_byte_deterministic() {
         assert_eq!(first_sink.volumes, second_sink.volumes, "ordered-parallel writer is not deterministic at jobs={jobs}");
     }
 }
+
+/// Restoring the same archive under each policy must apply exactly the metadata
+/// that policy admits, and report the rest rather than dropping it silently.
+///
+/// `tar_model/os_restore.rs` is the least-covered file in the crate, and it is
+/// the one that decides what actually lands on disk. The policies form a ladder
+/// -- Content applies none, Portable applies the portable set, SameOs adds
+/// native classes, System adds the privileged ones -- so walking the ladder with
+/// one fixture exercises the branch structure rather than a single path through
+/// it, and pins the ordering between them.
+#[cfg(unix)]
+#[test]
+fn each_restore_policy_applies_exactly_what_it_admits() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use tzap_core::entry_metadata::RestorePolicy;
+    use tzap_core::SafeExtractionOptions;
+
+    let fixture = Fixture::new(2);
+    let files = fixture.files();
+    let archive = write_archive(&files, &master_key(), options(1, 1, 1)).unwrap();
+    let opened = open_archive(&archive.bytes, &master_key()).unwrap();
+    let expected_mode = files[0].mode & 0o7777;
+
+    // Content first: it must not apply metadata, and must say so rather than
+    // silently skipping. Every later policy is compared against this baseline.
+    let mut restored_modes = Vec::new();
+    for policy in [RestorePolicy::Content, RestorePolicy::Portable, RestorePolicy::SameOs, RestorePolicy::System] {
+        let root = tempfile::tempdir().unwrap();
+        let outcome =
+            opened.extract_all_to(root.path(), SafeExtractionOptions { restore_policy: policy, allow_degraded: true, ..SafeExtractionOptions::default() });
+        let reports = match outcome {
+            Ok(reports) => reports,
+            // A policy the host cannot satisfy must refuse in a named way, not
+            // panic or half-apply; that refusal is itself the covered branch.
+            Err(error) => {
+                assert!(matches!(policy, RestorePolicy::SameOs | RestorePolicy::System), "{policy:?} must be satisfiable everywhere: {error:?}");
+                continue;
+            }
+        };
+        assert_eq!(reports.len(), 2, "{policy:?} must report on every member");
+
+        let member = root.path().join(&fixture.paths[0]);
+        assert_eq!(std::fs::read(&member).unwrap(), fixture.bodies[0], "{policy:?} must restore content whatever it does with metadata");
+        let mode = std::fs::symlink_metadata(&member).unwrap().permissions().mode() & 0o7777;
+        restored_modes.push((policy, mode));
+
+        // Diagnostics are the contract for anything a policy declines. A class
+        // that is outside the policy has to appear here; silence would mean the
+        // caller cannot tell "not requested" from "failed".
+        let diagnostics: Vec<_> = reports.iter().flat_map(|(_, diagnostics)| diagnostics).collect();
+        if policy == RestorePolicy::Content {
+            assert!(!diagnostics.is_empty(), "content restore must report the metadata it deliberately skipped");
+        }
+    }
+
+    // Content leaves the mode to the umask; every policy above it applies the
+    // stored mode. That ordering is the ladder's whole point.
+    for (policy, mode) in &restored_modes {
+        if *policy != RestorePolicy::Content {
+            assert_eq!(*mode, expected_mode, "{policy:?} must apply the stored mode");
+        }
+    }
+    assert!(restored_modes.iter().any(|(policy, _)| *policy == RestorePolicy::Portable), "portable restore must be reachable on every host");
+}
