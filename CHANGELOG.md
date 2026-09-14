@@ -25,9 +25,10 @@
   (§16.7.2 forbids `-0`), so an optional time in that window is omitted rather
   than approximated, and an `mtime` there fails loudly.
 
-  The differential matrix now carries pre-epoch fixtures and compares the two
-  builds' restored metadata, so no future release can change this without the
-  comparison saying so.
+  A regression in either direction is caught in-build by
+  `cli_round_trip_restores_pre_epoch_times_exactly`,
+  `pre_epoch_times_survive_the_full_encode_parse_round_trip`, and the encoder
+  test that pins `-1.5` literally.
 
 - Fixes a sparse input shortened or replaced mid-archive failing the whole run,
   while an ordinary file of the same size was zero-filled and reported. The two

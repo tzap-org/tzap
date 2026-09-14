@@ -79,7 +79,7 @@ impl TarEntryKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataOperation {
     Capture,
     Parse,
@@ -88,13 +88,46 @@ pub enum MetadataOperation {
     Restore,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl MetadataOperation {
+    /// The wire and display spelling of this operation.
+    ///
+    /// Hosts render diagnostics in their own formats, so the spelling belongs to
+    /// one owner here rather than to each of them. Deriving it from `Debug`
+    /// instead would silently produce `verifyplan` for any variant that is ever
+    /// named with two words.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Capture => "capture",
+            Self::Parse => "parse",
+            Self::Verify => "verify",
+            Self::Plan => "plan",
+            Self::Restore => "restore",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataDiagnosticStatus {
     Partial,
     Unsupported,
     Skipped,
     Materialized,
     Failed,
+}
+
+impl MetadataDiagnosticStatus {
+    /// The wire and display spelling of this status. See [`MetadataOperation::label`].
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Partial => "partial",
+            Self::Unsupported => "unsupported",
+            Self::Skipped => "skipped",
+            Self::Materialized => "materialized",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
