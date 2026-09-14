@@ -717,11 +717,14 @@ fn record_input_changed_during_read(path: &str, declared: u64, padded: u64) {
         let kept = declared.saturating_sub(padded);
         format!(
             "{path} was shortened while being archived; kept the {} still there and filled the remaining {} with zeros",
-            human_bytes(kept),
-            human_bytes(padded)
+            tzap_core::entry_metadata::human_bytes(kept),
+            tzap_core::entry_metadata::human_bytes(padded)
         )
     } else {
-        format!("{path} was still being written while being archived; stored the {} it had when archiving started", human_bytes(declared))
+        format!(
+            "{path} was still being written while being archived; stored the {} it had when archiving started",
+            tzap_core::entry_metadata::human_bytes(declared)
+        )
     };
     if let Ok(mut notes) = CHANGED_DURING_READ.lock() {
         if !notes.contains(&note) {
@@ -762,23 +765,6 @@ pub(crate) fn note_input_changed_before_read(path: &str, declared: u64) {
 /// Everything that moved during this run, in the order it was noticed.
 pub(crate) fn take_inputs_changed_during_read() -> Vec<String> {
     CHANGED_DURING_READ.lock().map(|mut notes| std::mem::take(&mut *notes)).unwrap_or_default()
-}
-
-fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
-    let mut scaled = bytes;
-    let mut remainder = 0u64;
-    let mut unit = 0;
-    while scaled >= 1024 && unit + 1 < UNITS.len() {
-        remainder = scaled % 1024;
-        scaled /= 1024;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} {}", UNITS[0])
-    } else {
-        format!("{scaled}.{} {}", remainder * 10 / 1024, UNITS[unit])
-    }
 }
 
 pub(crate) fn archive_timestamp(time: SystemTime) -> io::Result<ArchiveTimestamp> {
@@ -833,15 +819,6 @@ pub(crate) struct CapturedInputMetadata {
     /// partial by construction and must be declared as such.
     #[cfg(windows)]
     pub(crate) sparse_layout_partial: bool,
-}
-
-/// Whether a capture failure is the transient race worth re-observing for.
-///
-/// The host sees `anyhow::Error`, so it matches on the message tzap-core owns
-/// rather than on a type it cannot see through the context chain.
-pub(crate) fn is_capture_race_error(error: &anyhow::Error) -> bool {
-    let text = error.to_string();
-    text.contains(tzap_core::portable_capture::CAPTURE_RACE_MARKER) || text.contains(tzap_core::portable_capture::CAPTURE_PREOPEN_RACE_MARKER)
 }
 
 pub(crate) fn portable_input_metadata(identity: InputIdentity, input: &Path) -> Result<CapturedInputMetadata> {

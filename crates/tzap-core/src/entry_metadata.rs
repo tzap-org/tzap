@@ -113,6 +113,32 @@ pub fn archive_timestamp_from_system_time(time: std::time::SystemTime) -> Option
     }
 }
 
+/// A byte count as a short human-readable label, e.g. `1.5 MB`.
+///
+/// Lives here because both hosts report the same kinds of thing about the same
+/// archives, and a size that reads differently depending on which tool printed
+/// it is the small end of exactly the drift this module exists to prevent.
+///
+/// Scaled with integer arithmetic: a byte count can exceed what `f64` holds
+/// exactly, and only one decimal place is ever shown.
+#[must_use]
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
+    let mut scaled = bytes;
+    let mut remainder = 0u64;
+    let mut unit = 0;
+    while scaled >= 1024 && unit + 1 < UNITS.len() {
+        remainder = scaled % 1024;
+        scaled /= 1024;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{scaled}.{} {}", remainder * 10 / 1024, UNITS[unit])
+    }
+}
+
 /// The inverse of [`archive_timestamp_from_system_time`].
 ///
 /// `nanoseconds` is a forward offset from `seconds` even when `seconds` is

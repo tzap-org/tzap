@@ -1006,27 +1006,12 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
     #[cfg(windows)]
     reject_unsupported_windows_regular_file(&metadata, input)?;
     let archive_path = archive_path_to_string(archive_path)?;
-    // Re-observe on a lost race instead of retrying against the scan's identity.
-    //
-    // The capture is pinned to the identity the scan sampled, so once the file
-    // has genuinely changed, re-running the capture alone can never succeed: it
-    // spends the retry budget and fails anyway, which made archiving any file
-    // under active write fail outright. Redo the whole observation instead --
-    // stat, identity, sparse ranges and capture all come from one fresh look, so
-    // the index entry and the PAX records still describe a single object. A file
-    // that never settles is still caught, by the identity check the reader runs
-    // while streaming the data.
-    let observation = {
-        let mut attempt = 1usize;
-        loop {
-            match observe_regular_input(input) {
-                Ok(observation) => break observation,
-                Err(error) if is_capture_race_error(&error) && attempt < tzap_core::portable_capture::CAPTURE_ATTEMPTS => attempt += 1,
-                Err(error) => return Err(error),
-            }
-        }
-    };
-    let RegularInputObservation { metadata, identity, sparse_extents, captured } = observation;
+    // One look at the file, not two: stat, identity, sparse ranges and capture all
+    // come from the same observation, so the index entry and the PAX records
+    // always describe a single object. There is no retry -- neither 7-Zip nor
+    // libarchive retries a capture, and re-reading a file that is still being
+    // written cannot converge anyway.
+    let RegularInputObservation { metadata, identity, sparse_extents, captured } = observe_regular_input(input)?;
     #[cfg(target_os = "macos")]
     let macos_identity = captured.macos_identity;
     #[cfg_attr(not(windows), allow(unused_mut))]
