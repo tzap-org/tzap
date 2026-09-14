@@ -15,6 +15,22 @@ use xattr::FileExt as _;
 const INLINE_XATTR_BUDGET: usize = 32 * 1024 * 1024;
 const O_SYMLINK: libc::c_int = 0x0020_0000;
 
+#[cfg(test)]
+type CloneStagingTestHook = (libc::c_int, fn(libc::c_int, &CString));
+
+#[cfg(test)]
+static CLONE_STAGING_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<CloneStagingTestHook>>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn invoke_clone_staging_test_hook(parent_fd: libc::c_int, staging: &CString) {
+    let hook = CLONE_STAGING_TEST_HOOK.get_or_init(|| std::sync::Mutex::new(None)).lock().unwrap().as_ref().copied();
+    if let Some((hook_parent_fd, callback)) = hook {
+        if hook_parent_fd == parent_fd {
+            callback(parent_fd, staging);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MacosMetadataIdentity {
     len: u64,
@@ -935,6 +951,51 @@ mod clone_tests {
         assert_eq!(std::fs::read(&bystander).unwrap(), b"USER DATA THAT MUST SURVIVE", "a restored member named like the staging path was destroyed");
     }
 
+    static CLAIMED_STAGING_NAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn claim_clone_staging_name(parent_fd: libc::c_int, name: &CString) {
+        if CLAIMED_STAGING_NAME.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        // Simulate another process creating the name after the implementation
+        // has checked that it is free but before clonefileat uses it.
+        let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC, 0o600) };
+        assert!(fd >= 0, "the race fixture must be able to claim the staging name");
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        std::io::Write::write_all(&mut file, b"UNRELATED USER DATA").unwrap();
+    }
+
+    #[test]
+    fn restore_retries_when_staging_name_is_claimed_after_selection() {
+        use std::collections::BTreeMap;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.bin");
+        let second = temp.path().join("second.bin");
+        let payload = vec![13u8; 64 * 1024];
+        std::fs::write(&first, &payload).unwrap();
+        std::fs::write(&second, &payload).unwrap();
+        if query_macos_clone_id(&first).is_none() {
+            return;
+        }
+
+        let destination = clone_member(&second);
+        CLAIMED_STAGING_NAME.store(false, std::sync::atomic::Ordering::Release);
+        *CLONE_STAGING_TEST_HOOK.get_or_init(|| std::sync::Mutex::new(None)).lock().unwrap() = Some((destination.parent_fd(), claim_clone_staging_name));
+        let mut groups = BTreeMap::new();
+        groups.insert("f".repeat(32), vec![clone_member(&first), destination]);
+        let outcomes = restore_clone_groups(&groups);
+        *CLONE_STAGING_TEST_HOOK.get_or_init(|| std::sync::Mutex::new(None)).lock().unwrap() = None;
+
+        match &outcomes[0] {
+            CloneRestoreOutcome::Shared { .. } => {}
+            CloneRestoreOutcome::NotShared { reason, .. } => panic!("a claimed staging name must be retried, not reported as a clone failure: {reason}"),
+        }
+        assert_eq!(std::fs::read(temp.path().join(format!("second.bin.tzap-clone-{}-0", std::process::id()))).unwrap(), b"UNRELATED USER DATA");
+        assert_eq!(query_macos_clone_id(&second), query_macos_clone_id(&first), "the next staging name must complete the clone");
+        assert_eq!(std::fs::read(&second).unwrap(), payload);
+    }
+
     #[test]
     fn restore_refuses_to_overwrite_partners_whose_bytes_differ() {
         use std::collections::BTreeMap;
@@ -1182,20 +1243,31 @@ fn clone_over(source: &CloneMember, destination: &CloneMember) -> io::Result<()>
         return Err(io::Error::other("restored clone partners differ; refusing to overwrite"));
     }
 
-    // A unique sibling created with O_EXCL, not a name derived from the
-    // destination's stem. `with_extension("tzap-clone-staging")` *replaces* the
-    // real extension, so `disk2.img` staged through `disk2.tzap-clone-staging`
-    // -- and the unconditional `remove_file` that preceded it silently deleted a
-    // restored member that happened to carry that name.
-    let (staging, staging_c) = reserve_clone_staging_name(destination)?;
     let source_leaf = source.leaf_c()?;
-    // SAFETY: both directory fds are live, both names are NUL-terminated, and the
-    // call is synchronous.
-    if unsafe { libc::clonefileat(source.parent_fd(), source_leaf.as_ptr(), destination.parent_fd(), staging_c.as_ptr(), CLONE_NOFOLLOW) } != 0 {
-        let error = io::Error::last_os_error();
-        remove_staging(destination, &staging_c);
-        return Err(error);
-    }
+    // There is no useful preflight reservation for clonefileat: it refuses an
+    // existing destination, so unlinking a successful O_EXCL probe opens a
+    // TOCTOU window and can destroy a file another process placed there. Let
+    // clonefileat perform the atomic create and treat EEXIST as a name collision.
+    let staging_c = {
+        let mut cloned = None;
+        for attempt in 0..1000u32 {
+            let staging_c = clone_staging_name(destination, attempt)?;
+            #[cfg(test)]
+            invoke_clone_staging_test_hook(destination.parent_fd(), &staging_c);
+            // SAFETY: both directory fds are live, both names are NUL-terminated,
+            // and the call is synchronous.
+            if unsafe { libc::clonefileat(source.parent_fd(), source_leaf.as_ptr(), destination.parent_fd(), staging_c.as_ptr(), CLONE_NOFOLLOW) } == 0 {
+                cloned = Some(staging_c);
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(error);
+        }
+        cloned.ok_or_else(|| io::Error::other("could not find a free clone staging name"))?
+    };
     // `clonefile` copies the *source's* mode, ownership, times, flags, ACL and
     // xattrs along with its storage, so the staged clone currently describes the
     // wrong file. Put the destination's own metadata back before it is published,
@@ -1215,7 +1287,6 @@ fn clone_over(source: &CloneMember, destination: &CloneMember) -> io::Result<()>
         remove_staging(destination, &staging_c);
         return Err(error);
     }
-    let _ = staging;
     Ok(())
 }
 
@@ -1226,40 +1297,17 @@ fn remove_staging(destination: &CloneMember, staging: &CString) {
     }
 }
 
-/// Reserve a staging sibling of `destination` that did not previously exist.
+/// Choose a staging sibling of `destination` for one clonefileat attempt.
 ///
 /// Appends to the full leaf rather than replacing its extension, so two members
-/// in one directory can never stage through the same name, and never collides
-/// with a restored member. The `O_EXCL` create both proves the name was free and
-/// *holds* it: the descriptor is closed but the entry stays until `clonefileat`
-/// replaces it, so nothing else can take the name in between. The previous
-/// version unlinked the probe immediately and then relied on the name still
-/// being free, which is the race it was written to avoid.
-fn reserve_clone_staging_name(destination: &CloneMember) -> io::Result<(PathBuf, CString)> {
+/// in one directory cannot derive the same name accidentally. The name is only
+/// a candidate: `clonefileat` atomically decides whether it is available, and
+/// the caller retries on `EEXIST` rather than probing and unlinking the name.
+fn clone_staging_name(destination: &CloneMember, attempt: u32) -> io::Result<CString> {
     let leaf = destination.leaf.as_os_str();
-    for attempt in 0..1000u32 {
-        let mut candidate = leaf.to_os_string();
-        candidate.push(format!(".tzap-clone-{}-{attempt}", std::process::id()));
-        let path = PathBuf::from(candidate);
-        let name = CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
-        // SAFETY: the directory fd is live and the name is NUL-terminated.
-        let fd = unsafe { libc::openat(destination.parent_fd(), name.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC, 0o600) };
-        if fd >= 0 {
-            // SAFETY: `fd` is a fresh descriptor; closing it leaves the directory
-            // entry in place, which is what reserves the name.
-            unsafe { libc::close(fd) };
-            // `clonefileat` refuses an existing destination, so the reserved entry
-            // is removed immediately before it -- but under the same directory
-            // handle, so no path resolution happens in between.
-            remove_staging(destination, &name);
-            return Ok((path, name));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::AlreadyExists {
-            return Err(error);
-        }
-    }
-    Err(io::Error::other("could not find a free clone staging name"))
+    let mut candidate = leaf.to_os_string();
+    candidate.push(format!(".tzap-clone-{}-{attempt}", std::process::id()));
+    CString::new(candidate.as_os_str().as_bytes()).map_err(io::Error::other)
 }
 
 /// Copy the destination's mode, ownership, times, flags, ACL and xattrs onto the
