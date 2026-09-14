@@ -3302,6 +3302,7 @@ fn test_sparse_extent_input_reader_and_macos_system_xattr() {
         let identity = os_input::input_identity(&opened_file.metadata().unwrap()).unwrap();
         let extents = [SparseExtent { offset: 100, length: 50 }, SparseExtent { offset: 300, length: 50 }];
         let mut reader = os_input::SparseExtentInputReader {
+            path: "sparse_test.bin".to_owned(),
             file: opened_file,
             expected: identity,
             expected_extents: &extents,
@@ -3347,6 +3348,7 @@ fn test_sparse_extent_input_reader_and_macos_system_xattr() {
         os_input::augment_windows_input_identity(&mut identity, &opened_file).unwrap();
 
         let mut reader = os_input::SparseExtentInputReader {
+            path: "sparse_test.bin".to_owned(),
             file: opened_file,
             expected: identity,
             expected_extents: &source_ranges,
@@ -3898,6 +3900,15 @@ fn one_observation_of_an_input_describes_a_single_object() {
     }
 }
 
+/// Serializes the tests that assert on the process-global run-note buffers.
+///
+/// `CHANGED_DURING_READ` and friends are process-wide by design -- one archive
+/// run is one process -- but `cargo test` runs these in parallel threads inside
+/// a single binary. Two tests each draining the buffer and asserting on its
+/// exact contents will steal each other's notes. Holding this for the drain and
+/// the assertions keeps the global honest without weakening what is asserted.
+static RUN_NOTE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A file shortened mid-archive must still fill the length its header promised,
 /// and must say so.
 ///
@@ -3908,6 +3919,7 @@ fn one_observation_of_an_input_describes_a_single_object() {
 /// backing up a live system.
 #[test]
 fn a_file_shortened_mid_archive_is_padded_and_reported() {
+    let _serialized = RUN_NOTE_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     use crate::os_input::{take_inputs_changed_during_read, IdentityCheckedInputReader};
     use std::io::Read as _;
 
@@ -3946,6 +3958,65 @@ fn a_file_shortened_mid_archive_is_padded_and_reported() {
     // Substituted bytes are content the archive does not hold, so the run must not
     // report plain success.
     assert!(crate::os_input::archive_was_incomplete(), "zero-filling a shortened member must mark the archive incomplete");
+}
+
+/// The same promise for a member the host reports as sparse.
+///
+/// A sparse input took a different path out of `open_source` and got the
+/// opposite answer: `IdentityCheckedInputReader` padded a shortened file and
+/// reported it, while `SparseExtentInputReader` returned `UnexpectedEof` and
+/// failed the whole run. Whether a file happens to have holes is not something
+/// the person chose, and on Linux and Windows the sparse path is taken
+/// automatically -- so a VM image or database shortened during a live backup
+/// killed the archive while an ordinary file of the same size did not.
+///
+/// `tzap-operational-boundaries.md` documents the padding outcome without
+/// qualification, so this is also what the published contract already promised.
+#[test]
+fn a_sparse_file_shortened_mid_archive_is_padded_and_reported() {
+    let _serialized = RUN_NOTE_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    use crate::os_input::{take_inputs_changed_during_read, SparseExtentInputReader};
+    use std::io::Read as _;
+    use tzap_core::entry_metadata::SparseExtent;
+
+    let _ = take_inputs_changed_during_read(); // start from a clean slate
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("sparse-shrinking.bin");
+    fs::write(&path, vec![0xcd; 8192]).unwrap();
+    let identity = os_input::input_identity(&fs::symlink_metadata(&path).unwrap()).unwrap();
+
+    // The scan saw two allocated extents totalling 6144 bytes. By the time the
+    // bytes are read the file holds only 1024, so the first extent is short and
+    // the second cannot be reached at all.
+    fs::write(&path, vec![0xcd; 1024]).unwrap();
+    let extents = [SparseExtent { offset: 0, length: 4096 }, SparseExtent { offset: 4096, length: 2048 }];
+    let mut reader = SparseExtentInputReader {
+        path: "sparse-shrinking.bin".to_owned(),
+        file: fs::File::open(&path).unwrap(),
+        expected: identity,
+        expected_extents: &extents,
+        extent_index: 0,
+        extent_remaining: 0,
+        validated: false,
+    };
+
+    let mut out = Vec::new();
+    reader.read_to_end(&mut out).expect("a shortened sparse input must not fail the run");
+
+    assert_eq!(out.len(), 6144, "the member must be exactly the stored length its header promised");
+    assert_eq!(&out[..1024], &[0xcd; 1024], "the bytes that were still there must be kept");
+    assert!(out[1024..].iter().all(|byte| *byte == 0), "everything still owed must be zeros, across both extents");
+
+    let notes = take_inputs_changed_during_read();
+    assert_eq!(notes.len(), 1, "the change must be reported exactly once: {notes:?}");
+    assert!(notes[0].contains("sparse-shrinking.bin"), "{}", notes[0]);
+    // The amounts are against the STORED length (the extent sum), not the logical
+    // size: that is what the member header promised and what was actually filled.
+    assert!(notes[0].contains("kept the 1.0 KB"), "the kept amount must be what survived: {}", notes[0]);
+    assert!(notes[0].contains("remaining 5.0 KB"), "the zero-filled amount must be the whole shortfall (5120): {}", notes[0]);
+
+    assert!(crate::os_input::archive_was_incomplete(), "zero-filling a sparse member must mark the archive incomplete");
 }
 
 /// A directory archived without its native metadata must still be writable,

@@ -93,11 +93,16 @@ else
 fi
 
 echo "=== differential matrix vs $TAG ==="
-if ! ./scripts/differential-matrix.sh /work_old/target/release/tzap /work_new/target/release/tzap 2>&1 |
-    grep -E '^===|^  FAIL'; then
+# The matrix's own exit code, not grep's. Piping into grep made the pipeline
+# report whether grep MATCHED, and the '===' summary line always matches -- so a
+# matrix with 64 failures reported success here, which is the same mistake the
+# test-suite block above already documents.
+matrix_log=$(mktemp)
+./scripts/differential-matrix.sh /work_old/target/release/tzap /work_new/target/release/tzap >"$matrix_log" 2>&1 || status=1
+grep -E '^===|^  FAIL|^  note|^fixed by the candidate' "$matrix_log" || {
   echo 'differential matrix produced no summary'
   status=1
-fi
+}
 
 echo "=== overall: $([ "$status" -eq 0 ] && echo PASS || echo FAIL) ==="
 exit "$status"

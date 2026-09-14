@@ -29,8 +29,13 @@ pub struct CapturedPortableMetadata {
     pub metadata: PortableFileMetadata,
     /// Identity of the macOS object the native capture read, so a later
     /// resource-fork open can verify it is still the same file.
+    ///
+    /// Always present: the capture cannot succeed without observing the object,
+    /// so an `Option` here only invited callers to handle a case that does not
+    /// occur. A host that assembles metadata without a native capture has its own
+    /// type for that.
     #[cfg(target_os = "macos")]
-    pub macos_identity: Option<crate::macos_metadata::MacosMetadataIdentity>,
+    pub macos_identity: crate::macos_metadata::MacosMetadataIdentity,
 }
 
 /// Marker shared by every capture site that loses a race with a concurrent
@@ -150,16 +155,21 @@ fn capture_portable_file_metadata_once(input: &Path) -> io::Result<CapturedPorta
     let metadata = fs::symlink_metadata(input)?;
     let symlink = metadata.file_type().is_symlink();
 
-    let created = metadata.created().ok().and_then(archive_timestamp_from_system_time).filter(encodable);
+    let created = metadata.created().ok().and_then(archive_timestamp_from_system_time);
     // musl cannot expose birth time (statx/STATX_BTIME is unsupported there), so
     // fall back to ctime from the standard stat fields as an approximation.
+    //
+    // The fallback fires only when the host supplied NO birth time. Filtering for
+    // encodability first would also fire it when a real birth time exists but
+    // falls in the one second §16.7.2 cannot express -- substituting a different
+    // instant for a time the format deliberately drops, which is worse than
+    // omitting it.
     #[cfg(target_os = "linux")]
-    let created = created
-        .or_else(|| {
-            use std::os::unix::fs::MetadataExt as _;
-            Some(crate::entry_metadata::ArchiveTimestamp::new(metadata.ctime(), u32::try_from(metadata.ctime_nsec()).unwrap_or(0)))
-        })
-        .filter(encodable);
+    let created = created.or_else(|| {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(crate::entry_metadata::ArchiveTimestamp::new(metadata.ctime(), u32::try_from(metadata.ctime_nsec()).unwrap_or(0)))
+    });
+    let created = created.filter(encodable);
     let accessed = metadata.accessed().ok().and_then(archive_timestamp_from_system_time).filter(encodable);
 
     #[cfg(target_os = "macos")]
@@ -182,7 +192,7 @@ fn capture_portable_file_metadata_once(input: &Path) -> io::Result<CapturedPorta
     Ok(CapturedPortableMetadata {
         metadata: assemble_portable_file_metadata(native, portable_owner_ids(&metadata), portable_attributes(&metadata), created, accessed),
         #[cfg(target_os = "macos")]
-        macos_identity: Some(captured_macos.identity),
+        macos_identity: captured_macos.identity,
     })
 }
 
@@ -372,7 +382,8 @@ mod tests {
         let native = &captured.metadata.native;
         let aux_kind = |kind: &str| native.auxiliary_records.iter().any(|record| record.kind == kind);
 
-        assert!(captured.macos_identity.is_some(), "the identity must come back so a later fork open can verify the same object");
+        // The identity comes back so a later fork open can verify the same object.
+        assert_eq!(captured.macos_identity, crate::macos_metadata::MacosMetadataIdentity::from_metadata(&std::fs::symlink_metadata(&file).unwrap()));
         assert!(aux_kind("macos.finder-info"), "FinderInfo must be captured as its own auxiliary kind, not a generic xattr");
         assert!(aux_kind("macos.resource-fork"), "a fork over the PAX limit must still be captured");
         if acl_set {

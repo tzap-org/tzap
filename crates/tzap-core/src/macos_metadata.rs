@@ -741,6 +741,40 @@ mod clone_tests {
         assert!(assign_clone_groups(&[only]).is_empty(), "one path cannot form a sharing group");
     }
 
+    /// Build a `CloneMember` for a test path the same way the reader does: a
+    /// parent directory handle plus the leaf name.
+    fn clone_member(path: &std::path::Path) -> CloneMember {
+        let parent = cap_std::fs::Dir::open_ambient_dir(path.parent().expect("test paths have a parent"), cap_std::ambient_authority())
+            .expect("test parent directory opens");
+        CloneMember::new(std::sync::Arc::new(parent), std::path::PathBuf::from(path.file_name().expect("test paths have a leaf")))
+    }
+
+    /// The post-pass must not follow a symlink standing where a member should be.
+    ///
+    /// This is the property the `*at` rewrite exists for. The pass used to join
+    /// the archive path onto the extraction root and hand the result to
+    /// `File::open`, `clonefile`, `copyfile` and `rename` -- every one of which
+    /// follows symlinks -- while the rest of extraction resolves each component
+    /// with `open_dir_nofollow` precisely so a swapped entry cannot redirect a
+    /// write out of the tree. Anything appearing between extraction and this pass
+    /// had a free redirect.
+    #[test]
+    fn a_symlinked_member_is_refused_rather_than_followed() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside.bin");
+        std::fs::write(&outside, b"must not be touched").unwrap();
+
+        let tree = temp.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let masquerading = tree.join("member.bin");
+        std::os::unix::fs::symlink(&outside, &masquerading).unwrap();
+
+        let error = clone_member(&masquerading).open_nofollow().expect_err("a symlinked leaf must not be opened");
+        // ELOOP is what O_NOFOLLOW reports for a symlink at the final component.
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP), "the refusal must come from O_NOFOLLOW, not from something incidental");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"must not be touched", "the file outside the tree must be untouched");
+    }
+
     #[test]
     fn restore_reestablishes_sharing_and_leaves_bytes_untouched() {
         use std::collections::BTreeMap;
@@ -759,7 +793,7 @@ mod clone_tests {
         assert_ne!(query_macos_clone_id(&first), query_macos_clone_id(&second), "fixture must start unshared");
 
         let mut groups = BTreeMap::new();
-        groups.insert("a".repeat(32), vec![first.clone(), second.clone()]);
+        groups.insert("a".repeat(32), vec![clone_member(&first), clone_member(&second)]);
         let outcomes = restore_clone_groups(&groups);
 
         assert_eq!(outcomes.len(), 1);
@@ -852,7 +886,7 @@ mod clone_tests {
         let _ = xattr::set(&first, "com.tzap.only-first", b"not yours");
 
         let mut groups = BTreeMap::new();
-        groups.insert("d".repeat(32), vec![first.clone(), second.clone()]);
+        groups.insert("d".repeat(32), vec![clone_member(&first), clone_member(&second)]);
         let outcomes = restore_clone_groups(&groups);
         match &outcomes[0] {
             CloneRestoreOutcome::Shared { .. } => {}
@@ -895,7 +929,7 @@ mod clone_tests {
         }
 
         let mut groups = BTreeMap::new();
-        groups.insert("e".repeat(32), vec![first, second]);
+        groups.insert("e".repeat(32), vec![clone_member(&first), clone_member(&second)]);
         let _ = restore_clone_groups(&groups);
 
         assert_eq!(std::fs::read(&bystander).unwrap(), b"USER DATA THAT MUST SURVIVE", "a restored member named like the staging path was destroyed");
@@ -915,7 +949,7 @@ mod clone_tests {
         std::fs::write(&second, b"DIFFERENT bytes").unwrap();
 
         let mut groups = BTreeMap::new();
-        groups.insert("b".repeat(32), vec![first.clone(), second.clone()]);
+        groups.insert("b".repeat(32), vec![clone_member(&first), clone_member(&second)]);
         let outcomes = restore_clone_groups(&groups);
 
         assert!(matches!(&outcomes[0], CloneRestoreOutcome::NotShared { .. }), "differing partners must not be shared");
@@ -928,7 +962,7 @@ mod clone_tests {
         use std::collections::BTreeMap;
 
         let mut groups = BTreeMap::new();
-        groups.insert("c".repeat(32), vec![std::path::PathBuf::from("/nonexistent/only.bin")]);
+        groups.insert("c".repeat(32), vec![clone_member(std::path::Path::new("/tmp/only.bin"))]);
         assert!(restore_clone_groups(&groups).is_empty(), "a one-member group describes no sharing");
         assert!(restore_clone_groups(&BTreeMap::new()).is_empty());
     }
@@ -991,6 +1025,49 @@ fn hex_lower(bytes: &[u8]) -> String {
     })
 }
 
+/// One already-restored member of a clone group, addressed the way the rest of
+/// extraction addresses files: a directory handle plus a leaf name.
+///
+/// The post-pass used to take a `PathBuf` built by joining the archive path onto
+/// the extraction root, and hand that to `File::open`, `clonefile`, `copyfile`
+/// and `rename`. Every other restore path resolves each component with
+/// `open_dir_nofollow` precisely so a swapped ancestor cannot redirect a write
+/// outside the root; doing the post-pass by path gave that up, and re-opened the
+/// symlink-swap race those checks exist to close. Carrying the parent handle
+/// keeps every syscall below anchored to a directory that was resolved safely.
+pub struct CloneMember {
+    parent: std::sync::Arc<cap_std::fs::Dir>,
+    leaf: PathBuf,
+}
+
+impl CloneMember {
+    /// Build a member from a safely resolved parent directory and its leaf name.
+    #[must_use]
+    pub fn new(parent: std::sync::Arc<cap_std::fs::Dir>, leaf: PathBuf) -> Self {
+        Self { parent, leaf }
+    }
+
+    fn parent_fd(&self) -> libc::c_int {
+        self.parent.as_raw_fd()
+    }
+
+    fn leaf_c(&self) -> io::Result<CString> {
+        CString::new(self.leaf.as_os_str().as_bytes()).map_err(io::Error::other)
+    }
+
+    /// Open this member without following a symlink at the leaf.
+    fn open_nofollow(&self) -> io::Result<File> {
+        let leaf = self.leaf_c()?;
+        // SAFETY: the parent fd is live for the call and the name is NUL-terminated.
+        let fd = unsafe { libc::openat(self.parent_fd(), leaf.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh descriptor this call owns.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
 /// What happened when a clone group was re-established on restore.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloneRestoreOutcome {
@@ -998,7 +1075,10 @@ pub enum CloneRestoreOutcome {
     Shared { group: String, members: usize },
     /// The destination could not clone. Logical bytes are already correct;
     /// §16.11 makes this storage-layout degradation, not a failure.
-    NotShared { group: String, reason: String },
+    ///
+    /// `shared` is how many partners were re-shared before the pass stopped, so a
+    /// group that partly succeeded is not reported as if nothing happened.
+    NotShared { group: String, shared: usize, reason: String },
 }
 
 /// Re-establish APFS clone sharing across already-restored files.
@@ -1014,7 +1094,7 @@ pub enum CloneRestoreOutcome {
 /// `clonefile` into a temporary name and renamed into place, because `clonefile`
 /// refuses an existing destination. A group whose members somehow differ in
 /// content is left alone: the recorded hint is not authority to overwrite bytes.
-pub fn restore_clone_groups(groups: &std::collections::BTreeMap<String, Vec<std::path::PathBuf>>) -> Vec<CloneRestoreOutcome> {
+pub fn restore_clone_groups(groups: &std::collections::BTreeMap<String, Vec<CloneMember>>) -> Vec<CloneRestoreOutcome> {
     let mut outcomes = Vec::new();
     for (group, members) in groups {
         if members.len() < 2 {
@@ -1034,22 +1114,23 @@ pub fn restore_clone_groups(groups: &std::collections::BTreeMap<String, Vec<std:
         }
         match failure {
             None => outcomes.push(CloneRestoreOutcome::Shared { group: group.clone(), members: shared + 1 }),
-            Some(reason) => outcomes.push(CloneRestoreOutcome::NotShared { group: group.clone(), reason }),
+            // Report what actually happened. Stopping at the first failure can
+            // still leave earlier partners shared, and calling the whole group
+            // unshared reads as "nothing happened" when something did.
+            Some(reason) => outcomes.push(CloneRestoreOutcome::NotShared { group: group.clone(), shared, reason }),
         }
     }
     outcomes
 }
 
 /// Whether two restored partners hold the same bytes, compared in fixed-size
-/// chunks.
+/// chunks through already-open handles.
 ///
 /// `fs::read` on both, which this used to do, holds two whole files in memory at
 /// once: measured at 586 MB peak RSS against 326 MB for a 150 MB pair, and a
 /// cloned disk image -- the case §16.11 exists for -- is routinely tens of GB.
 /// Length is checked first, so unequal files usually cost no reads at all.
-fn restored_partners_match(source: &Path, destination: &Path) -> io::Result<bool> {
-    let mut left = fs::File::open(source)?;
-    let mut right = fs::File::open(destination)?;
+fn restored_partners_match(left: &mut File, right: &mut File) -> io::Result<bool> {
     if left.metadata()?.len() != right.metadata()?.len() {
         return Ok(false);
     }
@@ -1057,8 +1138,8 @@ fn restored_partners_match(source: &Path, destination: &Path) -> io::Result<bool
     let mut left_chunk = vec![0u8; 256 * 1024];
     let mut right_chunk = vec![0u8; 256 * 1024];
     loop {
-        let read = read_up_to(&mut left, &mut left_chunk)?;
-        if read_up_to(&mut right, &mut right_chunk[..read])? != read {
+        let read = read_up_to(left, &mut left_chunk)?;
+        if read_up_to(right, &mut right_chunk[..read])? != read {
             return Ok(false);
         }
         if read == 0 {
@@ -1071,7 +1152,7 @@ fn restored_partners_match(source: &Path, destination: &Path) -> io::Result<bool
 }
 
 /// Fill `buffer` until it is full or the file ends, returning how much was read.
-fn read_up_to(file: &mut fs::File, buffer: &mut [u8]) -> io::Result<usize> {
+fn read_up_to(file: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0usize;
     while filled < buffer.len() {
         match file.read(&mut buffer[filled..])? {
@@ -1082,12 +1163,22 @@ fn read_up_to(file: &mut fs::File, buffer: &mut [u8]) -> io::Result<usize> {
     Ok(filled)
 }
 
-fn clone_over(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::os::unix::ffi::OsStrExt as _;
+/// Re-share one destination with its group's source.
+///
+/// Every syscall is `*at`-relative to a directory handle the caller resolved
+/// with the extraction traversal, and the leaf is opened `O_NOFOLLOW`, so a
+/// symlink appearing anywhere on the path between extraction and this pass
+/// cannot redirect the clone or the rename out of the tree.
+/// `CLONE_NOFOLLOW` from `<sys/clonefile.h>`: do not follow a symlink at the
+/// source leaf. Not exposed by the `libc` crate, so it is spelled out here.
+const CLONE_NOFOLLOW: u32 = 0x0001;
 
+fn clone_over(source: &CloneMember, destination: &CloneMember) -> io::Result<()> {
     // The hint is not authority to change bytes: if the restored files differ,
     // leave them as restored.
-    if !restored_partners_match(source, destination)? {
+    let mut source_file = source.open_nofollow()?;
+    let mut destination_file = destination.open_nofollow()?;
+    if !restored_partners_match(&mut source_file, &mut destination_file)? {
         return Err(io::Error::other("restored clone partners differ; refusing to overwrite"));
     }
 
@@ -1096,13 +1187,13 @@ fn clone_over(source: &Path, destination: &Path) -> io::Result<()> {
     // real extension, so `disk2.img` staged through `disk2.tzap-clone-staging`
     // -- and the unconditional `remove_file` that preceded it silently deleted a
     // restored member that happened to carry that name.
-    let staging = unique_clone_staging_path(destination)?;
-    let source_c = std::ffi::CString::new(source.as_os_str().as_bytes()).map_err(io::Error::other)?;
-    let staging_c = std::ffi::CString::new(staging.as_os_str().as_bytes()).map_err(io::Error::other)?;
-    // SAFETY: both paths are NUL-terminated and live for the synchronous call.
-    if unsafe { libc::clonefile(source_c.as_ptr(), staging_c.as_ptr(), 0) } != 0 {
+    let (staging, staging_c) = reserve_clone_staging_name(destination)?;
+    let source_leaf = source.leaf_c()?;
+    // SAFETY: both directory fds are live, both names are NUL-terminated, and the
+    // call is synchronous.
+    if unsafe { libc::clonefileat(source.parent_fd(), source_leaf.as_ptr(), destination.parent_fd(), staging_c.as_ptr(), CLONE_NOFOLLOW) } != 0 {
         let error = io::Error::last_os_error();
-        let _ = fs::remove_file(&staging);
+        remove_staging(destination, &staging_c);
         return Err(error);
     }
     // `clonefile` copies the *source's* mode, ownership, times, flags, ACL and
@@ -1111,56 +1202,87 @@ fn clone_over(source: &Path, destination: &Path) -> io::Result<()> {
     // or the rename below silently replaces metadata that restore already applied
     // correctly -- measured: a 0644/2025 partner came back as 0600/2020, its
     // source's.
-    if let Err(error) = copy_metadata_onto_clone(destination, &staging) {
-        let _ = fs::remove_file(&staging);
+    if let Err(error) = copy_metadata_onto_clone(destination, &staging_c, &destination_file) {
+        remove_staging(destination, &staging_c);
         return Err(error);
     }
-    // Rename is atomic within a volume and replaces the restored copy.
-    fs::rename(&staging, destination).inspect_err(|_| {
-        let _ = fs::remove_file(&staging);
-    })
+    // Rename is atomic within a volume and replaces the restored copy. Relative
+    // to the same resolved directory handle on both sides.
+    let destination_leaf = destination.leaf_c()?;
+    // SAFETY: the directory fd is live and both names are NUL-terminated.
+    if unsafe { libc::renameat(destination.parent_fd(), staging_c.as_ptr(), destination.parent_fd(), destination_leaf.as_ptr()) } != 0 {
+        let error = io::Error::last_os_error();
+        remove_staging(destination, &staging_c);
+        return Err(error);
+    }
+    let _ = staging;
+    Ok(())
 }
 
-/// A staging sibling of `destination` that does not exist yet.
+fn remove_staging(destination: &CloneMember, staging: &CString) {
+    // SAFETY: the directory fd is live and the name is NUL-terminated.
+    unsafe {
+        libc::unlinkat(destination.parent_fd(), staging.as_ptr(), 0);
+    }
+}
+
+/// Reserve a staging sibling of `destination` that did not previously exist.
 ///
 /// Appends to the full leaf rather than replacing its extension, so two members
 /// in one directory can never stage through the same name, and never collides
-/// with a restored member: the O_EXCL create is what proves the name is free.
-fn unique_clone_staging_path(destination: &Path) -> io::Result<PathBuf> {
-    let parent = destination.parent().ok_or_else(|| io::Error::other("clone destination has no parent directory"))?;
-    let leaf = destination.file_name().ok_or_else(|| io::Error::other("clone destination has no file name"))?;
+/// with a restored member. The `O_EXCL` create both proves the name was free and
+/// *holds* it: the descriptor is closed but the entry stays until `clonefileat`
+/// replaces it, so nothing else can take the name in between. The previous
+/// version unlinked the probe immediately and then relied on the name still
+/// being free, which is the race it was written to avoid.
+fn reserve_clone_staging_name(destination: &CloneMember) -> io::Result<(PathBuf, CString)> {
+    let leaf = destination.leaf.as_os_str();
     for attempt in 0..1000u32 {
         let mut candidate = leaf.to_os_string();
         candidate.push(format!(".tzap-clone-{}-{attempt}", std::process::id()));
-        let path = parent.join(candidate);
-        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            // `clonefile` refuses an existing destination, so the probe is removed
-            // again immediately. Holding the name is not the point -- proving it
-            // was free, and never touching a name that was not, is.
-            Ok(_) => {
-                fs::remove_file(&path)?;
-                return Ok(path);
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
+        let path = PathBuf::from(candidate);
+        let name = CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+        // SAFETY: the directory fd is live and the name is NUL-terminated.
+        let fd = unsafe { libc::openat(destination.parent_fd(), name.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC, 0o600) };
+        if fd >= 0 {
+            // SAFETY: `fd` is a fresh descriptor; closing it leaves the directory
+            // entry in place, which is what reserves the name.
+            unsafe { libc::close(fd) };
+            // `clonefileat` refuses an existing destination, so the reserved entry
+            // is removed immediately before it -- but under the same directory
+            // handle, so no path resolution happens in between.
+            remove_staging(destination, &name);
+            return Ok((path, name));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
         }
     }
     Err(io::Error::other("could not find a free clone staging name"))
 }
 
-/// Copy `from`'s mode, ownership, times, flags, ACL and xattrs onto `onto`.
+/// Copy the destination's mode, ownership, times, flags, ACL and xattrs onto the
+/// staged clone.
 ///
 /// `COPYFILE_METADATA` is `COPYFILE_SECURITY | COPYFILE_XATTR`, i.e. stat, ACL
 /// and extended attributes -- the platform's own primitive for exactly this, and
-/// the symmetric inverse of what `clonefile` copied from the wrong file.
-fn copy_metadata_onto_clone(from: &Path, onto: &Path) -> io::Result<()> {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let from_c = std::ffi::CString::new(from.as_os_str().as_bytes()).map_err(io::Error::other)?;
-    let onto_c = std::ffi::CString::new(onto.as_os_str().as_bytes()).map_err(io::Error::other)?;
-    // SAFETY: both paths are NUL-terminated and live for the synchronous call;
-    // a null state is documented as "allocate and free one internally".
-    let status = unsafe { libc::copyfile(from_c.as_ptr(), onto_c.as_ptr(), std::ptr::null_mut(), libc::COPYFILE_METADATA | libc::COPYFILE_NOFOLLOW) };
+/// the symmetric inverse of what `clonefileat` copied from the wrong file.
+///
+/// The source is the open destination handle rather than its path, so this
+/// cannot be redirected either; the staged file is addressed through the same
+/// directory handle as everything else.
+fn copy_metadata_onto_clone(destination: &CloneMember, staging: &CString, destination_file: &File) -> io::Result<()> {
+    // SAFETY: the directory fd is live and the name is NUL-terminated.
+    let staged_fd = unsafe { libc::openat(destination.parent_fd(), staging.as_ptr(), libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if staged_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `staged_fd` is a fresh descriptor this scope owns.
+    let staged = unsafe { File::from_raw_fd(staged_fd) };
+    // SAFETY: both descriptors are live for the synchronous call; a null state is
+    // documented as "allocate and free one internally".
+    let status = unsafe { libc::fcopyfile(destination_file.as_raw_fd(), staged.as_raw_fd(), std::ptr::null_mut(), libc::COPYFILE_METADATA) };
     if status != 0 {
         return Err(io::Error::last_os_error());
     }

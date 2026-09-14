@@ -606,20 +606,52 @@ pub(crate) struct SparseExtentInputReader<'a> {
     pub(crate) extent_index: usize,
     pub(crate) extent_remaining: u64,
     pub(crate) validated: bool,
+    /// The archive path, so a note can name what the person recognises.
+    pub(crate) path: String,
 }
 
 impl SparseExtentInputReader<'_> {
-    fn validate_finished(&mut self) -> io::Result<()> {
+    /// Total bytes this member promised: the allocated extents, not the logical
+    /// size. That sum is already in the member header, so it is what must be
+    /// delivered however the file behaves from here.
+    fn promised(&self) -> u64 {
+        self.expected_extents.iter().map(|extent| extent.length).sum()
+    }
+
+    /// Bytes still owed once the current extent and every later one are counted.
+    fn still_owed(&self) -> u64 {
+        self.extent_remaining + self.expected_extents.iter().skip(self.extent_index + 1).map(|extent| extent.length).sum::<u64>()
+    }
+
+    /// Note that this member's bytes are as of the moment archiving started.
+    ///
+    /// The sparse path reaches this for the same reasons the dense one does -- a
+    /// live file shortened or rewritten underneath the read -- and owes the same
+    /// answer. Failing the whole archive here while the dense path pads and
+    /// reports made the outcome depend on whether the file happened to have
+    /// holes, which is not something the person chose.
+    fn note_changed(&mut self, padded: u64) {
         if self.validated {
-            return Ok(());
-        }
-        validate_opened_input_identity(&self.file, self.expected)?;
-        #[cfg(windows)]
-        if query_windows_allocated_ranges(&self.file, self.expected.len)? != self.expected_extents {
-            return Err(io::Error::other("sparse allocated ranges changed after scan"));
+            return;
         }
         self.validated = true;
-        Ok(())
+        record_input_changed_during_read(&self.path, self.promised(), padded);
+    }
+
+    fn validate_finished(&mut self) {
+        if self.validated {
+            return;
+        }
+        if validate_opened_input_identity(&self.file, self.expected).is_err() {
+            self.note_changed(0);
+            return;
+        }
+        #[cfg(windows)]
+        if query_windows_allocated_ranges(&self.file, self.expected.len).is_ok_and(|ranges| ranges != self.expected_extents) {
+            self.note_changed(0);
+            return;
+        }
+        self.validated = true;
     }
 }
 
@@ -631,17 +663,34 @@ impl Read for SparseExtentInputReader<'_> {
         let mut written = 0usize;
         while written < out.len() {
             if self.extent_remaining == 0 {
-                let Some(extent) = self.expected_extents.get(self.extent_index) else {
-                    self.validate_finished()?;
-                    break;
+                let (offset, length) = match self.expected_extents.get(self.extent_index) {
+                    Some(extent) => (extent.offset, extent.length),
+                    None => {
+                        self.validate_finished();
+                        break;
+                    }
                 };
-                self.file.seek(SeekFrom::Start(extent.offset))?;
-                self.extent_remaining = extent.length;
+                // Count the extent as owed before attempting the seek, so a seek
+                // failure reports this extent's bytes as well as every later one.
+                self.extent_remaining = length;
+                if self.file.seek(SeekFrom::Start(offset)).is_err() {
+                    let shortfall = self.still_owed();
+                    return Ok(self.pad_remaining(out, written, shortfall));
+                }
             }
             let count = (out.len() - written).min(usize::try_from(self.extent_remaining).unwrap_or(usize::MAX));
             let read = self.file.read(&mut out[written..written + count])?;
             if read == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "sparse extent ended before its scanned size"));
+                // The file was shortened or rewritten mid-archive. The member's
+                // stored length is already promised in its header, so fill the
+                // rest with zeros exactly as the dense path does -- a short
+                // member would leave every later member unreadable.
+                //
+                // The shortfall is everything still owed across this extent and
+                // all later ones, not just this chunk: the file is at EOF and no
+                // further extent can produce bytes either.
+                let shortfall = self.still_owed();
+                return Ok(self.pad_remaining(out, written, shortfall));
             }
             written += read;
             self.extent_remaining -= read as u64;
@@ -650,9 +699,41 @@ impl Read for SparseExtentInputReader<'_> {
             }
         }
         if self.extent_index == self.expected_extents.len() && self.extent_remaining == 0 {
-            self.validate_finished()?;
+            self.validate_finished();
         }
         Ok(written)
+    }
+}
+
+impl SparseExtentInputReader<'_> {
+    /// Zero-fill the rest of this buffer and account for the whole shortfall.
+    ///
+    /// Advances past every remaining extent so subsequent reads keep supplying
+    /// zeros until the promised length is met, then stop.
+    fn pad_remaining(&mut self, out: &mut [u8], written: usize, shortfall: u64) -> usize {
+        let fill = out.len() - written;
+        let fill = usize::try_from(shortfall).unwrap_or(usize::MAX).min(fill);
+        out[written..written + fill].fill(0);
+        let consumed = fill as u64;
+        // Walk the extent cursor forward by what was just emitted, so the next
+        // call resumes owing exactly the remainder.
+        let mut left = consumed;
+        while left > 0 {
+            if self.extent_remaining == 0 {
+                match self.expected_extents.get(self.extent_index) {
+                    Some(extent) => self.extent_remaining = extent.length,
+                    None => break,
+                }
+            }
+            let step = left.min(self.extent_remaining);
+            self.extent_remaining -= step;
+            left -= step;
+            if self.extent_remaining == 0 {
+                self.extent_index += 1;
+            }
+        }
+        self.note_changed(shortfall);
+        written + fill
     }
 }
 
@@ -924,6 +1005,26 @@ pub(crate) fn open_input_for_archiving(path: &Path) -> io::Result<File> {
 
 pub(crate) fn note_input_changed_before_read(path: &str, declared: u64) {
     record_input_changed_during_read(path, declared, 0);
+}
+
+/// Note a hardlink alias stored as a full copy instead of a link.
+///
+/// The two names for one inode stopped agreeing between the two stats that saw
+/// them, so the topology cannot be recorded from a settled observation. Storing
+/// the entry in full is always correct -- only larger -- whereas writing an alias
+/// from a stale observation points a link at a file that may have changed.
+///
+/// Not an incomplete archive: every byte of the entry is present. It is a note
+/// because the restored tree will have two independent files where the source had
+/// two names for one, and that is worth knowing.
+pub(crate) fn note_hardlink_not_grouped(path: &str) {
+    let note =
+        format!("{path} shares an inode with another input, but the inode changed while they were being scanned; stored it in full instead of as a hardlink");
+    if let Ok(mut notes) = CHANGED_DURING_READ.lock() {
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
 }
 
 /// Everything that moved during this run, in the order it was noticed.

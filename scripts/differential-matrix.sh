@@ -58,7 +58,17 @@ FIXED_COMBOS=()
 # reference rejects for one of these reasons, and the candidate accepts, counts as
 # a fix rather than a failure. Anything else the candidate newly accepts still fails,
 # so this cannot quietly hide a widening of what the writer allows.
-: "${EXPECTED_FIXES:=Windows BackupRead did not return the default data stream}"
+#
+# This applies on the WRITE side (the reference cannot create the shape) and on
+# the READ side (the reference cannot verify, list or extract the shape). Only
+# the write side was wired up originally, which meant a read-side fix reported
+# itself as a regression forever: the long-name fix put a 244-byte CJK name in
+# the corpus, 0.2.4 cannot restore it on any filesystem with a 255-BYTE component
+# limit, and every one of the 64 Linux combinations failed on a fix working
+# exactly as intended. macOS did not notice because APFS counts a component in
+# characters, not bytes, so the reference never hit the limit there.
+: "${EXPECTED_FIXES:=Windows BackupRead did not return the default data stream
+failed to create regular file}"
 
 # Strip the volatile parts of an error before comparing two builds' refusals.
 normalise_err() { sed -E 's/[A-Za-z0-9_.-]*\.tzap-create-[A-Za-z0-9]+\.partial/<tmp>/g; s#tmp\.[A-Za-z0-9]{8,}#<tmpdir>#g' "$1"; }
@@ -121,7 +131,7 @@ candidate_round_trip() {
 run_combo() {
   local name="$1"; shift
   local create_args=("$@")
-  local work; work=$(mktemp -d)
+  local work; work=$(mktemp -d) || { echo "  FAIL [$name] could not create a work directory"; FAIL=$((FAIL+1)); return; }
 
   # Capture the status directly: inside `if ! cmd`, $? is the negation's status,
   # not the command's.
@@ -181,13 +191,32 @@ run_combo() {
     eval "n=\$${op}_NEW"; eval "o=\$${op}_OLD"
     case $op in v) label=verify ;; l) label=list ;; *) label=extract ;; esac
     if [ "$n" != "$o" ]; then
-      echo "  FAIL [$name] $label disagrees: new=[$n] old=[$o]"; ok=0
+      # The candidate succeeding where the reference fails for a known-fixed
+      # reason is the fix landing, not a regression. Every other disagreement --
+      # including the candidate newly REFUSING something -- still fails, so this
+      # cannot hide a real behaviour change.
+      if [ "$n" = "ok" ] && is_expected_fix "${o#fail:}"; then
+        FIXED=$((FIXED+1)); FIXED_COMBOS+=("$name/$label (reference cannot read what the candidate fixed)")
+      else
+        echo "  FAIL [$name] $label disagrees: new=[$n] old=[$o]"; ok=0
+      fi
     elif [ "$n" = "tree-differs" ]; then
       echo "  FAIL [$name] $label: both extracted a tree that differs from the source"; ok=0
     elif [ "$n" != "ok" ]; then
       echo "  note [$name] both builds refuse $label identically: ${n#fail:}"
     fi
   done
+
+  # When both extracted, the two trees must agree on metadata as well as bytes.
+  # `compare_restored_tree` above only checks content, symlink target and entry
+  # kind -- it compares against the SOURCE, where a metadata difference can be the
+  # restore policy rather than a regression. Comparing the two builds to each
+  # other has no such caveat: same host, same policy, so any difference is a real
+  # change between versions. This is what makes the pre-epoch mtime fixtures in
+  # the corpus load-bearing.
+  if [ "${x_NEW:-}" = "ok" ] && [ "${x_OLD:-}" = "ok" ]; then
+    compare_restored_metadata "$work/out.NEW/corpus" "$work/out.OLD/corpus" "$name" || ok=0
+  fi
 
   # When both listed successfully they must describe the archive identically.
   if [ "${l_NEW:-}" = "ok" ] && [ "${l_OLD:-}" = "ok" ]; then
@@ -273,7 +302,7 @@ password_combo() {
   local name="$1"; shift
   local extra=("$@")
   local read_key="--password-stdin"
-  local work; work=$(mktemp -d)
+  local work; work=$(mktemp -d) || { echo "  FAIL [$name] could not create a work directory"; FAIL=$((FAIL+1)); return; }
   if ! printf '%s\n' "$PASSPHRASE" | $OLD create --password-stdin "${extra[@]}" -o "$work/old.tzap" corpus >/dev/null 2>"$work/e"; then
     # Same reference-rejects handling as run_combo: the candidate must either
     # reject identically, or -- for a reason listed in EXPECTED_FIXES -- accept it
@@ -304,6 +333,10 @@ password_combo() {
     rm -rf "$work/out.$tag"
     if printf '%s\n' "$PASSPHRASE" | $bin extract --password-stdin -C "$work/out.$tag" $flagged >/dev/null 2>"$work/e"; then
       compare_restored_tree corpus "$work/out.$tag/corpus" "$name/$tag" >/dev/null 2>&1 || { echo "  FAIL [$name] $tag extracted tree differs"; ok=0; }
+    elif [ "$tag" = OLD ] && is_expected_fix "$(cat "$work/e")"; then
+      # The reference cannot read a shape the candidate fixed. That is the fix
+      # landing, not a regression -- the candidate failing here still does.
+      FIXED=$((FIXED+1)); FIXED_COMBOS+=("$name/extract (reference cannot read what the candidate fixed)")
     else
       echo "  FAIL [$name] $tag extract: $(tail -1 "$work/e")"; ok=0
     fi
@@ -316,7 +349,7 @@ password_combo() {
 # through the plain path, through a bootstrap sidecar, and from a pipe.
 stream_combo() {
   local name="$1"; local make="$2"; local read_key="$3"; local expect_tree="$4"
-  local work; work=$(mktemp -d)
+  local work; work=$(mktemp -d) || { echo "  FAIL [$name] could not create a work directory"; FAIL=$((FAIL+1)); return; }
   if ! eval "${make//@BIN@/$OLD}" >/dev/null 2>"$work/e"; then
     rm -f "$work"/out*.tzap "$work/out.boot"
     if eval "${make//@BIN@/$NEW}" >/dev/null 2>"$work/probe.err"; then
@@ -392,7 +425,13 @@ stream_combo() {
     eval "n=\$${op}_NEW"; eval "o=\$${op}_OLD"
     case $op in sv) label=verify ;; sl) label=list ;; *) label=extract ;; esac
     if [ "${n:-}" != "${o:-}" ]; then
-      echo "  FAIL [$name] $label disagrees: new=[${n:-unset}] old=[${o:-unset}]"; ok=0
+      # Same allowance as the shape matrix: the candidate succeeding where the
+      # reference fails for a known-fixed reason is the fix, not a regression.
+      if [ "${n:-}" = "ok" ] && is_expected_fix "${o#fail:}"; then
+        FIXED=$((FIXED+1)); FIXED_COMBOS+=("$name/$label (reference cannot read what the candidate fixed)")
+      else
+        echo "  FAIL [$name] $label disagrees: new=[${n:-unset}] old=[${o:-unset}]"; ok=0
+      fi
     elif [ "${n:-}" = "tree-differs" ]; then
       echo "  FAIL [$name] $label: both extracted a tree that differs from the source"; ok=0
     elif [ "${n:-ok}" != "ok" ]; then

@@ -708,6 +708,21 @@ $ echo $?
 4
 ```
 
+**Sparse files are covered by the same promise.** A file the host reports as
+sparse — automatic on Linux through `SEEK_HOLE`, and on Windows through the
+allocated-range query — is read extent by extent rather than straight through,
+and a shortened one is zero-filled across every extent still owed, exactly as a
+dense file is. This was not always true: the sparse path used to fail the whole
+run, so whether a live backup survived depended on whether the file happened to
+have holes. A VM disk image or a database with a punched hole is precisely the
+kind of file that is both sparse and being written to.
+
+**Two names for one inode may be stored twice.** If the shared inode changes
+between the two points in the scan that see it, the pair cannot be grouped from a
+settled observation. The entry is then stored in full rather than as a hardlink
+alias — larger, always correct — and reported with a `note:`. The restored tree
+has two independent files where the source had two names for one.
+
 **A degraded directory is not a skipped one.** A directory whose own extended
 metadata cannot be read — because it is changing while it is scanned — is
 archived with portable metadata, along with everything inside it, and says so

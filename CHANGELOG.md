@@ -2,6 +2,74 @@
 
 ## Unreleased
 
+- **Changes how pre-epoch timestamps are interpreted, including in archives
+  written by 0.2.4.** §16.7.2 encodes a time as a signed decimal in sign-and-
+  magnitude form, so `-1.25` means 1.25 seconds before the epoch -- the timespec
+  `(-2, 750_000_000)`. 0.2.4 wrote and parsed the two timespec fields out
+  literally, which lands a full second early for every pre-epoch time with a
+  fractional part: it wrote `(-2, 750_000_000)` as `-2.75`, and read `-2.75` back
+  as `(-2, 750_000_000)`. That round-tripped within 0.2.4 while disagreeing with
+  the specification and with every other implementation of it.
+
+  Both directions are now correct, and the conversion happens only at the PAX
+  boundary (`ArchiveTimestamp::canonical_pax_value` and
+  `entry_metadata::parse_timestamp`); `ArchiveTimestamp` is a timespec
+  everywhere else, matching libc and every consumer that applies a restored time.
+
+  **What this means for existing archives.** A member written by 0.2.4 whose
+  `mtime`, `atime` or creation time falls before 1970 *and* carries a fraction
+  will restore 1.5 seconds away from what 0.2.4 intended -- silently, because
+  both values are well-formed. Whole-second pre-epoch times, and every time at or
+  after the epoch, are unaffected, as are archives written by this release and
+  read back by it. The last second before the epoch still has no encoding at all
+  (§16.7.2 forbids `-0`), so an optional time in that window is omitted rather
+  than approximated, and an `mtime` there fails loudly.
+
+  The differential matrix now carries pre-epoch fixtures and compares the two
+  builds' restored metadata, so no future release can change this without the
+  comparison saying so.
+
+- Fixes a sparse input shortened or replaced mid-archive failing the whole run,
+  while an ordinary file of the same size was zero-filled and reported. The two
+  went down different paths out of `open_source`: the dense reader padded to the
+  length the member header already promised and named the file, the sparse reader
+  returned `UnexpectedEof` and took the archive with it. Sparse detection is
+  automatic on Linux (`SEEK_HOLE`) and Windows, so whether a live backup survived
+  came down to whether the file happened to have holes -- a VM disk image or a
+  database with a punched hole would kill the run where a dense file did not.
+  `tzap-operational-boundaries.md` already documented the padding outcome without
+  qualification. The sparse path now pads every byte still owed, across the
+  current extent and all later ones, marks the archive incomplete, and names the
+  member.
+
+- Fixes two names for one inode failing the whole run when the inode was touched
+  between the two stats that saw it. Grouping them into a hardlink alias needs a
+  settled observation of both; without one, the entry is now stored in full as an
+  ordinary regular file -- larger, always correct -- and reported, rather than
+  aborting an archive over ordinary activity on a live tree.
+
+- Hardens the macOS APFS clone post-pass, which addressed already-restored
+  members by joining the archive path onto the extraction root and handing the
+  result to `File::open`, `clonefile`, `copyfile` and `rename`. Every other
+  restore path resolves each component with `open_dir_nofollow` precisely so a
+  swapped ancestor cannot redirect a write outside the root, and the post-pass
+  gave that up. It now resolves members through the same traversal and does its
+  work with `openat`/`clonefileat`/`fcopyfile`/`renameat` against the resolved
+  directory handle, opening each leaf `O_NOFOLLOW`. The staging name is also held
+  by its `O_EXCL` entry until `clonefileat` replaces it, instead of being unlinked
+  immediately and assumed still free. A group that partly succeeded now reports
+  how many partners were shared rather than reading as if nothing happened.
+
+- Fixes a Linux birth time in the one second before the epoch being replaced by
+  the file's ctime. §16.7.2 cannot encode that second, so the time is meant to be
+  omitted; the musl fallback that substitutes ctime where the host exposes no
+  birth time at all was firing for it too, recording a different instant instead
+  of none.
+
+- Restores exit `16` (`unsupported-feature`) for a streamed Windows auxiliary
+  shape the writer refuses. Moving those readers into `tzap-core` put them behind
+  an `io::Result`, and flattening that to an I/O error moved the exit code to `3`.
+
 - Fixes `create` telling the operator the archive held everything else when a
   skipped directory had taken its contents with it. The scan never enumerates a
   directory it could not read, so there is no count to report -- and both
@@ -57,17 +125,25 @@
   whose own extended metadata still cannot be read is archived with portable
   metadata, along with all of its contents, and says so.
 
-- Fixes members with long non-ASCII names being impossible to extract.
-  Restoring writes to a temporary sibling built from the member's own name plus
-  a 46-byte suffix, and a name near the component limit was shortened to make
-  room by cutting at a raw byte offset. That splits a multi-byte character, and
-  APFS rejects the result as an invalid name, so the member could not be
-  restored at all -- reported as `corrupt-archive`, which points at the archive
-  rather than at the name. Every Chinese filename over about 70 characters was
-  affected (11 of 11 measured). Shortening now stops on a character boundary,
-  and a filesystem that refuses the name for any other reason (eCryptfs caps a
-  component at 143 bytes) falls back to a shorter form instead of failing the
-  restore.
+- Fixes members with long names being impossible to extract. Restoring writes to
+  a temporary sibling built from the member's own name plus a 46-byte suffix, and
+  0.2.4 made no room for that suffix: any leaf of 210 bytes or more pushed the
+  temporary name past the 255-byte component limit that ext4, XFS, btrfs and NTFS
+  enforce, so the create failed before a single payload byte was written. The
+  member could not be restored at all, and the error said `corrupt-archive`,
+  which points at the archive rather than at the name. A CJK name is three bytes
+  per character, so this started at about 70 characters; an ASCII name needed
+  210. APFS is not affected, because it measures a component in characters rather
+  than bytes -- which is also why it went unnoticed on macOS.
+
+  The temporary name now keeps as much of the real leaf as fits alongside the
+  suffix, stopping on a character boundary so a multi-byte character is never
+  split (a filesystem that validates UTF-8, APFS among them, rejects a split
+  sequence outright with `EILSEQ`). A filesystem that refuses the name for any
+  other reason -- eCryptfs caps a component at 143 bytes -- falls back to a
+  shorter form, and finally to the suffix alone, instead of failing the restore.
+  The temporary name never reaches the restored tree: it is renamed to the
+  member's real leaf either way.
 
 - Fixes `extract --restore same-os` and `--restore system` refusing any macOS
   archive that contains an APFS clone pair, writing no files at all. The writer

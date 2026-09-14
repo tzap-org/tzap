@@ -93,6 +93,32 @@ make_test_corpus() {
   # FIFO, POSIX-only and root-free.
   mkfifo "$c/fifo.pipe" 2>/dev/null || true
 
+  # Pre-epoch mtimes, including a FRACTIONAL one.
+  #
+  # This is the case that distinguishes a right timestamp conversion from a wrong
+  # one. Revision-45 §16.7.2 is sign-and-magnitude, so "-1.25" is 1.25s before the
+  # epoch and the timespec is (-2, 750000000); writing the two fields out literally
+  # lands a full second early, and a reader applying the same wrong rule round-trips
+  # self-consistently while disagreeing with every other build. Nothing in the
+  # corpus had a negative time at all, so the one harness able to compare two
+  # builds' interpretations could not see it.
+  #
+  # GNU touch takes @seconds with a fraction. BSD touch has no sub-second form, so
+  # fall back to a whole pre-epoch second there and skip if even that is refused --
+  # the corpus skips what a host cannot express rather than failing.
+  printf 'pre-epoch fractional\n' > "$c/pre-epoch-fractional.bin"
+  touch -d '@-1.25' "$c/pre-epoch-fractional.bin" 2>/dev/null \
+    || touch -t 196912312359.58 "$c/pre-epoch-fractional.bin" 2>/dev/null \
+    || rm -f "$c/pre-epoch-fractional.bin"
+  printf 'pre-epoch whole\n' > "$c/pre-epoch-whole.bin"
+  touch -d '@-86400' "$c/pre-epoch-whole.bin" 2>/dev/null \
+    || touch -t 196912310000.00 "$c/pre-epoch-whole.bin" 2>/dev/null \
+    || rm -f "$c/pre-epoch-whole.bin"
+  # A nanosecond-precision modern time, so fraction handling is exercised on the
+  # positive side too.
+  printf 'fractional mtime\n' > "$c/fractional-mtime.bin"
+  touch -d '@1700000000.123456789' "$c/fractional-mtime.bin" 2>/dev/null || true
+
   # A second tree holding only regular files and directories. Streaming tar input
   # supports those kinds and nothing else, so feeding it the full corpus makes two
   # builds refuse for different reasons -- whichever unsupported kind each notices
@@ -134,4 +160,83 @@ compare_restored_tree() {
     fi
   done < <(cd "$src" && find . -mindepth 1 | sed 's|^\./||')
   return $rc
+}
+
+# Emit a stable per-entry metadata fingerprint for a restored tree.
+#
+# `compare_restored_tree` deliberately compares only content, symlink target and
+# entry kind, because a restored tree legitimately differs from its SOURCE in
+# metadata the active restore policy does not apply. That left the differential
+# matrix blind to metadata regressions -- in a project whose whole subject is
+# metadata capture and round-trip restoration.
+#
+# The fix is to compare the two BUILDS against each other rather than against the
+# source. Both run the same policy on the same host, so any difference is a real
+# behaviour change between versions, with no policy caveat to reason about.
+#
+# Mode and mtime (to nanoseconds where the host's stat exposes them) are what the
+# portable profile restores on every platform. Ownership is deliberately absent:
+# it needs a System restore, so including it would compare zeros.
+metadata_fingerprint() {
+  local root="$1" flavour="" rel
+  # GNU and BSD stat take different flags; Git Bash ships GNU.
+  if stat -c '%a' . >/dev/null 2>&1; then flavour=gnu
+  elif stat -f '%Lp' . >/dev/null 2>&1; then flavour=bsd
+  else return 0; fi
+
+  while IFS= read -r rel; do
+    local target="$root/$rel"
+    # Never dereference: a symlink's own mode and time are the entry's.
+    if [ "$flavour" = gnu ]; then
+      printf '%s\t%s\n' "$rel" "$(stat -c '%f|%.9Y' "$target" 2>/dev/null)"
+    else
+      printf '%s\t%s\n' "$rel" "$(stat -f '%Lp|%Fm' "$target" 2>/dev/null)"
+    fi
+  done < <(cd "$root" && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort)
+}
+
+# Entries whose metadata is EXPECTED to differ between the two builds, because
+# the candidate deliberately changed how it is interpreted.
+#
+# Revision-45 §16.7.2 is sign-and-magnitude: "-1.25" is 1.25s before the epoch,
+# i.e. the timespec (-2, 750000000). 0.2.4 wrote and read the two fields out
+# literally, which lands a full second early -- self-consistent within 0.2.4, and
+# wrong against the spec and every other implementation. Correcting it means the
+# two builds necessarily disagree on exactly these entries.
+#
+# EMPTY THIS once the release carrying the correction has shipped: from then on a
+# difference here is a regression again, and this is the only thing standing
+# between that and a silent pass.
+: "${EXPECTED_METADATA_DIFFS:=pre-epoch-fractional.bin
+pre-epoch-whole.bin}"
+
+# Drop the expected-difference entries from a fingerprint.
+filter_expected_metadata_diffs() {
+  local line rel
+  while IFS= read -r line; do
+    rel="${line%%	*}"
+    local skip=0 pattern
+    while IFS= read -r pattern; do
+      [ -n "$pattern" ] || continue
+      [ "$rel" = "$pattern" ] && skip=1
+    done <<< "$EXPECTED_METADATA_DIFFS"
+    [ "$skip" -eq 1 ] || printf '%s\n' "$line"
+  done
+}
+
+# Compare two restored trees' metadata, reporting the first few differences.
+compare_restored_metadata() {
+  local left="$1" right="$2" label="$3"
+  local a b
+  a=$(metadata_fingerprint "$left" | filter_expected_metadata_diffs) || return 0
+  b=$(metadata_fingerprint "$right" | filter_expected_metadata_diffs) || return 0
+  # An empty fingerprint means this host has no usable stat; say nothing rather
+  # than claiming agreement.
+  [ -n "$a" ] || return 0
+  if [ "$a" != "$b" ]; then
+    echo "  $label: restored metadata differs between builds"
+    diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") | head -12 | sed 's/^/    /'
+    return 1
+  fi
+  return 0
 }

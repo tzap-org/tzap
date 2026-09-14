@@ -1891,6 +1891,18 @@ pub(crate) struct PreparedDestination {
     pub(crate) leaf: PathBuf,
 }
 
+impl PreparedDestination {
+    /// Hand the resolved parent handle and leaf to a pass that must address the
+    /// member with its own `*at` syscalls.
+    ///
+    /// macOS-only: the APFS clone post-pass is the only caller, and an ungated
+    /// helper is dead code everywhere else -- which `-D warnings` rejects.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn into_parts(self) -> (CapDir, PathBuf) {
+        (self.parent, self.leaf)
+    }
+}
+
 pub(crate) fn prepare_destination(
     root: &Path,
     archive_path: &[u8],
@@ -1956,7 +1968,14 @@ fn open_or_create_safe_child_dir(parent: &CapDir, component: &str) -> Result<Cap
     parent.open_dir_nofollow(component).map_err(|_| FormatError::UnsafeArchivePath)
 }
 
-fn existing_safe_regular_path(root: &Path, archive_path: &[u8]) -> Result<PreparedDestination, FormatError> {
+/// Reopen an already-restored regular member without following a symlink at any
+/// component, including the leaf.
+///
+/// Used by every pass that has to address a member again after it is on disk --
+/// hardlink targets, and the macOS clone post-pass. A pass that instead joins the
+/// archive path onto the root and hands the result to a path-based syscall gives
+/// up the no-follow guarantee the rest of extraction is built on.
+pub(crate) fn existing_safe_regular_path(root: &Path, archive_path: &[u8]) -> Result<PreparedDestination, FormatError> {
     validate_file_path_bytes(archive_path, u32::MAX)?;
     let components = path_components(archive_path)?;
     let mut parent = open_extraction_root(root)?;

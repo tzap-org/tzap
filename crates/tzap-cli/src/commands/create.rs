@@ -773,6 +773,7 @@ impl RegularFileSource for InputSpec {
         }
         if let Some(extents) = self.sparse_extents.as_deref() {
             return Ok(Box::new(SparseExtentInputReader {
+                path: self.archive_path.clone(),
                 file,
                 expected: self.identity,
                 expected_extents: extents,
@@ -810,7 +811,18 @@ impl RegularFileSource for InputSpec {
                 Box::new(move |path: &Path| validate_windows_input_path_identity(path, expected)),
             )
             .map(|reader| reader as Box<dyn Read + '_>)
-            .map_err(ArchiveWriteError::Io)
+            // A record shape core refuses is an unsupported writer shape, not an
+            // I/O failure. Core reports it as `InvalidData` because its signature
+            // is `io::Result`; flattening that to `ArchiveWriteError::Io` moved
+            // the CLI's exit code from 16 (unsupported-feature) to 3 (io-error)
+            // when these readers moved out of this crate.
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::InvalidData {
+                    FormatError::WriterUnsupported("unsupported streamed Windows auxiliary source").into()
+                } else {
+                    ArchiveWriteError::Io(error)
+                }
+            })
         }
         #[cfg(not(any(windows, target_os = "macos")))]
         Err(FormatError::WriterUnsupported("streamed Windows auxiliary sources require Windows").into())
@@ -903,8 +915,17 @@ pub(crate) fn apply_selected_hardlink_topology(specs: &mut [InputSpec]) -> Resul
             // scan opens either of them -- Windows updates it on the shared
             // inode -- so a raw comparison rejected any directory containing a
             // hardlink pair, on the strength of a field the scan changed itself.
+            // A mismatch here means the two names no longer describe one settled
+            // object -- something touched the inode between the two stats. Do not
+            // fail the run over it: leave this entry as an ordinary regular file
+            // so it is stored in full. That is larger than an alias and always
+            // correct, whereas aliasing on a stale observation stores a link to a
+            // file that may no longer be the same one. The whole release exists
+            // to stop ordinary activity on a live tree destroying an archive, and
+            // a hardlink pair whose inode was touched mid-scan is exactly that.
             if !input_identity_matches_after_read(canonical.identity, spec.identity) {
-                bail!("selected hardlink identity changed while grouping inputs");
+                note_hardlink_not_grouped(&spec.archive_path);
+                continue;
             }
             let (canonical_target, mode, mtime, mut portable_metadata) =
                 (canonical.archive_path.as_bytes().to_vec(), canonical.mode, canonical.mtime, canonical.portable_metadata.clone());
@@ -1148,9 +1169,9 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
     let archive_path = archive_path_to_string(archive_path)?;
     // One look at the file, not two: stat, identity, sparse ranges and capture all
     // come from the same observation, so the index entry and the PAX records
-    // always describe a single object. There is no retry -- neither 7-Zip nor
-    // libarchive retries a capture, and re-reading a file that is still being
-    // written cannot converge anyway.
+    // always describe a single object. A lost race retries the whole observation
+    // rather than re-testing a scan-time identity that can never match again --
+    // see `observe_with_capture_retry`, which is why the grouping matters.
     let RegularInputObservation { metadata, identity, sparse_extents, captured } = observe_with_capture_retry(|| observe_regular_input(input))?;
     #[cfg(target_os = "macos")]
     let macos_identity = captured.macos_identity;

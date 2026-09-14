@@ -3447,7 +3447,7 @@ fn restore_macos_clone_groups(
 ) {
     use std::collections::BTreeMap;
 
-    let mut groups: BTreeMap<String, Vec<std::path::PathBuf>> = BTreeMap::new();
+    let mut groups: BTreeMap<String, Vec<crate::macos_metadata::CloneMember>> = BTreeMap::new();
     for (_, _, member) in planned {
         if member.kind != TarEntryKind::Regular || member.reparse_placeholder {
             continue;
@@ -3455,17 +3455,26 @@ fn restore_macos_clone_groups(
         let Some(metadata) = member.v45_metadata.as_ref() else { continue };
         let Some(value) = metadata.primary_records.get("TZAP.macos.clone-group") else { continue };
         let Ok(group) = std::str::from_utf8(value) else { continue };
-        let Ok(relative) = std::str::from_utf8(&member.path) else { continue };
-        groups.entry(group.to_owned()).or_default().push(root.join(relative));
+        // Resolve through the same no-follow traversal the rest of restore uses,
+        // rather than joining the archive path onto the root. A member that will
+        // not resolve safely is simply left unshared: the hint is optimization
+        // only, so dropping it costs nothing and is never worth relaxing a path
+        // check for.
+        let Ok(resolved) = crate::tar_model::restore::existing_safe_regular_path(root, &member.path) else { continue };
+        let (parent, leaf) = resolved.into_parts();
+        groups.entry(group.to_owned()).or_default().push(crate::macos_metadata::CloneMember::new(std::sync::Arc::new(parent), leaf));
     }
     if groups.is_empty() {
         return;
     }
 
     for outcome in crate::macos_metadata::restore_clone_groups(&groups) {
-        let crate::macos_metadata::CloneRestoreOutcome::NotShared { reason, .. } = outcome else {
+        let crate::macos_metadata::CloneRestoreOutcome::NotShared { reason, shared, .. } = outcome else {
             continue;
         };
+        // Say how far the group got. "Could not be recreated" on a group where
+        // three of four partners were re-shared reads as if nothing happened.
+        let extent = if shared == 0 { String::new() } else { format!("; {shared} partner(s) were shared before it stopped") };
         // Attach the degradation to the first restored entry: it describes the
         // tree's storage layout, not any single member's content.
         //
@@ -3481,7 +3490,7 @@ fn restore_macos_clone_groups(
                 "clone-group",
                 crate::tar_model::MetadataOperation::Restore,
                 crate::tar_model::MetadataDiagnosticStatus::Skipped,
-                format!("APFS clone sharing could not be recreated ({reason}); logical bytes are unaffected"),
+                format!("APFS clone sharing could not be recreated ({reason}){extent}; logical bytes are unaffected"),
             ));
         }
     }
