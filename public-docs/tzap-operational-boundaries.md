@@ -656,6 +656,69 @@ tzap list --keyfile project.key project.tzap
 # project and project/empty are both listed
 ```
 
+## Inputs `create` leaves out of an archive it still writes
+
+`create` does not refuse a whole archive because one input could not be read.
+An input discovered while walking a directory is reported and passed over, the
+archive is written from everything else, and the run exits `4`
+(`incomplete-archive`) so a caller can tell that outcome from both plain success
+and a failed run. GNU tar draws the same distinction with its exit `2`.
+
+An input **named on the command line** is not passed over: a typo or a missing
+path fails the run rather than quietly producing an archive missing the thing
+that was asked for.
+
+Three things end up in this category:
+
+| Condition | Reported as | In the archive |
+| --- | --- | --- |
+| The input could not be opened, enumerated, or have its metadata captured | `warning: skipped <path>: <reason>` | absent |
+| The input's name is not valid UTF-8, which a revision-45 member path must be | `warning: skipped <path>: file name is not valid UTF-8 …` | absent |
+| The input vanished or shrank between the scan and the read of its bytes | `note: <path> … stored <size> of zeros in its place` / `… was shortened while being archived` | present, at its promised length, with the missing bytes as zeros |
+
+```sh
+$ tzap create --no-encryption -o tree.tzap ./tree
+created 2 member(s), 4 bytes in, 396328 archive bytes, 1 volume(s), …
+warning: skipped tree/locked: failed to read directory tree/locked: Permission denied (os error 13)
+1 input(s) skipped, named above; 1 of them is a directory, so everything inside it was skipped too
+$ echo $?
+4
+```
+
+**A skipped directory takes its contents with it.** The scan never enumerated
+them, so there is no count to report and the summary does not pretend
+otherwise — it says a directory was skipped. `tzap list` on the resulting
+archive is the authoritative answer to what was captured.
+
+**`--dry-run` reports the same thing.** The scan has already run by then, so a
+dry run names every input the real run would leave out, counts them as
+`inputs skipped:`, and exits `4` as well. A pre-flight check that only reported
+the good news would be worth nothing.
+
+```sh
+$ tzap create --no-encryption -o tree.tzap --dry-run ./tree
+create dry-run summary:
+  files: 2
+  input bytes: 4
+  inputs skipped: 1
+  …
+warning: skipped tree/locked: failed to read directory tree/locked: Permission denied (os error 13)
+1 input(s) skipped, named above; 1 of them is a directory, so everything inside it was skipped too
+$ echo $?
+4
+```
+
+**A degraded directory is not a skipped one.** A directory whose own extended
+metadata cannot be read — because it is changing while it is scanned — is
+archived with portable metadata, along with everything inside it, and says so
+with a `note:` rather than a `warning:`. That is not an incomplete archive and
+does not change the exit code: mode, ownership and times are intact, and only
+the native layer (xattrs, ACL, flags) is missing.
+
+**The archive itself is always complete and verifiable.** Exit `4` describes
+what was collected, not the integrity of what was written: `tzap verify`
+succeeds on these archives, and every member in them is whole.
+
 ## Tar metadata profile
 
 The v0.45 CLI create path emits complete `portable-v1` regular-file,
@@ -677,9 +740,9 @@ currently has these platform boundaries:
 
 | Capture host | Captured for accepted regular files and directories | Rejected or not captured |
 |---|---|---|
-| Linux | Numeric ownership; no-follow symlink ownership and readable xattrs; canonical POSIX.1e access/default ACLs; inline and auxiliary xattrs; observed ctime; available creation time; exact Linux inode flags; optional project IDs; sparse allocation; FIFO, character-device, block-device, and whiteout descriptors; and selected regular-file hardlink topology. | Live sockets, unreadable privileged namespaces, filesystem metadata hidden from the caller, and source objects that change during capture. Linux birth time is captured where exposed but cannot generally be assigned during restore. |
+| Linux | Numeric ownership; no-follow symlink ownership and readable xattrs; canonical POSIX.1e access/default ACLs; inline and auxiliary xattrs; observed ctime; available creation time; exact Linux inode flags; optional project IDs; sparse allocation; FIFO, character-device, block-device, and whiteout descriptors; and selected regular-file hardlink topology. | Live sockets, unreadable privileged namespaces, filesystem metadata hidden from the caller, and source objects that keep changing faster than the scan can re-observe them — such an input is reported and skipped, not fatal to the run. A directory that will not hold still is archived with portable metadata and a note instead, so its contents are never skipped with it. Linux birth time is captured where exposed but cannot generally be assigned during restore. |
 | Windows | Creation, access, write, and change times at 100-ns precision, including pre-1970 values; exact supported attributes; primary and alternate-stream sparse data; relative-symlink, junction, and opaque reparse buffers; directory case-sensitive state; selected hardlink topology; owner/group/DACL self-relative security descriptor plus SACL when available; raw EFS regular files where the Windows raw API accepts the source; native compression; and EA/property/object-ID backup streams when exposed. | Encrypted directories, offline/cloud placeholders without an explicit hydration policy, read-mutating streams, and transactional/ghosted or otherwise unregistered backup streams. These cases fail creation instead of silently discarding metadata. ReFS sparse layout is preserved logically but authenticated as partial because ReFS does not expose exact allocated ranges. |
-| macOS | Numeric ownership; no-follow symlink ownership, xattrs, ACLs, flags, and timestamps; readable inline/auxiliary xattrs; recognized Darwin flags with unknown bits retained but not applied; observed ctime; available creation time; native ACL external form; FinderInfo; streamed resource forks; FIFO and device descriptors; and selected regular-file hardlink topology. | Live sockets, unreadable privileged metadata, APFS clone hints, and source objects or resource forks that change during capture. Device recreation and system Darwin flags require an authorized System restore with superuser privilege. |
+| macOS | Numeric ownership; no-follow symlink ownership, xattrs, ACLs, flags, and timestamps; readable inline/auxiliary xattrs; recognized Darwin flags with unknown bits retained but not applied; observed ctime; available creation time; native ACL external form; FinderInfo; streamed resource forks; FIFO and device descriptors; selected regular-file hardlink topology; and APFS clone-group hints for selected clone partners, re-established on restore where the destination supports cloning. | Live sockets, unreadable privileged metadata, and source objects or resource forks that keep changing faster than the scan can re-observe them — such an input is reported and skipped, not fatal to the run. A directory that will not hold still is archived with portable metadata and a note instead, so its contents are never skipped with it. Device recreation and system Darwin flags require an authorized System restore with superuser privilege. |
 | Other POSIX hosts | Portable regular-file, directory, and safe symlink fields. | Source-native profile capture is not yet implemented. |
 
 Linux POSIX ACL backing xattrs are converted to canonical `SCHILY.acl.*`

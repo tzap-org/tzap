@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+- Fixes `create` telling the operator the archive held everything else when a
+  skipped directory had taken its contents with it. The scan never enumerates a
+  directory it could not read, so there is no count to report -- and both
+  wordings ("the archive contains everything else", then "the archive holds the
+  rest") asserted the opposite of what happened. Measured: a directory holding
+  five files was skipped and the run still reported `created 2 member(s)` and
+  `the archive holds the rest`. The summary now names how many skipped inputs
+  were directories and says plainly that everything inside them was skipped too.
+
+- Fixes the same run also claiming it had archived that directory. A directory
+  records "archived it and everything inside it without that layer" before it is
+  enumerated, and the permission failure that hides its extended metadata is
+  usually the one that then fails `read_dir` -- so the run printed that claim
+  and, two lines later, that the directory had been skipped entirely. The note
+  is now retracted when the scan abandons the input.
+
+- Fixes one file name that is not valid UTF-8 discarding its whole directory.
+  The name was decoded inside the directory's child loop and the failure raised
+  out of it, so the caller rolled the directory back: every sibling already
+  collected, every sibling after it, and the directory itself, reported as a
+  single skipped directory. A POSIX file name is a byte string, so this is
+  ordinary in a real Linux tree -- measured on ext4, a directory of five
+  readable files plus one undecodable name produced `created 1 member(s)` and
+  never mentioned the five. The undecodable entry alone is now skipped and
+  named. An input named on the command line still fails the run.
+
+- Fixes `create --dry-run` hiding the inputs the real run would leave out. The
+  scan already ran by the time the dry-run summary was printed, but it counted
+  only what survived and exited `0`: the tree that made `create` exit `4` with a
+  named skip made `create --dry-run` print a clean summary. A dry run now
+  reports `inputs skipped:`, names each one, and exits `4` as the real run
+  would.
+
+- Corrects `public-docs/tzap-operational-boundaries.md`, which still listed APFS
+  clone hints as not captured on macOS while the writer records them and the
+  reader re-establishes sharing on restore, and still described any source
+  object changing during capture as rejected. Adds the section on inputs
+  `create` leaves out of an archive it still writes, with worked examples and
+  exit labels for the skip, zero-fill, degraded-directory, and dry-run cases.
+
 - Fixes `create` dropping a whole subtree when a directory changed while it was
   being scanned. A directory's mtime, ctime and size move every time one of its
   children is created or removed, and the capture compared all of them against

@@ -21,7 +21,7 @@ This document is a compact command reference for `tzap` operators and automation
 | 1 | error | Unexpected runtime or internal error |
 | 2 | usage | Invalid args / command-line usage |
 | 3 | io-error | Filesystem I/O or permission problem |
-| 4 | incomplete-archive | `create` produced a valid archive, but something was left out of it: an input it could not read, or one that was replaced by zeros because it vanished or shrank while being archived. Every such input is named on stderr. The archive itself is complete and verifiable. |
+| 4 | incomplete-archive | `create` produced a valid archive, but something was left out of it: an input it could not read, one whose name is not valid UTF-8, or one that was replaced by zeros because it vanished or shrank while being archived. A skipped directory takes its contents with it. Every such input is named on stderr, and `create --dry-run` reports and exits the same way for the run it is rehearsing. The archive itself is complete and verifiable. See [operational boundaries](tzap-operational-boundaries.md#inputs-create-leaves-out-of-an-archive-it-still-writes). |
 | 10 | wrong-key | Wrong passphrase or key for archive |
 | 11 | corrupt-archive | Archive integrity or payload problem |
 | 12 | unsupported-revision | Unsupported archive revision; use or upgrade to a reader that supports it |
@@ -101,7 +101,9 @@ Useful flags:
 - `--jobs`: worker count for reader/writer CPU work; defaults to the logical CPU
   count reported by the operating system
 - `--timings`: print a create-stage timing breakdown for performance diagnosis
-- `--dry-run`: print planned actions without writing bytes
+- `--dry-run`: print planned actions without writing bytes. The input scan still
+  runs, so this also names every input the real run would skip and exits `4` when
+  there is one
 - `--force`: allow overwrite of outputs and bootstrap
 
 Notes:

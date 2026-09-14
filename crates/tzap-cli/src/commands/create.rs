@@ -41,6 +41,12 @@ fn create_summary_fec_fragment(options: &WriterOptions, tolerance: u8) -> String
 /// us in any create mode, and wiring this into one of them is how it silently
 /// did nothing for the others.
 fn report_inputs_not_fully_archived(quiet: bool) -> Result<()> {
+    // Directories whose own extended metadata could not be read but which are
+    // still in the archive. A directory the scan went on to abandon has had its
+    // note retracted by now, so this never contradicts a skip below.
+    for note in take_degraded_directories() {
+        eprintln!("note: {note}");
+    }
     // Files that moved while they were archived. The archive is complete and
     // readable; these members hold what was there when archiving started.
     for note in take_inputs_changed_during_read() {
@@ -49,15 +55,31 @@ fn report_inputs_not_fully_archived(quiet: bool) -> Result<()> {
     // Inputs left out entirely. Stated after the summary so what was produced
     // comes first, then what it is missing.
     let skipped = take_skipped_inputs();
-    for note in &skipped {
-        eprintln!("warning: {note}");
+    for skip in &skipped {
+        eprintln!("warning: {}", skip.note);
     }
     if !skipped.is_empty() {
-        // Count what was skipped; do not claim anything about what was not. The
-        // previous wording ("the archive contains everything else") was read out
-        // even when a single skipped directory had taken its whole subtree with
-        // it -- one warning line standing for six missing inputs.
-        emit_success_summary(quiet, &format!("{} input(s) skipped, named above; the archive holds the rest", skipped.len()))?;
+        // Count what was skipped; do not claim anything about what was not.
+        //
+        // "the archive contains everything else", and the "the archive holds the
+        // rest" that replaced it, were both read out when a skipped *directory*
+        // had taken its whole subtree with it -- one warning line standing for
+        // every file underneath, none of which the scan ever enumerated, so
+        // there is no honest count to give. Say that a directory was skipped
+        // instead of asserting something about its contents.
+        let directories = skipped.iter().filter(|skip| skip.took_contents).count();
+        let summary = if directories == 0 {
+            format!("{} input(s) skipped, named above; every other input was archived", skipped.len())
+        } else {
+            format!(
+                "{} input(s) skipped, named above; {directories} of them {} director{}, so everything inside {} was skipped too",
+                skipped.len(),
+                if directories == 1 { "is a" } else { "are" },
+                if directories == 1 { "y" } else { "ies" },
+                if directories == 1 { "it" } else { "them" }
+            )
+        };
+        emit_success_summary(quiet, &summary)?;
         mark_archive_incomplete();
     }
     Ok(())
@@ -313,6 +335,12 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
         eprintln!("create dry-run summary:");
         eprintln!("  files: {}", input_specs.len());
         eprintln!("  input bytes: {}", input_bytes);
+        // The scan has already run, so a dry run knows exactly what the real run
+        // would leave out. Counting only what survived and exiting 0 made the one
+        // command meant to rehearse a backup the one that hid the problem: the
+        // same tree reported "files: 2" and success here while `create` reported
+        // a skipped input and exited 4.
+        eprintln!("  inputs skipped: {}", skipped_input_count());
         eprintln!(
             "  key mode: {}",
             create_key_mode_label(keyfile.as_deref(), recipient_cert.as_deref(), password_stdin, password, no_encryption, insecure_zero_key)
@@ -326,6 +354,10 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
         if let Some(bootstrap_path) = bootstrap_output {
             eprintln!("  bootstrap: {}", bootstrap_path);
         }
+        // Names each skipped input and sets the incomplete-archive exit, so a
+        // pre-flight check fails for the same reason the real run would. The
+        // rehearsal is worth nothing if it only reports the good news.
+        report_inputs_not_fully_archived(quiet)?;
         return Ok(());
     }
 
@@ -914,13 +946,19 @@ pub(crate) fn input_specs_total_size(specs: &[InputSpec]) -> Result<u64> {
 /// quietly produce an archive missing the thing that was asked for.
 fn collect_child_input_spec(input: &Path, archive_path: &Path, out: &mut Vec<InputSpec>) -> Result<()> {
     let before = out.len();
+    // A directory records a degradation note before it is enumerated, so an
+    // input abandoned afterwards has to retract it as well as its specs. The
+    // same permission failure typically causes both, and the note claims the
+    // directory "and everything inside it" was archived.
+    let degraded_mark = degraded_directory_mark();
     match collect_one_input_spec(input, archive_path, out) {
         Ok(()) => Ok(()),
         Err(error) => {
             // Anything already pushed for this input describes a half-read
             // object; drop it so the archive never carries a partial entry.
             out.truncate(before);
-            note_input_skipped(input, &format!("{error:#}"));
+            rollback_degraded_directories(degraded_mark);
+            note_input_skipped(input, &format!("{error:#}"), skipped_input_took_contents(input));
             Ok(())
         }
     }
@@ -1026,7 +1064,21 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
         let mut entries = fs::read_dir(input).with_context(|| format!("failed to read directory {}", input.display()))?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
-            let child_name = entry.file_name().into_string().map_err(|_| anyhow!("input path is not valid UTF-8"))?;
+            // A name the archive cannot express is one entry's problem. Raising it
+            // out of this loop made the caller's `collect_child_input_spec` roll the
+            // whole directory back -- the siblings already collected, every sibling
+            // after it, and the directory itself -- for one undecodable leaf, and
+            // report it as a single skipped directory. A POSIX file name is a byte
+            // string, so on Linux this is an ordinary thing to find in a real tree.
+            //
+            // An input named on the command line still fails the run: that is
+            // `collect_input_specs`, and a typo should say so rather than quietly
+            // produce an archive missing what was asked for.
+            let Ok(child_name) = entry.file_name().into_string() else {
+                let child = entry.path();
+                note_input_skipped(&child, "file name is not valid UTF-8, which a revision-45 member path must be", skipped_input_took_contents(&child));
+                continue;
+            };
             collect_child_input_spec(&entry.path(), &archive_path.join(child_name), out)?;
         }
         return Ok(());

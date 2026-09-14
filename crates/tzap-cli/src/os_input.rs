@@ -749,6 +749,16 @@ fn record_input_changed_during_read(path: &str, declared: u64, padded: u64) {
     }
 }
 
+/// One input this run left out, and whether leaving it out took more with it.
+pub(crate) struct SkippedInput {
+    pub(crate) note: String,
+    /// The input was a directory, so its contents were skipped along with it.
+    /// The scan never enumerated them, so there is no count to report -- only
+    /// the fact, which is what stops the summary claiming the archive holds
+    /// everything else.
+    pub(crate) took_contents: bool,
+}
+
 /// Note an input this run could not archive, so the rest still can be.
 ///
 /// Refusing the whole archive because one file is unreadable is not what an
@@ -757,16 +767,31 @@ fn record_input_changed_during_read(path: &str, declared: u64, padded: u64) {
 /// three still write the archive with everything they could read. A backup that
 /// produces nothing because one file had the wrong permissions is worse than a
 /// backup that is honest about what it skipped.
-pub(crate) fn note_input_skipped(path: &Path, reason: &str) {
+///
+/// `took_contents` says the skipped input was a directory. Its children are not
+/// separately reported -- a directory is usually skipped precisely because it
+/// could not be enumerated -- so the summary has to say plainly that more than
+/// the named entry is missing.
+pub(crate) fn note_input_skipped(path: &Path, reason: &str, took_contents: bool) {
     let note = format!("skipped {}: {reason}", path.display());
     if let Ok(mut notes) = SKIPPED_INPUTS.lock() {
-        if !notes.contains(&note) {
-            notes.push(note);
+        if !notes.iter().any(|existing| existing.note == note) {
+            notes.push(SkippedInput { note, took_contents });
         }
     }
 }
 
-static SKIPPED_INPUTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Whether `path` is a directory, for the skip notes.
+///
+/// A directory is commonly skipped because it could not be read, but the failure
+/// that makes it unreadable is its own -- `symlink_metadata` goes through the
+/// parent, so the kind is still knowable. An unknowable kind reports `false`:
+/// claiming contents were lost when they were not is its own wrong answer.
+pub(crate) fn skipped_input_took_contents(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+static SKIPPED_INPUTS: std::sync::Mutex<Vec<SkippedInput>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether this run left something out of the archive it produced.
 ///
@@ -784,8 +809,17 @@ pub(crate) fn archive_was_incomplete() -> bool {
 }
 
 /// Everything this run could not archive, in the order it was noticed.
-pub(crate) fn take_skipped_inputs() -> Vec<String> {
+pub(crate) fn take_skipped_inputs() -> Vec<SkippedInput> {
     SKIPPED_INPUTS.lock().map(|mut notes| std::mem::take(&mut *notes)).unwrap_or_default()
+}
+
+/// How many inputs have been skipped so far, without draining them.
+///
+/// The dry-run summary reports the count inline and then lets
+/// `report_inputs_not_fully_archived` name them, so it must not consume the
+/// buffer on the way past.
+pub(crate) fn skipped_input_count() -> usize {
+    SKIPPED_INPUTS.lock().map(|notes| notes.len()).unwrap_or(0)
 }
 
 /// Note an input that became unreadable between the scan and the read.
@@ -806,20 +840,61 @@ pub(crate) fn note_input_vanished_before_read(path: &str, declared: u64, error: 
     mark_archive_incomplete();
 }
 
+/// Directories archived without their platform-native metadata.
+///
+/// Kept apart from `CHANGED_DURING_READ` because these are recorded during the
+/// scan, which can still abandon the directory afterwards, while that buffer is
+/// filled by the writer's threads during the read. Separating them makes
+/// [`rollback_degraded_directories`] provably safe: nothing else writes here
+/// while the scan runs, so a mark taken before an input still describes the same
+/// buffer when that input is abandoned.
+static DEGRADED_DIRECTORIES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// Note a directory archived without its platform-native metadata.
 ///
 /// Reported, not fatal, and not an incomplete archive: the directory and
 /// everything inside it are present, with mode, ownership and times intact. Only
 /// the native layer -- xattrs, ACL, flags -- is missing, because the directory
 /// would not hold still long enough to read it.
+///
+/// The claim is only true if the directory is still archived when the scan ends.
+/// The same permission failure that hides a directory's xattrs usually also
+/// fails the `read_dir` that follows, and the note was emitted first: an
+/// unreadable directory announced "archived it and everything inside it" and was
+/// then skipped entirely, two lines apart. [`rollback_degraded_directories`] is
+/// how the scan retracts it.
 pub(crate) fn note_directory_metadata_degraded(path: &Path, reason: &str) {
     let note =
         format!("{}: could not read the directory's own extended metadata ({reason}); archived it and everything inside it without that layer", path.display());
-    if let Ok(mut notes) = CHANGED_DURING_READ.lock() {
+    if let Ok(mut notes) = DEGRADED_DIRECTORIES.lock() {
         if !notes.contains(&note) {
             notes.push(note);
         }
     }
+}
+
+/// How many degraded-directory notes stand, for a caller about to try an input
+/// it may have to abandon.
+pub(crate) fn degraded_directory_mark() -> usize {
+    DEGRADED_DIRECTORIES.lock().map(|notes| notes.len()).unwrap_or(0)
+}
+
+/// Drop every degraded-directory note recorded since `mark`.
+///
+/// The scan is sequential -- `collect_input_specs` walks inputs one at a time,
+/// and the writer has not started -- so the notes above `mark` are exactly the
+/// ones the abandoned input produced.
+pub(crate) fn rollback_degraded_directories(mark: usize) {
+    if let Ok(mut notes) = DEGRADED_DIRECTORIES.lock() {
+        if mark <= notes.len() {
+            notes.truncate(mark);
+        }
+    }
+}
+
+/// Every directory archived with degraded metadata, in the order it was noticed.
+pub(crate) fn take_degraded_directories() -> Vec<String> {
+    DEGRADED_DIRECTORIES.lock().map(|mut notes| std::mem::take(&mut *notes)).unwrap_or_default()
 }
 
 /// Note a regular input that moved between the scan and the read of its bytes.

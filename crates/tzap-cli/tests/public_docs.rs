@@ -527,3 +527,34 @@ fn published_v45_conformance_declares_classes_and_discloses_corpus_gaps() {
     assert!(conformance.contains("external conformance program"), "the page must keep deferring total conformance to an external program");
     assert!(conformance.contains("clone hints"), "the macOS class must still account for clone hints one way or the other");
 }
+
+/// The docs must describe what `create` leaves out, and must not contradict it.
+///
+/// AGENTS.md puts operational boundaries in `public-docs/` with concrete
+/// examples, expected exit labels, and user actions. The incomplete-archive
+/// behaviour shipped with a one-line row in the CLI reference and nothing here,
+/// while this file still listed APFS clone hints as not captured on macOS --
+/// which the writer records and the reader re-establishes on restore.
+#[test]
+fn operational_boundaries_document_inputs_left_out_of_an_archive() {
+    let boundaries = read_workspace_file("public-docs/tzap-operational-boundaries.md");
+    let reference = read_workspace_file("public-docs/tzap-cli-reference.md");
+
+    assert!(boundaries.contains("## Inputs `create` leaves out of an archive it still writes"));
+    // The exit label and the three ways an input goes missing.
+    assert!(boundaries.contains("`4`\n(`incomplete-archive`)") || boundaries.contains("exits `4`"));
+    assert!(boundaries.contains("not valid UTF-8"), "the undecodable-name skip must be documented");
+    assert!(boundaries.contains("A skipped directory takes its contents with it."));
+    assert!(boundaries.contains("`--dry-run` reports the same thing."));
+    assert!(boundaries.contains("A degraded directory is not a skipped one."));
+    // The CLI reference points at the worked examples rather than restating them.
+    assert!(reference.contains("#inputs-create-leaves-out-of-an-archive-it-still-writes"));
+
+    // The macOS capture row must not deny what the writer records. `create`
+    // stores `TZAP.macos.clone-group` for selected clone partners and the
+    // reader re-establishes sharing under `same-os` and `system`.
+    let macos_row = boundaries.lines().find(|line| line.starts_with("| macOS |")).expect("the capture boundary table must have a macOS row");
+    let rejected = macos_row.rsplit('|').nth(1).expect("the row has a rejected column");
+    assert!(!rejected.contains("clone"), "APFS clone hints are captured, so they must not be listed as rejected: {rejected}");
+    assert!(macos_row.contains("APFS clone-group hints"), "the captured column must say so: {macos_row}");
+}

@@ -2447,3 +2447,147 @@ fn cli_create_completes_when_an_input_disappears_before_its_bytes_are_read() {
         assert!(listed.contains(&format!("keep-{index}.bin")), "every readable member must survive: {listed}");
     }
 }
+
+/// A skipped directory must never be summarised as if only it went missing.
+///
+/// The scan never enumerates an unreadable directory, so its children are not
+/// separately reported -- and both wordings this replaced ("the archive contains
+/// everything else", then "the archive holds the rest") asserted the opposite of
+/// what happened. Measured: a directory holding five files was skipped and the
+/// run still told the operator the archive held the rest.
+///
+/// The paired defect is the `note:` line. A directory records "archived it and
+/// everything inside it without that layer" *before* it is enumerated, and the
+/// same permission failure that hides its xattrs also fails the `read_dir` that
+/// follows -- so the run printed that claim and, two lines later, that the
+/// directory had been skipped entirely.
+#[cfg(unix)]
+#[test]
+fn cli_create_says_a_skipped_directory_took_its_contents_with_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("tree");
+    let locked = source.join("locked");
+    let archive = temp.path().join("tree.tzap");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(source.join("top.txt"), b"kept\n").unwrap();
+    for index in 0..5 {
+        fs::write(locked.join(format!("inner-{index}.txt")), b"lost\n").unwrap();
+    }
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Running as root defeats the fixture: the directory stays readable.
+    if fs::read_dir(&locked).is_ok() {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let output =
+        Command::cargo_bin("tzap").unwrap().args(["create", "--no-encryption", "-o", archive.to_str().unwrap(), source.to_str().unwrap()]).output().unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(4), "a skipped input must exit 4 (incomplete-archive): {stderr}");
+    assert!(stderr.contains("locked"), "the skipped directory must be named: {stderr}");
+    // The claim, not just the warning. These are the two phrasings that were read
+    // out while five files were missing.
+    assert!(!stderr.contains("the archive holds the rest"), "must not claim the archive holds what a skipped directory took: {stderr}");
+    assert!(!stderr.contains("the archive contains everything else"), "must not claim completeness: {stderr}");
+    assert!(stderr.contains("is a directory, so everything inside it was skipped too"), "the summary must say the contents went too: {stderr}");
+    // The retracted note: the directory was not archived, so nothing may say it
+    // and its contents were.
+    assert!(!stderr.contains("archived it and everything inside it"), "a directory that was then skipped must not also be reported as archived: {stderr}");
+
+    // And the archive is still delivered, holding exactly what could be read.
+    Command::cargo_bin("tzap").unwrap().args(["verify", archive.to_str().unwrap()]).assert().success();
+    let listed = Command::cargo_bin("tzap").unwrap().args(["list", archive.to_str().unwrap()]).assert().success().get_output().stdout.clone();
+    let listed = String::from_utf8_lossy(&listed);
+    assert!(listed.contains("top.txt"), "the readable member must be archived: {listed}");
+    assert!(!listed.contains("inner-"), "nothing under the skipped directory may be claimed: {listed}");
+}
+
+/// `--dry-run` must rehearse the real run's bad news, not only its good news.
+///
+/// The scan runs before the dry-run summary is printed, so by then the run knows
+/// exactly what it would skip. It reported only the inputs that survived and
+/// exited 0: the same tree that made `create` exit 4 with a named skip made
+/// `create --dry-run` print a clean summary. A pre-flight check that cannot fail
+/// for the reason the real run fails is worse than none.
+#[cfg(unix)]
+#[test]
+fn cli_create_dry_run_reports_the_inputs_the_real_run_would_skip() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("tree");
+    let archive = temp.path().join("tree.tzap");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("readable.txt"), b"kept\n").unwrap();
+    fs::write(source.join("locked.txt"), b"unreadable\n").unwrap();
+    fs::set_permissions(source.join("locked.txt"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    if fs::File::open(source.join("locked.txt")).is_ok() {
+        return; // running as root; nothing is unreadable
+    }
+
+    let output = Command::cargo_bin("tzap")
+        .unwrap()
+        .args(["create", "--no-encryption", "-o", archive.to_str().unwrap(), "--dry-run", source.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(stderr.contains("create dry-run summary:"), "{stderr}");
+    assert!(stderr.contains("inputs skipped: 1"), "the dry run must count what it would skip: {stderr}");
+    assert!(stderr.contains("locked.txt"), "the dry run must name what it would skip: {stderr}");
+    assert_eq!(output.status.code(), Some(4), "the dry run must exit as the real run would: {stderr}");
+    assert!(!archive.exists(), "a dry run must still write nothing");
+}
+
+/// One undecodable file name must cost one entry, not its whole directory.
+///
+/// A POSIX file name is a byte string, so a name that is not valid UTF-8 is an
+/// ordinary thing to find in a real Linux tree. Raising it out of the directory's
+/// child loop made the caller roll the whole directory back -- every sibling
+/// already collected, every sibling after it, and the directory itself -- and
+/// report it as a single skipped directory. Measured on ext4: a directory of five
+/// readable files plus one undecodable name produced `created 1 member(s)`, and
+/// the five files were never mentioned.
+///
+/// Linux-only by necessity: APFS validates that a name is UTF-8 and refuses to
+/// create this fixture at all.
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_create_skips_only_the_member_whose_name_is_not_utf8() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("tree");
+    let archive = temp.path().join("tree.tzap");
+    fs::create_dir(&source).unwrap();
+    for index in 0..5 {
+        fs::write(source.join(format!("aaa-keep-{index}.txt")), b"kept\n").unwrap();
+    }
+    // Sorts after the keepers, so a rollback takes all five with it.
+    let undecodable = source.join(OsStr::from_bytes(b"zz-bad-\xff\xfe.txt"));
+    if fs::write(&undecodable, b"lost\n").is_err() {
+        return; // the filesystem refuses the name; nothing to assert
+    }
+
+    let output =
+        Command::cargo_bin("tzap").unwrap().args(["create", "--no-encryption", "-o", archive.to_str().unwrap(), source.to_str().unwrap()]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(4), "the undecodable name must be reported as a skip: {stderr}");
+    assert!(stderr.contains("not valid UTF-8"), "the reason must name the actual problem: {stderr}");
+    assert!(stderr.contains("every other input was archived"), "only one entry was lost, so say so: {stderr}");
+
+    Command::cargo_bin("tzap").unwrap().args(["verify", archive.to_str().unwrap()]).assert().success();
+    let listed = Command::cargo_bin("tzap").unwrap().args(["list", archive.to_str().unwrap()]).assert().success().get_output().stdout.clone();
+    let listed = String::from_utf8_lossy(&listed);
+    for index in 0..5 {
+        assert!(listed.contains(&format!("aaa-keep-{index}.txt")), "the sibling files must survive: {listed}");
+    }
+}
