@@ -40,7 +40,7 @@ fn main() -> ExitCode {
         // The archive exists and verifies, but something was left out of it.
         // GNU tar exits 2 in this situation and bsdtar and 7-Zip exit 1; the
         // point is that a script can tell, while the archive is still delivered.
-        Ok(()) if os_input::archive_was_incomplete() => ExitCode::from(formatters::EXIT_GENERIC),
+        Ok(()) if os_input::archive_was_incomplete() => ExitCode::from(formatters::EXIT_INCOMPLETE_ARCHIVE),
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let diagnostic = classify_error(&err);

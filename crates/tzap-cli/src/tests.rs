@@ -3934,4 +3934,268 @@ fn a_file_shortened_mid_archive_is_padded_and_reported() {
     assert_eq!(notes.len(), 1, "the change must be reported exactly once: {notes:?}");
     assert!(notes[0].contains("shrinking.bin"), "{}", notes[0]);
     assert!(notes[0].contains("shortened"), "the note must say plainly what happened: {}", notes[0]);
+
+    // The numbers, not just the wording. The shortfall used to be reported as the
+    // size of whichever chunk first hit EOF rather than everything still owed, so
+    // the note inverted the loss: a 300 MB file truncated to 1 MB was described as
+    // "kept the 299.9 MB still there and filled the remaining 8.0 KB with zeros".
+    // Asserting only on the word "shortened" passed throughout.
+    assert!(notes[0].contains("kept the 1.0 KB"), "the kept amount must be what survived (1024 of 4096): {}", notes[0]);
+    assert!(notes[0].contains("remaining 3.0 KB"), "the zero-filled amount must be the whole shortfall (3072): {}", notes[0]);
+
+    // Substituted bytes are content the archive does not hold, so the run must not
+    // report plain success.
+    assert!(crate::os_input::archive_was_incomplete(), "zero-filling a shortened member must mark the archive incomplete");
+}
+
+/// A directory archived without its native metadata must still be writable,
+/// restorable, and must still carry its contents.
+///
+/// This is the fallback for a directory that will not hold still long enough for
+/// its extended metadata to be read. It exists because the alternative was to
+/// drop the directory *and every entry already collected beneath it*. It had no
+/// test, and the first version of it produced a declaration the writer refused
+/// outright ("native primary metadata is not a valid v45 declaration") because
+/// the creation time it still carried is owned by `posix-backup-v1`, a profile
+/// the stripped-down entry no longer declared. The whole archive failed, which
+/// is worse than the loss the fallback exists to avoid.
+#[test]
+fn a_directory_archived_without_native_metadata_still_writes_and_restores() {
+    use crate::os_input::{input_identity, portable_only_input_metadata};
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("tree");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("child.bin"), b"child payload").unwrap();
+
+    let mut specs = collect_input_specs(&[source.to_string_lossy().into_owned()]).unwrap();
+    // Replace the directory's metadata with exactly what the fallback produces.
+    let directory_index = specs.iter().position(|spec| spec.entry_kind == tzap_core::SourceEntryKind::Directory).expect("the tree has a directory member");
+    let identity = input_identity(&fs::symlink_metadata(&source).unwrap()).unwrap();
+    specs[directory_index].portable_metadata = portable_only_input_metadata(identity, &source).unwrap().metadata;
+    #[cfg(target_os = "macos")]
+    {
+        specs[directory_index].macos_identity = None;
+    }
+
+    let key = MasterKey::from_raw_key(&[83u8; 32]).unwrap();
+    let mut sink = tzap_core::MemoryArchiveSink::default();
+    tzap_core::write_archive_sources_to_sink(
+        &specs,
+        &key,
+        WriterOptions { stripe_width: 1, volume_loss_tolerance: 0, bit_rot_buffer_pct: 0, ..WriterOptions::default() },
+        None,
+        &KdfParams::Raw,
+        None,
+        None,
+        &mut sink,
+    )
+    .unwrap_or_else(|error| panic!("a portable-only directory must still be writable: {error:?}"));
+
+    let opened = tzap_core::open_archive(&sink.volumes[0], &key).unwrap();
+    opened.verify().unwrap();
+
+    let output = temp.path().join("out");
+    fs::create_dir(&output).unwrap();
+    opened
+        .extract_all_to(&output, tzap_core::SafeExtractionOptions::default())
+        .unwrap_or_else(|error| panic!("a portable-only directory must still restore: {error:?}"));
+
+    // The point of the fallback: the contents survive.
+    assert!(output.join("tree").is_dir(), "the directory itself is missing from the restored tree");
+    assert_eq!(fs::read(output.join("tree").join("child.bin")).unwrap(), b"child payload", "the directory's contents were lost");
+}
+
+/// The race predicate has to recognise the wording every capture path emits,
+/// through the context this host adds on the way up.
+///
+/// It gates the retry that lets a live tree be archived at all. If it stops
+/// matching -- because a message is reworded, or because a context line replaces
+/// rather than wraps it -- the retry silently stops firing and directories start
+/// being skipped again, with nothing failing to say so.
+#[test]
+fn the_capture_race_predicate_matches_every_wording_the_capture_paths_emit() {
+    use crate::os_input::is_capture_race;
+    use anyhow::{anyhow, Context as _};
+
+    for emitted in [
+        "input changed during metadata capture",
+        "input changed before metadata capture",
+        "input kind changed before metadata capture",
+        "xattr changed during metadata capture",
+        "symlink changed before metadata capture",
+        "symlink xattr changed during metadata capture",
+    ] {
+        assert!(is_capture_race(&anyhow!("{emitted}")), "bare: {emitted}");
+        // This host appends the path at the macOS capture site...
+        assert!(is_capture_race(&anyhow!("{emitted}: /tmp/a.bin")), "with a path: {emitted}");
+        // ...and wraps with `.context(..)` elsewhere, which puts the marker in
+        // the chain rather than the outermost message.
+        let wrapped = Err::<(), _>(anyhow!("{emitted}")).context("failed to collect input /tmp/a.bin").unwrap_err();
+        assert!(is_capture_race(&wrapped), "wrapped in context: {emitted}");
+    }
+
+    // Things that are not the race must not be retried: retrying a missing file
+    // or a permission problem only delays the report.
+    for other in [
+        "No such file or directory (os error 2)",
+        "Permission denied (os error 13)",
+        "input changed after scan",
+        "failed to open /tmp/a.bin for metadata capture",
+    ] {
+        assert!(!is_capture_race(&anyhow!("{other}")), "must not be treated as a race: {other}");
+    }
+}
+
+/// A real APFS clone pair, archived and restored the way a user would.
+///
+/// `macos_clone_partners_share_a_recorded_clone_group` stops at capture. That is
+/// the gap AGENTS.md names -- "asserting what capture produced is not coverage" --
+/// and it is exactly how this shipped broken: the writer recorded a clone-group
+/// hint the reader's conformance table had no arm for, so `same-os` and `system`
+/// restore refused the whole member and wrote no files at all. Nothing in either
+/// the unit suite or the differential corpus ever restored a cloned pair.
+///
+/// The second half is the other defect at the same site: re-establishing sharing
+/// used `clonefile`, which copies the *source's* mode, times and xattrs, and
+/// renamed that over a destination whose metadata restore had already applied
+/// correctly. Each partner must come back as itself.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_clone_partners_round_trip_at_every_restore_policy() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree");
+    fs::create_dir(&root).unwrap();
+    let first = root.join("a-first.bin");
+    let second = root.join("b-second.bin");
+    fs::write(&first, vec![21u8; 256 * 1024]).unwrap();
+    if !std::process::Command::new("/bin/cp").arg("-c").arg(&first).arg(&second).status().is_ok_and(|status| status.success()) {
+        return;
+    }
+    if tzap_core::macos_metadata::query_macos_clone_id(&first).is_none() {
+        return; // volume has no clone tracking
+    }
+
+    // Deliberately different in every dimension `clonefile` would carry over.
+    fs::set_permissions(&first, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&second, fs::Permissions::from_mode(0o644)).unwrap();
+    let second_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_746_403_200);
+    fs::File::options().write(true).open(&second).unwrap().set_times(fs::FileTimes::new().set_modified(second_time)).unwrap();
+    let tagged = xattr::set(&second, "com.tzap.only-second", b"keep me").is_ok();
+
+    let specs = collect_input_specs(&[root.to_string_lossy().into_owned()]).unwrap_or_else(|error| panic!("{error:#}"));
+    assert!(
+        specs.iter().any(|spec| spec.portable_metadata.native.primary_pax_records.contains_key("TZAP.macos.clone-group")),
+        "the fixture must actually produce a clone group, or this proves nothing"
+    );
+
+    let key = MasterKey::from_raw_key(&[91u8; 32]).unwrap();
+    let mut sink = tzap_core::MemoryArchiveSink::default();
+    tzap_core::write_archive_sources_to_sink(
+        &specs,
+        &key,
+        WriterOptions { stripe_width: 1, volume_loss_tolerance: 0, bit_rot_buffer_pct: 0, ..WriterOptions::default() },
+        None,
+        &KdfParams::Raw,
+        None,
+        None,
+        &mut sink,
+    )
+    .unwrap_or_else(|error| panic!("a cloned pair must be archivable: {error:?}"));
+    let opened = tzap_core::open_archive(&sink.volumes[0], &key).unwrap();
+    opened.verify().unwrap();
+
+    for policy in [tzap_core::RestorePolicy::Content, tzap_core::RestorePolicy::Portable, tzap_core::RestorePolicy::SameOs] {
+        let output = temp.path().join(format!("out-{policy:?}"));
+        fs::create_dir(&output).unwrap();
+        // `extract_selected_files_to`, because that is what the CLI calls for
+        // every extraction. `extract_all_to` is a different path that never runs
+        // the clone post-pass, so restoring through it would leave the half of
+        // this that matters most -- sharing re-established without trampling each
+        // partner's own metadata -- completely unexercised.
+        let paths = specs.iter().map(|spec| spec.archive_path.clone()).collect::<Vec<_>>();
+        opened
+            .extract_selected_files_to(
+                &paths,
+                &output,
+                tzap_core::SafeExtractionOptions { restore_policy: policy, ..tzap_core::SafeExtractionOptions::default() },
+                1,
+            )
+            .unwrap_or_else(|error| panic!("a cloned pair must restore at {policy:?}: {error:?}"));
+
+        let restored_first = output.join("tree").join("a-first.bin");
+        let restored_second = output.join("tree").join("b-second.bin");
+        assert_eq!(fs::read(&restored_second).unwrap(), vec![21u8; 256 * 1024], "{policy:?}: bytes must survive");
+
+        // `Content` deliberately restores no metadata, so only the other two
+        // policies can say anything about it.
+        if policy == tzap_core::RestorePolicy::Content {
+            continue;
+        }
+        let metadata = fs::metadata(&restored_second).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o644, "{policy:?}: the second partner took the first's mode");
+        assert_eq!(metadata.modified().unwrap(), second_time, "{policy:?}: the second partner took the first's mtime");
+        assert_eq!(fs::metadata(&restored_first).unwrap().permissions().mode() & 0o777, 0o600, "{policy:?}: the first partner changed");
+        if tagged && policy == tzap_core::RestorePolicy::SameOs {
+            assert_eq!(
+                xattr::get(&restored_second, "com.tzap.only-second").unwrap().as_deref(),
+                Some(b"keep me".as_slice()),
+                "{policy:?}: the second partner's own xattr was lost"
+            );
+        }
+    }
+}
+
+/// A long non-ASCII filename, archived from disk and restored the way a user
+/// would -- the combination the corpora missed.
+///
+/// The suite had a long ASCII name and short unicode names, and the differential
+/// corpus had the same two shapes, so nothing ever built a name that was both.
+/// Restoring shortens the member's own leaf to make room for a temporary suffix,
+/// and cutting at a raw byte offset splits a character; APFS rejects the result,
+/// so the member could not be restored at all. The core-level fixture covers the
+/// writer/reader pair; this covers the path a real file on disk takes, where the
+/// name comes from the filesystem rather than from a string literal.
+#[test]
+fn a_long_non_ascii_filename_round_trips_from_disk() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree");
+    fs::create_dir(&root).unwrap();
+
+    // 80 three-byte characters plus ".bin" = 244 bytes, past the 209-byte budget
+    // the temporary name leaves, with the cut landing mid-character.
+    let leaf = format!("{}.bin", "\u{8cc7}".repeat(80));
+    let body = b"long unicode payload";
+    if fs::write(root.join(&leaf), body).is_err() {
+        return; // the filesystem will not hold the name; nothing to assert
+    }
+
+    let specs = collect_input_specs(&[root.to_string_lossy().into_owned()]).unwrap_or_else(|error| panic!("{error:#}"));
+    assert!(specs.iter().any(|spec| spec.archive_path.ends_with(&leaf)), "the long name must reach the archive plan");
+
+    let key = MasterKey::from_raw_key(&[93u8; 32]).unwrap();
+    let mut sink = tzap_core::MemoryArchiveSink::default();
+    tzap_core::write_archive_sources_to_sink(
+        &specs,
+        &key,
+        WriterOptions { stripe_width: 1, volume_loss_tolerance: 0, bit_rot_buffer_pct: 0, ..WriterOptions::default() },
+        None,
+        &KdfParams::Raw,
+        None,
+        None,
+        &mut sink,
+    )
+    .unwrap_or_else(|error| panic!("a long non-ASCII name must be archivable: {error:?}"));
+
+    let opened = tzap_core::open_archive(&sink.volumes[0], &key).unwrap();
+    opened.verify().unwrap();
+    let output = temp.path().join("out");
+    fs::create_dir(&output).unwrap();
+    opened.extract_all_to(&output, tzap_core::SafeExtractionOptions::default()).unwrap_or_else(|error| panic!("a long non-ASCII name must restore: {error:?}"));
+
+    let restored = output.join("tree").join(&leaf);
+    assert!(restored.exists(), "the long non-ASCII member is missing from the restored tree");
+    assert_eq!(fs::read(&restored).unwrap(), body, "the long non-ASCII member restored the wrong bytes");
 }

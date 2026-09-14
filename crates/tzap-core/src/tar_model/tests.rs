@@ -2162,6 +2162,7 @@ fn a_member_named_close_to_the_component_limit_restores() {
     // mainstream filesystem accepting the name. The error blamed archive integrity,
     // which sends you looking in the wrong place.
     for leaf_len in [200usize, 209, 210, 240, 255] {
+        // covered below by the non-ASCII case as well
         let temp = tempfile::tempdir().unwrap();
         let name = format!("{}.bin", "n".repeat(leaf_len - 4));
         assert_eq!(name.len(), leaf_len);
@@ -2188,4 +2189,121 @@ fn a_member_named_close_to_the_component_limit_restores() {
         assert!(restored.exists(), "{leaf_len}-byte name is missing from the restored tree");
         assert_eq!(std::fs::read(&restored).unwrap(), body.as_bytes(), "{leaf_len}-byte name restored the wrong bytes");
     }
+}
+
+/// The same limit, reached in characters that are more than one byte wide.
+///
+/// The temporary sibling is shortened to make room for its suffix, and shortening
+/// at a raw byte offset cuts a multi-byte character in half. APFS validates that a
+/// name is UTF-8 and returns `EILSEQ`, so the member could not be restored at all
+/// -- reported as `corrupt-archive`, which sends you looking at the archive. It
+/// reproduced on 11 of 11 Chinese names past the budget, while the ASCII fixture
+/// above passed throughout, because a name has to be non-ASCII to have a character
+/// boundary in the wrong place.
+#[test]
+fn a_member_named_close_to_the_component_limit_in_wide_characters_restores() {
+    // 3 bytes each, so the cut lands mid-character for most of this range.
+    for character_count in [69usize, 70, 71, 75, 80] {
+        let temp = tempfile::tempdir().unwrap();
+        let name = format!("{}.b", "\u{8cc7}".repeat(character_count));
+        let body = format!("payload for {character_count} wide characters");
+
+        let files = [crate::writer::RegularFile::new(&name, body.as_bytes())];
+        let key = crate::crypto::MasterKey::from_raw_key(&[97u8; 32]).unwrap();
+        let archive = crate::writer::write_archive(
+            &files,
+            &key,
+            crate::writer::WriterOptions { stripe_width: 1, volume_loss_tolerance: 0, ..crate::writer::WriterOptions::default() },
+        )
+        .unwrap_or_else(|error| panic!("{character_count}-character name failed to archive: {error:?}"));
+
+        let opened = crate::reader::open_archive(&archive.bytes, &key).unwrap();
+        let output = temp.path().join("restored");
+        std::fs::create_dir(&output).unwrap();
+        opened
+            .extract_all_to(&output, crate::tar_model::SafeExtractionOptions::default())
+            .unwrap_or_else(|error| panic!("{character_count}-character name failed to restore: {error:?}"));
+
+        let restored = output.join(&name);
+        assert!(restored.exists(), "{character_count}-character name is missing from the restored tree");
+        assert_eq!(std::fs::read(&restored).unwrap(), body.as_bytes(), "{character_count}-character name restored the wrong bytes");
+    }
+}
+
+/// The temp-name shortener must never produce a name the filesystem will reject.
+///
+/// Pins the primary fix directly. The end-to-end restore test above cannot: a
+/// second safety net in `create_temp_regular_file` retries with a smaller budget
+/// when the filesystem refuses a name, so a restore still succeeds even with the
+/// cut in the wrong place. This asserts the cut itself.
+#[test]
+fn temp_name_shortening_never_splits_a_character() {
+    use super::sparse::leaf_prefix_within;
+
+    // 3-byte characters, so most budgets land mid-character.
+    let wide: std::ffi::OsString = "\u{8cc7}".repeat(80).into();
+    for keep in 0..=wide.len() {
+        let Some(prefix) = leaf_prefix_within(&wide, keep) else { continue };
+        assert!(prefix.len() <= keep, "kept {} bytes for a budget of {keep}", prefix.len());
+        assert!(prefix.to_str().is_some(), "budget {keep} produced a name that is not valid UTF-8: {prefix:?}");
+    }
+
+    // A 4-byte character (outside the BMP) exercises a wider sequence.
+    let emoji: std::ffi::OsString = "\u{1f600}".repeat(40).into();
+    for keep in 0..=emoji.len() {
+        if let Some(prefix) = leaf_prefix_within(&emoji, keep) {
+            assert!(prefix.to_str().is_some(), "budget {keep} split a 4-byte character");
+        }
+    }
+
+    // A budget at or past the whole name keeps it intact, unshortened.
+    let plain: std::ffi::OsString = "ordinary.bin".into();
+    assert_eq!(leaf_prefix_within(&plain, plain.len()).as_deref(), Some(plain.as_os_str()));
+    assert_eq!(leaf_prefix_within(&plain, plain.len() + 50).as_deref(), Some(plain.as_os_str()));
+}
+
+/// A clone-group hint must never make a member unrestorable.
+///
+/// §16.11 classes the hint "optimization only; never applied as authority": the
+/// bytes and every other piece of metadata restore identically with or without
+/// it, and a destination that cannot clone is storage-layout degradation with a
+/// diagnostic. The reader's conformance table had no arm for the key, so it fell
+/// through to the blanket "unsupported native primary record" and refused
+/// `same-os` and `system` restore for the whole member -- writing no files at
+/// all, for a record the writer had just produced itself. Cloned files are the
+/// ordinary state of an APFS volume, so this reached everyday archives.
+#[test]
+fn a_clone_group_hint_never_makes_a_member_unrestorable() {
+    for policy in [RestorePolicy::Portable, RestorePolicy::SameOs, RestorePolicy::System] {
+        let bytes = member(b"disk.img", b'0', b"payload", b"");
+        let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+        let mut metadata = parsed.v45_metadata;
+        metadata.declaration.source_os = crate::entry_metadata::host_source_os_label().into();
+        metadata.primary_has_native_scalar = true;
+        metadata.primary_records.insert("TZAP.macos.clone-group".into(), b"0123456789abcdef0123456789abcdef".to_vec());
+
+        let planned = plan_restore(
+            b"disk.img",
+            &metadata,
+            TarEntryKind::Regular,
+            false,
+            SafeExtractionOptions {
+                restore_policy: policy,
+                // Orthogonal to the hint; `System` refuses without it regardless.
+                system_authorized: policy == RestorePolicy::System,
+                ..SafeExtractionOptions::default()
+            },
+        );
+        assert!(planned.is_ok(), "a clone hint must not block {policy:?} restore: {:?}", planned.unwrap_err());
+    }
+
+    // And it is the arm, not some accident of the surrounding declaration: the
+    // predicate the arm lives in must report the key as supported on every host,
+    // for both the same-os and the system pass.
+    let bytes = member(b"disk.img", b'0', b"payload", b"");
+    let parsed = parse_tar_member_group(&bytes, 4096).unwrap();
+    let mut metadata = parsed.v45_metadata;
+    metadata.primary_records.insert("TZAP.macos.clone-group".into(), b"0123456789abcdef0123456789abcdef".to_vec());
+    assert!(!super::os_restore::native_primary_restore_unsupported(&metadata, false), "clone hint reported unsupported for same-os");
+    assert!(!super::os_restore::native_primary_restore_unsupported(&metadata, true), "clone hint reported unsupported for system");
 }

@@ -3468,6 +3468,12 @@ fn restore_macos_clone_groups(
         };
         // Attach the degradation to the first restored entry: it describes the
         // tree's storage layout, not any single member's content.
+        //
+        // The reason travels with it. "Could not be recreated" alone cannot be
+        // acted on, and the reasons are not interchangeable: a destination with
+        // no clone support is expected and needs no attention, while "restored
+        // clone partners differ; refusing to overwrite" says the two members came
+        // out of the archive holding different bytes, which does.
         if let Some((path, diagnostics)) = restored.first_mut() {
             diagnostics.push(MetadataDiagnostic::new(
                 path.as_bytes(),
@@ -3475,9 +3481,8 @@ fn restore_macos_clone_groups(
                 "clone-group",
                 crate::tar_model::MetadataOperation::Restore,
                 crate::tar_model::MetadataDiagnosticStatus::Skipped,
-                "APFS clone sharing could not be recreated; logical bytes are unaffected",
+                format!("APFS clone sharing could not be recreated ({reason}); logical bytes are unaffected"),
             ));
-            let _ = &reason;
         }
     }
 }

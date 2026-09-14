@@ -2386,6 +2386,11 @@ fn cli_create_skips_an_unreadable_input_and_still_writes_the_archive() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "an incomplete archive must not report plain success: {stderr}");
+    // The specific code, not just "non-zero". Exit 1 is documented as an
+    // unexpected runtime error, so reusing it here left a caller unable to tell
+    // "archive written, one input skipped" from "the run failed and produced
+    // nothing". Asserting only on `!success()` accepted either.
+    assert_eq!(output.status.code(), Some(4), "an incomplete archive must exit 4 (incomplete-archive): {stderr}");
     assert!(stderr.contains("locked.txt"), "the skipped file must be named: {stderr}");
     assert!(stderr.contains("skipped"), "the skip must be stated plainly: {stderr}");
 

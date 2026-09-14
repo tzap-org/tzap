@@ -369,6 +369,14 @@ pub(crate) const EXIT_UNSAFE_PATH: u8 = 13;
 pub(crate) const EXIT_MISSING_BOOTSTRAP: u8 = 14;
 pub(crate) const EXIT_UNSUPPORTED_FEATURE: u8 = 16;
 pub(crate) const EXIT_GENERIC: u8 = 1;
+/// The archive was written and verifies, but does not hold everything asked for.
+///
+/// Distinct from `EXIT_GENERIC` on purpose. Reusing exit 1 made "archive written,
+/// one file skipped" indistinguishable from "the run failed and produced nothing",
+/// while the published table defines 1 as an unexpected runtime error -- so a
+/// script could neither trust a success nor explain a failure. GNU tar draws the
+/// same distinction with its exit 2.
+pub(crate) const EXIT_INCOMPLETE_ARCHIVE: u8 = 4;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Diagnostic {

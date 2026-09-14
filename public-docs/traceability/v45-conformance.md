@@ -58,6 +58,26 @@ for both exact syntax IDs, and the reparse-placeholder negative direction was
 already asserted against a real Windows junction. Both had been recorded as gaps
 by an earlier name-led pass.
 
+### What "no open rows" did not catch
+
+Full §16.18 coverage is a floor, and clearing it is not the same as covering the
+combinations the rows describe. Two release-blocking defects sat inside rows
+recorded as covered:
+
+- **Long non-ASCII names.** 16.18.1 has a long-name fixture and a unicode-name
+  fixture, and neither is a long unicode name. Every member named in more than
+  about 70 Chinese characters archived cleanly and could not be extracted at
+  all. The differential corpus had the same shape, so neither matrix saw it.
+  Both now carry a 240-byte CJK name, and `leaf_prefix_within` is pinned
+  directly rather than only through a restore.
+- **APFS clone pairs.** 16.18.2 claims macOS clone hints, but nothing in either
+  corpus produced two files that actually share storage, so the reader refusing
+  to restore the hint the writer had just recorded went unseen. The shared
+  corpus now builds a clone pair where the platform supports one.
+
+The lesson is about corpora rather than about these two rows: a row is covered
+by a fixture that reaches the code, not by a fixture that shares its name.
+
 ## Reproducing
 
 ```sh

@@ -54,6 +54,9 @@ fn readme_has_exit_code_and_platform_sections() {
     assert!(install.contains("| Windows aarch64 |"));
 
     assert!(reference.contains("| 2 | usage | Invalid args / command-line usage |"));
+    // `create` exits 4 when it writes a valid archive that is missing something.
+    // The code is part of the published contract, so the table has to carry it.
+    assert!(reference.contains("| 4 | incomplete-archive |"), "the exit-code table must document incomplete-archive");
     assert!(reference.contains("| 10 | wrong-key | Wrong passphrase or key for archive |"));
     assert!(reference.contains("| 16 | unsupported-feature | Unsupported archive feature or writer shape |"));
 }

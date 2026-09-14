@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+- Fixes `create` dropping a whole subtree when a directory changed while it was
+  being scanned. A directory's mtime, ctime and size move every time one of its
+  children is created or removed, and the capture compared all of them against
+  the identity the scan had taken, so ordinary activity read as "input changed
+  before metadata capture". The retry could not recover: it re-tested the same
+  scan-time identity, which could never match again. The directory was then
+  skipped, and skipping it discarded every entry already collected beneath it.
+  Measured under a churning directory, 10 of 12 runs silently lost five files
+  that nothing had touched, while the run reported `created 3 member(s)` and
+  `the archive contains everything else`. A directory is now compared as an
+  object -- device, inode, mode, ownership, flags, kind -- and every retry
+  re-observes the input instead of re-testing a stale expectation. A directory
+  whose own extended metadata still cannot be read is archived with portable
+  metadata, along with all of its contents, and says so.
+
+- Fixes members with long non-ASCII names being impossible to extract.
+  Restoring writes to a temporary sibling built from the member's own name plus
+  a 46-byte suffix, and a name near the component limit was shortened to make
+  room by cutting at a raw byte offset. That splits a multi-byte character, and
+  APFS rejects the result as an invalid name, so the member could not be
+  restored at all -- reported as `corrupt-archive`, which points at the archive
+  rather than at the name. Every Chinese filename over about 70 characters was
+  affected (11 of 11 measured). Shortening now stops on a character boundary,
+  and a filesystem that refuses the name for any other reason (eCryptfs caps a
+  component at 143 bytes) falls back to a shorter form instead of failing the
+  restore.
+
+- Fixes `extract --restore same-os` and `--restore system` refusing any macOS
+  archive that contains an APFS clone pair, writing no files at all. The writer
+  records a `TZAP.macos.clone-group` hint, but the reader's conformance table
+  had no entry for it and fell through to "unsupported native metadata". §16.11
+  classes the hint as optimization only, never applied as authority, so it can
+  never make a member unrestorable. Cloned files are the ordinary state of an
+  APFS volume, so this affected everyday archives.
+
+- Fixes APFS clone restore overwriting the second partner's metadata with the
+  first's. `clonefile` copies the source's mode, times, ACL and extended
+  attributes along with its storage, and the restore pass renamed that over a
+  destination whose metadata had already been applied correctly: a 0644 file
+  stamped 2025 came back 0600 stamped 2020, carrying the other file's xattrs.
+  The pass now hands the destination's own metadata back before publishing.
+  Two further defects at the same site: it compared partners by reading both
+  files fully into memory (586 MB peak for a 150 MB pair, and a cloned disk
+  image is routinely tens of GB) and now streams the comparison; and its
+  staging name replaced the destination's extension rather than extending it,
+  so a restored member named `<stem>.tzap-clone-staging` was silently deleted.
+
+- Fixes the report for a file shortened while it was being archived naming the
+  wrong amounts, in the direction that understates the loss. It described the
+  size of whichever read first hit end-of-file rather than everything still
+  owed, so a 300 MB file truncated to 1 MB was reported as "kept the 299.9 MB
+  still there and filled the remaining 8.0 KB with zeros" when 276 MB of the
+  member had in fact become zeros. Such a run also exited 0; substituted bytes
+  now mark the archive incomplete, as a vanished input already did.
+
+- `create` now exits `4` (`incomplete-archive`) rather than `1` when it writes
+  a valid archive that is missing something -- an input it could not read, or
+  one replaced by zeros because it vanished or shrank mid-write. Exit `1` is
+  documented as an unexpected runtime error, so reusing it left a caller unable
+  to tell "archive written, one file skipped" from "the run failed and produced
+  nothing". Every affected input is still named on stderr.
+
 - Fixes `create --tar-stdin` rejecting sparse members that GNU tar and
   libarchive actually produce. A GNU sparse 1.0 map ends with a zero-length
   entry at the logical size, and starts with one at offset 0 when the file

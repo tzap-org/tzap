@@ -308,6 +308,17 @@ pub(crate) fn native_primary_restore_unsupported(metadata: &MemberMetadata, incl
                     }
                 });
         }
+        if key == "TZAP.macos.clone-group" {
+            // §16.11 classes the clone hint "optimization only; never applied as
+            // authority": a member's bytes and metadata restore identically with
+            // or without it, and a destination that cannot clone is storage-layout
+            // degradation with a diagnostic, never a content error. So it is never
+            // an unsupported record -- on any host. Falling through to the blanket
+            // `true` below made every macOS archive holding an APFS clone pair
+            // refuse `same-os` and `system` restore outright, writing no files at
+            // all, for a record that is not required to restore anything.
+            return false;
+        }
         if key.starts_with("SCHILY.acl.") || key.starts_with("TZAP.acl.") {
             return !cfg!(target_os = "linux");
         }

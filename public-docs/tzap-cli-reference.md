@@ -21,6 +21,7 @@ This document is a compact command reference for `tzap` operators and automation
 | 1 | error | Unexpected runtime or internal error |
 | 2 | usage | Invalid args / command-line usage |
 | 3 | io-error | Filesystem I/O or permission problem |
+| 4 | incomplete-archive | `create` produced a valid archive, but something was left out of it: an input it could not read, or one that was replaced by zeros because it vanished or shrank while being archived. Every such input is named on stderr. The archive itself is complete and verifiable. |
 | 10 | wrong-key | Wrong passphrase or key for archive |
 | 11 | corrupt-archive | Archive integrity or payload problem |
 | 12 | unsupported-revision | Unsupported archive revision; use or upgrade to a reader that supports it |

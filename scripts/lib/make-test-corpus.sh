@@ -46,6 +46,13 @@ make_test_corpus() {
   printf 'dots\n' > "$c/archive.tar.gz.bin"
   printf 'leading dot\n' > "$c/.hidden"
   printf 'long\n' > "$c/$(printf 'l%.0s' $(seq 1 180)).bin"
+  # Long AND non-ASCII, which is the combination neither the long ASCII name
+  # above nor the short unicode names below cover. Restoring builds a temporary
+  # sibling from this leaf plus a 46-byte suffix, so a name past the budget has
+  # to be shortened -- and shortening it at a raw byte offset splits a character,
+  # which APFS rejects outright. Every such member failed to restore, reported as
+  # archive corruption, and no fixture in either matrix had this shape.
+  printf 'long unicode\n' > "$c/$(printf '資%.0s' $(seq 1 80)).bin"
   mkdir -p "$c/dir with spaces/日本語"
   printf 'nested unicode\n' > "$c/dir with spaces/日本語/inner.bin"
 
@@ -59,6 +66,16 @@ make_test_corpus() {
   # Hardlinks: two names for one inode, so the writer must store the data once.
   printf 'shared inode payload\n' > "$c/hardlink-target.bin"
   ln "$c/hardlink-target.bin" "$c/hardlink-alias.bin" 2>/dev/null || true
+
+  # A copy-on-write clone pair, where the platform has one. Two files sharing
+  # storage is the ordinary state of an APFS volume (`cp -c`, Finder duplicate,
+  # every `cp` on some tools), and the writer records a clone-group hint for it.
+  # Nothing in the corpus produced that hint, so the reader refusing to restore
+  # the hint it had just written went unnoticed by both matrices.
+  printf 'clone partner\n' > "$c/clone-source.bin"
+  cp -c "$c/clone-source.bin" "$c/clone-partner.bin" 2>/dev/null \
+    || cp --reflink=always "$c/clone-source.bin" "$c/clone-partner.bin" 2>/dev/null \
+    || cp "$c/clone-source.bin" "$c/clone-partner.bin"
 
   # A sparse file where the host supports punching one.
   if command -v truncate >/dev/null 2>&1; then

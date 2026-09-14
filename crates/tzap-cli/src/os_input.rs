@@ -689,9 +689,17 @@ impl Read for IdentityCheckedInputReader {
             // The file was shortened mid-archive. Fill the rest of the promised
             // length with zeros: a short member would leave every later member
             // unreadable. GNU tar and libarchive both pad here.
+            //
+            // The shortfall is everything still owed, not this one chunk. The file
+            // is at EOF and the member's length is already promised, so every byte
+            // left will be a zero. Reporting the chunk instead inverted the whole
+            // message: a 300 MB file truncated to 1 MB said "kept the 299.9 MB
+            // still there and filled the remaining 8.0 KB with zeros" when 276 MB
+            // of the member had in fact become zeros.
+            let shortfall = self.remaining;
             out[..max_read].fill(0);
             self.remaining -= max_read as u64;
-            self.note_changed(max_read as u64);
+            self.note_changed(shortfall);
             return Ok(max_read);
         }
         self.remaining -= count as u64;
@@ -713,6 +721,14 @@ impl Read for IdentityCheckedInputReader {
 static CHANGED_DURING_READ: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 fn record_input_changed_during_read(path: &str, declared: u64, padded: u64) {
+    // Substituted bytes are content this archive does not hold. That is the same
+    // thing `note_input_vanished_before_read` reports, and it has to reach the
+    // exit code the same way -- a backup that silently stored 276 MB of zeros in
+    // place of real data must not report success. A file that merely changed
+    // underneath the read is still a complete member and stays a note.
+    if padded > 0 {
+        mark_archive_incomplete();
+    }
     let note = if padded > 0 {
         let kept = declared.saturating_sub(padded);
         format!(
@@ -788,6 +804,22 @@ pub(crate) fn note_input_vanished_before_read(path: &str, declared: u64, error: 
         }
     }
     mark_archive_incomplete();
+}
+
+/// Note a directory archived without its platform-native metadata.
+///
+/// Reported, not fatal, and not an incomplete archive: the directory and
+/// everything inside it are present, with mode, ownership and times intact. Only
+/// the native layer -- xattrs, ACL, flags -- is missing, because the directory
+/// would not hold still long enough to read it.
+pub(crate) fn note_directory_metadata_degraded(path: &Path, reason: &str) {
+    let note =
+        format!("{}: could not read the directory's own extended metadata ({reason}); archived it and everything inside it without that layer", path.display());
+    if let Ok(mut notes) = CHANGED_DURING_READ.lock() {
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
 }
 
 /// Note a regular input that moved between the scan and the read of its bytes.
@@ -878,14 +910,34 @@ pub(crate) struct CapturedInputMetadata {
     pub(crate) sparse_layout_partial: bool,
 }
 
+/// Whether a capture insists the object still matches the identity the scan saw.
+///
+/// A directory's mtime, ctime and size change every time a child is created,
+/// renamed or removed. That is ordinary activity, not the object being replaced,
+/// so holding a directory to a scan-time identity fails on any directory anyone
+/// is using -- and, because the expectation is fixed the moment the scan takes
+/// it, fails again on every retry. The capture's own open-compare-recompare still
+/// catches a directory swapped underneath it, which is the thing worth catching.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IdentityExpectation {
+    /// The object must still be exactly the one the scan identified.
+    Strict,
+    /// Describe whatever object is at the path now, coherently.
+    Relaxed,
+}
+
 pub(crate) fn portable_input_metadata(identity: InputIdentity, input: &Path) -> Result<CapturedInputMetadata> {
+    portable_input_metadata_expecting(identity, input, IdentityExpectation::Strict)
+}
+
+pub(crate) fn portable_input_metadata_expecting(identity: InputIdentity, input: &Path, expectation: IdentityExpectation) -> Result<CapturedInputMetadata> {
     // tzap-core owns the portable assembly -- source OS, mode origin, owner-name
     // resolution, and the optional-time rules -- so this host and zmanager cannot
     // disagree about it. What stays here is genuinely this host's: the sparse and
     // reparse handling layered on top, and the scan identity it captures against.
     let metadata = fs::symlink_metadata(input)?;
     let (created, accessed) = portable_optional_times(&metadata);
-    let captured = capture_native_file_metadata(input, identity)?;
+    let captured = capture_native_file_metadata_expecting(input, identity, expectation)?;
     Ok(CapturedInputMetadata {
         metadata: tzap_core::portable_capture::assemble_portable_file_metadata(
             captured.native,
@@ -899,6 +951,65 @@ pub(crate) fn portable_input_metadata(identity: InputIdentity, input: &Path) -> 
         #[cfg(windows)]
         sparse_layout_partial: false,
     })
+}
+
+/// Portable metadata only, for an input whose native capture could not be taken.
+///
+/// Mode, ownership and times still describe the object; what is missing is the
+/// platform-native layer -- xattrs, ACL, flags. Used for a directory that keeps
+/// losing the capture race, because the alternative this replaced was to drop the
+/// directory *and everything inside it* from the archive over its own xattrs.
+pub(crate) fn portable_only_input_metadata(identity: InputIdentity, input: &Path) -> Result<CapturedInputMetadata> {
+    let _ = fs::symlink_metadata(input)?;
+    // No creation or access time either. Both are owned by `posix-backup-v1`
+    // (§16.7.1), and declaring that profile on an entry carrying none of its
+    // metadata would tell a reader to expect a native layer that is not there.
+    // Dropping them says plainly what happened: this entry is portable-only.
+    Ok(CapturedInputMetadata {
+        metadata: tzap_core::portable_capture::assemble_portable_file_metadata(
+            NativeFileMetadata::default(),
+            portable_owner_ids(&identity),
+            identity.attributes,
+            None,
+            None,
+        ),
+        #[cfg(target_os = "macos")]
+        macos_identity: None,
+        #[cfg(windows)]
+        sparse_layout_partial: false,
+    })
+}
+
+/// Whether an error is the transient capture race, recognised through whatever
+/// context this host added on the way up.
+///
+/// Renders the whole chain: the capture sites qualify their wording, and this
+/// host appends the path, so matching only the outermost message would miss it.
+pub(crate) fn is_capture_race(error: &anyhow::Error) -> bool {
+    let rendered = format!("{error:#}");
+    rendered.contains(tzap_core::portable_capture::CAPTURE_RACE_MARKER) || rendered.contains(tzap_core::portable_capture::CAPTURE_PREOPEN_RACE_MARKER)
+}
+
+/// Run one complete observation -- stat, identify, capture -- retrying the whole
+/// thing when it loses a race with a concurrent writer.
+///
+/// Every attempt re-observes. Sampling the identity once and retrying only the
+/// capture against it, which the directory and symlink paths did, cannot converge:
+/// the expectation is stale from the first failure onwards, so all three attempts
+/// fail against an object that has long since settled. Measured directly -- a
+/// directory changed once and then left alone still burned the whole budget,
+/// while a freshly observed identity succeeded immediately.
+pub(crate) fn observe_with_capture_retry<T>(mut observe: impl FnMut() -> Result<T>) -> Result<T> {
+    for attempt in 0..tzap_core::portable_capture::CAPTURE_ATTEMPTS {
+        match observe() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt + 1 < tzap_core::portable_capture::CAPTURE_ATTEMPTS && is_capture_race(&error) => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the retry loop returns from every attempt")
 }
 
 pub(crate) fn portable_symlink_metadata(identity: InputIdentity, _input: &Path) -> Result<CapturedInputMetadata> {
@@ -957,6 +1068,12 @@ pub(crate) fn capture_linux_symlink_metadata(input: &Path, _identity: InputIdent
     tzap_core::portable_capture::with_capture_retry(|| tzap_core::linux_metadata::capture_linux_metadata(input, true)).map_err(Into::into)
 }
 
+/// Capture insisting the object is still the one the scan identified.
+#[cfg(test)]
+pub(crate) fn capture_native_file_metadata(input: &Path, identity: InputIdentity) -> Result<CapturedNativeMetadata> {
+    capture_native_file_metadata_expecting(input, identity, IdentityExpectation::Strict)
+}
+
 #[cfg(unix)]
 pub(crate) fn symlink_target_bytes(path: &Path) -> io::Result<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
@@ -972,22 +1089,29 @@ pub(crate) fn symlink_target_bytes(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn capture_native_file_metadata(input: &Path, _identity: InputIdentity) -> Result<CapturedNativeMetadata> {
-    // A file changing mid-capture is ordinary during a live backup, and a re-read
-    // almost always succeeds. zmanager has retried this since "Fix TZAP Unicode
-    // archives and metadata capture races"; this host never did.
-    let native = tzap_core::portable_capture::with_capture_retry(|| tzap_core::linux_metadata::capture_linux_metadata(input, false))?;
+pub(crate) fn capture_native_file_metadata_expecting(
+    input: &Path,
+    _identity: InputIdentity,
+    _expectation: IdentityExpectation,
+) -> Result<CapturedNativeMetadata> {
+    // Linux capture takes no expected identity, so it re-observes on its own and
+    // has nothing to go stale. The retry lives with the caller that re-samples.
+    let native = tzap_core::linux_metadata::capture_linux_metadata(input, false)?;
     Ok(CapturedNativeMetadata { native })
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn capture_native_file_metadata(input: &Path, identity: InputIdentity) -> Result<CapturedNativeMetadata> {
-    capture_macos_native_metadata(input, identity, false)
+pub(crate) fn capture_native_file_metadata_expecting(
+    input: &Path,
+    identity: InputIdentity,
+    expectation: IdentityExpectation,
+) -> Result<CapturedNativeMetadata> {
+    capture_macos_native_metadata(input, identity, false, expectation)
 }
 
 #[cfg(target_os = "macos")]
 pub(crate) fn capture_macos_symlink_metadata(input: &Path, identity: InputIdentity) -> Result<CapturedNativeMetadata> {
-    capture_macos_native_metadata(input, identity, true)
+    capture_macos_native_metadata(input, identity, true, IdentityExpectation::Strict)
 }
 
 /// macOS capture is tzap-core's. This host supplies only the identity it saw at
@@ -998,9 +1122,16 @@ pub(crate) fn capture_macos_symlink_metadata(input: &Path, identity: InputIdenti
 /// which is how they came to disagree about whether `LIBARCHIVE.creationtime` is
 /// written unconditionally.
 #[cfg(target_os = "macos")]
-fn capture_macos_native_metadata(input: &Path, identity: InputIdentity, symlink: bool) -> Result<CapturedNativeMetadata> {
-    let expected = identity.macos_identity;
-    let captured = tzap_core::portable_capture::with_capture_retry(|| tzap_core::macos_metadata::capture_macos_metadata_with(input, symlink, expected))
+fn capture_macos_native_metadata(input: &Path, identity: InputIdentity, symlink: bool, expectation: IdentityExpectation) -> Result<CapturedNativeMetadata> {
+    // No retry here. Retrying against an expectation the caller sampled once can
+    // never converge -- the identity is stale from the first failure onwards, so
+    // all three attempts fail on an object that has long since settled. The retry
+    // belongs where the identity is re-sampled: `observe_input_metadata`.
+    let expected = match expectation {
+        IdentityExpectation::Strict => identity.macos_identity,
+        IdentityExpectation::Relaxed => None,
+    };
+    let captured = tzap_core::macos_metadata::capture_macos_metadata_with(input, symlink, expected)
         // Add the path, but keep core's own wording: `is_transient_capture_race`
         // matches on it, and a context line that replaced it would leave the
         // retry working while the message stopped saying what happened.
@@ -1009,7 +1140,11 @@ fn capture_macos_native_metadata(input: &Path, identity: InputIdentity, symlink:
 }
 
 #[cfg(windows)]
-pub(crate) fn capture_native_file_metadata(input: &Path, identity: InputIdentity) -> Result<CapturedNativeMetadata> {
+pub(crate) fn capture_native_file_metadata_expecting(
+    input: &Path,
+    identity: InputIdentity,
+    _expectation: IdentityExpectation,
+) -> Result<CapturedNativeMetadata> {
     // tzap-core owns Windows capture. This host only supplies the attributes and
     // times it already observed when the input was identified, so the archive
     // describes that observation rather than a second, later one.
@@ -1019,7 +1154,7 @@ pub(crate) fn capture_native_file_metadata(input: &Path, identity: InputIdentity
         last_access_time_100ns: identity.last_access_time_100ns,
         change_time_100ns: identity.change_time_100ns,
     };
-    let native = tzap_core::portable_capture::with_capture_retry(|| tzap_core::windows_metadata::capture_windows_metadata_with(input, Some(observed)))
+    let native = tzap_core::windows_metadata::capture_windows_metadata_with(input, Some(observed))
         .with_context(|| format!("failed to capture Windows metadata for {}", input.display()))?;
     Ok(CapturedNativeMetadata { native })
 }
@@ -1038,7 +1173,11 @@ pub(crate) fn validate_windows_input_path_identity(path: &Path, expected: InputI
 }
 
 #[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(windows)))]
-pub(crate) fn capture_native_file_metadata(_input: &Path, _identity: InputIdentity) -> Result<CapturedNativeMetadata> {
+pub(crate) fn capture_native_file_metadata_expecting(
+    _input: &Path,
+    _identity: InputIdentity,
+    _expectation: IdentityExpectation,
+) -> Result<CapturedNativeMetadata> {
     Ok(CapturedNativeMetadata { native: NativeFileMetadata::default() })
 }
 

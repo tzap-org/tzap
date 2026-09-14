@@ -53,7 +53,11 @@ fn report_inputs_not_fully_archived(quiet: bool) -> Result<()> {
         eprintln!("warning: {note}");
     }
     if !skipped.is_empty() {
-        emit_success_summary(quiet, &format!("{} input(s) skipped; the archive contains everything else", skipped.len()))?;
+        // Count what was skipped; do not claim anything about what was not. The
+        // previous wording ("the archive contains everything else") was read out
+        // even when a single skipped directory had taken its whole subtree with
+        // it -- one warning line standing for six missing inputs.
+        emit_success_summary(quiet, &format!("{} input(s) skipped, named above; the archive holds the rest", skipped.len()))?;
         mark_archive_incomplete();
     }
     Ok(())
@@ -355,7 +359,6 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
         );
         emit_success_summary(quiet, &summary)?;
         report_inputs_not_fully_archived(quiet)?;
-        report_inputs_not_fully_archived(quiet)?;
         emit_success_summary(quiet, "  key wrap: recipient certificate")?;
         if let Some(path) = bootstrap_output {
             emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
@@ -406,7 +409,6 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
             bit_rot_buffer_pct
         );
         emit_success_summary(quiet, &summary)?;
-        report_inputs_not_fully_archived(quiet)?;
         report_inputs_not_fully_archived(quiet)?;
         if let Some(profile) = root_auth_profile.as_ref() {
             emit_success_summary(quiet, &format!("  root auth: {} signed", profile.label()))?;
@@ -942,9 +944,15 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
     }
     if metadata.file_type().is_symlink() {
         let archive_path = archive_path_to_string(archive_path)?;
-        let identity = input_identity(&metadata).with_context(|| format!("failed to identify symlink {}", input.display()))?;
         let link_target = symlink_target_bytes(input).with_context(|| format!("failed to read symlink {}", input.display()))?;
-        let captured = portable_symlink_metadata(identity, input)?;
+        // Stat and capture as one retried unit, so each attempt gets a fresh
+        // identity rather than re-testing one that can no longer match.
+        let (metadata, identity, captured) = observe_with_capture_retry(|| {
+            let metadata = fs::symlink_metadata(input).with_context(|| format!("failed to inspect symlink {}", input.display()))?;
+            let identity = input_identity(&metadata).with_context(|| format!("failed to identify symlink {}", input.display()))?;
+            let captured = portable_symlink_metadata(identity, input)?;
+            Ok((metadata, identity, captured))
+        })?;
         out.push(InputSpec {
             source: input.to_owned(),
             archive_path,
@@ -970,15 +978,37 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
             );
         }
         let archive_path_string = archive_path_to_string(archive_path)?;
-        let identity = input_identity(&metadata).with_context(|| format!("failed to identify input {}", input.display()))?;
-        #[cfg(windows)]
-        let identity = {
-            let mut identity = identity;
-            let file = open_windows_metadata_handle(input).with_context(|| format!("failed to open Windows directory {}", input.display()))?;
-            augment_windows_input_identity(&mut identity, &file).with_context(|| format!("failed to identify Windows directory {}", input.display()))?;
-            identity
+        // Stat and capture as one retried unit, and hold the directory only to
+        // `Relaxed` identity: a directory's mtime, ctime and size move whenever a
+        // child is created or removed, which is ordinary activity rather than the
+        // object being replaced.
+        let observe_directory = || {
+            let metadata = fs::symlink_metadata(input).with_context(|| format!("failed to inspect input {}", input.display()))?;
+            let identity = input_identity(&metadata).with_context(|| format!("failed to identify input {}", input.display()))?;
+            #[cfg(windows)]
+            let identity = {
+                let mut identity = identity;
+                let file = open_windows_metadata_handle(input).with_context(|| format!("failed to open Windows directory {}", input.display()))?;
+                augment_windows_input_identity(&mut identity, &file).with_context(|| format!("failed to identify Windows directory {}", input.display()))?;
+                identity
+            };
+            let captured = portable_input_metadata_expecting(identity, input, IdentityExpectation::Relaxed)?;
+            Ok((metadata, identity, captured))
         };
-        let captured = portable_input_metadata(identity, input)?;
+        // A directory that will not hold still must never take its contents with
+        // it. Losing its own xattrs and ACL is a small, reported degradation;
+        // dropping the directory propagated an error that discarded the entire
+        // subtree already collected beneath it -- files nothing had touched.
+        let (metadata, identity, captured) = match observe_with_capture_retry(observe_directory) {
+            Ok(observed) => observed,
+            Err(error) => {
+                let metadata = fs::symlink_metadata(input).with_context(|| format!("failed to inspect input {}", input.display()))?;
+                let identity = input_identity(&metadata).with_context(|| format!("failed to identify input {}", input.display()))?;
+                let captured = portable_only_input_metadata(identity, input)?;
+                note_directory_metadata_degraded(input, &format!("{error:#}"));
+                (metadata, identity, captured)
+            }
+        };
         out.push(InputSpec {
             source: input.to_owned(),
             archive_path: archive_path_string,
@@ -1069,7 +1099,7 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
     // always describe a single object. There is no retry -- neither 7-Zip nor
     // libarchive retries a capture, and re-reading a file that is still being
     // written cannot converge anyway.
-    let RegularInputObservation { metadata, identity, sparse_extents, captured } = observe_regular_input(input)?;
+    let RegularInputObservation { metadata, identity, sparse_extents, captured } = observe_with_capture_retry(|| observe_regular_input(input))?;
     #[cfg(target_os = "macos")]
     let macos_identity = captured.macos_identity;
     #[cfg_attr(not(windows), allow(unused_mut))]

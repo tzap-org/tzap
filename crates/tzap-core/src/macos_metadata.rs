@@ -44,6 +44,26 @@ impl MacosMetadataIdentity {
     pub fn from_metadata(metadata: &fs::Metadata) -> Self {
         metadata_identity(metadata)
     }
+
+    /// Whether both describe the same filesystem object, ignoring the fields that
+    /// move when the object is merely *used*.
+    ///
+    /// Identity and content are different questions. `dev`/`ino` say which object
+    /// this is, and mode, ownership, flags and kind say what it is; length and the
+    /// three timestamps say what has happened to it lately. For a directory the
+    /// second group changes every time a child is created or removed, which is not
+    /// the directory being replaced -- so comparing it there rejects ordinary
+    /// activity and, with the expectation fixed at scan time, keeps rejecting it.
+    #[must_use]
+    pub fn describes_same_object(self, other: Self) -> bool {
+        self.dev == other.dev
+            && self.ino == other.ino
+            && self.mode == other.mode
+            && self.uid == other.uid
+            && self.gid == other.gid
+            && self.flags == other.flags
+            && self.symlink == other.symlink
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,12 +89,35 @@ pub fn capture_macos_metadata_with(input: &Path, symlink: bool, expected: Option
         return Err(io::Error::other("input kind changed before metadata capture"));
     }
     let identity = metadata_identity(&metadata);
-    if expected.is_some_and(|expected| expected != identity) {
+    // Same rule as the recheck below, for the same reason: a caller that scanned
+    // a directory a moment ago is not wrong about *which* directory it is just
+    // because something has been written inside it since.
+    let matches_expected = |expected: MacosMetadataIdentity| {
+        if metadata.file_type().is_dir() {
+            expected.describes_same_object(identity)
+        } else {
+            expected == identity
+        }
+    };
+    if expected.is_some_and(|expected| !matches_expected(expected)) {
         return Err(io::Error::other("input changed before metadata capture"));
     }
     let native = capture_from_file(input, &file, identity, symlink)?;
     let final_metadata = file.metadata()?;
-    if metadata_identity(&final_metadata) != identity {
+    // A directory is compared as an *object*, not byte for byte. Creating,
+    // renaming or removing a child moves the directory's mtime, ctime and size,
+    // so an exact comparison reports "changed during capture" for activity that
+    // is neither a change to the directory's own metadata nor the directory being
+    // replaced -- and a live directory produces that activity constantly. What
+    // still has to hold is that the handle refers to the same object, which
+    // `describes_same_object` checks. Everything that is not a directory keeps the
+    // exact comparison, where length and mtime genuinely qualify the capture.
+    let settled = if metadata.file_type().is_dir() {
+        metadata_identity(&final_metadata).describes_same_object(identity)
+    } else {
+        metadata_identity(&final_metadata) == identity
+    };
+    if !settled {
         return Err(io::Error::other("input changed during metadata capture"));
     }
     Ok(CapturedMacosMetadata { native, identity })
@@ -731,6 +774,133 @@ mod clone_tests {
         assert!(!temp.path().join("second.tzap-clone-staging").exists(), "staging file must not be left behind");
     }
 
+    /// Each partner must keep the metadata restore gave it, not the source's.
+    ///
+    /// `clonefile` copies the source's mode, times, ACL and xattrs along with its
+    /// storage, and the pass then renames that over the destination -- so without
+    /// an explicit metadata hand-back the second partner silently inherits the
+    /// first's. Measured before the fix: a 0644 file stamped 2025 came back 0600
+    /// stamped 2020. The old test asserted only clone id and bytes, so it passed
+    /// throughout.
+    /// A directory whose children change is still the same directory.
+    ///
+    /// Creating or removing a child moves the directory's mtime, ctime and size.
+    /// Comparing those made a capture report "changed before/during metadata
+    /// capture" for ordinary activity -- and since the caller's expectation is
+    /// fixed at scan time, every retry re-tested the same stale value and failed
+    /// too. In the CLI that discarded the directory *and its whole subtree*:
+    /// measured at 10 of 12 runs losing five files nothing had touched.
+    #[test]
+    fn a_directory_capture_survives_its_children_changing() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("busy");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("existing"), b"x").unwrap();
+
+        let scanned = MacosMetadataIdentity::from_metadata(&std::fs::symlink_metadata(&directory).unwrap());
+
+        // Exactly the activity a live directory sees.
+        std::fs::write(directory.join("appeared"), b"y").unwrap();
+        std::fs::remove_file(directory.join("existing")).unwrap();
+
+        let captured =
+            capture_macos_metadata_with(&directory, false, Some(scanned)).expect("a directory whose children changed is still the directory that was scanned");
+        assert!(captured.identity.describes_same_object(scanned), "the capture must report the same object");
+
+        // The relaxation is for directories only, and only for the fields that
+        // move on their own. A directory genuinely replaced is still refused.
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        let replaced = capture_macos_metadata_with(&directory, false, Some(scanned));
+        assert!(replaced.is_err(), "a directory replaced by a different one must still be refused");
+
+        // A regular file keeps the exact comparison: its length and mtime are
+        // part of what the capture is asserting about the member.
+        let file = temp.path().join("file.bin");
+        std::fs::write(&file, b"before").unwrap();
+        let scanned_file = MacosMetadataIdentity::from_metadata(&std::fs::symlink_metadata(&file).unwrap());
+        std::fs::write(&file, b"after it grew").unwrap();
+        assert!(capture_macos_metadata_with(&file, false, Some(scanned_file)).is_err(), "a regular file that changed must still be refused");
+    }
+
+    #[test]
+    fn restore_keeps_each_partners_own_metadata() {
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.bin");
+        let second = temp.path().join("second.bin");
+        let payload = vec![7u8; 128 * 1024];
+        std::fs::write(&first, &payload).unwrap();
+        std::fs::write(&second, &payload).unwrap();
+        if query_macos_clone_id(&first).is_none() {
+            return; // volume has no clone tracking
+        }
+
+        // Deliberately different in every dimension the clone would carry over.
+        std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&second, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let first_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_880_000);
+        let second_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_746_403_200);
+        let set_mtime = |path: &std::path::Path, when: std::time::SystemTime| {
+            std::fs::File::options().write(true).open(path).unwrap().set_times(std::fs::FileTimes::new().set_modified(when)).unwrap();
+        };
+        set_mtime(&first, first_time);
+        set_mtime(&second, second_time);
+        let tagged = xattr::set(&second, "com.tzap.only-second", b"keep me").is_ok();
+        let _ = xattr::set(&first, "com.tzap.only-first", b"not yours");
+
+        let mut groups = BTreeMap::new();
+        groups.insert("d".repeat(32), vec![first.clone(), second.clone()]);
+        let outcomes = restore_clone_groups(&groups);
+        match &outcomes[0] {
+            CloneRestoreOutcome::Shared { .. } => {}
+            CloneRestoreOutcome::NotShared { reason, .. } => panic!("sharing failed on an APFS volume: {reason}"),
+        }
+
+        // Sharing happened...
+        assert_eq!(query_macos_clone_id(&second), query_macos_clone_id(&first), "partners must share storage after the pass");
+        // ...and cost the destination none of its own identity.
+        let metadata = std::fs::metadata(&second).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o644, "the cloned partner kept the source's mode");
+        assert_eq!(metadata.modified().unwrap(), second_time, "the cloned partner kept the source's mtime");
+        assert_eq!(std::fs::read(&second).unwrap(), payload, "bytes must be untouched");
+        if tagged {
+            assert_eq!(xattr::get(&second, "com.tzap.only-second").unwrap().as_deref(), Some(b"keep me".as_slice()), "the partner's own xattr was lost");
+            assert!(xattr::get(&second, "com.tzap.only-first").unwrap().is_none(), "the partner inherited the source's xattr");
+        }
+    }
+
+    /// The staging name must never be one a restored member could occupy.
+    ///
+    /// `with_extension("tzap-clone-staging")` *replaces* the real extension, so
+    /// `disk2.img` staged through `disk2.tzap-clone-staging` -- and the pass then
+    /// deleted whatever already sat at that name, with no diagnostic. A member
+    /// legitimately carrying it was silently removed from the restored tree.
+    #[test]
+    fn restore_does_not_disturb_a_file_named_like_the_staging_path() {
+        use std::collections::BTreeMap;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("disk.img");
+        let second = temp.path().join("disk2.img");
+        let bystander = temp.path().join("disk2.tzap-clone-staging");
+        let payload = vec![9u8; 64 * 1024];
+        std::fs::write(&first, &payload).unwrap();
+        std::fs::write(&second, &payload).unwrap();
+        std::fs::write(&bystander, b"USER DATA THAT MUST SURVIVE").unwrap();
+        if query_macos_clone_id(&first).is_none() {
+            return;
+        }
+
+        let mut groups = BTreeMap::new();
+        groups.insert("e".repeat(32), vec![first, second]);
+        let _ = restore_clone_groups(&groups);
+
+        assert_eq!(std::fs::read(&bystander).unwrap(), b"USER DATA THAT MUST SURVIVE", "a restored member named like the staging path was destroyed");
+    }
+
     #[test]
     fn restore_refuses_to_overwrite_partners_whose_bytes_differ() {
         use std::collections::BTreeMap;
@@ -870,17 +1040,63 @@ pub fn restore_clone_groups(groups: &std::collections::BTreeMap<String, Vec<std:
     outcomes
 }
 
+/// Whether two restored partners hold the same bytes, compared in fixed-size
+/// chunks.
+///
+/// `fs::read` on both, which this used to do, holds two whole files in memory at
+/// once: measured at 586 MB peak RSS against 326 MB for a 150 MB pair, and a
+/// cloned disk image -- the case §16.11 exists for -- is routinely tens of GB.
+/// Length is checked first, so unequal files usually cost no reads at all.
+fn restored_partners_match(source: &Path, destination: &Path) -> io::Result<bool> {
+    let mut left = fs::File::open(source)?;
+    let mut right = fs::File::open(destination)?;
+    if left.metadata()?.len() != right.metadata()?.len() {
+        return Ok(false);
+    }
+
+    let mut left_chunk = vec![0u8; 256 * 1024];
+    let mut right_chunk = vec![0u8; 256 * 1024];
+    loop {
+        let read = read_up_to(&mut left, &mut left_chunk)?;
+        if read_up_to(&mut right, &mut right_chunk[..read])? != read {
+            return Ok(false);
+        }
+        if read == 0 {
+            return Ok(true);
+        }
+        if left_chunk[..read] != right_chunk[..read] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Fill `buffer` until it is full or the file ends, returning how much was read.
+fn read_up_to(file: &mut fs::File, buffer: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0usize;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..])? {
+            0 => break,
+            count => filled += count,
+        }
+    }
+    Ok(filled)
+}
+
 fn clone_over(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
 
     // The hint is not authority to change bytes: if the restored files differ,
     // leave them as restored.
-    if fs::read(source)? != fs::read(destination)? {
+    if !restored_partners_match(source, destination)? {
         return Err(io::Error::other("restored clone partners differ; refusing to overwrite"));
     }
 
-    let staging = destination.with_extension("tzap-clone-staging");
-    let _ = fs::remove_file(&staging);
+    // A unique sibling created with O_EXCL, not a name derived from the
+    // destination's stem. `with_extension("tzap-clone-staging")` *replaces* the
+    // real extension, so `disk2.img` staged through `disk2.tzap-clone-staging`
+    // -- and the unconditional `remove_file` that preceded it silently deleted a
+    // restored member that happened to carry that name.
+    let staging = unique_clone_staging_path(destination)?;
     let source_c = std::ffi::CString::new(source.as_os_str().as_bytes()).map_err(io::Error::other)?;
     let staging_c = std::ffi::CString::new(staging.as_os_str().as_bytes()).map_err(io::Error::other)?;
     // SAFETY: both paths are NUL-terminated and live for the synchronous call.
@@ -889,8 +1105,64 @@ fn clone_over(source: &Path, destination: &Path) -> io::Result<()> {
         let _ = fs::remove_file(&staging);
         return Err(error);
     }
+    // `clonefile` copies the *source's* mode, ownership, times, flags, ACL and
+    // xattrs along with its storage, so the staged clone currently describes the
+    // wrong file. Put the destination's own metadata back before it is published,
+    // or the rename below silently replaces metadata that restore already applied
+    // correctly -- measured: a 0644/2025 partner came back as 0600/2020, its
+    // source's.
+    if let Err(error) = copy_metadata_onto_clone(destination, &staging) {
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
     // Rename is atomic within a volume and replaces the restored copy.
     fs::rename(&staging, destination).inspect_err(|_| {
         let _ = fs::remove_file(&staging);
     })
+}
+
+/// A staging sibling of `destination` that does not exist yet.
+///
+/// Appends to the full leaf rather than replacing its extension, so two members
+/// in one directory can never stage through the same name, and never collides
+/// with a restored member: the O_EXCL create is what proves the name is free.
+fn unique_clone_staging_path(destination: &Path) -> io::Result<PathBuf> {
+    let parent = destination.parent().ok_or_else(|| io::Error::other("clone destination has no parent directory"))?;
+    let leaf = destination.file_name().ok_or_else(|| io::Error::other("clone destination has no file name"))?;
+    for attempt in 0..1000u32 {
+        let mut candidate = leaf.to_os_string();
+        candidate.push(format!(".tzap-clone-{}-{attempt}", std::process::id()));
+        let path = parent.join(candidate);
+        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            // `clonefile` refuses an existing destination, so the probe is removed
+            // again immediately. Holding the name is not the point -- proving it
+            // was free, and never touching a name that was not, is.
+            Ok(_) => {
+                fs::remove_file(&path)?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::other("could not find a free clone staging name"))
+}
+
+/// Copy `from`'s mode, ownership, times, flags, ACL and xattrs onto `onto`.
+///
+/// `COPYFILE_METADATA` is `COPYFILE_SECURITY | COPYFILE_XATTR`, i.e. stat, ACL
+/// and extended attributes -- the platform's own primitive for exactly this, and
+/// the symmetric inverse of what `clonefile` copied from the wrong file.
+fn copy_metadata_onto_clone(from: &Path, onto: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let from_c = std::ffi::CString::new(from.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let onto_c = std::ffi::CString::new(onto.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: both paths are NUL-terminated and live for the synchronous call;
+    // a null state is documented as "allocate and free one internally".
+    let status = unsafe { libc::copyfile(from_c.as_ptr(), onto_c.as_ptr(), std::ptr::null_mut(), libc::COPYFILE_METADATA | libc::COPYFILE_NOFOLLOW) };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
