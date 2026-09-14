@@ -2398,3 +2398,47 @@ fn cli_create_skips_an_unreadable_input_and_still_writes_the_archive() {
     assert!(listed.contains("readable.txt"), "the readable member must be archived: {listed}");
     assert!(!listed.contains("locked.txt"), "the unreadable member must not be claimed: {listed}");
 }
+
+/// A file that disappears between the scan and the read must not cost the archive.
+///
+/// By the time its bytes are wanted, the member's length is in its header and
+/// its place is in the index, so it cannot be dropped without replanning. The
+/// archive is completed with the promised length of zeros, the substitution is
+/// reported, and the exit code says the archive is not the whole story -- rather
+/// than the whole run failing because one file went away mid-backup.
+#[cfg(unix)]
+#[test]
+fn cli_create_completes_when_an_input_disappears_before_its_bytes_are_read() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("tree");
+    let archive = temp.path().join("tree.tzap");
+    fs::create_dir(&source).unwrap();
+    for index in 0..6 {
+        fs::write(source.join(format!("keep-{index}.bin")), vec![b'k'; 2048]).unwrap();
+    }
+    let doomed = source.join("vanishes.bin");
+    fs::write(&doomed, vec![b'v'; 4096]).unwrap();
+
+    // Remove it while the scan is still walking the tree, so the member is
+    // planned and then cannot be opened.
+    let remover = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let _ = fs::remove_file(&doomed);
+    });
+
+    let output =
+        Command::cargo_bin("tzap").unwrap().args(["create", "--no-encryption", "-o", archive.to_str().unwrap(), source.to_str().unwrap()]).output().unwrap();
+    let _ = remover.join();
+
+    // Either outcome is acceptable and both must leave a usable archive: the
+    // file may vanish before the scan sees it (skipped) or after (zero-filled).
+    // What must never happen is no archive at all.
+    assert!(archive.exists(), "the archive must be written whichever way the race went: {}", String::from_utf8_lossy(&output.stderr));
+    Command::cargo_bin("tzap").unwrap().args(["verify", archive.to_str().unwrap()]).assert().success();
+
+    let listed = Command::cargo_bin("tzap").unwrap().args(["list", archive.to_str().unwrap()]).assert().success().get_output().stdout.clone();
+    let listed = String::from_utf8_lossy(&listed);
+    for index in 0..6 {
+        assert!(listed.contains(&format!("keep-{index}.bin")), "every readable member must survive: {listed}");
+    }
+}

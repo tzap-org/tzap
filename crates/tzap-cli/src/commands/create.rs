@@ -717,7 +717,19 @@ impl RegularFileSource for InputSpec {
             }
             return Ok(Box::new(io::empty()));
         }
-        let file = open_input_for_archiving(&self.source).map_err(ArchiveWriteError::Io)?;
+        // A file that disappeared between the scan and this read cannot be
+        // dropped from the archive: its length is already promised in the member
+        // header and its place is already planned into the index. Writing the
+        // promised number of zero bytes and reporting it keeps the archive valid
+        // and delivers everything else, which is the same trade GNU tar and
+        // libarchive make when a file shrinks under them.
+        let file = match open_input_for_archiving(&self.source) {
+            Ok(file) => file,
+            Err(error) => {
+                note_input_vanished_before_read(&self.archive_path, self.size, &error);
+                return Ok(Box::new(io::repeat(0).take(self.size)) as Box<dyn Read + '_>);
+            }
+        };
         // A regular file that moved between the scan and this open is not a
         // reason to refuse the archive. The member is written at exactly the
         // length its header already promised -- the reader clamps a file that

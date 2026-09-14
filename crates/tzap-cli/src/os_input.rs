@@ -772,6 +772,24 @@ pub(crate) fn take_skipped_inputs() -> Vec<String> {
     SKIPPED_INPUTS.lock().map(|mut notes| std::mem::take(&mut *notes)).unwrap_or_default()
 }
 
+/// Note an input that became unreadable between the scan and the read.
+///
+/// Distinct from a file that merely changed: nothing of it could be read at all,
+/// so the member is entirely zeros. Worth its own wording -- "stored as zeros"
+/// is a materially different thing to be told than "shortened".
+pub(crate) fn note_input_vanished_before_read(path: &str, declared: u64, error: &io::Error) {
+    let note = format!(
+        "{path} could not be read when its contents were archived ({error}); stored {} of zeros in its place",
+        tzap_core::entry_metadata::human_bytes(declared)
+    );
+    if let Ok(mut notes) = CHANGED_DURING_READ.lock() {
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+    mark_archive_incomplete();
+}
+
 /// Note a regular input that moved between the scan and the read of its bytes.
 /// Open a regular input for archiving, denying writers while it is read.
 ///
