@@ -21,8 +21,8 @@ use tzap_core::PortablePosixOwner;
 #[cfg(test)]
 use tzap_core::{write_archive_with_kdf, RegularFile};
 use tzap_core::{
-    ArchiveTimestamp, EntryMetadataVerification, KdfParams, MasterKey, MetadataDiagnostic, MetadataVerificationReport, PublicNoKeyVerification,
-    RegularFileSource, RestorePolicy, RestorePolicyCapability, RootAuthSigningRequest, RootAuthWriterConfig, SourceEntryKind, TarEntryKind, WriterOptions,
+    ArchiveTimestamp, EntryMetadataVerification, KdfParams, MasterKey, MetadataDiagnostic, MetadataVerificationReport, PublicNoKeyVerification, RestorePolicy,
+    RestorePolicyCapability, RootAuthSigningRequest, RootAuthWriterConfig, SourceEntryKind, TarEntryKind, WriterOptions,
 };
 #[cfg(test)]
 use tzap_core::{MetadataDiagnosticStatus, MetadataOperation};
@@ -39,13 +39,14 @@ use std::io;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
-use tzap_core::{write_archive_sources_to_sink, RegularFileSource};
+use tzap_core::write_archive_sources_to_sink;
 #[cfg(any(target_os = "linux", windows))]
 use tzap_core::{write_archive_sources_to_sink_ordered_parallel, MemoryArchiveSink, SafeExtractionOptions};
 
 use super::*;
 use crate::commands::*;
 use plaintext_spool::ExplicitPlaintextSpool;
+use tzap_core::RegularFileSource;
 
 use std::io::Cursor;
 
