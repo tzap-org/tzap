@@ -877,15 +877,12 @@ pub(crate) fn is_capture_race(error: &anyhow::Error) -> bool {
     rendered.contains(tzap_core::portable_capture::CAPTURE_RACE_MARKER) || rendered.contains(tzap_core::portable_capture::CAPTURE_PREOPEN_RACE_MARKER)
 }
 
-/// Run one complete observation -- stat, identify, capture -- retrying the whole
-/// thing when it loses a race with a concurrent writer.
+/// Run one complete scan observation -- stat, identify, sparse probe, and
+/// capture -- retrying the whole attempt when metadata capture loses a race.
 ///
-/// Every attempt re-observes. Sampling the identity once and retrying only the
-/// capture against it, which the directory and symlink paths did, cannot converge:
-/// the expectation is stale from the first failure onwards, so all three attempts
-/// fail against an object that has long since settled. Measured directly -- a
-/// directory changed once and then left alone still burned the whole budget,
-/// while a freshly observed identity succeeded immediately.
+/// Every attempt re-observes. The later data read remains intentionally
+/// best-effort, matching 7-Zip: a live regular file can change after this scan,
+/// and directory activity must not invalidate the planned subtree.
 pub(crate) fn observe_with_capture_retry<T>(mut observe: impl FnMut() -> Result<T>) -> Result<T> {
     for attempt in 0..tzap_core::portable_capture::CAPTURE_ATTEMPTS {
         match observe() {
@@ -924,16 +921,17 @@ pub(crate) fn portable_symlink_metadata(identity: InputIdentity, _input: &Path) 
 /// `mtime` is deliberately not here: losing it silently is a different decision.
 fn portable_optional_times(metadata: &fs::Metadata) -> (Option<ArchiveTimestamp>, Option<ArchiveTimestamp>) {
     let encodable = |time: ArchiveTimestamp| time.canonical_pax_value().is_ok().then_some(time);
-    let created = metadata.created().ok().and_then(|time| archive_timestamp(time).ok()).and_then(encodable);
-    // std cannot expose the birth time on musl (statx/STATX_BTIME is unsupported
-    // there), so fall back to ctime as core does -- otherwise this host silently
-    // drops a creation time that zmanager records on the same file.
+    // Preserve a real birth time when the host exposes one. std cannot expose
+    // the birth time on musl (statx/STATX_BTIME is unsupported there), so fall
+    // back to ctime only when no birth time was supplied. A real but
+    // unencodable birth time must remain omitted rather than being replaced by
+    // a different timestamp.
+    let created = metadata.created().ok().and_then(|time| archive_timestamp(time).ok());
     #[cfg(target_os = "linux")]
     let created = created.or_else(|| {
         use std::os::unix::fs::MetadataExt as _;
         Some(ArchiveTimestamp::new(metadata.ctime(), u32::try_from(metadata.ctime_nsec()).unwrap_or(0)))
     });
-    #[cfg(target_os = "linux")]
     let created = created.and_then(encodable);
     (created, metadata.accessed().ok().and_then(|time| archive_timestamp(time).ok()).and_then(encodable))
 }

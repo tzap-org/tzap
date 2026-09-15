@@ -3,7 +3,6 @@ use crate::{ArchiveTimestamp, NativeAuxiliaryMetadata, NativeAuxiliaryNameEncodi
 use std::fs::{self, File};
 use std::io;
 use std::io::{Read, Seek as _, SeekFrom};
-use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::AsRawHandle as _;
 use std::path::Path;
 use std::path::PathBuf;

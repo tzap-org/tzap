@@ -21,8 +21,8 @@ use tzap_core::PortablePosixOwner;
 #[cfg(test)]
 use tzap_core::{write_archive_with_kdf, RegularFile};
 use tzap_core::{
-    ArchiveTimestamp, EntryMetadataVerification, KdfParams, MasterKey, MetadataDiagnostic, MetadataVerificationReport, PublicNoKeyVerification, RestorePolicy,
-    RestorePolicyCapability, RootAuthSigningRequest, RootAuthWriterConfig, SourceEntryKind, TarEntryKind, WriterOptions,
+    ArchiveTimestamp, EntryMetadataVerification, KdfParams, MasterKey, MetadataDiagnostic, MetadataVerificationReport, PublicNoKeyVerification,
+    RegularFileSource, RestorePolicy, RestorePolicyCapability, RootAuthSigningRequest, RootAuthWriterConfig, SourceEntryKind, TarEntryKind, WriterOptions,
 };
 #[cfg(test)]
 use tzap_core::{MetadataDiagnosticStatus, MetadataOperation};
@@ -1999,6 +1999,25 @@ fn standalone_windows_directory_alternate_data_round_trips() {
     let restored = output.join("native-directory");
     assert!(restored.is_dir());
     assert_eq!(fs::read(PathBuf::from(format!("{}:tzap-directory", restored.display()))).unwrap(), b"directory alternate metadata");
+}
+
+#[test]
+fn directory_input_open_tolerates_scan_time_child_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("tree");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("existing"), b"x").unwrap();
+
+    let specs = collect_input_specs(&[source.to_string_lossy().into_owned()]).unwrap();
+    let directory = specs.iter().find(|spec| spec.entry_kind == SourceEntryKind::Directory).expect("the scanned directory must be present");
+
+    fs::write(source.join("appeared"), b"y").unwrap();
+    fs::remove_file(source.join("existing")).unwrap();
+
+    let mut reader = directory.open().unwrap();
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+    assert!(bytes.is_empty());
 }
 
 #[cfg(windows)]

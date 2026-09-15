@@ -679,6 +679,12 @@ impl RegularFileSource for InputSpec {
     }
 
     fn open(&self) -> std::result::Result<Box<dyn Read + '_>, ArchiveWriteError> {
+        // Match 7-Zip's practical directory behavior: a directory has no
+        // primary data stream, so child activity after the scan must not make
+        // the already-planned directory member fail identity validation.
+        if self.entry_kind == SourceEntryKind::Directory {
+            return Ok(Box::new(io::empty()));
+        }
         if self.entry_kind != SourceEntryKind::Regular {
             let metadata = fs::symlink_metadata(&self.source).map_err(ArchiveWriteError::Io)?;
             let actual = input_identity(&metadata).map_err(ArchiveWriteError::Io)?;
@@ -1167,11 +1173,10 @@ pub(crate) fn collect_one_input_spec(input: &Path, archive_path: &Path, out: &mu
     #[cfg(windows)]
     reject_unsupported_windows_regular_file(&metadata, input)?;
     let archive_path = archive_path_to_string(archive_path)?;
-    // One look at the file, not two: stat, identity, sparse ranges and capture all
-    // come from the same observation, so the index entry and the PAX records
-    // always describe a single object. A lost race retries the whole observation
-    // rather than re-testing a scan-time identity that can never match again --
-    // see `observe_with_capture_retry`, which is why the grouping matters.
+    // Capture the metadata and sparse layout used for planning as one scan
+    // observation. Like 7-Zip, the later data read remains best-effort: a live
+    // regular file may change after this scan, and directory activity must not
+    // invalidate the planned subtree.
     let RegularInputObservation { metadata, identity, sparse_extents, captured } = observe_with_capture_retry(|| observe_regular_input(input))?;
     #[cfg(target_os = "macos")]
     let macos_identity = captured.macos_identity;
