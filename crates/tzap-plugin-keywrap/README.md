@@ -11,8 +11,8 @@ RecipientWrap archives.
 
 ```toml
 [dependencies]
-tzap-core = "0.2.5"
-tzap-plugin-keywrap = "0.2.5"
+tzap-core = "0.2.6"
+tzap-plugin-keywrap = "0.2.6"
 ```
 
 ## Architecture
