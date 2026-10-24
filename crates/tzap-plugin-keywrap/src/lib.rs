@@ -7,7 +7,6 @@ use hpke::{
     Deserializable, Kem as HpkeKem, OpModeR, OpModeS, Serializable,
 };
 use openssl::{bn::BigNumContext, ec::PointConversionForm, nid::Nid, pkey::PKey, x509::X509};
-use rand_core::{OsRng, UnwrapErr};
 use sha2::{Digest, Sha256};
 use tzap_core::format::{FORMAT_VERSION, VOLUME_FORMAT_REV_45};
 use tzap_core::wire::RecipientRecordV1;
@@ -265,18 +264,15 @@ fn hpke_seal_master_key_with_aad_domain(
     let (enc, ciphertext) = match (suite.kem_id, suite.aead_id) {
         (X25519_KEM_ID, CHACHA20POLY1305_AEAD_ID) => {
             let public_key = x25519_public_key_from_certificate(recipient_certificate_der).map_err(|_| KeyWrapOutcome::UnsupportedSuite)?;
-            let mut rng = UnwrapErr(OsRng);
             let (enc, ciphertext) =
-                hpke::single_shot_seal::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256, _>(&OpModeS::Base, &public_key, &info, master_key, &aad, &mut rng)
+                hpke::single_shot_seal::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>(&OpModeS::Base, &public_key, &info, master_key, &aad)
                     .map_err(|_| KeyWrapOutcome::InvalidRecord)?;
             (enc.to_bytes().to_vec(), ciphertext)
         }
         (P256_KEM_ID, AES256GCM_AEAD_ID) => {
             let public_key = p256_public_key_from_certificate(recipient_certificate_der).map_err(|_| KeyWrapOutcome::UnsupportedSuite)?;
-            let mut rng = UnwrapErr(OsRng);
-            let (enc, ciphertext) =
-                hpke::single_shot_seal::<AesGcm256, HkdfSha256, DhP256HkdfSha256, _>(&OpModeS::Base, &public_key, &info, master_key, &aad, &mut rng)
-                    .map_err(|_| KeyWrapOutcome::InvalidRecord)?;
+            let (enc, ciphertext) = hpke::single_shot_seal::<AesGcm256, HkdfSha256, DhP256HkdfSha256>(&OpModeS::Base, &public_key, &info, master_key, &aad)
+                .map_err(|_| KeyWrapOutcome::InvalidRecord)?;
             (enc.to_bytes().to_vec(), ciphertext)
         }
         _ => return Err(KeyWrapOutcome::UnsupportedSuite),

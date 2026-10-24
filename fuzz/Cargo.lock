@@ -336,9 +336,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
 ]
@@ -1174,7 +1174,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "tzap-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "aes-gcm",
  "aes-gcm-siv",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "tzap-plugin-signing"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "ed25519-dalek",
  "openssl",

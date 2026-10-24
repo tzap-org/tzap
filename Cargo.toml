@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.5"
+version = "0.2.6"
 authors = ["Frank Zhu"]
 description = "Rust reference implementation of the tzap archive format specification"
 edition = "2021"
@@ -37,7 +37,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
-hpke = "0.13"
+hpke = { version = "0.14.1", default-features = false, features = ["alloc", "getrandom", "x25519", "nistp", "aes", "chacha"] }
 libc = "0.2"
 linux-raw-sys = { version = "0.12", features = ["ioctl"] }
 memmap2 = "0.9"
