@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.2.7 - 2026-10-28
+
+- Updates zstd to 0.14.3 and HPKE dependencies to patched versions, resolving
+  the RustSec audit findings and yanked dependency detected in the prior
+  lockfiles.
+
 - **Changes how pre-epoch timestamps are interpreted, including in archives
   written by 0.2.4.** §16.7.2 encodes a time as a signed decimal in sign-and-
   magnitude form, so `-1.25` means 1.25 seconds before the epoch -- the timespec
