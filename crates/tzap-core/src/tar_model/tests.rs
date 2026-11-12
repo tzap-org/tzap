@@ -448,6 +448,7 @@ fn rejects_platform_escape_paths() {
 fn safe_restore_rejects_symlink_parent() {
     let tmp = tempdir().unwrap();
     let outside = tempdir().unwrap();
+    fs::write(outside.path().join("sentinel.txt"), b"outside data").unwrap();
     std::os::unix::fs::symlink(outside.path(), tmp.path().join("link")).unwrap();
 
     let member = OwnedTarMember {
@@ -464,6 +465,8 @@ fn safe_restore_rejects_symlink_parent() {
     };
 
     assert_eq!(restore_tar_member(tmp.path(), &member, SafeExtractionOptions::default()).unwrap_err(), FormatError::UnsafeArchivePath);
+    assert_eq!(fs::read(outside.path().join("sentinel.txt")).unwrap(), b"outside data");
+    assert!(!outside.path().join("file.txt").exists(), "restore must not write through a symlink outside the extraction root");
 }
 
 #[cfg(unix)]
