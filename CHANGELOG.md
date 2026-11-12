@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.8 - 2026-11-12
+
+- Updates `cap-std` and `cap-fs-ext` to 4.0.3 to fix RustSec
+  [RUSTSEC-2026-0482](https://rustsec.org/advisories/RUSTSEC-2026-0482.html).
+  On affected platforms and kernels, a path component or symlink ending in a
+  slash could escape the capability filesystem sandbox and allow reads or
+  writes outside the sandbox.
+
 ## 0.2.7 - 2026-10-28
 
 - Updates zstd to 0.14.3 and HPKE dependencies to patched versions, resolving
