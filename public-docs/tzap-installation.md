@@ -104,7 +104,7 @@ Supported target artifacts:
 | Windows aarch64 | `tzap-vX.Y.Z-windows-aarch64.zip` |
 
 Release artifacts are built on pinned baseline runners instead of moving
-`*-latest` labels: `ubuntu-22.04`, `macos-15-intel`, `macos-14`, and
+`*-latest` labels: `ubuntu-22.04`, `macos-15-intel`, `macos-15`, and
 `windows-2022`. macOS builds set `MACOSX_DEPLOYMENT_TARGET=10.12` for
 x86_64 and `MACOSX_DEPLOYMENT_TARGET=11.0` for aarch64. Linux publishes
 static musl artifacts for x86_64 and aarch64; Windows release builds use the

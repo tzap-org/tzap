@@ -24,7 +24,7 @@ fn ci_workflow_has_cross_platform_matrix() {
     assert!(workflow.contains("include:"));
     assert!(workflow.contains("os: ubuntu-22.04"));
     assert!(workflow.contains("os: macos-15-intel"));
-    assert!(workflow.contains("os: macos-14"));
+    assert!(workflow.contains("os: macos-15"));
     assert!(workflow.contains("os: windows-2022"));
     assert!(workflow.contains("release-artifacts:"));
     assert!(workflow.contains("Release artifact ${{ matrix.name }}"));
@@ -81,7 +81,7 @@ fn release_workflow_uses_pinned_baseline_runners() {
 
     assert!(workflow.contains("os: ubuntu-22.04"));
     assert!(workflow.contains("os: macos-15-intel"));
-    assert!(workflow.contains("os: macos-14"));
+    assert!(workflow.contains("os: macos-15"));
     assert!(workflow.contains("os: windows-2022"));
     assert!(workflow.contains("runs-on: ubuntu-22.04"));
     assert!(workflow.contains("MACOSX_DEPLOYMENT_TARGET"));

@@ -21,7 +21,7 @@ jobs:
             run_fmt: true
           - os: macos-15-intel
             run_fmt: false
-          - os: macos-14
+          - os: macos-15
             run_fmt: false
           - os: windows-2022
             run_fmt: false
@@ -92,7 +92,7 @@ jobs:
             macosx_deployment_target: "10.12"
             rustflags: ""
           - name: macos-aarch64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             builder: cargo
             emulator: ""
