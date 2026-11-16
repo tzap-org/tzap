@@ -35,6 +35,44 @@ target/release/tzap
 cargo install --git https://github.com/tzap-org/tzap tzap
 ```
 
+## OpenSSL for source builds
+
+The CI and release workflows build and statically link
+[OpenSSL 3.5.9 LTS](https://github.com/openssl/openssl/releases/tag/openssl-3.5.9)
+from the official, checksum-pinned source tarball. The build applies the
+[upstream RSA-PSS provider alias](https://github.com/openssl/openssl/commit/af2aaf3271c0b0a193f33d5c0be07754b846759e)
+to keep certificate decoding reliable when signing operations run in parallel.
+
+A plain `cargo build` or `cargo install` uses the vendored OpenSSL selected by
+Cargo. The workspace, fuzz, and published TZAP 0.2.8 lockfiles select
+`openssl-src 300.6.1+3.6.3`.
+Without `--locked`, `cargo install` resolves dependencies afresh.
+[OpenSSL 3.6 has reached end of life](https://openssl-library.org/post/2026-11-01-eol34-36/).
+
+To select the same OpenSSL as the release workflows, run these commands from a
+TZAP checkout with Python 3, Perl, and native C build tools installed:
+
+```sh
+target="$(rustc -vV | sed -n 's/^host: //p')"
+OPENSSL_DIR="$(python3 scripts/build-openssl.py "$target")" || exit 1
+export OPENSSL_DIR OPENSSL_STATIC=1 OPENSSL_NO_VENDOR=1
+cargo build --locked --release -p tzap
+# To install or replace the crates.io binary, run cargo install --locked --force tzap
+```
+
+On Windows, use Developer PowerShell with the MSVC tools for the Rust target
+and a native Perl distribution such as Strawberry Perl:
+
+```powershell
+$target = (rustc -vV | Select-String '^host: ').Line.Substring(6)
+$env:OPENSSL_DIR = python scripts/build-openssl.py $target
+if ($LASTEXITCODE -ne 0) { throw "OpenSSL build failed" }
+$env:OPENSSL_STATIC = "1"
+$env:OPENSSL_NO_VENDOR = "1"
+cargo build --locked --release -p tzap
+# To install or replace the crates.io binary, run cargo install --locked --force tzap
+```
+
 ## From GitHub release assets
 
 ```sh
@@ -110,6 +148,9 @@ x86_64 and `MACOSX_DEPLOYMENT_TARGET=11.0` for aarch64. Linux publishes
 static musl artifacts for x86_64 and aarch64; Windows release builds use the
 static CRT.
 
+The release archives include `THIRD-PARTY-NOTICES.txt` and
+`OPENSSL-LICENSE.txt` alongside the executable.
+
 Release artifacts are accompanied by:
 
 - individual `.sha256` files
@@ -118,4 +159,5 @@ Release artifacts are accompanied by:
 - GitHub artifact attestations for release assets
 
 The `tzap trust-info` command prints the embedded official TZAP root
-fingerprint and build identity for the binary you are running.
+fingerprint, build identity, and linked OpenSSL version for the binary you are
+running.

@@ -30,6 +30,9 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Set up static OpenSSL
+        uses: ./.github/actions/setup-openssl
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -90,6 +93,9 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Set up static OpenSSL
+        uses: ./.github/actions/setup-openssl
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked

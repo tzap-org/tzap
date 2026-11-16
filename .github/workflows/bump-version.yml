@@ -22,6 +22,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Set up static OpenSSL
+        uses: ./.github/actions/setup-openssl
+
       - name: Run version bump script
         run: |
           chmod +x ./scripts/bump-version.sh

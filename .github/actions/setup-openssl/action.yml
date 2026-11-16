@@ -1,0 +1,42 @@
+name: Set up static OpenSSL
+description: Build TZAP's pinned OpenSSL and select it for subsequent Cargo commands
+
+inputs:
+  target:
+    description: Rust target triple, or the Rust host when empty
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Set up the target MSVC tools
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+      with:
+        arch: ${{ inputs.target == 'aarch64-pc-windows-msvc' && 'amd64_arm64' || 'amd64' }}
+
+    - name: Build OpenSSL (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        TZAP_TARGET: ${{ inputs.target }}
+      run: |
+        $target = $env:TZAP_TARGET
+        if (!$target) {
+          $target = (rustc -vV | Select-String '^host: ').Line.Substring(6)
+        }
+        $opensslDir = python scripts/build-openssl.py $target
+        if ($LASTEXITCODE -ne 0 -or !$opensslDir) {
+          throw "Failed to build OpenSSL for $target"
+        }
+        "OPENSSL_DIR=$opensslDir", "OPENSSL_NO_VENDOR=1", "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
+
+    - name: Build OpenSSL (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        TZAP_TARGET: ${{ inputs.target }}
+      run: |
+        target="${TZAP_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
+        openssl_dir="$(python3 scripts/build-openssl.py "$target")"
+        printf '%s\n' "OPENSSL_DIR=$openssl_dir" OPENSSL_NO_VENDOR=1 OPENSSL_STATIC=1 >> "$GITHUB_ENV"

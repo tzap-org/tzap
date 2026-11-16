@@ -18,6 +18,9 @@ jobs:
           rustup update stable
           rustup default stable
 
+      - name: Set up static OpenSSL
+        uses: ./.github/actions/setup-openssl
+
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

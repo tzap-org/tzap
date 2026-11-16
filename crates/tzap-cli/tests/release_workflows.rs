@@ -1,6 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const RELEASE_ARTIFACT_ACTION: &str = ".github/actions/build-release-artifact/action.yml";
+const USE_RELEASE_ARTIFACT_ACTION: &str = "uses: ./.github/actions/build-release-artifact";
+const USE_OPENSSL_SETUP_ACTION: &str = "uses: ./.github/actions/setup-openssl";
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
@@ -20,6 +24,7 @@ fn assert_contains_in_order(text: &str, labels: &[&str]) {
 #[test]
 fn ci_workflow_has_cross_platform_matrix() {
     let workflow = read_workspace_file(".github/workflows/ci.yml");
+    let artifact_action = read_workspace_file(RELEASE_ARTIFACT_ACTION);
 
     assert!(workflow.contains("include:"));
     assert!(workflow.contains("os: ubuntu-22.04"));
@@ -32,18 +37,18 @@ fn ci_workflow_has_cross_platform_matrix() {
     assert!(workflow.contains("aarch64-unknown-linux-musl"));
     assert!(workflow.contains("x86_64-pc-windows-msvc"));
     assert!(workflow.contains("aarch64-pc-windows-msvc"));
-    assert!(workflow.contains("Install musl tools"));
-    assert!(workflow.contains("CC_x86_64_unknown_linux_musl=musl-gcc"));
-    assert!(workflow.contains("Install QEMU"));
+    assert!(workflow.contains(USE_RELEASE_ARTIFACT_ACTION));
+    assert!(artifact_action.contains("musl-tools"));
+    assert!(artifact_action.contains("CC_x86_64_unknown_linux_musl=musl-gcc"));
+    assert!(artifact_action.contains("qemu-user-static"));
     assert!(workflow.contains("qemu-aarch64-static"));
-    assert!(workflow.contains("Install cross"));
-    assert!(workflow.contains("cross build --locked --release -p tzap --target ${{ matrix.target }}"));
-    assert!(workflow.contains("Smoke test release binary"));
+    assert!(artifact_action.contains("cargo install cross --locked"));
+    assert!(artifact_action.contains("cross build --locked --release -p tzap --target \"$TZAP_TARGET\""));
+    assert!(artifact_action.contains("scripts/smoke-release.py"));
     assert!(workflow.contains("matrix.run_fmt"));
     assert!(workflow.contains("cargo fmt --all -- --check"));
     assert!(workflow.contains("cargo check --workspace --all-targets --locked"));
     assert!(workflow.contains("cargo test --workspace --locked"));
-    assert!(workflow.contains("cmp \"$WORKDIR/input.txt\" \"$WORKDIR/out/input.txt\""));
     assert!(!workflow.contains("ubuntu-latest"));
     assert!(!workflow.contains("macos-latest"));
     assert!(!workflow.contains("windows-latest"));
@@ -78,20 +83,21 @@ fn release_workflow_targets_distinct_build_triples() {
 #[test]
 fn release_workflow_uses_pinned_baseline_runners() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
+    let artifact_action = read_workspace_file(RELEASE_ARTIFACT_ACTION);
 
     assert!(workflow.contains("os: ubuntu-22.04"));
     assert!(workflow.contains("os: macos-15-intel"));
     assert!(workflow.contains("os: macos-15"));
     assert!(workflow.contains("os: windows-2022"));
     assert!(workflow.contains("runs-on: ubuntu-22.04"));
-    assert!(workflow.contains("MACOSX_DEPLOYMENT_TARGET"));
+    assert!(workflow.contains(USE_RELEASE_ARTIFACT_ACTION));
+    assert!(workflow.contains("macosx_deployment_target: ${{ matrix.macosx_deployment_target }}"));
+    assert!(artifact_action.contains("MACOSX_DEPLOYMENT_TARGET: ${{ inputs.macosx_deployment_target }}"));
     assert!(workflow.contains(r#"macosx_deployment_target: "10.12""#));
     assert!(workflow.contains(r#"macosx_deployment_target: "11.0""#));
-    assert!(workflow.contains("musl-tools"));
-    assert!(workflow.contains("CC_x86_64_unknown_linux_musl=musl-gcc"));
-    assert!(workflow.contains("qemu-user-static"));
-    assert!(workflow.contains("cargo install cross --locked"));
     assert!(workflow.contains("target-feature=+crt-static"));
+    assert!(workflow.contains("rustflags: ${{ matrix.rustflags }}"));
+    assert!(artifact_action.contains("RUSTFLAGS: ${{ inputs.rustflags }}"));
     assert!(!workflow.contains("ubuntu-latest"));
     assert!(!workflow.contains("macos-latest"));
     assert!(!workflow.contains("windows-latest"));
@@ -100,6 +106,8 @@ fn release_workflow_uses_pinned_baseline_runners() {
 #[test]
 fn release_workflow_has_smoke_checks() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
+    let artifact_action = read_workspace_file(RELEASE_ARTIFACT_ACTION);
+    let smoke_script = read_workspace_file("scripts/smoke-release.py");
 
     assert!(workflow.contains("preflight:"));
     assert!(workflow.contains("needs: preflight"));
@@ -112,39 +120,52 @@ fn release_workflow_has_smoke_checks() {
         "cargo run --manifest-path fuzz/Cargo.toml --bin fuzz_smoke --locked",
         "cargo check --manifest-path fuzz/Cargo.toml --bins --features libfuzzer --locked",
         "cargo install cargo-audit --locked",
-        "cargo audit",
+        "cargo audit --file Cargo.lock",
+        "cargo audit --file fuzz/Cargo.lock",
     ] {
         assert!(workflow.contains(command), "release workflow missing preflight command {command:?}");
     }
 
-    assert!(workflow.contains("Smoke test artifact (Unix)"));
-    assert!(workflow.contains("Smoke test artifact (Windows)"));
-    assert!(workflow.contains("--version"));
-    assert!(workflow.contains("--help"));
-    assert!(workflow.contains("tzap.exe"));
-    assert!(workflow.contains("tar -xzf \"dist/${{ matrix.archive }}\""));
-    assert!(workflow.contains("Expand-Archive -Path \"dist/${{ matrix.archive }}\""));
-    assert!(workflow.contains("create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8 --argon2-parallelism 1"));
-    assert!(workflow.contains("list --password-stdin"));
-    assert!(workflow.contains("verify --password-stdin"));
-    assert!(workflow.contains("extract --password-stdin --directory"));
-    assert!(workflow.contains("grep -F \"input.txt\""));
-    assert!(workflow.contains("release smoke list output did not include input.txt"));
-    assert!(workflow.contains("cmp \"$WORKDIR/input.txt\" \"$WORKDIR/out/input.txt\""));
-    assert!(workflow.contains("release smoke payload mismatch"));
-    assert!(!workflow.contains("Smoke test build"));
+    assert!(workflow.contains("archive: ${{ matrix.archive }}"));
+    assert!(workflow.contains("run_smoke: ${{ matrix.run_smoke }}"));
+    assert!(artifact_action.contains("--inspect-only"));
+    assert_contains_in_order(&workflow, &[USE_RELEASE_ARTIFACT_ACTION, "Generate checksum (Unix)", "Generate checksum (Windows)", "Upload asset"]);
+    assert_contains_in_order(&artifact_action, &["Package Unix", "Package Windows", "Check the packaged binary", "scripts/smoke-release.py"]);
     assert_contains_in_order(
-        &workflow,
+        &smoke_script,
         &[
-            "Package Unix",
-            "Smoke test artifact (Unix)",
-            "Generate checksum (Unix)",
-            "Package Windows",
-            "Smoke test artifact (Windows)",
-            "Generate checksum (Windows)",
-            "Upload asset",
+            "def smoke(",
+            "trust-info",
+            "openssl_version",
+            "\"--version\"",
+            "\"--help\"",
+            "\"create\", \"--password-stdin\"",
+            "\"list\", \"--password-stdin\"",
+            "\"verify\", \"--password-stdin\"",
+            "\"extract\", \"--password-stdin\"",
+            "source.read_bytes() != (out / source.name).read_bytes()",
         ],
     );
+    assert_contains_in_order(&smoke_script, &["shutil.unpack_archive", "check_linkage(binary, args.target)", "smoke(binary, work, version, args.emulator)"]);
+}
+
+#[test]
+fn native_workflows_set_up_static_openssl_before_building() {
+    for (workflow, build_step) in [
+        ("bump-version", "Run version bump script"),
+        ("ci", "Check workspace"),
+        ("compatibility", "Build the candidate"),
+        ("publish-crates", "Publish crates\n"),
+        ("quality", "Check workspace"),
+        ("release", "Check workspace"),
+    ] {
+        let workflow = read_workspace_file(&format!(".github/workflows/{workflow}.yml"));
+        assert_contains_in_order(&workflow, &[USE_OPENSSL_SETUP_ACTION, build_step]);
+    }
+    let quality_workflow = read_workspace_file(".github/workflows/quality.yml");
+    assert_contains_in_order(&quality_workflow, &["fuzz:", USE_OPENSSL_SETUP_ACTION, "Run deterministic fuzz smoke"]);
+    let artifact_action = read_workspace_file(RELEASE_ARTIFACT_ACTION);
+    assert_contains_in_order(&artifact_action, &[USE_OPENSSL_SETUP_ACTION, "cargo build --locked"]);
 }
 
 #[test]

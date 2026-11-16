@@ -89,6 +89,7 @@ jobs:
 
             def install
               bin.install "tzap"
+              doc.install "OPENSSL-LICENSE.txt", "THIRD-PARTY-NOTICES.txt" if File.exist?("THIRD-PARTY-NOTICES.txt")
             end
 
             test do

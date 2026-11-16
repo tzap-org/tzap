@@ -85,9 +85,9 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Comparing against $tag ($(git log -1 --format=%h "$tag"))"
 
-      # No `shell: bash` on the cargo steps. Under bash the Windows runner resolves
-      # Git Bash's perl before Strawberry Perl, and vendored OpenSSL cannot
-      # configure with it. ci.yml builds on Windows for the same reason.
+      - name: Set up static OpenSSL
+        uses: ./.github/actions/setup-openssl
+
       - name: Build the candidate
         run: cargo build --release --bin tzap --locked
 

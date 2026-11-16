@@ -514,7 +514,8 @@ Useful flags:
 
 ## Command: trust-info
 
-Show the official trust material embedded in this `tzap` binary:
+Show the official trust material embedded in this `tzap` binary, its build
+identity, and the runtime OpenSSL version:
 
 ```sh
 tzap trust-info

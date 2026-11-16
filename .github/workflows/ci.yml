@@ -38,6 +38,9 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Set up static OpenSSL
+        uses: ./.github/actions/setup-openssl
+
       - name: Check formatting
         if: ${{ matrix.run_fmt }}
         run: cargo fmt --all -- --check
@@ -128,57 +131,13 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
-
-      - name: Install QEMU
-        if: matrix.emulator != ''
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-user-static
-
-      - name: Install cross
-        if: matrix.builder == 'cross'
-        run: cargo install cross --locked
-
-      - name: Build release binary with cargo
-        if: matrix.builder == 'cargo'
-        env:
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
-          RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo build --locked --release -p tzap --target ${{ matrix.target }}
-
-      - name: Build release binary with cross
-        if: matrix.builder == 'cross'
-        run: cross build --locked --release -p tzap --target ${{ matrix.target }}
-
-      - name: Smoke test release binary
-        if: matrix.run_smoke
-        shell: bash
-        run: |
-          set -euo pipefail
-          WORKDIR="$(mktemp -d)"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            BIN="target/${{ matrix.target }}/release/tzap.exe"
-          else
-            BIN="target/${{ matrix.target }}/release/tzap"
-          fi
-          run_tzap() {
-            if [ -n "${{ matrix.emulator }}" ]; then
-              "${{ matrix.emulator }}" "$BIN" "$@"
-            else
-              "$BIN" "$@"
-            fi
-          }
-          printf 'ci release smoke payload\n' > "$WORKDIR/input.txt"
-          run_tzap --version
-          run_tzap --help
-          printf 'ci-release-smoke-passphrase\n' | run_tzap create --password-stdin --argon2-t-cost 1 --argon2-m-cost-kib 8 --argon2-parallelism 1 -o "$WORKDIR/smoke.tzap" "$WORKDIR/input.txt"
-          printf 'ci-release-smoke-passphrase\n' | run_tzap list --password-stdin "$WORKDIR/smoke.tzap" | grep -F "input.txt"
-          printf 'ci-release-smoke-passphrase\n' | run_tzap verify --password-stdin "$WORKDIR/smoke.tzap"
-          printf 'ci-release-smoke-passphrase\n' | run_tzap extract --password-stdin --directory "$WORKDIR/out" "$WORKDIR/smoke.tzap" input.txt
-          cmp "$WORKDIR/input.txt" "$WORKDIR/out/input.txt"
+      - name: Build and smoke test release artifact
+        uses: ./.github/actions/build-release-artifact
+        with:
+          target: ${{ matrix.target }}
+          archive: tzap-ci-${{ matrix.name }}.${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}
+          builder: ${{ matrix.builder }}
+          emulator: ${{ matrix.emulator }}
+          run_smoke: ${{ matrix.run_smoke }}
+          macosx_deployment_target: ${{ matrix.macosx_deployment_target }}
+          rustflags: ${{ matrix.rustflags }}

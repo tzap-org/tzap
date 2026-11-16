@@ -1,0 +1,116 @@
+name: Build TZAP release artifact
+description: Build, package, and smoke test the release binary with static OpenSSL
+
+inputs:
+  target:
+    description: Rust target triple
+    required: true
+  archive:
+    description: Release archive filename
+    required: true
+  builder:
+    description: Cargo or cross build command
+    required: true
+  emulator:
+    description: Optional emulator for the package smoke test
+    default: ""
+  run_smoke:
+    description: Whether the target binary can run on this runner
+    default: "true"
+  macosx_deployment_target:
+    description: Minimum supported macOS version
+    default: ""
+  rustflags:
+    description: Target-specific Cargo flags
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install musl tools
+      if: inputs.target == 'x86_64-unknown-linux-musl'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools
+        echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+
+    - name: Install QEMU and cross
+      if: inputs.builder == 'cross'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-user-static
+        cargo install cross --locked --version 0.2.5
+
+    - name: Build OpenSSL for Cargo
+      if: inputs.builder == 'cargo'
+      uses: ./.github/actions/setup-openssl
+      env:
+        MACOSX_DEPLOYMENT_TARGET: ${{ inputs.macosx_deployment_target }}
+      with:
+        target: ${{ inputs.target }}
+
+    - name: Build with cargo
+      if: inputs.builder == 'cargo'
+      env:
+        MACOSX_DEPLOYMENT_TARGET: ${{ inputs.macosx_deployment_target }}
+        RUSTFLAGS: ${{ inputs.rustflags }}
+        TZAP_TARGET: ${{ inputs.target }}
+      shell: pwsh
+      run: cargo build --locked --release -p tzap --target $env:TZAP_TARGET
+
+    - name: Build OpenSSL and TZAP with the same musl toolchain
+      if: inputs.builder == 'cross'
+      shell: bash
+      env:
+        TZAP_TARGET: ${{ inputs.target }}
+      run: |
+        image=tzap-aarch64-musl:ci
+        docker build --tag "$image" --file scripts/aarch64-musl.Dockerfile scripts
+        CROSS_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_IMAGE="$image" \
+          cross build --locked --release -p tzap --target "$TZAP_TARGET"
+        mkdir -p package
+        docker run --rm --entrypoint sh "$image" -c \
+          'tar -C "$OPENSSL_DIR" -cf - OPENSSL-LICENSE.txt THIRD-PARTY-NOTICES.txt' | tar -x -C package
+
+    - name: Package Unix
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        TZAP_TARGET: ${{ inputs.target }}
+        TZAP_ARCHIVE: ${{ inputs.archive }}
+        TZAP_BUILDER: ${{ inputs.builder }}
+      run: |
+        mkdir -p dist package
+        if [ "$TZAP_BUILDER" = cargo ]; then
+          cp "$OPENSSL_DIR/"{OPENSSL-LICENSE.txt,THIRD-PARTY-NOTICES.txt} package/
+        fi
+        cp "target/$TZAP_TARGET/release/tzap" package/tzap
+        tar -czf "dist/$TZAP_ARCHIVE" -C package tzap OPENSSL-LICENSE.txt THIRD-PARTY-NOTICES.txt
+
+    - name: Package Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        TZAP_TARGET: ${{ inputs.target }}
+        TZAP_ARCHIVE: ${{ inputs.archive }}
+      run: |
+        New-Item -ItemType Directory -Force dist, package | Out-Null
+        Copy-Item "target/$env:TZAP_TARGET/release/tzap.exe" package/tzap.exe
+        Copy-Item "$env:OPENSSL_DIR/OPENSSL-LICENSE.txt", "$env:OPENSSL_DIR/THIRD-PARTY-NOTICES.txt" package/
+        Compress-Archive -Path package/tzap.exe, package/OPENSSL-LICENSE.txt, package/THIRD-PARTY-NOTICES.txt -DestinationPath "dist/$env:TZAP_ARCHIVE" -Force
+
+    - name: Check the packaged binary
+      shell: pwsh
+      env:
+        TZAP_TARGET: ${{ inputs.target }}
+        TZAP_ARCHIVE: ${{ inputs.archive }}
+        TZAP_EMULATOR: ${{ inputs.emulator }}
+        TZAP_RUN_SMOKE: ${{ inputs.run_smoke }}
+      run: |
+        $python = if ($IsWindows) { "python" } else { "python3" }
+        $options = @()
+        if ($env:TZAP_EMULATOR) { $options += "--emulator", $env:TZAP_EMULATOR }
+        if ($env:TZAP_RUN_SMOKE -eq "false") { $options += "--inspect-only" }
+        & $python scripts/smoke-release.py "dist/$env:TZAP_ARCHIVE" $env:TZAP_TARGET @options

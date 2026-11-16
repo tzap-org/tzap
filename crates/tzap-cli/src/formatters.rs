@@ -13,6 +13,7 @@ use crate::commands::UsageError;
 
 pub(crate) fn emit_trust_info(json_output: bool) -> io::Result<()> {
     let build_profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let openssl_version = openssl::version::version();
     if json_output {
         println!(
             "{}",
@@ -23,6 +24,7 @@ pub(crate) fn emit_trust_info(json_output: bool) -> io::Result<()> {
                 "version": env!("CARGO_PKG_VERSION"),
                 "repository": env!("CARGO_PKG_REPOSITORY"),
                 "build_profile": build_profile,
+                "openssl_version": openssl_version,
                 "target_os": std::env::consts::OS,
                 "target_arch": std::env::consts::ARCH,
             }))
@@ -33,6 +35,7 @@ pub(crate) fn emit_trust_info(json_output: bool) -> io::Result<()> {
     println!("tzap {}", env!("CARGO_PKG_VERSION"));
     println!("repository: {}", env!("CARGO_PKG_REPOSITORY"));
     println!("build-profile: {build_profile}");
+    println!("openssl-version: {openssl_version}");
     println!("target: {}-{}", std::env::consts::OS, std::env::consts::ARCH);
     println!("official-tzap-root-source: embedded");
     println!("official-tzap-root-sha256: {OFFICIAL_TZAP_ROOT_CERT_SHA256}");
