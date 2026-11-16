@@ -169,6 +169,20 @@ fn native_workflows_set_up_static_openssl_before_building() {
 }
 
 #[test]
+fn cargo_builds_use_the_pinned_openssl_without_vendoring() {
+    for path in ["Cargo.lock", "fuzz/Cargo.lock"] {
+        let lockfile = read_workspace_file(path);
+        assert!(!lockfile.contains("\"openssl-src\""), "vendored OpenSSL in {path}");
+    }
+
+    // Each crate ships its own guard so it works when installed from crates.io.
+    let cli_guard = read_workspace_file("crates/tzap-cli/build.rs");
+    for name in ["tzap-plugin-keywrap", "tzap-plugin-signing"] {
+        assert_eq!(read_workspace_file(&format!("crates/{name}/build.rs")), cli_guard);
+    }
+}
+
+#[test]
 fn release_workflow_uploads_checksum_artifacts() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
 

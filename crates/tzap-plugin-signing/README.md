@@ -20,6 +20,9 @@ tzap-core = "0.2.8"
 tzap-plugin-signing = "0.2.8"
 ```
 
+Follow the [OpenSSL 3.5.9 build setup](https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-installation.md#openssl-for-source-builds)
+before building a project that uses this crate.
+
 ## Architecture
 
 `tzap-core` is the standalone archive foundation. Projects choose the compact

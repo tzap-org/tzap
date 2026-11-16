@@ -37,13 +37,8 @@ brew tap tzap-org/tzap
 brew install tzap
 ```
 
-From crates.io:
-
-```sh
-cargo install tzap
-```
-
-The CLI requires Rust 1.85 or newer when installing from source.
+[Cargo installation](https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-installation.md#openssl-for-source-builds)
+requires the patched static OpenSSL 3.5.9 build.
 
 ## Quick start: passphrase archive
 

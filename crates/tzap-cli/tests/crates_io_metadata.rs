@@ -130,9 +130,10 @@ fn package_readmes_render_without_workspace_paths() {
     let keywrap_readme = read_workspace_file("crates/tzap-plugin-keywrap/README.md");
 
     let ver = workspace_version();
-    assert!(root_readme.contains("cargo install tzap"));
+    assert!(root_readme.contains("brew install tzap"));
+    assert!(root_readme.contains("public-docs/tzap-installation.md"));
     assert!(cli_readme.contains("# tzap"));
-    assert!(cli_readme.contains("cargo install tzap"));
+    assert!(cli_readme.contains("public-docs/tzap-installation.md#openssl-for-source-builds"));
     assert!(cli_readme.contains("tzap create --keyfile"));
     assert!(core_readme.contains("# tzap-core"));
     assert!(core_readme.contains("use tzap_core::"));
@@ -165,7 +166,11 @@ fn package_trees_are_small_and_focused() {
                 let relative = path.strip_prefix(&package_dir).unwrap();
                 let root_name = relative.components().next().unwrap().as_os_str().to_string_lossy();
 
-                assert!(["Cargo.toml", "README.md", "src", "tests"].contains(&root_name.as_ref()), "unexpected package file: {}", relative.display());
+                assert!(
+                    ["Cargo.toml", "README.md", "build.rs", "src", "tests"].contains(&root_name.as_ref()),
+                    "unexpected package file: {}",
+                    relative.display()
+                );
 
                 if path.is_dir() {
                     pending.push(path);

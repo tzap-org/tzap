@@ -12,6 +12,9 @@ readme = "README.md"
 keywords = ["archive", "backup", "encryption", "recovery", "zstd"]
 categories = ["command-line-utilities", "compression", "cryptography", "filesystem"]
 
+[package.metadata.cargo-machete]
+ignored = ["openssl-sys"] # build.rs reads the dependency's native version metadata.
+
 [[bin]]
 name = "tzap"
 path = "src/main.rs"
@@ -24,6 +27,7 @@ memmap2.workspace = true
 rand.workspace = true
 serde_json.workspace = true
 openssl.workspace = true
+openssl-sys.workspace = true
 rpassword = "7"
 tempfile.workspace = true
 time.workspace = true

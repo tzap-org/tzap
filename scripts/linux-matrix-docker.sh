@@ -24,7 +24,7 @@ TAG="$1"
 export PATH=/usr/local/cargo/bin:$PATH
 export CARGO_TERM_COLOR=never
 apt-get update -qq >/dev/null 2>&1
-apt-get install -y -qq openssl git perl >/dev/null 2>&1
+apt-get install -y -qq openssl git perl python3 >/dev/null 2>&1
 # `rust:latest` ships without clippy; the versioned images carry it.
 rustup component add clippy >/dev/null 2>&1 || true
 
@@ -47,6 +47,9 @@ run_build() {
 
 cp -r /src/. /work_new
 cd /work_new
+target=$(rustc -vV | sed -n 's/^host: //p')
+OPENSSL_DIR=$(python3 scripts/build-openssl.py "$target")
+export OPENSSL_DIR OPENSSL_NO_VENDOR=1 OPENSSL_STATIC=1
 run_build "build (under test)" cargo build --release --workspace --all-features
 
 cp -r /src/. /work_old

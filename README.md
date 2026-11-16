@@ -52,8 +52,11 @@ checksums, parity files, split-volume naming, and restore logic.
 Install:
 
 ```sh
-cargo install tzap
+brew tap tzap-org/homebrew-tzap
+brew install tzap
 ```
+
+For other platforms or Cargo installs, see the [installation guide](public-docs/tzap-installation.md).
 
 Create an encrypted archive:
 

@@ -135,7 +135,8 @@ Example create-speed benchmark shape:
 
 Create or copy the benchmark corpus into `$CORPUS` before running the timed
 commands, and publish the corpus generation command or source alongside the
-result.
+result. Set up [OpenSSL 3.5.9 for source builds](tzap-installation.md#openssl-for-source-builds)
+before building `tzap` for these examples.
 
 ```sh
 cargo build --release -p tzap

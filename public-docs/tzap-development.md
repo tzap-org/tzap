@@ -68,6 +68,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Local development
 
+Set up [OpenSSL 3.5.9 for source builds](tzap-installation.md#openssl-for-source-builds)
+in the shell before running the Cargo commands below.
+
 Run the test suite:
 
 ```sh

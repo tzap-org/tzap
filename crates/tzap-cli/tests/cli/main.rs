@@ -112,6 +112,7 @@ fn cli_trust_info_reports_embedded_official_root() {
     assert_eq!(value["official_tzap_root_certificate_sha256"], "sha256:d80d318f6cd6096dc791e314ec6f41434caa47feb75e85ad6f87d5bf72bbd53d");
     assert_eq!(value["official_tzap_root_source"], "embedded");
     assert_eq!(value["openssl_version"], openssl::version::version());
+    assert_eq!(openssl::version::number(), 0x3050_0090);
 }
 
 #[test]

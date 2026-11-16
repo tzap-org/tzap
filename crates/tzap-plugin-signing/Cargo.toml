@@ -12,9 +12,13 @@ readme = "README.md"
 keywords = ["archive", "cryptography", "ed25519", "signing", "tzap"]
 categories = ["cryptography"]
 
+[package.metadata.cargo-machete]
+ignored = ["openssl-sys"] # build.rs reads the dependency's native version metadata.
+
 [dependencies]
 ed25519-dalek.workspace = true
 openssl.workspace = true
+openssl-sys.workspace = true
 sha2.workspace = true
 tzap-core.workspace = true
 x509-parser.workspace = true

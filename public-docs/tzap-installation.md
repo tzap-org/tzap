@@ -9,55 +9,23 @@ brew tap tzap-org/homebrew-tzap
 brew install tzap
 ```
 
-## crates.io
-
-```sh
-cargo install tzap
-```
-
-`tzap` requires Rust 1.85 or newer when installing from source.
-
-## From a checkout
-
-```sh
-cargo build --release -p tzap
-```
-
-The binary will be available at:
-
-```sh
-target/release/tzap
-```
-
-## From GitHub
-
-```sh
-cargo install --git https://github.com/tzap-org/tzap tzap
-```
-
 ## OpenSSL for source builds
 
-The CI and release workflows build and statically link
+Cargo source builds require the static
 [OpenSSL 3.5.9 LTS](https://github.com/openssl/openssl/releases/tag/openssl-3.5.9)
-from the official, checksum-pinned source tarball. The build applies the
+build for the Rust target with the
 [upstream RSA-PSS provider alias](https://github.com/openssl/openssl/commit/af2aaf3271c0b0a193f33d5c0be07754b846759e)
-to keep certificate decoding reliable when signing operations run in parallel.
+backport. The CLI and plugins check the header version and the alias in
+`libcrypto` during compilation.
 
-A plain `cargo build` or `cargo install` uses the vendored OpenSSL selected by
-Cargo. The workspace, fuzz, and published TZAP 0.2.8 lockfiles select
-`openssl-src 300.6.1+3.6.3`.
-Without `--locked`, `cargo install` resolves dependencies afresh.
-[OpenSSL 3.6 has reached end of life](https://openssl-library.org/post/2026-11-01-eol34-36/).
-
-To select the same OpenSSL as the release workflows, run these commands from a
-TZAP checkout with Python 3, Perl, and native C build tools installed:
+Run these commands from a TZAP checkout with Python 3, Perl, and native C build
+tools installed. The script applies the backport to the checksum-pinned release
+used by CI and release builds.
 
 ```sh
 target="$(rustc -vV | sed -n 's/^host: //p')"
 OPENSSL_DIR="$(python3 scripts/build-openssl.py "$target")" || exit 1
 export OPENSSL_DIR OPENSSL_STATIC=1 OPENSSL_NO_VENDOR=1
-cargo build --locked --release -p tzap
-# To install or replace the crates.io binary, run cargo install --locked --force tzap
 ```
 
 On Windows, use Developer PowerShell with the MSVC tools for the Rust target
@@ -69,9 +37,19 @@ $env:OPENSSL_DIR = python scripts/build-openssl.py $target
 if ($LASTEXITCODE -ne 0) { throw "OpenSSL build failed" }
 $env:OPENSSL_STATIC = "1"
 $env:OPENSSL_NO_VENDOR = "1"
-cargo build --locked --release -p tzap
-# To install or replace the crates.io binary, run cargo install --locked --force tzap
 ```
+
+Choose the Cargo command for your install source in the same shell.
+
+| Source | Command |
+| --- | --- |
+| crates.io | `cargo install --locked tzap` |
+| GitHub | `cargo install --locked --git https://github.com/tzap-org/tzap tzap` |
+| Local checkout | `cargo install --locked --path crates/tzap-cli` |
+| Build from a checkout | `cargo build --locked --release -p tzap` |
+
+The build from a checkout produces `target/release/tzap` or
+`target/release/tzap.exe`.
 
 ## From GitHub release assets
 
