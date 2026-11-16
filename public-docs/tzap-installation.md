@@ -18,9 +18,10 @@ build for the Rust target with the
 backport. The CLI and plugins check the header version and the alias in
 `libcrypto` during compilation.
 
-Run these commands from a TZAP checkout with Python 3, Perl, and native C build
-tools installed. The script applies the backport to the checksum-pinned release
-used by CI and release builds.
+Run these commands from a TZAP checkout with Python 3, Git, Perl, and native C
+build tools installed. The script verifies the SHA-256 of the OpenSSL release
+tarball and the upstream patch, then applies the original `names.h` diff from
+that patch. CI and release builds use the same script.
 
 ```sh
 target="$(rustc -vV | sed -n 's/^host: //p')"

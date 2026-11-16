@@ -14,9 +14,11 @@ from urllib.request import urlopen
 
 
 VERSION = "3.5.9"
-SHA256 = "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
 RELEASE = f"https://github.com/openssl/openssl/releases/download/openssl-{VERSION}/openssl-{VERSION}.tar.gz"
-RSA_PSS_ALIAS_BACKPORT = "https://github.com/openssl/openssl/commit/af2aaf3271c0b0a193f33d5c0be07754b846759e"
+RELEASE_SHA256 = "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
+RSA_PSS_ALIAS_PATCH = "https://github.com/openssl/openssl/commit/af2aaf3271c0b0a193f33d5c0be07754b846759e.patch"
+RSA_PSS_ALIAS_PATCH_SHA256 = "e08c7ad5e3f31488eb622515da4434a858038873b07fa1f021271c98bed8e2fe"
+RSA_PSS_ALIAS_HEADER = "providers/implementations/include/prov/names.h"
 TARGETS = {
     "aarch64-apple-darwin": "darwin64-arm64-cc",
     "x86_64-apple-darwin": "darwin64-x86_64-cc",
@@ -29,15 +31,21 @@ TARGETS = {
 }
 
 
-def native_build(target: str, install: Path, work: Path) -> None:
-    archive = work / "openssl.tar.gz"
+def download_verified(url: str, destination: Path, sha256: str) -> None:
     digest = hashlib.sha256()
-    with urlopen(RELEASE, timeout=60) as response, archive.open("wb") as output:
+    with urlopen(url, timeout=60) as response, destination.open("wb") as output:
         for chunk in iter(lambda: response.read(1024 * 1024), b""):
             digest.update(chunk)
             output.write(chunk)
-    if digest.hexdigest() != SHA256:
-        raise ValueError("OpenSSL release tarball failed SHA-256 verification")
+    if digest.hexdigest() != sha256:
+        raise ValueError(f"SHA-256 verification failed for {url}")
+
+
+def native_build(target: str, install: Path, work: Path) -> None:
+    archive = work / "openssl.tar.gz"
+    patch = work / "openssl-rsa-pss-alias.patch"
+    download_verified(RELEASE, archive, RELEASE_SHA256)
+    download_verified(RSA_PSS_ALIAS_PATCH, patch, RSA_PSS_ALIAS_PATCH_SHA256)
 
     env = os.environ.copy()
     target_env = target.replace("-", "_")
@@ -48,18 +56,15 @@ def native_build(target: str, install: Path, work: Path) -> None:
 
     subprocess.run(["tar", "-xf", str(archive)], cwd=work, check=True, stdout=sys.stderr)
     source = work / f"openssl-{VERSION}"
-    # OpenSSL 3.5.9 can cache an empty RSA-PSS decoder list if X.509 decoding
-    # races with legacy name registration. Backport the upstream provider alias.
-    names_header = source / "providers/implementations/include/prov/names.h"
-    names = names_header.read_bytes()
-    original = b'#define PROV_NAMES_RSA_PSS "RSA-PSS:RSASSA-PSS:1.2.840.113549.1.1.10"'
-    replacement = (
-        b"/* TZAP backport of the upstream rsassaPss provider alias. */\n"
-        b'#define PROV_NAMES_RSA_PSS "RSA-PSS:RSASSA-PSS:rsassaPss:1.2.840.113549.1.1.10"'
+    # Apply the upstream alias hunk to the extracted tarball, even when it
+    # sits under the TZAP checkout. The other hunks are OpenSSL deprecations.
+    subprocess.run(
+        ["git", "apply", f"--include={RSA_PSS_ALIAS_HEADER}", str(patch)],
+        cwd=source,
+        env={**env, "GIT_CEILING_DIRECTORIES": str(work)},
+        check=True,
+        stdout=sys.stderr,
     )
-    if names.count(original) != 1:
-        raise ValueError("OpenSSL source does not match the RSA-PSS alias backport")
-    names_header.write_bytes(names.replace(original, replacement))
 
     windows = target.endswith("-msvc")
     openssl_dir = "SYS$MANAGER:[OPENSSL]" if windows else "/usr/local/ssl"
@@ -90,7 +95,8 @@ def native_build(target: str, install: Path, work: Path) -> None:
     (install / "THIRD-PARTY-NOTICES.txt").write_text(
         f"This TZAP binary statically links OpenSSL {VERSION} (Apache-2.0).\n"
         f"Source: {RELEASE}\n"
-        f"TZAP backport (RSA-PSS provider alias): {RSA_PSS_ALIAS_BACKPORT}\n"
+        f"Upstream RSA-PSS provider alias diff ({RSA_PSS_ALIAS_HEADER}): {RSA_PSS_ALIAS_PATCH}\n"
+        f"Patch SHA-256: {RSA_PSS_ALIAS_PATCH_SHA256}\n"
         "See OPENSSL-LICENSE.txt for the upstream license and notices.\n",
         encoding="utf-8",
     )
@@ -113,7 +119,7 @@ def provision(target: str, root: Path) -> Path:
     def complete(path: Path) -> bool:
         if not all((path / item).is_file() for item in expected):
             return False
-        if RSA_PSS_ALIAS_BACKPORT not in (path / notice).read_text(encoding="utf-8"):
+        if RSA_PSS_ALIAS_PATCH_SHA256 not in (path / notice).read_text(encoding="utf-8"):
             return False
         header = (path / version_header).read_text(encoding="utf-8")
         return re.search(rf'^# *define +OPENSSL_VERSION_STR +"{re.escape(VERSION)}"$', header, re.MULTILINE) is not None
@@ -142,7 +148,7 @@ def main() -> None:
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "target" / "tzap-openssl" / f"{VERSION}-r1",
+        default=Path(__file__).resolve().parents[1] / "target" / "tzap-openssl" / f"{VERSION}-r2",
         help="installation root containing the per-target directories",
     )
     parser.add_argument("target", choices=TARGETS)
