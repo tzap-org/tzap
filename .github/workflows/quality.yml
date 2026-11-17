@@ -50,7 +50,22 @@ jobs:
       - name: Measure and enforce coverage
         run: |
           cargo install cargo-llvm-cov --locked
-          cargo llvm-cov --workspace --all-features --fail-under-lines 85 --fail-under-functions 85 --fail-under-regions 80 --lcov --output-path coverage.lcov
+          if cargo llvm-cov --workspace --all-features --fail-under-lines 85 --fail-under-functions 85 --fail-under-regions 80 --lcov --output-path coverage.lcov; then
+            coverage_status=0
+          else
+            coverage_status=$?
+          fi
+
+          if cargo llvm-cov report --summary-only; then
+            summary_status=0
+          else
+            summary_status=$?
+          fi
+
+          if [ "$coverage_status" -ne 0 ]; then
+            exit "$coverage_status"
+          fi
+          exit "$summary_status"
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
