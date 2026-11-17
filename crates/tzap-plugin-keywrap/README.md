@@ -11,8 +11,8 @@ RecipientWrap archives.
 
 ```toml
 [dependencies]
-tzap-core = "0.2.8"
-tzap-plugin-keywrap = "0.2.8"
+tzap-core = "0.2.9"
+tzap-plugin-keywrap = "0.2.9"
 ```
 
 Follow the [OpenSSL 3.5.9 build setup](https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-installation.md#openssl-for-source-builds)

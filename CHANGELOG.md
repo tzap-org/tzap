@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.2.9 - 2026-11-17
+
+- Redacts key material from diagnostic output and zeroizes secret buffers when
+  they are no longer needed.
+- Pins source, CI, and release builds to OpenSSL 3.5.9 with the upstream
+  RSA-PSS provider alias patch. Source builds now verify the OpenSSL and patch
+  checksums and check the required version and alias during compilation.
+- Fixes OpenSSL cache invalidation and Linux coverage gating in CI, and ensures
+  quality workflow coverage summaries are reported when thresholds fail.
+
 ## 0.2.8 - 2026-11-12
 
 - Updates `cap-std` and `cap-fs-ext` to 4.0.3 to fix RustSec
