@@ -127,7 +127,11 @@ def provision(target: str, root: Path) -> Path:
     if complete(prefix):
         return prefix
     if prefix.exists():
-        raise ValueError(f"incomplete OpenSSL installation at {prefix}")
+        print(f"Removing incomplete cached OpenSSL installation at {prefix}", file=sys.stderr)
+        if prefix.is_dir() and not prefix.is_symlink():
+            shutil.rmtree(prefix)
+        else:
+            prefix.unlink()
     with tempfile.TemporaryDirectory(dir=root, prefix=f"{target}-") as work_dir:
         work = Path(work_dir)
         install = work / "install"
