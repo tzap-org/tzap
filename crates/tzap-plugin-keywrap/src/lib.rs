@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use tzap_core::format::{FORMAT_VERSION, VOLUME_FORMAT_REV_45};
 use tzap_core::wire::RecipientRecordV1;
 use x509_parser::parse_x509_certificate;
+use zeroize::Zeroizing;
 
 /// Profile identifier for key-wrap v1 recipient records.
 pub const KEYWRAP_PROFILE_ID: u16 = 0x0001;
@@ -113,7 +114,7 @@ pub trait PrivateKeyLookup {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum KeyWrapOutcome {
     UnsupportedProfileId,
     UnsupportedArchiveIdentity,
@@ -123,6 +124,25 @@ pub enum KeyWrapOutcome {
     InvalidRecord,
     NoMatchingPrivateKey,
     UnwrappedCandidateMasterKey { master_key: [u8; 32], recipient_spki_digest: [u8; 32] },
+}
+
+impl std::fmt::Debug for KeyWrapOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnwrappedCandidateMasterKey { recipient_spki_digest, .. } => formatter
+                .debug_struct("UnwrappedCandidateMasterKey")
+                .field("master_key", &"[REDACTED]")
+                .field("recipient_spki_digest", recipient_spki_digest)
+                .finish(),
+            Self::UnsupportedProfileId => formatter.write_str("UnsupportedProfileId"),
+            Self::UnsupportedArchiveIdentity => formatter.write_str("UnsupportedArchiveIdentity"),
+            Self::UnsupportedRecipientIdentity => formatter.write_str("UnsupportedRecipientIdentity"),
+            Self::UnsupportedSuite => formatter.write_str("UnsupportedSuite"),
+            Self::CertificatePolicyRejected => formatter.write_str("CertificatePolicyRejected"),
+            Self::InvalidRecord => formatter.write_str("InvalidRecord"),
+            Self::NoMatchingPrivateKey => formatter.write_str("NoMatchingPrivateKey"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +206,7 @@ where
         Some(private_key) => private_key,
         None => return KeyWrapOutcome::NoMatchingPrivateKey,
     };
+    let private_key = Zeroizing::new(private_key);
 
     if !private_key_lookup.is_recipient_certificate_accepted(
         &input.archive_identity,

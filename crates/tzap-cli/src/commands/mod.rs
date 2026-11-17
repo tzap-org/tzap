@@ -8,7 +8,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
-use memmap2::Mmap;
 use openssl::pkey::PKey;
 use openssl::x509::X509;
 use rand::RngCore;
@@ -27,6 +26,7 @@ use tzap_plugin_keywrap::{
     RecipientRecordInput, RecipientRecordMetadata,
 };
 use tzap_plugin_signing::x509_chain::{self, X509RootAuthSigner};
+use zeroize::Zeroizing;
 
 pub(crate) mod create;
 pub(crate) mod extract;
@@ -73,10 +73,19 @@ pub(crate) struct OpenedArchiveSelection {
     pub(crate) opened: OpenedArchive,
 }
 
-#[derive(Debug)]
 pub(crate) struct CliRecipientPrivateKeyLookup {
-    pub(crate) private_key_bytes: Vec<u8>,
+    pub(crate) private_key_bytes: Zeroizing<Vec<u8>>,
     pub(crate) private_key_spki_der: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for CliRecipientPrivateKeyLookup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CliRecipientPrivateKeyLookup")
+            .field("private_key_bytes", &"[REDACTED]")
+            .field("private_key_spki_der", &self.private_key_spki_der.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl PrivateKeyLookup for CliRecipientPrivateKeyLookup {
@@ -93,7 +102,7 @@ impl PrivateKeyLookup for CliRecipientPrivateKeyLookup {
                 return None;
             }
         }
-        Some(self.private_key_bytes.clone())
+        Some(self.private_key_bytes.to_vec())
     }
 }
 
@@ -132,35 +141,6 @@ pub(crate) fn resolve_archive_input_paths(primary: &str, additional: &[String], 
         return Ok(ArchiveInputSelection { paths, autodiscovered: false });
     }
     Ok(ArchiveInputSelection { paths: discovered, autodiscovered: true })
-}
-
-pub(crate) enum MappedVolumeInput {
-    Empty(Vec<u8>),
-    Mapped(Mmap),
-}
-
-impl MappedVolumeInput {
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Empty(bytes) => bytes,
-            Self::Mapped(map) => map.as_ref(),
-        }
-    }
-}
-
-pub(crate) fn map_volume_inputs_from_paths(paths: &[String]) -> Result<Vec<MappedVolumeInput>> {
-    paths
-        .iter()
-        .map(|path| {
-            let file = File::open(path).with_context(|| format!("failed to read archive {path}"))?;
-            if file.metadata().with_context(|| format!("failed to inspect archive {path}"))?.len() == 0 {
-                return Ok(MappedVolumeInput::Empty(Vec::new()));
-            }
-            // SAFETY: the mapping is read-only and retained while verifier slices are in use.
-            let map = unsafe { Mmap::map(&file) }.with_context(|| format!("failed to map archive {path}"))?;
-            Ok(MappedVolumeInput::Mapped(map))
-        })
-        .collect()
 }
 
 pub(crate) fn open_volume_inputs_from_paths(paths: &[String]) -> Result<Vec<File>> {
@@ -626,7 +606,7 @@ pub(crate) fn load_single_x509_certificate_file(label: &'static str, path: &str)
 }
 
 pub(crate) fn load_recipient_private_key_lookup(path: &str) -> Result<CliRecipientPrivateKeyLookup> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read recipient key {path}"))?;
+    let bytes = Zeroizing::new(fs::read(path).with_context(|| format!("failed to read recipient key {path}"))?);
     if bytes.len() == 32 {
         return Ok(CliRecipientPrivateKeyLookup { private_key_bytes: bytes, private_key_spki_der: None });
     }
@@ -635,7 +615,7 @@ pub(crate) fn load_recipient_private_key_lookup(path: &str) -> Result<CliRecipie
     } else {
         PKey::private_key_from_der(&bytes).with_context(|| format!("failed to parse recipient private key {path}"))?
     };
-    let private_key_bytes = private_key.private_key_to_der().with_context(|| format!("failed to normalize recipient private key {path}"))?;
+    let private_key_bytes = Zeroizing::new(private_key.private_key_to_der().with_context(|| format!("failed to normalize recipient private key {path}"))?);
     let private_key_spki_der = private_key.public_key_to_der().ok();
     Ok(CliRecipientPrivateKeyLookup { private_key_bytes, private_key_spki_der })
 }
@@ -823,7 +803,7 @@ pub(crate) fn load_raw_master_key(keyfile: Option<&str>) -> Result<MasterKey> {
     let keyfile = keyfile.ok_or_else(|| {
         anyhow!("no key source provided; use --password-stdin, --password, --keyfile PATH, --recipient-cert FILE, or --no-encryption for create")
     })?;
-    let bytes = fs::read(keyfile).with_context(|| format!("failed to read keyfile {keyfile}"))?;
+    let bytes = Zeroizing::new(fs::read(keyfile).with_context(|| format!("failed to read keyfile {keyfile}"))?);
     if bytes.len() == 32 {
         return MasterKey::from_raw_key(&bytes).map_err(Into::into);
     }
@@ -832,15 +812,15 @@ pub(crate) fn load_raw_master_key(keyfile: Option<&str>) -> Result<MasterKey> {
     if hex.len() != 64 {
         bail!("keyfile must contain either 32 raw bytes or 64 hex characters");
     }
-    let mut raw = [0u8; 32];
+    let mut raw = Zeroizing::new([0u8; 32]);
     for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
         raw[idx] = decode_hex_byte(chunk)?;
     }
-    MasterKey::from_raw_key(&raw).map_err(Into::into)
+    MasterKey::from_raw_key(&raw[..]).map_err(Into::into)
 }
 
-pub(crate) fn read_passphrase_stdin() -> Result<String> {
-    let mut passphrase = String::new();
+pub(crate) fn read_passphrase_stdin() -> Result<Zeroizing<String>> {
+    let mut passphrase = Zeroizing::new(String::new());
     io::stdin().read_to_string(&mut passphrase).context("failed to read passphrase from stdin")?;
     if passphrase.ends_with('\n') {
         passphrase.pop();
@@ -854,7 +834,7 @@ pub(crate) fn read_passphrase_stdin() -> Result<String> {
     Ok(passphrase)
 }
 
-pub(crate) fn read_passphrase_interactive_create() -> Result<String> {
+pub(crate) fn read_passphrase_interactive_create() -> Result<Zeroizing<String>> {
     loop {
         let first = read_passphrase_interactive("Passphrase: ")?;
         let second = read_passphrase_interactive("Confirm passphrase: ")?;
@@ -865,11 +845,11 @@ pub(crate) fn read_passphrase_interactive_create() -> Result<String> {
     }
 }
 
-pub(crate) fn read_passphrase_interactive_open() -> Result<String> {
+pub(crate) fn read_passphrase_interactive_open() -> Result<Zeroizing<String>> {
     read_passphrase_interactive("Passphrase: ")
 }
 
-pub(crate) fn read_passphrase_interactive(prompt: &str) -> Result<String> {
+pub(crate) fn read_passphrase_interactive(prompt: &str) -> Result<Zeroizing<String>> {
     if !io::stdin().is_terminal() {
         eprint!("{prompt}");
         io::stderr().flush()?;
@@ -888,19 +868,19 @@ pub(crate) fn read_passphrase_interactive(prompt: &str) -> Result<String> {
     read_non_empty_passphrase(passphrase)
 }
 
-pub(crate) fn read_non_empty_passphrase(passphrase: String) -> Result<String> {
+pub(crate) fn read_non_empty_passphrase(passphrase: Zeroizing<String>) -> Result<Zeroizing<String>> {
     if passphrase.is_empty() {
         bail!("passphrase must not be empty");
     }
     Ok(passphrase)
 }
 
-pub(crate) fn read_passphrase_hidden(prompt: &str) -> Result<String> {
-    Ok(rpassword::prompt_password(prompt)?)
+pub(crate) fn read_passphrase_hidden(prompt: &str) -> Result<Zeroizing<String>> {
+    Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
 }
 
-pub(crate) fn read_passphrase_stdin_fallback() -> Result<String> {
-    let mut passphrase = String::new();
+pub(crate) fn read_passphrase_stdin_fallback() -> Result<Zeroizing<String>> {
+    let mut passphrase = Zeroizing::new(String::new());
     io::stdin().read_line(&mut passphrase).context("failed to read passphrase from stdin")?;
     if passphrase.ends_with('\n') {
         passphrase.pop();

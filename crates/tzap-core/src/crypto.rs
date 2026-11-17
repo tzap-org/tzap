@@ -55,8 +55,14 @@ impl KdfParams {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct MasterKey(pub [u8; MASTER_KEY_LEN]);
+
+impl std::fmt::Debug for MasterKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("MasterKey").field(&"[REDACTED]").finish()
+    }
+}
 
 impl MasterKey {
     pub fn from_raw_key(raw_key: &[u8]) -> Result<Self, FormatError> {
@@ -87,7 +93,7 @@ impl MasterKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct Subkeys {
     pub enc_key: [u8; SUBKEY_LEN],
     pub mac_key: [u8; SUBKEY_LEN],
@@ -97,6 +103,12 @@ pub struct Subkeys {
     pub dictionary_key: [u8; SUBKEY_LEN],
     pub dir_hint_key: [u8; SUBKEY_LEN],
     pub index_nonce_seed: [u8; SUBKEY_LEN],
+}
+
+impl std::fmt::Debug for Subkeys {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Subkeys").field("key_material", &"[REDACTED]").finish()
+    }
 }
 
 impl Subkeys {

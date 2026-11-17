@@ -7,10 +7,10 @@ use serde_json::json;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tzap_core::format::{FormatError, FORMAT_VERSION, VOLUME_FORMAT_REV_45};
 use tzap_core::{
-    public_no_key_verify_volumes_with_options, verify_non_seekable_stream_with_bootstrap_sidecar, verify_non_seekable_stream_with_options,
+    public_no_key_verify_readers_with_options, verify_non_seekable_stream_with_bootstrap_sidecar, verify_non_seekable_stream_with_options,
     verify_non_seekable_stream_with_recipient_wrap_resolver_and_bootstrap_sidecar, verify_non_seekable_stream_with_recipient_wrap_resolver_options,
     verify_unencrypted_non_seekable_stream_with_bootstrap_sidecar, verify_unencrypted_non_seekable_stream_with_options, AeadAlgo, ArchiveContentVerification,
-    KdfAlgo, OpenedArchive, PublicNoKeyVerification, ReaderOptions, RootAuthVerification, SequentialRootAuthStatus,
+    ArchiveReadAt, KdfAlgo, OpenedArchive, PublicNoKeyVerification, ReaderOptions, RootAuthVerification, SequentialRootAuthStatus,
 };
 use tzap_plugin_signing::ed25519_raw::{self, Ed25519RootAuthOutcome, Ed25519VerificationMode, ED25519_AUTHENTICATOR_ID};
 use tzap_plugin_signing::x509_chain::{self, X509RootAuthReport, X509_AUTHENTICATOR_ID};
@@ -533,7 +533,7 @@ pub(crate) fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) ->
         }
     };
     let archive_paths = selection.paths;
-    let volume_inputs = match map_volume_inputs_from_paths(&archive_paths) {
+    let volume_inputs = match open_volume_inputs_from_paths(&archive_paths) {
         Ok(volume_inputs) => volume_inputs,
         Err(err) => {
             if request.json {
@@ -542,10 +542,10 @@ pub(crate) fn run_public_no_key_verify(request: PublicNoKeyVerifyRequest<'_>) ->
             return Err(err);
         }
     };
-    let borrowed = volume_inputs.iter().map(MappedVolumeInput::as_slice).collect::<Vec<_>>();
+    let borrowed = volume_inputs.iter().map(|file| file as &dyn ArchiveReadAt).collect::<Vec<_>>();
     let mut x509_report = None;
     let mut x509_error = None;
-    let verification = match public_no_key_verify_volumes_with_options(
+    let verification = match public_no_key_verify_readers_with_options(
         &borrowed,
         |footer, archive_root| match &trust {
             PublicNoKeyTrust::Ed25519 { public_key } => {

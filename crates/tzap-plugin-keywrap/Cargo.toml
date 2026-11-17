@@ -17,6 +17,7 @@ ignored = ["openssl-sys"] # build.rs reads the dependency's native version metad
 
 [dependencies]
 tzap-core.workspace = true
+zeroize.workspace = true
 hpke = { workspace = true }
 openssl = { workspace = true }
 openssl-sys.workspace = true

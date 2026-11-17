@@ -289,7 +289,7 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenedArchive {
     options: ReaderOptions,
     observed_archive_bytes: u64,
@@ -305,6 +305,12 @@ pub struct OpenedArchive {
     pub root_auth_footer: Option<RootAuthFooterV1>,
     pub index_root: IndexRoot,
     payload_dictionary: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for OpenedArchive {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("OpenedArchive").field("key_material", &"[REDACTED]").finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
