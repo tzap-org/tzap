@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      notarization_test:
+        description: "Build and notarize macOS artifacts without publishing a GitHub release"
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -18,6 +25,7 @@ jobs:
         uses: actions/checkout@v6.0.2
 
       - name: Check version matches tag
+        if: github.event_name == 'push'
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           if ! [[ "$TAG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -165,6 +173,95 @@ jobs:
           macosx_deployment_target: ${{ matrix.macosx_deployment_target }}
           rustflags: ${{ matrix.rustflags }}
 
+      - name: Import Developer ID certificate
+        if: startsWith(matrix.name, 'macos-') && (github.event_name == 'push' || (github.ref == 'refs/heads/main' && inputs.notarization_test))
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLE_DEVELOPER_ID_P12_BASE64" ] || [ -z "$APPLE_DEVELOPER_ID_P12_PASSWORD" ]; then
+            echo "::error::Configure APPLE_DEVELOPER_ID_P12_BASE64 and APPLE_DEVELOPER_ID_P12_PASSWORD repository secrets."
+            exit 1
+          fi
+
+          keychain_path="$RUNNER_TEMP/tzap-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          echo "::add-mask::$keychain_password"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+
+          certificate_path="$RUNNER_TEMP/developer-id.p12"
+          printf '%s' "$APPLE_DEVELOPER_ID_P12_BASE64" | base64 -D > "$certificate_path"
+          security import "$certificate_path" -k "$keychain_path" \
+            -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$certificate_path"
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$keychain_password" "$keychain_path"
+          security list-keychains -d user -s "$keychain_path" "$HOME/Library/Keychains/login.keychain-db"
+
+          identity="$(security find-identity -v -p codesigning "$keychain_path" \
+            | awk '/Developer ID Application/ { print $2 }')"
+          if [ -z "$identity" ]; then
+            echo "::error::The imported P12 contains no valid Developer ID Application identity."
+            exit 1
+          fi
+          identity_count="$(printf '%s\n' "$identity" | wc -l | tr -d ' ')"
+          if [ "$identity_count" -ne 1 ]; then
+            echo "::error::Expected exactly one Developer ID Application identity in the imported P12."
+            exit 1
+          fi
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+        id: signing
+
+      - name: Sign and notarize macOS CLI
+        if: startsWith(matrix.name, 'macos-') && (github.event_name == 'push' || (github.ref == 'refs/heads/main' && inputs.notarization_test))
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          TZAP_ARCHIVE: ${{ matrix.archive }}
+          SIGNING_IDENTITY: ${{ steps.signing.outputs.identity }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLE_API_KEY_BASE64" ] || [ -z "$APPLE_API_KEY_ID" ] || [ -z "$APPLE_API_ISSUER_ID" ]; then
+            echo "::error::Configure APPLE_API_KEY_BASE64, APPLE_API_KEY_ID, and APPLE_API_ISSUER_ID repository secrets."
+            exit 1
+          fi
+
+          package_dir="$RUNNER_TEMP/tzap-package"
+          mkdir -p "$package_dir"
+          tar -xzf "dist/$TZAP_ARCHIVE" -C "$package_dir"
+          binary="$package_dir/tzap"
+          codesign --force --options runtime --timestamp \
+            --identifier org.tzap-org.tzap --sign "$SIGNING_IDENTITY" "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+
+          api_key_path="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$APPLE_API_KEY_BASE64" | base64 -D > "$api_key_path"
+          chmod 600 "$api_key_path"
+          notary_zip="$RUNNER_TEMP/tzap-notary.zip"
+          ditto -c -k --keepParent "$package_dir" "$notary_zip"
+          notary_response="$RUNNER_TEMP/notary-response.json"
+          xcrun notarytool submit "$notary_zip" \
+            --key "$api_key_path" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait --timeout 30m --output-format json > "$notary_response"
+          status="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["status"])' "$notary_response")"
+          if [ "$status" != "Accepted" ]; then
+            echo "::error::Apple notarization did not accept this macOS binary (status: $status)."
+            exit 1
+          fi
+
+          tar -czf "dist/$TZAP_ARCHIVE" -C "$package_dir" tzap OPENSSL-LICENSE.txt THIRD-PARTY-NOTICES.txt
+          security delete-keychain "$RUNNER_TEMP/tzap-signing.keychain-db"
+          rm -f "$api_key_path" "$notary_zip" "$notary_response"
+
       - name: Generate checksum (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -197,6 +294,7 @@ jobs:
 
   homebrew:
     name: Test Homebrew formula ${{ matrix.name }}
+    if: github.event_name == 'push'
     needs: build
     runs-on: ${{ matrix.os }}
 
@@ -334,6 +432,7 @@ jobs:
 
   publish:
     name: Publish GitHub release
+    if: github.event_name == 'push'
     runs-on: ubuntu-22.04
     needs:
       - build
