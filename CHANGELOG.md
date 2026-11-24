@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## 0.2.10 - 2026-11-24
+## 0.3.0 - 2026-11-24
 
 - Signs and submits both macOS release binaries to Apple's notarization service
   before packaging them into the release archives.
