@@ -397,7 +397,7 @@ pub(crate) fn publish_regular_file(
                     destination.parent.as_raw_fd(),
                     target.as_ptr(),
                     libc::RENAME_NOREPLACE,
-                )
+                ) as libc::c_int
             }
         };
         if result != 0 {
