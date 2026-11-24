@@ -480,6 +480,18 @@ mod tests {
     }
 
     #[test]
+    fn merkle_root_from_leaf_hashes_matches_payload_leaf_path() {
+        let leaves = vec![
+            DataBlockMerkleLeaf { block_index: 2, kind: BlockKind::PayloadData, flags: 0, payload: vec![1, 2, 3] },
+            DataBlockMerkleLeaf { block_index: 3, kind: BlockKind::PayloadData, flags: 0, payload: vec![4, 5] },
+            DataBlockMerkleLeaf { block_index: 4, kind: BlockKind::PayloadData, flags: 1, payload: vec![6, 7, 8, 9] },
+        ];
+        let leaf_hashes = leaves.iter().map(|leaf| data_block_merkle_leaf_hash(leaf.block_index, leaf.kind, leaf.flags, &leaf.payload)).collect::<Vec<_>>();
+
+        assert_eq!(data_block_merkle_root(&leaves), data_block_merkle_root_from_leaf_hashes(&leaf_hashes));
+    }
+
+    #[test]
     fn archive_root_rejects_legacy_revision_43() {
         assert_eq!(
             archive_root_for_revision(sample_archive_inputs(43, KdfAlgo::None, [8; 32])).unwrap_err(),

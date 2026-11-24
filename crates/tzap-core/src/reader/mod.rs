@@ -20,8 +20,9 @@ use crate::metadata::{
 use crate::non_seekable_reader::{StreamedEnvelopeSummary, StreamedFrameSummary, StreamedPayloadSummary};
 use crate::raw_stream_profile::reject_unsupported_raw_stream_profile;
 use crate::root_auth::{
-    archive_root_for_revision, critical_metadata_digest, data_block_merkle_root_for_revision, fec_layout_digest_for_revision, index_digest_for_revision,
-    root_auth_descriptor_digest_for_revision, signer_identity_digest, ArchiveRootInputs, CriticalMetadataDigestInputs, DataBlockMerkleLeaf, FecLayoutObjectRow,
+    archive_root_for_revision, critical_metadata_digest, data_block_merkle_leaf_hash_for_revision, data_block_merkle_root_from_leaf_hashes_for_revision,
+    fec_layout_digest_for_revision, index_digest_for_revision, root_auth_descriptor_digest_for_revision, signer_identity_digest, ArchiveRootInputs,
+    CriticalMetadataDigestInputs, FecLayoutObjectRow,
 };
 #[cfg(windows)]
 use crate::tar_model::replay_windows_descendant_metadata;
@@ -2790,6 +2791,14 @@ impl OpenedArchive {
                 self.decode_loaded_owned_tar_member_with_scratch(shard, entry.file_index, false, scratch)
             },
         )?;
+        let cap = total_extraction_size_cap(self.options, self.observed_archive_bytes);
+        let total_selected_size = metadata
+            .iter()
+            .filter(|member| member.kind == TarEntryKind::Regular)
+            .try_fold(0u64, |total, member| total.checked_add(member.logical_size).ok_or(FormatError::InvalidArchive("total extraction size overflow")))?;
+        if total_selected_size > cap {
+            return Err(FormatError::ReaderUnsupported("total extraction size exceeds configured cap"));
+        }
         validate_owned_restore_plan(&metadata.iter().collect::<Vec<_>>(), options)?;
         let mut planned = entries.into_iter().zip(metadata).map(|((path, entry), member)| (path, entry, member)).collect::<Vec<_>>();
         planned.sort_by(|left, right| restore_phase(&left.2).cmp(&restore_phase(&right.2)).then_with(|| left.2.path.cmp(&right.2.path)));
@@ -2974,9 +2983,9 @@ impl OpenedArchive {
         let shards = self.load_all_index_shards()?;
         let fec_layout_rows = self.root_auth_fec_layout_rows(&shards)?;
         let fec_layout_digest = fec_layout_digest_for_revision(format_version, volume_format_rev, &fec_layout_rows)?;
-        let data_leaves = self.root_auth_data_block_leaves(&fec_layout_rows)?;
-        let total_data_block_count = u64::try_from(data_leaves.len()).map_err(|_| FormatError::InvalidArchive("root-auth data block count overflow"))?;
-        let data_block_merkle_root = data_block_merkle_root_for_revision(format_version, volume_format_rev, &data_leaves)?;
+        let data_leaf_hashes = self.root_auth_data_block_leaf_hashes(&fec_layout_rows)?;
+        let total_data_block_count = u64::try_from(data_leaf_hashes.len()).map_err(|_| FormatError::InvalidArchive("root-auth data block count overflow"))?;
+        let data_block_merkle_root = data_block_merkle_root_from_leaf_hashes_for_revision(format_version, volume_format_rev, &data_leaf_hashes)?;
         let archive_root = archive_root_for_revision(ArchiveRootInputs {
             archive_uuid: self.volume_header.archive_uuid,
             session_id: self.volume_header.session_id,
@@ -3120,7 +3129,7 @@ impl OpenedArchive {
         }
     }
 
-    fn root_auth_data_block_leaves(&self, rows: &[FecLayoutObjectRow]) -> Result<Vec<DataBlockMerkleLeaf>, FormatError> {
+    fn root_auth_data_block_leaf_hashes(&self, rows: &[FecLayoutObjectRow]) -> Result<Vec<[u8; 32]>, FormatError> {
         let block_provider = self.block_provider();
         let present_rows = rows.iter().filter(|row| row.present).collect::<Vec<_>>();
         let chunks = parallel_map_ref(&present_rows, self.options.jobs, |row| {
@@ -3136,12 +3145,17 @@ impl OpenedArchive {
                 load_repaired_object_data_shards_from_parts(&block_provider, &self.crypto_header, extent, data_kind, parity_kind, data_max, parity_max)?;
             let mut leaves = Vec::new();
             for (offset, payload) in repaired.into_iter().enumerate() {
-                leaves.push(DataBlockMerkleLeaf {
-                    block_index: checked_u64_add(row.first_block_index, offset as u64, "root-auth data block")?,
-                    kind: data_kind,
-                    flags: if offset + 1 == row.data_block_count as usize { 0x01 } else { 0 },
-                    payload,
-                });
+                let block_index = checked_u64_add(row.first_block_index, offset as u64, "root-auth data block")?;
+                let flags = if offset + 1 == row.data_block_count as usize { 0x01 } else { 0 };
+                let hash = data_block_merkle_leaf_hash_for_revision(
+                    self.volume_header.format_version,
+                    self.volume_header.volume_format_rev,
+                    block_index,
+                    data_kind,
+                    flags,
+                    &payload,
+                )?;
+                leaves.push((block_index, hash));
             }
             Ok(leaves)
         })?;
@@ -3149,8 +3163,8 @@ impl OpenedArchive {
         for mut chunk in chunks {
             leaves.append(&mut chunk);
         }
-        leaves.sort_by_key(|leaf| leaf.block_index);
-        Ok(leaves)
+        leaves.sort_by_key(|(block_index, _)| *block_index);
+        Ok(leaves.into_iter().map(|(_, hash)| hash).collect())
     }
 
     fn validate_total_extraction_size(&self, logical_size: u64) -> Result<(), FormatError> {

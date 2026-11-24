@@ -1,6 +1,8 @@
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_vendor = "apple")))]
+use super::restore::remove_existing_leaf_if_needed;
 #[cfg(not(windows))]
 use super::restore::sync_directory;
-use super::restore::{create_new_file_options, read_member_bytes, remove_existing_leaf_if_needed, PreparedDestination, TarMemberStreamHandler};
+use super::restore::{create_new_file_options, read_member_bytes, PreparedDestination, TarMemberStreamHandler};
 use super::*;
 
 #[cfg(target_os = "linux")]
@@ -278,7 +280,7 @@ pub(crate) fn verify_windows_sparse_file(file: &fs::File, logical_size: u64, exp
 }
 
 #[cfg(windows)]
-fn rename_open_file_noreplace(file: &fs::File, destination_parent: &CapDir, destination_leaf: &Path) -> Result<(), FormatError> {
+fn rename_open_file(file: &fs::File, destination_parent: &CapDir, destination_leaf: &Path, overwrite: bool) -> Result<(), FormatError> {
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
@@ -327,9 +329,10 @@ fn rename_open_file_noreplace(file: &fs::File, destination_parent: &CapDir, dest
     let mut storage = vec![0usize; storage_len];
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     // SAFETY: `storage` is pointer-aligned and large enough for the fixed structure plus every
-    // UTF-16 filename unit. ReplaceIfExists=false gives the required no-clobber publication.
+    // UTF-16 filename unit. The resolved path targets the directory handle, and ReplaceIfExists
+    // selects atomic no-clobber or replacement semantics without removing the old leaf first.
     unsafe {
-        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).Anonymous.ReplaceIfExists = overwrite;
         (*info).RootDirectory = std::ptr::null_mut();
         (*info).FileNameLength =
             u32::try_from(name.len() * size_of::<u16>()).map_err(|_| FormatError::FilesystemExtractionFailed("destination filename exceeds Windows limit"))?;
@@ -358,16 +361,12 @@ pub(crate) fn publish_regular_file(
     temp_file: fs::File,
     options: SafeExtractionOptions,
 ) -> Result<fs::File, FormatError> {
-    if options.overwrite_existing {
-        remove_existing_leaf_if_needed(destination)?;
-    }
-
     #[cfg(windows)]
     {
         if options.sync_published_files {
             temp_file.sync_data().map_err(|_| FormatError::FilesystemExtractionFailed("failed to sync regular file data"))?;
         }
-        if let Err(error) = rename_open_file_noreplace(&temp_file, &destination.parent, &destination.leaf) {
+        if let Err(error) = rename_open_file(&temp_file, &destination.parent, &destination.leaf, options.overwrite_existing) {
             let _ = destination.parent.remove_file_or_symlink(temp_leaf);
             return Err(error);
         }
@@ -387,17 +386,21 @@ pub(crate) fn publish_regular_file(
         // libc does not expose renameat2 on every Linux libc target, so invoke the
         // kernel interface directly. Both names are validated single components
         // beneath the same pinned parent.
-        if unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                destination.parent.as_raw_fd(),
-                source.as_ptr(),
-                destination.parent.as_raw_fd(),
-                target.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        } != 0
-        {
+        let result = if options.overwrite_existing {
+            unsafe { libc::renameat(destination.parent.as_raw_fd(), source.as_ptr(), destination.parent.as_raw_fd(), target.as_ptr()) }
+        } else {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    destination.parent.as_raw_fd(),
+                    source.as_ptr(),
+                    destination.parent.as_raw_fd(),
+                    target.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            }
+        };
+        if result != 0 {
             let error = std::io::Error::last_os_error();
             let _ = destination.parent.remove_file_or_symlink(temp_leaf);
             return if error.raw_os_error() == Some(libc::EEXIST) {
@@ -432,9 +435,12 @@ pub(crate) fn publish_regular_file(
         // renameat2(RENAME_NOREPLACE) call above: an atomic rename that fails
         // instead of replacing an existing destination. Both names are validated
         // single components beneath the same pinned parent.
-        if unsafe { libc::renameatx_np(destination.parent.as_raw_fd(), source.as_ptr(), destination.parent.as_raw_fd(), target.as_ptr(), libc::RENAME_EXCL) }
-            != 0
-        {
+        let result = if options.overwrite_existing {
+            unsafe { libc::renameat(destination.parent.as_raw_fd(), source.as_ptr(), destination.parent.as_raw_fd(), target.as_ptr()) }
+        } else {
+            unsafe { libc::renameatx_np(destination.parent.as_raw_fd(), source.as_ptr(), destination.parent.as_raw_fd(), target.as_ptr(), libc::RENAME_EXCL) }
+        };
+        if result != 0 {
             let error = std::io::Error::last_os_error();
             let _ = destination.parent.remove_file_or_symlink(temp_leaf);
             return if error.raw_os_error() == Some(libc::EEXIST) {
@@ -453,15 +459,20 @@ pub(crate) fn publish_regular_file(
     }
 
     #[cfg(all(not(windows), not(target_os = "linux"), not(target_vendor = "apple")))]
-    let mut output = match destination.parent.open_with(&destination.leaf, &create_new_file_options()) {
-        Ok(file) => file.into_std(),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = destination.parent.remove_file_or_symlink(temp_leaf);
-            return Err(FormatError::UnsafeOverwrite);
+    let mut output = {
+        if options.overwrite_existing {
+            remove_existing_leaf_if_needed(destination)?;
         }
-        Err(_) => {
-            let _ = destination.parent.remove_file_or_symlink(temp_leaf);
-            return Err(FormatError::FilesystemExtractionFailed("failed to create regular file"));
+        match destination.parent.open_with(&destination.leaf, &create_new_file_options()) {
+            Ok(file) => file.into_std(),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = destination.parent.remove_file_or_symlink(temp_leaf);
+                return Err(FormatError::UnsafeOverwrite);
+            }
+            Err(_) => {
+                let _ = destination.parent.remove_file_or_symlink(temp_leaf);
+                return Err(FormatError::FilesystemExtractionFailed("failed to create regular file"));
+            }
         }
     };
 

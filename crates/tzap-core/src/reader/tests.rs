@@ -2172,6 +2172,21 @@ fn selected_restore_preflights_every_path_before_writing() {
 }
 
 #[test]
+fn selected_restore_enforces_aggregate_extraction_size_before_writing() {
+    let archive =
+        write_archive(&[RegularFile::new("first.txt", b"12"), RegularFile::new("second.txt", b"34")], &master_key(), single_stream_options()).unwrap();
+    let options = ReaderOptions { max_total_extraction_size: 3, ..ReaderOptions::default() };
+    let opened = OpenedArchive::open_with_options(&archive.bytes, &master_key(), options).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let error = opened.extract_selected_files_to(&["first.txt".into(), "second.txt".into()], tmp.path(), SafeExtractionOptions::default(), 2).unwrap_err();
+
+    assert_eq!(error, FormatError::ReaderUnsupported("total extraction size exceeds configured cap"));
+    assert!(!tmp.path().join("first.txt").exists());
+    assert!(!tmp.path().join("second.txt").exists());
+}
+
+#[test]
 fn safe_extract_rejects_overwriting_existing_file_by_default() {
     let archive = write_archive(&[RegularFile::new("hello.txt", b"new")], &master_key(), single_stream_options()).unwrap();
     let opened = open_archive(&archive.bytes, &master_key()).unwrap();

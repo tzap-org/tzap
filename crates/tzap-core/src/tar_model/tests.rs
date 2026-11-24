@@ -1546,6 +1546,7 @@ fn create_and_publish_temp_regular_file() {
     )
     .unwrap_err();
     assert_eq!(err, FormatError::UnsafeOverwrite);
+    assert_eq!(fs::read(dir.path().join("target.txt")).unwrap(), b"sparse file data");
 
     // Publishing with overwrite_existing and sync_published_files must succeed
     let (tmp_leaf3, mut tmp_file3) = create_temp_regular_file(&prep).unwrap();
@@ -1559,6 +1560,26 @@ fn create_and_publish_temp_regular_file() {
     .unwrap();
     drop(published3);
     assert_eq!(fs::read(dir.path().join("target.txt")).unwrap(), b"overwritten content");
+}
+
+#[test]
+fn overwrite_publish_failure_preserves_the_destination_leaf() {
+    let dir = tempfile::tempdir().unwrap();
+    let ambient_dir = cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+    let prep = PreparedDestination { parent: ambient_dir, leaf: PathBuf::from("target.txt") };
+    let (tmp_leaf, mut tmp_file) = create_temp_regular_file(&prep).unwrap();
+    tmp_file.write_all(b"new data").unwrap();
+
+    // Simulate another writer winning after preparation. The attempted replacement
+    // cannot rename a regular file over a directory, and must leave the directory
+    // intact instead of deleting it before publication.
+    fs::create_dir(dir.path().join("target.txt")).unwrap();
+    let error =
+        publish_regular_file(&prep, &tmp_leaf, tmp_file, SafeExtractionOptions { overwrite_existing: true, sync_published_files: false, ..Default::default() })
+            .unwrap_err();
+
+    assert!(matches!(error, FormatError::FilesystemExtractionFailed(_)));
+    assert!(dir.path().join("target.txt").is_dir());
 }
 
 #[test]
