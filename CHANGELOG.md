@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.10 - 2026-11-24
+
+- Signs and submits both macOS release binaries to Apple's notarization service
+  before packaging them into the release archives.
+- Preserves existing destinations during atomic overwrite and bounds selected
+  restore work to the requested members.
+- Fixes a Linux rename result handling issue.
+
 ## 0.2.9 - 2026-11-17
 
 - Redacts key material from diagnostic output and zeroizes secret buffers when
