@@ -49,7 +49,7 @@ pub fn repair_data_gf16(data_shards: &[Option<Vec<u8>>], parity_shards: &[Option
     let data_shard_count = data_shards.len();
     let parity_shard_count = parity_shards.len();
     validate_fec_counts(data_shard_count, parity_shard_count)?;
-    if shard_size % 2 != 0 {
+    if !shard_size.is_multiple_of(2) {
         return Err(FormatError::FecOddShardSize);
     }
 
@@ -104,12 +104,11 @@ pub fn repair_data_gf16(data_shards: &[Option<Vec<u8>>], parity_shards: &[Option
 
     for output_row in 0..data_shard_count {
         let dest = &mut repaired[output_row];
-        for source_row in 0..data_shard_count {
+        for (source_row, src) in available.iter().take(data_shard_count).enumerate() {
             let coefficient = inverse[output_row][source_row];
             if coefficient == 0 {
                 continue;
             }
-            let src = &available[source_row];
             if coefficient == 1 {
                 accumulate_xor_shard(dest, src);
             } else {
@@ -156,15 +155,13 @@ pub(crate) fn recover_data_bytes_gf16(data_shards: &[Option<Vec<u8>>], parity_sh
 
 #[inline]
 fn accumulate_xor_shard(dest: &mut [u8], src: &[u8]) {
-    let mut d_chunks = dest.chunks_exact_mut(8);
-    let mut s_chunks = src.chunks_exact(8);
-    for (d, s) in (&mut d_chunks).zip(&mut s_chunks) {
-        let dv = u64::from_ne_bytes(d.try_into().unwrap());
-        let sv = u64::from_ne_bytes(s.try_into().unwrap());
+    let (d_chunks, d_rem) = dest.as_chunks_mut::<8>();
+    let (s_chunks, s_rem) = src.as_chunks::<8>();
+    for (d, s) in d_chunks.iter_mut().zip(s_chunks) {
+        let dv = u64::from_ne_bytes(*d);
+        let sv = u64::from_ne_bytes(*s);
         d.copy_from_slice(&(dv ^ sv).to_ne_bytes());
     }
-    let d_rem = d_chunks.into_remainder();
-    let s_rem = s_chunks.remainder();
     for (d, s) in d_rem.iter_mut().zip(s_rem.iter()) {
         *d ^= *s;
     }
@@ -266,7 +263,7 @@ pub fn gf16_inverse(value: u16) -> Result<u16, FormatError> {
 fn validate_fec_shape(data_shard_count: usize, parity_shard_count: usize, data_shards: &[Vec<u8>]) -> Result<(), FormatError> {
     validate_fec_counts(data_shard_count, parity_shard_count)?;
     let shard_size = data_shards[0].len();
-    if shard_size % 2 != 0 {
+    if !shard_size.is_multiple_of(2) {
         return Err(FormatError::FecOddShardSize);
     }
     if data_shards.iter().any(|shard| shard.len() != shard_size) {
@@ -425,8 +422,8 @@ mod tests {
         for (i, out_row) in out.iter_mut().enumerate() {
             for (j, cell) in out_row.iter_mut().enumerate() {
                 let mut acc = 0u16;
-                for k in 0..n {
-                    acc ^= gf16_mul_slow(left[i][k], right[k][j]);
+                for (k, right_row) in right.iter().take(n).enumerate() {
+                    acc ^= gf16_mul_slow(left[i][k], right_row[j]);
                 }
                 *cell = acc;
             }

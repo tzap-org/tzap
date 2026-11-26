@@ -349,6 +349,12 @@ impl ArchiveTimestamp {
     }
 }
 
+/// Keep optional portable timestamps only when the archive format can encode
+/// them. Required modification times use the writer's error path instead.
+pub fn optional_timestamp_if_encodable(timestamp: ArchiveTimestamp) -> Option<ArchiveTimestamp> {
+    timestamp.canonical_pax_value().ok().map(|_| timestamp)
+}
+
 impl fmt::Display for ArchiveTimestamp {
     /// Renders the same signed decimal [`ArchiveTimestamp::canonical_pax_value`]
     /// writes, so what `tzap list` prints is the time the archive holds.
@@ -1841,10 +1847,10 @@ fn validate_builtin_auxiliary_payload(record: &AuxiliaryRecord, retained: Option
 }
 
 fn validate_windows_stream_name(name: &[u8]) -> Result<(), FormatError> {
-    if name.len() % 2 != 0 {
+    if !name.len().is_multiple_of(2) {
         return invalid("AuxiliaryMetadata", "Windows alternate-data name is not UTF-16LE");
     }
-    let units = name.chunks_exact(2).map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect::<Vec<_>>();
+    let units = name.as_chunks::<2>().0.iter().map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect::<Vec<_>>();
     const SUFFIX: &[u16] = &[b':' as u16, b'$' as u16, b'D' as u16, b'A' as u16, b'T' as u16, b'A' as u16];
     if units.len() <= SUFFIX.len() + 1
         || units.first() != Some(&(b':' as u16))
@@ -1963,7 +1969,7 @@ fn validate_acl(payload: &[u8], offset: usize) -> Result<(), FormatError> {
     for _ in 0..count {
         let ace = payload.get(cursor..cursor + 4).ok_or(FormatError::InvalidArchive("ACE header is out of bounds"))?;
         let ace_size = u16::from_le_bytes([ace[2], ace[3]]) as usize;
-        if ace_size < 4 || ace_size % 4 != 0 {
+        if ace_size < 4 || !ace_size.is_multiple_of(4) {
             return invalid("SecurityDescriptor", "ACE size is invalid");
         }
         cursor = cursor.checked_add(ace_size).ok_or(FormatError::InvalidArchive("ACE size overflow"))?;
@@ -2000,7 +2006,9 @@ fn validate_reparse_name_offsets(data: &[u8], path_buffer_offset: usize) -> Resu
     for field in [0usize, 4] {
         let offset = u16::from_le_bytes([data[field], data[field + 1]]) as usize;
         let len = u16::from_le_bytes([data[field + 2], data[field + 3]]) as usize;
-        if offset % 2 != 0 || len % 2 != 0 || path_buffer_offset.checked_add(offset).and_then(|start| start.checked_add(len)).is_none_or(|end| end > data.len())
+        if !offset.is_multiple_of(2)
+            || !len.is_multiple_of(2)
+            || path_buffer_offset.checked_add(offset).and_then(|start| start.checked_add(len)).is_none_or(|end| end > data.len())
         {
             return invalid("ReparseBuffer", "reparse name offset is out of bounds");
         }
@@ -2037,7 +2045,7 @@ fn validate_windows_ea_stream(payload: &[u8]) -> Result<(), FormatError> {
             return Ok(());
         }
         let next_cursor = cursor.checked_add(next).ok_or(FormatError::InvalidArchive("EA next-entry offset overflow"))?;
-        if next < record_len || next % 4 != 0 || next_cursor > payload.len() {
+        if next < record_len || !next.is_multiple_of(4) || next_cursor > payload.len() {
             return invalid("WindowsEaStream", "EA next-entry offset is invalid");
         }
         if payload[record_end..next_cursor].iter().any(|byte| *byte != 0) {
@@ -2076,7 +2084,7 @@ fn decode_auxiliary_name(encoding: &str, value: &[u8]) -> Result<Vec<u8>, Format
         }
         "utf16le-base64" => {
             let decoded = canonical_base64_decode(value)?;
-            if decoded.is_empty() || decoded.len() % 2 != 0 || decoded.chunks_exact(2).any(|unit| unit == [0, 0]) {
+            if decoded.is_empty() || decoded.len() % 2 != 0 || decoded.as_chunks::<2>().0.contains(&[0, 0]) {
                 return invalid("AuxiliaryMetadata", "decoded UTF-16LE name is invalid");
             }
             Ok(decoded)
@@ -2132,14 +2140,13 @@ pub fn canonical_base64_decode(value: &[u8]) -> Result<Vec<u8>, FormatError> {
 pub fn canonical_base64_encode(value: &[u8]) -> Vec<u8> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::with_capacity(value.len().div_ceil(3) * 4);
-    let mut chunks = value.chunks_exact(3);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = value.as_chunks::<3>();
+    for chunk in chunks {
         out.push(ALPHABET[(chunk[0] >> 2) as usize]);
         out.push(ALPHABET[(((chunk[0] & 3) << 4) | (chunk[1] >> 4)) as usize]);
         out.push(ALPHABET[(((chunk[1] & 15) << 2) | (chunk[2] >> 6)) as usize]);
         out.push(ALPHABET[(chunk[2] & 63) as usize]);
     }
-    let remainder = chunks.remainder();
     if let Some(&a) = remainder.first() {
         out.push(ALPHABET[(a >> 2) as usize]);
         if let Some(&b) = remainder.get(1) {
@@ -2208,11 +2215,11 @@ pub fn encode_percent_name(value: &[u8]) -> Result<String, FormatError> {
 /// Convert Linux's version-2 POSIX ACL xattr ABI into v45 canonical SCHILY
 /// POSIX.1e text. Numeric qualifiers are retained without name-service lookup.
 pub fn linux_posix_acl_xattr_to_schily(value: &[u8]) -> Result<Vec<u8>, FormatError> {
-    if value.len() < 4 || (value.len() - 4) % 8 != 0 || value[..4] != 2u32.to_le_bytes() {
+    if value.len() < 4 || !(value.len() - 4).is_multiple_of(8) || value[..4] != 2u32.to_le_bytes() {
         return invalid("LinuxAcl", "invalid POSIX ACL xattr framing");
     }
     let mut entries = Vec::new();
-    for entry in value[4..].chunks_exact(8) {
+    for entry in value[4..].as_chunks::<8>().0 {
         let tag = u16::from_le_bytes([entry[0], entry[1]]);
         let permissions = u16::from_le_bytes([entry[2], entry[3]]);
         let id = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
@@ -2372,7 +2379,7 @@ fn parse_fixed_hex_32(value: &[u8]) -> Result<[u8; 32], FormatError> {
         return invalid("AuxiliaryMetadata", "SHA-256 is not lowercase hexadecimal");
     }
     let mut out = [0u8; 32];
-    for (index, pair) in value.chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_chunks::<2>().0.iter().enumerate() {
         out[index] = hex_nibble(pair[0]) * 16 + hex_nibble(pair[1]);
     }
     Ok(out)
@@ -3074,6 +3081,9 @@ mod tests {
 
         let ts_invalid = ArchiveTimestamp::new(123, 1_000_000_000);
         assert!(ts_invalid.canonical_pax_value().is_err());
+        assert_eq!(optional_timestamp_if_encodable(ts_frac), Some(ts_frac));
+        let unencodable_optional = ArchiveTimestamp::new(-1, 500_000_000);
+        assert_eq!(optional_timestamp_if_encodable(unencodable_optional), None);
     }
 
     #[test]

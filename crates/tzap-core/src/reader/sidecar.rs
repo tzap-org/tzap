@@ -212,13 +212,13 @@ pub(crate) fn validate_sidecar_size_cap(header: &BootstrapSidecarHeader, crypto_
     let record_len = checked_u64_add(crypto_header.block_size as u64, BLOCK_RECORD_FRAMING_LEN as u64, "bootstrap sidecar cap overflow")?;
     let max_index_records = crypto_header.index_root_fec_data_shards as u64 + crypto_header.index_root_fec_parity_shards as u64;
     let max_record_section_bytes = checked_u64_mul(max_index_records, record_len, "bootstrap sidecar cap overflow")?;
-    if header.index_root_records_length % record_len != 0 {
+    if !header.index_root_records_length.is_multiple_of(record_len) {
         return Err(FormatError::InvalidArchive("bootstrap sidecar IndexRoot records length is not aligned"));
     }
     if header.index_root_records_length / record_len > max_index_records {
         return Err(FormatError::InvalidArchive("bootstrap sidecar IndexRoot records exceed resource cap"));
     }
-    if header.dictionary_records_length % record_len != 0 {
+    if !header.dictionary_records_length.is_multiple_of(record_len) {
         return Err(FormatError::InvalidArchive("bootstrap sidecar dictionary records length is not aligned"));
     }
     if header.dictionary_records_length / record_len > max_index_records {
@@ -257,7 +257,7 @@ pub(crate) fn parse_sidecar_block_records(
     section: SidecarBlockRecordsSection,
 ) -> Result<Vec<BlockRecord>, FormatError> {
     let record_len = block_size.checked_add(BLOCK_RECORD_FRAMING_LEN).ok_or(FormatError::InvalidArchive("BlockRecord length overflow"))?;
-    if section.length % record_len as u64 != 0 {
+    if !section.length.is_multiple_of(record_len as u64) {
         return Err(FormatError::InvalidArchive("sidecar BlockRecord section is not aligned"));
     }
     let expected_count = section.extent.data_block_count as usize + section.extent.parity_block_count as usize;

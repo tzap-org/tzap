@@ -1478,9 +1478,9 @@ fn apply_macos_native_metadata(
     _file: &fs::File,
     _path: &[u8],
     _metadata: &MemberMetadata,
-    _staged: &mut Vec<StagedAuxiliary>,
+    _staged: &mut [StagedAuxiliary],
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }
@@ -1569,7 +1569,7 @@ fn apply_macos_file_timestamps(
     _metadata: &MemberMetadata,
     _mtime: (i64, u32),
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }
@@ -1640,7 +1640,7 @@ fn apply_macos_file_flags(
     _path: &[u8],
     _metadata: &MemberMetadata,
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }
@@ -1716,9 +1716,9 @@ pub(crate) fn apply_generic_xattr_auxiliaries_to_path(
 pub(crate) fn apply_generic_xattr_auxiliaries(
     _base_file: &fs::File,
     _path: &[u8],
-    _staged: &mut Vec<StagedAuxiliary>,
+    _staged: &mut [StagedAuxiliary],
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }
@@ -1727,9 +1727,9 @@ pub(crate) fn apply_generic_xattr_auxiliaries(
 pub(crate) fn apply_windows_alternate_streams(
     _base_file: &fs::File,
     _path: &[u8],
-    _staged: &mut Vec<StagedAuxiliary>,
+    _staged: &mut [StagedAuxiliary],
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }
@@ -2038,7 +2038,7 @@ pub(crate) fn apply_windows_security_descriptor(
     _path: &[u8],
     _metadata: &MemberMetadata,
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }
@@ -2430,7 +2430,7 @@ pub(crate) fn apply_windows_basic_metadata(
     _path: &[u8],
     _metadata: &MemberMetadata,
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }
@@ -2557,7 +2557,7 @@ pub(crate) fn apply_linux_project_id(
     _path: &[u8],
     _metadata: &MemberMetadata,
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }
@@ -2568,7 +2568,7 @@ pub(crate) fn apply_linux_inode_flags(
     _path: &[u8],
     _metadata: &MemberMetadata,
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }
@@ -2635,7 +2635,7 @@ fn apply_regular_file_posix_acl(
     _path: &[u8],
     _metadata: &MemberMetadata,
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }
@@ -2718,7 +2718,7 @@ fn apply_regular_file_xattrs(
     _path: &[u8],
     _metadata: &MemberMetadata,
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }
@@ -2778,7 +2778,7 @@ fn apply_regular_file_ownership(
     _uid: Option<u64>,
     _gid: Option<u64>,
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }
@@ -2842,7 +2842,7 @@ fn apply_regular_file_attributes(
     _path: &[u8],
     _attributes: Option<u32>,
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }

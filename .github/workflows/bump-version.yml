@@ -26,16 +26,20 @@ jobs:
         uses: ./.github/actions/setup-openssl
 
       - name: Run version bump script
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           chmod +x ./scripts/bump-version.sh
-          ./scripts/bump-version.sh "${{ inputs.version }}"
+          ./scripts/bump-version.sh "$VERSION"
 
       - name: Verify workspace tests
         run: cargo test --workspace
 
       - name: Commit and push version bump
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -am "chore: bump version to v${{ inputs.version }}"
+          git commit -am "chore: bump version to v$VERSION"
           git push

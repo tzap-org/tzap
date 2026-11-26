@@ -326,7 +326,7 @@ pub(crate) fn plan_writer_options(mut options: WriterOptions) -> Result<WriterOp
     if options.jobs == 0 {
         return Err(FormatError::WriterUnsupported("jobs must be at least 1"));
     }
-    if options.block_size < MIN_BLOCK_SIZE || options.block_size % 2 != 0 {
+    if options.block_size < MIN_BLOCK_SIZE || !options.block_size.is_multiple_of(2) {
         return Err(FormatError::WriterUnsupported("writer requires an even block size of at least 4096"));
     }
     if options.stripe_width == 0 {

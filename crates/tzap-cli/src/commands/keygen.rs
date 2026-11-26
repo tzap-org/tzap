@@ -13,13 +13,13 @@ pub(crate) fn run_keygen(quiet: bool, args: KeygenArgs) -> Result<()> {
     let bytes = generate_random_key_material()?;
     let key_hex = format!("{}\n", encode_hex(&bytes));
     if stdout {
-        print!("{}", key_hex);
+        print!("{key_hex}");
         io::stdout().flush()?;
         return Ok(());
     }
     let output = output.expect("--output required by clap");
     write_keyfile(&output, &key_hex, force).context("failed to write keyfile")?;
-    emit_success_summary(quiet, &format!("wrote keyfile to {}", output))?;
+    emit_success_summary(quiet, &format!("wrote keyfile to {output}"))?;
     Ok(())
 }
 

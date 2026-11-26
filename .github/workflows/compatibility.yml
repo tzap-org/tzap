@@ -60,9 +60,11 @@ jobs:
       - name: Resolve the reference tag
         id: reference
         shell: bash
+        env:
+          REQUESTED_REFERENCE: ${{ inputs.reference }}
         run: |
           set -euo pipefail
-          requested='${{ inputs.reference }}'
+          requested="$REQUESTED_REFERENCE"
           if [ -n "$requested" ]; then
             tag="$requested"
           else

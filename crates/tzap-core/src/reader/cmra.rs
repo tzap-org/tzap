@@ -1349,7 +1349,7 @@ pub(crate) fn recover_cmra_from_bytes(
 
 pub(crate) fn validate_cmra_decoder_tuple(tuple: CmraDecoderTuple) -> Result<(), FormatError> {
     let shard_size = tuple.shard_size as u64;
-    if !(512..=4096).contains(&shard_size) || shard_size % 2 != 0 {
+    if !(512..=4096).contains(&shard_size) || !shard_size.is_multiple_of(2) {
         return Err(FormatError::InvalidArchive("CMRA shard_size is invalid"));
     }
     let image_length = tuple.image_length as u64;
@@ -1454,7 +1454,7 @@ pub(crate) fn validate_critical_metadata_image(image: &CriticalMetadataImage, mo
             }
         }
         CmraRecoveryMode::PublicNoKey => {
-            if image.block_records_length % block_record_len_u64 != 0 {
+            if !image.block_records_length.is_multiple_of(block_record_len_u64) {
                 return Err(FormatError::InvalidArchive("CriticalMetadataImage BlockRecord region is not aligned"));
             }
         }

@@ -33,6 +33,16 @@ use crate::writer::{
     write_archive_with_root_auth_and_recipient_wrap_records, MemoryArchiveSink, PortableFileMetadata, PortableModeOrigin, PortablePosixOwner, RegularFile,
     RegularFileSource, RootAuthSigningRequest, RootAuthWriterConfig, SourceEntryKind, WriterOptions, WrittenArchive,
 };
+
+#[test]
+fn explicit_extraction_limit_can_exceed_the_default_archive_ratio() {
+    let configured_limit = super::DEFAULT_MAX_TOTAL_EXTRACTION_SIZE + 1;
+    assert_eq!(
+        super::validation::total_extraction_size_cap(ReaderOptions { max_total_extraction_size: configured_limit, ..ReaderOptions::default() }, 1),
+        configured_limit
+    );
+    assert_eq!(super::validation::total_extraction_size_cap(ReaderOptions::default(), 1), 10);
+}
 #[cfg(target_os = "linux")]
 use crate::writer::{NativeAuxiliaryMetadata, NativeAuxiliaryNameEncoding};
 
@@ -7763,7 +7773,7 @@ fn extraction_options_allow_absolute_symlinks_toggle() {
         Err(crate::format::FormatError::FilesystemExtractionFailed(msg)) => {
             assert_eq!(msg, "failed to create symlink");
         }
-        Err(other) => panic!("expected Ok or FilesystemExtractionFailed, got {:?}", other),
+        Err(other) => panic!("expected Ok or FilesystemExtractionFailed, got {other:?}"),
     }
 }
 

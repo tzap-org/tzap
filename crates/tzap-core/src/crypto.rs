@@ -446,6 +446,10 @@ fn parse_recipient_wrap_kdf_params(bytes: &[u8]) -> Result<(KdfParams, usize), F
     ))
 }
 
+pub fn validate_argon2id_params(t_cost: u32, m_cost_kib: u32, parallelism: u32) -> Result<(), FormatError> {
+    validate_argon2id_bounds(t_cost, m_cost_kib, parallelism, 16)
+}
+
 fn validate_argon2id_bounds(t_cost: u32, m_cost_kib: u32, parallelism: u32, salt_length: u16) -> Result<(), FormatError> {
     if !(ARGON2ID_MIN_SALT_LEN..=ARGON2ID_MAX_SALT_LEN).contains(&salt_length) {
         return Err(FormatError::InvalidKdfParams("argon2id salt length must be 8..64 bytes"));
@@ -886,11 +890,7 @@ mod tests {
 
         let manifest_tag_v45 =
             compute_integrity_tag(HmacDomain::ManifestFooter, AeadAlgo::None, VOLUME_FORMAT_REV_45, None, &uuid(), &session(), covered).unwrap();
-        assert_eq!(
-            verify_integrity_tag(HmacDomain::ManifestFooter, AeadAlgo::None, VOLUME_FORMAT_REV_45, None, &uuid(), &session(), covered, &manifest_tag_v45,)
-                .unwrap(),
-            ()
-        );
+        verify_integrity_tag(HmacDomain::ManifestFooter, AeadAlgo::None, VOLUME_FORMAT_REV_45, None, &uuid(), &session(), covered, &manifest_tag_v45).unwrap();
         assert_ne!(
             tag_v45,
             compute_integrity_tag(HmacDomain::ManifestFooter, AeadAlgo::None, VOLUME_FORMAT_REV_45, None, &uuid(), &session(), covered,).unwrap()

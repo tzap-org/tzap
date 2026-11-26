@@ -113,7 +113,7 @@ fn observer_write_zeros<O: TarStreamObserver>(observer: &mut O, mut len: u64) ->
 }
 
 pub fn parse_tar_member_group<'a>(group: &'a [u8], max_path_length: u32) -> Result<ParsedTarMember<'a>, FormatError> {
-    if group.len() < TAR_BLOCK_LEN * 3 || group.len() % TAR_BLOCK_LEN != 0 {
+    if group.len() < TAR_BLOCK_LEN * 3 || !group.len().is_multiple_of(TAR_BLOCK_LEN) {
         return Err(FormatError::InvalidArchive("tar member group is not block aligned"));
     }
 
@@ -666,7 +666,7 @@ pub(super) fn validate_windows_essential_reparse_data(data: &[u8]) -> Result<u32
     let decode = |offset: usize, len: usize| -> Result<String, FormatError> {
         let end = offset.checked_add(len).ok_or(FormatError::InvalidArchive("reparse path range overflows"))?;
         let bytes = path_buffer.get(offset..end).ok_or(FormatError::InvalidArchive("reparse path range exceeds payload"))?;
-        let units = bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect::<Vec<_>>();
+        let units = bytes.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect::<Vec<_>>();
         let text = String::from_utf16(&units).map_err(|_| FormatError::InvalidArchive("reparse path is not valid UTF-16"))?;
         if text.contains('\0') {
             return Err(FormatError::InvalidArchive("reparse path contains NUL"));
@@ -803,7 +803,7 @@ pub(super) fn parse_minimal_decimal_u64(value: &[u8], structure: &'static str) -
 }
 
 pub fn validate_tar_stream_total_extraction_size(stream: &[u8], max_path_length: u32, cap: u64) -> Result<(), FormatError> {
-    if stream.len() % TAR_BLOCK_LEN != 0 {
+    if !stream.len().is_multiple_of(TAR_BLOCK_LEN) {
         return Err(FormatError::InvalidArchive("tar stream is not block aligned"));
     }
 
@@ -1233,10 +1233,15 @@ pub(crate) fn validate_v45_member_graph(members: &[TarStreamMemberSummary]) -> R
     Ok(())
 }
 
-pub(crate) fn validate_owned_restore_plan(members: &[&OwnedTarMember], options: SafeExtractionOptions) -> Result<(), FormatError> {
-    let mut selected = BTreeMap::<&[u8], &OwnedTarMember>::new();
+pub(crate) fn validate_owned_restore_plan(
+    members: &[&OwnedTarMember],
+    options: SafeExtractionOptions,
+    case_insensitive_paths: bool,
+) -> Result<(), FormatError> {
+    let mut selected = BTreeMap::<Vec<u8>, &OwnedTarMember>::new();
     for &member in members {
-        if selected.insert(member.path.as_slice(), member).is_some() {
+        let key = restore_path_collision_key(&member.path, case_insensitive_paths);
+        if selected.insert(key, member).is_some() {
             return Err(FormatError::InvalidArchive("restore plan contains duplicate selected paths"));
         }
         plan_owned_member_restore(member, options)?;
@@ -1244,7 +1249,9 @@ pub(crate) fn validate_owned_restore_plan(members: &[&OwnedTarMember], options: 
     for member in selected.values() {
         if member.kind == TarEntryKind::Hardlink {
             let target_path = member.link_target.as_deref().ok_or(FormatError::InvalidArchive("hardlink target is missing"))?;
-            let target = selected.get(target_path).ok_or(FormatError::InvalidArchive("hardlink target is not present in the selected restore graph"))?;
+            let target = selected
+                .get(&restore_path_collision_key(target_path, case_insensitive_paths))
+                .ok_or(FormatError::InvalidArchive("hardlink target is not present in the selected restore graph"))?;
             if target.kind != TarEntryKind::Regular || target.reparse_placeholder {
                 return Err(FormatError::InvalidArchive("hardlink target is not a canonical regular primary"));
             }
@@ -1262,7 +1269,7 @@ pub(crate) fn validate_owned_restore_plan(members: &[&OwnedTarMember], options: 
                 ancestor.push(b'/');
             }
             ancestor.extend_from_slice(component);
-            if let Some(parent) = selected.get(ancestor.as_slice()) {
+            if let Some(parent) = selected.get(&restore_path_collision_key(&ancestor, case_insensitive_paths)) {
                 if parent.reparse_placeholder || parent.kind == TarEntryKind::Symlink {
                     return Err(FormatError::InvalidArchive("restore path traverses a selected symlink or reparse ancestor"));
                 }
@@ -1273,6 +1280,14 @@ pub(crate) fn validate_owned_restore_plan(members: &[&OwnedTarMember], options: 
         }
     }
     Ok(())
+}
+
+fn restore_path_collision_key(path: &[u8], case_insensitive: bool) -> Vec<u8> {
+    if case_insensitive {
+        String::from_utf8_lossy(path).chars().flat_map(char::to_lowercase).collect::<String>().into_bytes()
+    } else {
+        path.to_vec()
+    }
 }
 
 pub(crate) fn plan_owned_member_restore(member: &OwnedTarMember, options: SafeExtractionOptions) -> Result<Vec<MetadataDiagnostic>, FormatError> {

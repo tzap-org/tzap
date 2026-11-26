@@ -594,7 +594,7 @@ fn cli_keyfile_raw_bytes_and_hex_with_whitespace_are_accepted() {
     let output_hex = temp.path().join("hex.tzap");
 
     fs::write(&raw_keyfile, [0x42u8; 32]).unwrap();
-    fs::write(&hex_keyfile, format!("  {}\n", KEY_HEX)).unwrap();
+    fs::write(&hex_keyfile, format!("  {KEY_HEX}\n")).unwrap();
     fs::write(&input, b"hello\n").unwrap();
 
     Command::cargo_bin("tzap")

@@ -391,7 +391,7 @@ pub(crate) struct Diagnostic {
 pub(crate) fn encode_hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        let _ = std::fmt::Write::write_fmt(&mut output, format_args!("{:02x}", byte));
+        let _ = std::fmt::Write::write_fmt(&mut output, format_args!("{byte:02x}"));
     }
     output
 }

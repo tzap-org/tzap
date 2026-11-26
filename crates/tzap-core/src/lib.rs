@@ -28,7 +28,7 @@ pub mod writer;
 mod raw_stream_profile;
 mod streaming_writer;
 
-pub use crypto::{HmacDomain, KdfParams, MasterKey, Subkeys};
+pub use crypto::{validate_argon2id_params, HmacDomain, KdfParams, MasterKey, Subkeys};
 pub use entry_metadata::{
     canonical_base64_encode, decode_percent_name, encode_percent_name, linux_posix_acl_xattr_to_schily, schily_posix_acl_to_linux_xattr, ArchiveTimestamp,
     RestoreClass, RestorePolicy, SparseExtent,

@@ -1886,8 +1886,8 @@ fn sink_writer_progress_reports_each_volume_size_replanning_attempt() {
     let planning_attempts = progress.phases.iter().filter(|phase| **phase == ArchiveWritePhase::PlanningPayload).count();
     assert!(planning_attempts > 1);
     assert_eq!(progress.phases.len(), planning_attempts * 2 + 2, "each planning attempt has payload and metadata phases before emission",);
-    for phases in progress.phases[..planning_attempts * 2].chunks_exact(2) {
-        assert_eq!(phases, [ArchiveWritePhase::PlanningPayload, ArchiveWritePhase::PlanningMetadata,]);
+    for phases in progress.phases[..planning_attempts * 2].as_chunks::<2>().0 {
+        assert_eq!(*phases, [ArchiveWritePhase::PlanningPayload, ArchiveWritePhase::PlanningMetadata,]);
     }
     assert_eq!(&progress.phases[planning_attempts * 2..], [ArchiveWritePhase::EmittingPayload, ArchiveWritePhase::EmittingMetadata,]);
     assert_eq!(progress.bytes_for(ArchiveWritePhase::PlanningPayload), file_size as u64 * planning_attempts as u64,);

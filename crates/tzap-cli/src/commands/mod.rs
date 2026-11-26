@@ -11,10 +11,7 @@ use ed25519_dalek::SigningKey;
 use openssl::pkey::PKey;
 use openssl::x509::X509;
 use rand::RngCore;
-use tzap_core::format::{
-    FormatError, CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION, READER_MAX_ARGON2ID_M_COST_KIB, READER_MAX_ARGON2ID_PARALLELISM, READER_MAX_ARGON2ID_T_COST,
-    VOLUME_FORMAT_REV_45, VOLUME_HEADER_LEN,
-};
+use tzap_core::format::{FormatError, CRYPTO_HEADER_FIXED_LEN, FORMAT_VERSION, VOLUME_FORMAT_REV_45, VOLUME_HEADER_LEN};
 use tzap_core::reader::RecipientWrapRecordContext;
 use tzap_core::wire::{CryptoHeader, CryptoHeaderFixed, VolumeHeader};
 use tzap_core::{
@@ -184,7 +181,7 @@ pub(crate) fn write_repaired_archive_copies(paths: &[String], opened: &OpenedArc
             .suffix(".partial")
             .tempfile_in(parent)
             .with_context(|| format!("failed to create temporary repaired output in {}", parent.display()))?;
-        let mut input = File::open(&input_path).with_context(|| format!("failed to open archive volume {}", input_path))?;
+        let mut input = File::open(&input_path).with_context(|| format!("failed to open archive volume {input_path}"))?;
         io::copy(&mut input, temp.as_file_mut()).with_context(|| format!("failed to copy archive volume {} to {}", input_path, output_path.display()))?;
 
         for patch in &volume_patches {
@@ -687,7 +684,7 @@ pub(crate) fn load_32_byte_key_file(label: &'static str, path: &str) -> Result<[
         bail!("{label} must contain either 32 raw bytes or 64 hex characters");
     }
     let mut out = [0u8; 32];
-    for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (idx, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         out[idx] = decode_hex_byte(chunk)?;
     }
     Ok(out)
@@ -777,26 +774,7 @@ pub(crate) fn derive_key_from_passphrase(kdf_params: &KdfParams, passphrase: &st
 }
 
 pub(crate) fn validate_argon2_params(t_cost: u32, m_cost_kib: u32, parallelism: u32) -> Result<()> {
-    if t_cost == 0 {
-        return Err(anyhow!(FormatError::InvalidKdfParams("argon2 t_cost must be at least 1",)));
-    }
-    if t_cost > READER_MAX_ARGON2ID_T_COST {
-        return Err(anyhow!(FormatError::InvalidKdfParams("argon2 t_cost exceeds reader maximum",)));
-    }
-    if parallelism == 0 {
-        return Err(anyhow!(FormatError::InvalidKdfParams("argon2 parallelism must be at least 1",)));
-    }
-    if parallelism > READER_MAX_ARGON2ID_PARALLELISM {
-        return Err(anyhow!(FormatError::InvalidKdfParams("argon2 parallelism exceeds reader maximum",)));
-    }
-    if m_cost_kib > READER_MAX_ARGON2ID_M_COST_KIB {
-        return Err(anyhow!(FormatError::InvalidKdfParams("argon2 memory cost exceeds reader maximum",)));
-    }
-    let min_memory = parallelism.checked_mul(8).ok_or_else(|| anyhow!(FormatError::InvalidKdfParams("argon2 memory per lane computation overflows",)))?;
-    if m_cost_kib < min_memory {
-        return Err(anyhow!(FormatError::InvalidKdfParams("argon2 memory must be at least 8 KiB per lane",)));
-    }
-    Ok(())
+    tzap_core::validate_argon2id_params(t_cost, m_cost_kib, parallelism).map_err(Into::into)
 }
 
 pub(crate) fn load_raw_master_key(keyfile: Option<&str>) -> Result<MasterKey> {
@@ -813,7 +791,7 @@ pub(crate) fn load_raw_master_key(keyfile: Option<&str>) -> Result<MasterKey> {
         bail!("keyfile must contain either 32 raw bytes or 64 hex characters");
     }
     let mut raw = Zeroizing::new([0u8; 32]);
-    for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (idx, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         raw[idx] = decode_hex_byte(chunk)?;
     }
     MasterKey::from_raw_key(&raw[..]).map_err(Into::into)
@@ -997,10 +975,41 @@ pub(crate) enum CreateRootAuthProfile {
 pub(crate) fn ensure_distinct_output_paths(left_label: &str, left: &Path, right_label: &str, right: &Path) -> Result<()> {
     let left_identity = output_identity_path(left)?;
     let right_identity = output_identity_path(right)?;
-    if left_identity == right_identity {
+    if paths_may_alias_on_host(&left_identity, &right_identity)? {
         bail!("{left_label} and {right_label} must be different paths: {}", left.display());
     }
     Ok(())
+}
+
+fn paths_may_alias_on_host(left: &Path, right: &Path) -> Result<bool> {
+    if left == right {
+        return Ok(true);
+    }
+    if left.parent() != right.parent() {
+        return Ok(false);
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let parent = left.parent().unwrap_or_else(|| Path::new("."));
+        if !filesystem_is_case_insensitive(parent)? {
+            return Ok(false);
+        }
+        let left_name = left.file_name().map(|name| name.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let right_name = right.file_name().map(|name| name.to_string_lossy().to_lowercase()).unwrap_or_default();
+        Ok(left_name == right_name)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Ok(false)
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn filesystem_is_case_insensitive(parent: &Path) -> Result<bool> {
+    let probe = tempfile::tempdir_in(parent).with_context(|| format!("failed to inspect filesystem case sensitivity in {}", parent.display()))?;
+    let lowercase = probe.path().join("tzapCaseProbe");
+    fs::File::create(&lowercase).with_context(|| format!("failed to inspect filesystem case sensitivity in {}", parent.display()))?;
+    Ok(probe.path().join("TZAPCASEPROBE").exists())
 }
 pub(crate) fn output_identity_path(path: &Path) -> Result<PathBuf> {
     let parent = path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
@@ -1071,25 +1080,96 @@ pub(crate) fn write_atomic_output_files(outputs: &[AtomicOutput<'_>], force: boo
         temps.push(Some(temp));
     }
 
-    let mut persisted_paths = Vec::new();
-    for (index, output) in outputs.iter().enumerate() {
-        let temp = temps[index].take().ok_or_else(|| anyhow!("missing temporary {}", output.label))?;
-        let publish_result = if force { temp.persist(output.path) } else { temp.persist_noclobber(output.path) };
-        match publish_result {
-            Ok(_) => persisted_paths.push(output.path.to_path_buf()),
-            Err(error) if !force && error.error.kind() == io::ErrorKind::AlreadyExists => {
-                for path in &persisted_paths {
-                    let _ = fs::remove_file(path);
+    publish_temp_files_transactionally(
+        temps.into_iter().map(|temp| temp.ok_or_else(|| anyhow!("missing temporary output"))).collect::<Result<Vec<_>>>()?,
+        &outputs.iter().map(|output| output.path.to_path_buf()).collect::<Vec<_>>(),
+        force,
+    )
+}
+
+pub(crate) fn publish_temp_files_transactionally(temps: Vec<tempfile::NamedTempFile>, output_paths: &[PathBuf], force: bool) -> Result<()> {
+    if temps.len() != output_paths.len() {
+        bail!("temporary and destination output counts differ");
+    }
+    for (index, output_path) in output_paths.iter().enumerate() {
+        for previous in &output_paths[..index] {
+            ensure_distinct_output_paths("output", previous, "output", output_path)?;
+        }
+    }
+    let mut backups = Vec::<(PathBuf, PathBuf)>::new();
+    if force {
+        for output_path in output_paths {
+            match fs::symlink_metadata(output_path) {
+                Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+                    let parent = output_path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+                    let backup = match tempfile::Builder::new().prefix(".tzap-backup-").tempfile_in(parent) {
+                        Ok(backup) => backup,
+                        Err(error) => {
+                            restore_output_backups(&backups)?;
+                            return Err(error).with_context(|| format!("failed to allocate backup for {}", output_path.display()));
+                        }
+                    };
+                    let backup_path = match backup.into_temp_path().keep() {
+                        Ok(path) => path,
+                        Err(error) => {
+                            restore_output_backups(&backups)?;
+                            return Err(error.into());
+                        }
+                    };
+                    if let Err(error) = fs::remove_file(&backup_path) {
+                        let _ = fs::remove_file(&backup_path);
+                        restore_output_backups(&backups)?;
+                        return Err(error).with_context(|| format!("failed to prepare backup path for {}", output_path.display()));
+                    }
+                    if let Err(error) = fs::rename(output_path, &backup_path) {
+                        restore_output_backups(&backups)?;
+                        return Err(error).with_context(|| format!("failed to preserve existing output {}", output_path.display()));
+                    }
+                    backups.push((output_path.clone(), backup_path));
                 }
-                bail!("{} already exists: {}; use --force to overwrite", output.label, output.path.display());
-            }
-            Err(error) => {
-                for path in &persisted_paths {
-                    let _ = fs::remove_file(path);
+                Ok(_) => {
+                    restore_output_backups(&backups)?;
+                    bail!("output path is not a file: {}", output_path.display());
                 }
-                return Err(error.error).with_context(|| format!("failed to publish {} {}", output.label, output.path.display()));
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    restore_output_backups(&backups)?;
+                    return Err(error).with_context(|| format!("failed to inspect output {}", output_path.display()));
+                }
             }
         }
+    }
+    let mut published = Vec::new();
+    for (temp, output_path) in temps.into_iter().zip(output_paths) {
+        let result = temp.persist_noclobber(output_path);
+        match result {
+            Ok(_) => published.push(output_path.clone()),
+            Err(error) => {
+                let mut rollback_error = None;
+                for path in &published {
+                    if let Err(remove_error) = fs::remove_file(path) {
+                        rollback_error.get_or_insert_with(|| anyhow!("failed to remove newly published output {}: {remove_error}", path.display()));
+                    }
+                }
+                if let Err(restore_error) = restore_output_backups(&backups) {
+                    rollback_error.get_or_insert(restore_error);
+                }
+                if let Some(rollback_error) = rollback_error {
+                    return Err(error.error).context(format!("publication failed and rollback was incomplete: {rollback_error:#}"));
+                }
+                return Err(error.error).with_context(|| format!("failed to publish output {}", output_path.display()));
+            }
+        }
+    }
+    for (_, saved) in backups {
+        fs::remove_file(&saved).with_context(|| format!("outputs were published but backup cleanup failed for {}", saved.display()))?;
+    }
+    Ok(())
+}
+
+fn restore_output_backups(backups: &[(PathBuf, PathBuf)]) -> Result<()> {
+    for (original, saved) in backups.iter().rev() {
+        fs::rename(saved, original).with_context(|| format!("failed to restore previous output {} from {}", original.display(), saved.display()))?;
     }
     Ok(())
 }

@@ -754,6 +754,7 @@ struct StagedExtraction {
 impl StagedExtraction {
     fn new(output_dir: &Path) -> Result<Self, ExtractError> {
         let parent = output_dir.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(ExtractError::Output)?;
         let tempdir = tempfile::Builder::new().prefix(".tzap-nonseekable-").tempdir_in(parent).map_err(ExtractError::Output)?;
         let root = tempdir.path().join("root");
         fs::create_dir(&root).map_err(ExtractError::Output)?;
@@ -873,6 +874,16 @@ fn merge_staged_dir(staged_dir: &Path, final_dir: &Path, options: SafeExtraction
         }
         if options.overwrite_existing && fs::symlink_metadata(&final_path).is_ok() {
             fs::remove_file(&final_path).map_err(ExtractError::Output)?;
+        }
+        if !options.overwrite_existing && metadata.file_type().is_file() {
+            match fs::hard_link(&staged_path, &final_path) {
+                Ok(()) => {
+                    fs::remove_file(&staged_path).map_err(ExtractError::Output)?;
+                    continue;
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => return Err(FormatError::UnsafeOverwrite.into()),
+                Err(error) => return Err(ExtractError::Output(error)),
+            }
         }
         fs::rename(&staged_path, &final_path).map_err(ExtractError::Output)?;
     }

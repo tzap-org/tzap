@@ -703,7 +703,7 @@ impl DirectoryHintTable {
         let entry_bytes_len = checked_mul(entry_count, DIRECTORY_HINT_ENTRY_LEN, structure)?;
         let entries_end = checked_add(DIRECTORY_HINT_TABLE_LEN, entry_bytes_len, structure)?;
         expect_offset(structure, "shard list", header.shard_list_offset, entries_end)?;
-        if header.shard_list_offset % 4 != 0 {
+        if !header.shard_list_offset.is_multiple_of(4) {
             return invalid(structure, "shard list is not 4-byte aligned");
         }
 
@@ -870,7 +870,7 @@ pub fn is_directory_ancestor(directory_path: &[u8], file_path: &[u8]) -> bool {
 fn parse_shard_entries(bytes: &[u8], limits: MetadataLimits) -> Result<Vec<ShardEntry>, FormatError> {
     let mut entries = Vec::with_capacity(bytes.len() / SHARD_ENTRY_LEN);
     let mut seen_indexes = HashSet::new();
-    for chunk in bytes.chunks_exact(SHARD_ENTRY_LEN) {
+    for chunk in bytes.as_chunks::<SHARD_ENTRY_LEN>().0 {
         let entry = ShardEntry {
             shard_index: read_u64(chunk, 0, "ShardEntry")?,
             first_block_index: read_u64(chunk, 8, "ShardEntry")?,
@@ -919,7 +919,7 @@ fn parse_shard_entries(bytes: &[u8], limits: MetadataLimits) -> Result<Vec<Shard
 fn parse_directory_hint_shard_entries(bytes: &[u8], limits: MetadataLimits) -> Result<Vec<DirectoryHintShardEntry>, FormatError> {
     let mut entries = Vec::with_capacity(bytes.len() / DIRECTORY_HINT_SHARD_ENTRY_LEN);
     let mut seen_indexes = HashSet::new();
-    for chunk in bytes.chunks_exact(DIRECTORY_HINT_SHARD_ENTRY_LEN) {
+    for chunk in bytes.as_chunks::<DIRECTORY_HINT_SHARD_ENTRY_LEN>().0 {
         let entry = DirectoryHintShardEntry {
             hint_shard_index: read_u64(chunk, 0, "DirectoryHintShardEntry")?,
             first_dir_hash: read_array::<8>(chunk, 8, "DirectoryHintShardEntry")?,
@@ -1028,7 +1028,7 @@ fn parse_envelope_entry(bytes: &[u8]) -> Result<EnvelopeEntry, FormatError> {
 
 fn parse_directory_hint_entries(bytes: &[u8]) -> Result<Vec<DirectoryHintEntry>, FormatError> {
     let mut entries = Vec::with_capacity(bytes.len() / DIRECTORY_HINT_ENTRY_LEN);
-    for chunk in bytes.chunks_exact(DIRECTORY_HINT_ENTRY_LEN) {
+    for chunk in bytes.as_chunks::<DIRECTORY_HINT_ENTRY_LEN>().0 {
         expect_zero("DirectoryHintEntry", slice(chunk, 20, 4, "DirectoryHintEntry")?)?;
         expect_zero("DirectoryHintEntry", slice(chunk, 32, 8, "DirectoryHintEntry")?)?;
         entries.push(DirectoryHintEntry {
@@ -1640,7 +1640,7 @@ fn parse_counted_table<T>(bytes: &[u8], spec: CountedTableSpec<T>, cursor: &mut 
 
 fn parse_u32_array(bytes: &[u8], structure: &'static str) -> Result<Vec<u32>, FormatError> {
     let mut out = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0 {
         out.push(read_u32(chunk, 0, structure)?);
     }
     Ok(out)

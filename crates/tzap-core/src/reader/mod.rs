@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Write;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use sha2::{Digest, Sha256};
@@ -27,10 +28,10 @@ use crate::root_auth::{
 #[cfg(windows)]
 use crate::tar_model::replay_windows_descendant_metadata;
 use crate::tar_model::{
-    metadata_verification_report, parse_tar_member_group, plan_owned_member_restore, restore_phase, restore_regular_file_metadata_to_open_file,
-    restore_streaming_tar_member_group, stream_regular_tar_member_group_to_writer, validate_owned_restore_plan, ExpectedMember, MetadataDiagnostic,
-    MetadataVerificationReport, NoopTarStreamObserver, OwnedTarMember, SafeExtractionOptions, StreamingMemberExpectation, TarEntryKind, TarMemberGroupReader,
-    TarStreamFilesystemRestoreObserver, TarStreamObserver, TarStreamSummaryValidator, ValidatingRestoreObserver,
+    inspect_streaming_tar_member_group, metadata_verification_report, parse_tar_member_group, plan_owned_member_restore, restore_phase,
+    restore_regular_file_metadata_to_open_file, restore_streaming_tar_member_group, stream_regular_tar_member_group_to_writer, validate_owned_restore_plan,
+    ExpectedMember, MetadataDiagnostic, MetadataVerificationReport, NoopTarStreamObserver, OwnedTarMember, SafeExtractionOptions, StreamingMemberExpectation,
+    TarEntryKind, TarMemberGroupReader, TarStreamFilesystemRestoreObserver, TarStreamObserver, TarStreamSummaryValidator, ValidatingRestoreObserver,
 };
 use crate::wire::{BlockRecord, CryptoHeader, CryptoHeaderFixed, ManifestFooter, RootAuthFooterV1, VolumeHeader, VolumeTrailer};
 
@@ -856,6 +857,26 @@ where
 /// Callers receive no decoded bytes if terminal authentication fails.
 pub fn sequential_extract_tar_stream(bytes: &[u8], master_key: &MasterKey) -> Result<Vec<u8>, FormatError> {
     sequential_extract_tar_stream_with_options(bytes, master_key, ReaderOptions::default())
+}
+
+fn extraction_filesystem_is_case_insensitive(root: &Path) -> Result<bool, FormatError> {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let mut parent = root;
+        while !parent.is_dir() {
+            parent = parent.parent().ok_or(FormatError::FilesystemExtractionFailed("failed to inspect destination filesystem"))?;
+        }
+        let parent = parent.canonicalize().map_err(|_| FormatError::FilesystemExtractionFailed("failed to inspect destination filesystem"))?;
+        let probe = tempfile::tempdir_in(&parent).map_err(|_| FormatError::FilesystemExtractionFailed("failed to inspect destination filesystem"))?;
+        let lowercase = probe.path().join("tzapCaseProbe");
+        File::create(&lowercase).map_err(|_| FormatError::FilesystemExtractionFailed("failed to inspect destination filesystem"))?;
+        Ok(probe.path().join("TZAPCASEPROBE").exists())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = root;
+        Ok(false)
+    }
 }
 
 impl OpenedArchive {
@@ -1914,7 +1935,7 @@ impl OpenedArchive {
             planned.push((path, member));
         }
         let members: Vec<_> = planned.iter().map(|(_, member)| member).collect();
-        validate_owned_restore_plan(&members, options)?;
+        validate_owned_restore_plan(&members, options, cfg!(windows))?;
         planned.into_iter().map(|(path, member)| Ok((path, plan_owned_member_restore(&member, options)?))).collect()
     }
 
@@ -2792,14 +2813,32 @@ impl OpenedArchive {
             },
         )?;
         let cap = total_extraction_size_cap(self.options, self.observed_archive_bytes);
-        let total_selected_size = metadata
+        let regular_sizes = metadata
             .iter()
             .filter(|member| member.kind == TarEntryKind::Regular)
-            .try_fold(0u64, |total, member| total.checked_add(member.logical_size).ok_or(FormatError::InvalidArchive("total extraction size overflow")))?;
+            .map(|member| (member.path.clone(), member.logical_size))
+            .collect::<BTreeMap<_, _>>();
+        let total_selected_size = metadata.iter().try_fold(0u64, |total, member| {
+            let v45_metadata = member.v45_metadata.as_ref().ok_or(FormatError::InvalidArchive("revision-45 member metadata is missing"))?;
+            let primary_size = if member.kind == TarEntryKind::Regular {
+                member.logical_size
+            } else if options.restore_policy == crate::entry_metadata::RestorePolicy::Content && member.kind == TarEntryKind::Hardlink {
+                member.link_target.as_deref().and_then(|target| regular_sizes.get(target).copied()).unwrap_or(0)
+            } else {
+                0
+            };
+            let auxiliary_size = v45_metadata
+                .auxiliary
+                .iter()
+                .filter(|record| Self::auxiliary_is_restored(record.restore_class, options))
+                .try_fold(0u64, |sum, record| sum.checked_add(record.logical_size).ok_or(FormatError::InvalidArchive("total extraction size overflow")))?;
+            total.checked_add(primary_size).and_then(|sum| sum.checked_add(auxiliary_size)).ok_or(FormatError::InvalidArchive("total extraction size overflow"))
+        })?;
         if total_selected_size > cap {
             return Err(FormatError::ReaderUnsupported("total extraction size exceeds configured cap"));
         }
-        validate_owned_restore_plan(&metadata.iter().collect::<Vec<_>>(), options)?;
+        let case_insensitive_paths = extraction_filesystem_is_case_insensitive(root)?;
+        validate_owned_restore_plan(&metadata.iter().collect::<Vec<_>>(), options, case_insensitive_paths)?;
         let mut planned = entries.into_iter().zip(metadata).map(|((path, entry), member)| (path, entry, member)).collect::<Vec<_>>();
         planned.sort_by(|left, right| restore_phase(&left.2).cmp(&restore_phase(&right.2)).then_with(|| left.2.path.cmp(&right.2.path)));
         let mut restored = Vec::with_capacity(planned.len());
@@ -2868,6 +2907,16 @@ impl OpenedArchive {
         Ok(restored)
     }
 
+    fn auxiliary_is_restored(class: crate::entry_metadata::RestoreClass, options: SafeExtractionOptions) -> bool {
+        use crate::entry_metadata::{RestoreClass, RestorePolicy};
+        match class {
+            RestoreClass::None => false,
+            RestoreClass::Portable => options.restore_policy != RestorePolicy::Content,
+            RestoreClass::SameOs => matches!(options.restore_policy, RestorePolicy::SameOs | RestorePolicy::System),
+            RestoreClass::System => options.restore_policy == RestorePolicy::System && options.system_authorized,
+        }
+    }
+
     fn decode_loaded_owned_tar_member(&self, shard: &IndexShard, file_index: usize, enforce_extraction_cap: bool) -> Result<OwnedTarMember, FormatError> {
         let mut scratch = PayloadReadScratch::new(self)?;
         self.decode_loaded_owned_tar_member_with_scratch(shard, file_index, enforce_extraction_cap, &mut scratch)
@@ -2881,11 +2930,37 @@ impl OpenedArchive {
         scratch: &mut PayloadReadScratch,
     ) -> Result<OwnedTarMember, FormatError> {
         let file = shard.files.get(file_index).ok_or(FormatError::InvalidArchive("FileEntry index out of bounds"))?;
-        // Always enforce the extraction cap: this path materializes the file's full
-        // decompressed content into memory regardless of enforce_extraction_cap, so the
-        // cap protects list/verify metadata passes just as much as extraction.
+        // Enforce the per-file extraction cap for both extraction and metadata
+        // inspection. Metadata inspection streams payload bytes into a discard
+        // handler; extraction materializes them only when explicitly requested.
         self.validate_total_extraction_size(file.file_data_size)?;
         let expected_path = shard.file_path(file_index).ok_or(FormatError::InvalidArchive("FileEntry path is missing"))?;
+        if !enforce_extraction_cap {
+            let mut reader = DecodedTarMemberGroupReader::new(self, shard, file, scratch);
+            let member = inspect_streaming_tar_member_group(
+                &mut reader,
+                StreamingMemberExpectation {
+                    path: expected_path,
+                    file_data_size: file.file_data_size,
+                    file_flags: file.flags,
+                    group_len: file.tar_member_group_size,
+                    max_path_length: self.crypto_header.max_path_length,
+                },
+            )
+            .map_err(format_error_from_extract_error)?;
+            return Ok(OwnedTarMember {
+                path: member.path,
+                kind: member.kind,
+                data: Vec::new(),
+                link_target: member.link_target,
+                mode: member.mode,
+                mtime: member.mtime,
+                logical_size: member.logical_size,
+                reparse_placeholder: member.reparse_placeholder,
+                v45_metadata: Some(member.v45_metadata),
+                diagnostics: member.diagnostics,
+            });
+        }
         let offset = file.offset_in_first_frame_plaintext as usize;
         let group_len = to_usize(file.tar_member_group_size, "FileEntry")?;
         let required_bytes = offset.checked_add(group_len).ok_or(FormatError::InvalidArchive("member group offset overflow"))?;

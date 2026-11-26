@@ -199,7 +199,7 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
                 eprintln!("    {path}");
             }
             if let Some(bootstrap_path) = bootstrap_out.as_ref() {
-                eprintln!("  bootstrap: {}", bootstrap_path);
+                eprintln!("  bootstrap: {bootstrap_path}");
             }
             return Ok(());
         }
@@ -227,12 +227,13 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
         )?;
         let root_auth = root_auth_profile.as_ref().map(CreateRootAuthProfile::root_auth_writer_config).transpose()?;
         let core_writer_started = Instant::now();
-        let (bootstrap_sidecar, summary_text, writer_timings) = match stdin_mode {
+        let (_bootstrap_sidecar, summary_text, writer_timings) = match stdin_mode {
             CreateStdinMode::Tar => {
                 let options = build_writer_options(None)?;
                 validate_create_writer_options(&options)?;
                 let fec_fragment = create_summary_fec_fragment(&options, resolved_volume_loss_tolerance);
-                let (summary, bootstrap_sidecar) = write_tar_stdin_archive_output(&output, &key, options, root_auth, root_auth_profile.as_ref(), force)?;
+                let (summary, bootstrap_sidecar) =
+                    write_tar_stdin_archive_output(&output, &key, options, root_auth, root_auth_profile.as_ref(), bootstrap_out.as_deref(), force)?;
                 let summary_text = format!(
                     "created {} member(s), {} tar bytes in, {} archive bytes, {} volume(s), {}, bit-rot buffer {}%",
                     summary.input_member_count,
@@ -258,6 +259,7 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
                     options,
                     root_auth,
                     root_auth_profile.as_ref(),
+                    bootstrap_out.as_deref(),
                     force,
                 )?;
                 let summary_text = format!(
@@ -284,6 +286,7 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
                     options,
                     root_auth,
                     root_auth_profile.as_ref(),
+                    bootstrap_out.as_deref(),
                     force,
                 )?;
                 let summary_text = format!(
@@ -296,12 +299,6 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
         };
         let core_writer = core_writer_started.elapsed();
         let write_outputs_started = Instant::now();
-        if let Some(path) = bootstrap_out.as_deref() {
-            if bootstrap_sidecar.is_empty() {
-                return Err(FormatError::WriterUnsupported("bootstrap output is unavailable for this archive shape").into());
-            }
-            write_bootstrap_output_with_archive_rollback(path, &bootstrap_sidecar, &output, 1, force)?;
-        }
         let write_outputs = write_outputs_started.elapsed();
         emit_success_summary(quiet, &summary_text)?;
         report_inputs_not_fully_archived(quiet)?;
@@ -309,7 +306,7 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
             emit_success_summary(quiet, &format!("  root auth: {} signed", profile.label()))?;
         }
         if let Some(path) = bootstrap_out.as_ref() {
-            emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
+            emit_success_summary(quiet, &format!("  bootstrap output: {path}"))?;
         }
         if timings {
             emit_sink_backed_create_timing_report(
@@ -334,7 +331,7 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
     if dry_run {
         eprintln!("create dry-run summary:");
         eprintln!("  files: {}", input_specs.len());
-        eprintln!("  input bytes: {}", input_bytes);
+        eprintln!("  input bytes: {input_bytes}");
         // The scan has already run, so a dry run knows exactly what the real run
         // would leave out. Counting only what survived and exiting 0 made the one
         // command meant to rehearse a backup the one that hid the problem: the
@@ -352,7 +349,7 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
             eprintln!("    {path}");
         }
         if let Some(bootstrap_path) = bootstrap_output {
-            eprintln!("  bootstrap: {}", bootstrap_path);
+            eprintln!("  bootstrap: {bootstrap_path}");
         }
         // Names each skipped input and sets the incomplete-archive exit, so a
         // pre-flight check fails for the same reason the real run would. The
@@ -367,18 +364,19 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
         let master_key = generate_random_master_key()?;
         let recipient_record = build_recipient_wrap_record(recipient_cert_path, &master_key, &mut recipient_options)?;
         let core_writer_started = Instant::now();
-        let (archive, bootstrap_sidecar) =
-            write_file_inputs_ordered_parallel_recipient_wrap_to_output(&output, &input_specs, &master_key, recipient_options, recipient_record, force)
-                .context("failed to create recipient-wrap archive")?;
+        let (archive, _bootstrap_sidecar) = write_file_inputs_ordered_parallel_recipient_wrap_to_output(
+            &output,
+            &input_specs,
+            &master_key,
+            recipient_options,
+            recipient_record,
+            bootstrap_out.as_deref(),
+            force,
+        )
+        .context("failed to create recipient-wrap archive")?;
         let core_writer = core_writer_started.elapsed();
 
         let write_outputs_started = Instant::now();
-        if let Some(path) = bootstrap_out.as_deref() {
-            if bootstrap_sidecar.is_empty() {
-                return Err(FormatError::WriterUnsupported("bootstrap output is unavailable for this archive shape").into());
-            }
-            write_bootstrap_output_with_archive_rollback(path, &bootstrap_sidecar, &output, archive.volume_count, force)?;
-        }
         let write_outputs = write_outputs_started.elapsed();
         let summary = format!(
             "created {} member(s), {} bytes in, {} archive bytes, {} volume(s), {}, bit-rot buffer {}%",
@@ -393,7 +391,7 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
         report_inputs_not_fully_archived(quiet)?;
         emit_success_summary(quiet, "  key wrap: recipient certificate")?;
         if let Some(path) = bootstrap_output {
-            emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
+            emit_success_summary(quiet, &format!("  bootstrap output: {path}"))?;
         }
         if timings {
             emit_sink_backed_create_timing_report(
@@ -418,18 +416,20 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
     if dictionary_bytes.is_none() && options.target_volume_size.is_none() && options.volume_loss_tolerance == 0 {
         let fec_fragment = create_summary_fec_fragment(&options, resolved_volume_loss_tolerance);
         let core_writer_started = Instant::now();
-        let (archive, bootstrap_sidecar) =
-            write_file_inputs_ordered_parallel_to_output(&output, &input_specs, &key, options, root_auth, root_auth_profile.as_ref(), force)
-                .context("failed to create archive")?;
+        let (archive, _bootstrap_sidecar) = write_file_inputs_ordered_parallel_to_output(
+            &output,
+            &input_specs,
+            &key,
+            options,
+            root_auth,
+            root_auth_profile.as_ref(),
+            bootstrap_out.as_deref(),
+            force,
+        )
+        .context("failed to create archive")?;
         let core_writer = core_writer_started.elapsed();
 
         let write_outputs_started = Instant::now();
-        if let Some(path) = bootstrap_out.as_deref() {
-            if bootstrap_sidecar.is_empty() {
-                return Err(FormatError::WriterUnsupported("bootstrap output is unavailable for this archive shape").into());
-            }
-            write_bootstrap_output_with_archive_rollback(path, &bootstrap_sidecar, &output, archive.volume_count, force)?;
-        }
         let write_outputs = write_outputs_started.elapsed();
         let summary = format!(
             "created {} member(s), {} bytes in, {} archive bytes, {} volume(s), {}, bit-rot buffer {}%",
@@ -446,7 +446,7 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
             emit_success_summary(quiet, &format!("  root auth: {} signed", profile.label()))?;
         }
         if let Some(path) = bootstrap_output {
-            emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
+            emit_success_summary(quiet, &format!("  bootstrap output: {path}"))?;
         }
         if timings {
             emit_sink_backed_create_timing_report(
@@ -511,7 +511,7 @@ pub(crate) fn run_create(quiet: bool, args: CreateArgs) -> Result<()> {
         emit_success_summary(quiet, &format!("  root auth: {} signed", profile.label()))?;
     }
     if let Some(path) = bootstrap_output {
-        emit_success_summary(quiet, &format!("  bootstrap output: {}", path))?;
+        emit_success_summary(quiet, &format!("  bootstrap output: {path}"))?;
     }
     if timings {
         emit_create_timing_report(scan_inputs, read_inputs, core_writer, write_outputs, create_total_started.elapsed(), archive.timings)?;
@@ -864,6 +864,13 @@ pub(crate) fn collect_input_specs(paths: &[String]) -> Result<Vec<InputSpec>> {
         let input = PathBuf::from(path);
         let base = input.file_name().and_then(OsStr::to_str).ok_or_else(|| anyhow!("input path has no valid UTF-8 file name: {path}"))?.to_owned();
         collect_one_input_spec(&input, Path::new(&base), &mut out).with_context(|| format!("failed to collect input {path}"))?;
+    }
+    let mut seen_paths = std::collections::BTreeSet::new();
+    for spec in &out {
+        let path_key = spec.archive_path.as_str();
+        if !seen_paths.insert(path_key) {
+            bail!("multiple inputs map to the same archive path: {}", spec.archive_path);
+        }
     }
     out.sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
     #[cfg(any(unix, windows))]
@@ -1265,6 +1272,7 @@ pub(crate) fn write_archive_outputs(output: &str, volumes: &[Vec<u8>], force: bo
     }
     flush_archive_output_temps(&mut temps, &output_paths)?;
     publish_archive_output_temps(temps, &output_paths, force)?;
+    cleanup_stale_archive_volumes(output, volumes.len(), force)?;
     Ok(())
 }
 
@@ -1279,19 +1287,35 @@ pub(crate) fn write_archive_outputs_with_optional_bootstrap(
         return Err(FormatError::WriterUnsupported("bootstrap output is unavailable for this archive shape").into());
     }
 
-    write_archive_outputs(output, volumes, force)?;
     if let Some(path) = bootstrap_out {
-        write_bootstrap_output_with_archive_rollback(path, bootstrap_sidecar, output, volumes.len(), force)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn write_bootstrap_output_with_archive_rollback(path: &str, bytes: &[u8], output: &str, volume_count: usize, force: bool) -> Result<()> {
-    if let Err(err) = write_bootstrap_output(path, bytes, force) {
-        for output_path in create_output_paths(output, volume_count) {
-            let _ = fs::remove_file(output_path);
+        if volumes.is_empty() {
+            bail!("writer returned no volumes");
         }
-        return Err(err).with_context(|| "failed to publish bootstrap output; removed archive outputs published by this command");
+        if bootstrap_sidecar.is_empty() {
+            return Err(FormatError::WriterUnsupported("bootstrap output is unavailable for this archive shape").into());
+        }
+        let output_paths = create_output_paths(output, volumes.len());
+        let bootstrap_path = PathBuf::from(path);
+        for archive_path in &output_paths {
+            ensure_distinct_output_paths("archive output", archive_path, "bootstrap output", &bootstrap_path)?;
+        }
+        let mut temps = create_archive_output_temps(&output_paths)?;
+        for ((temp, output_path), volume) in temps.iter_mut().zip(&output_paths).zip(volumes) {
+            temp.as_file_mut().write_all(volume).with_context(|| format!("failed to write temporary archive volume for {}", output_path.display()))?;
+        }
+        flush_archive_output_temps(&mut temps, &output_paths)?;
+        let parent = bootstrap_path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        let mut bootstrap_temp = tempfile::Builder::new().prefix(".tzap-write-").suffix(".partial").tempfile_in(parent)?;
+        bootstrap_temp.as_file_mut().write_all(bootstrap_sidecar)?;
+        bootstrap_temp.as_file_mut().flush()?;
+        bootstrap_temp.as_file_mut().sync_all()?;
+        temps.push(bootstrap_temp);
+        let mut all_paths = output_paths;
+        all_paths.push(bootstrap_path);
+        publish_archive_output_temps(temps, &all_paths, force)?;
+        cleanup_stale_archive_volumes(output, volumes.len(), force)?;
+    } else {
+        write_archive_outputs(output, volumes, force)?;
     }
     Ok(())
 }
@@ -1332,17 +1356,28 @@ pub(crate) fn write_tar_stdin_archive_output(
     options: WriterOptions,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     root_auth_profile: Option<&CreateRootAuthProfile>,
+    bootstrap_out: Option<&str>,
     force: bool,
 ) -> Result<(StreamingTarWriterSummary, Vec<u8>)> {
     let stdin = io::stdin();
     let mut stdin_lock = stdin.lock();
     if let (Some(profile), Some(root_auth)) = (root_auth_profile, root_auth) {
         let mut authenticator = |request: &RootAuthSigningRequest| root_auth_authenticator_value(profile, request);
-        return write_tar_stdin_archive_output_from_reader(output, &mut stdin_lock, key, options, Some(root_auth), Some(&mut authenticator), force);
+        return write_tar_stdin_archive_output_from_reader(
+            output,
+            &mut stdin_lock,
+            key,
+            options,
+            Some(root_auth),
+            Some(&mut authenticator),
+            bootstrap_out,
+            force,
+        );
     }
-    write_tar_stdin_archive_output_from_reader(output, &mut stdin_lock, key, options, None, None, force)
+    write_tar_stdin_archive_output_from_reader(output, &mut stdin_lock, key, options, None, None, bootstrap_out, force)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_tar_stdin_archive_output_from_reader<R: Read>(
     output: &str,
     reader: &mut R,
@@ -1350,10 +1385,11 @@ pub(crate) fn write_tar_stdin_archive_output_from_reader<R: Read>(
     options: WriterOptions,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     authenticator: Option<&mut CliRootAuthAuthenticator<'_>>,
+    bootstrap_out: Option<&str>,
     force: bool,
 ) -> Result<(StreamingTarWriterSummary, Vec<u8>)> {
     let volume_count = options.stripe_width as usize;
-    write_stdin_archive_output_with_sink(output, volume_count, force, |sink| {
+    write_stdin_archive_output_with_sink(output, volume_count, bootstrap_out, force, |sink| {
         write_tar_stream_archive_to_sink_with_kdf_and_root_auth(reader, &key.master_key, options, &key.kdf_params, root_auth, authenticator, sink)
     })
 }
@@ -1368,6 +1404,7 @@ pub(crate) fn write_raw_stdin_archive_output<R: Read>(
     options: WriterOptions,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     root_auth_profile: Option<&CreateRootAuthProfile>,
+    bootstrap_out: Option<&str>,
     force: bool,
 ) -> Result<(StreamingRawWriterSummary, Vec<u8>)> {
     if let (Some(profile), Some(root_auth)) = (root_auth_profile, root_auth) {
@@ -1381,12 +1418,14 @@ pub(crate) fn write_raw_stdin_archive_output<R: Read>(
             options,
             Some(root_auth),
             Some(&mut authenticator),
+            bootstrap_out,
             force,
         );
     }
-    write_raw_stdin_archive_output_from_reader(output, &mut reader, archive_path, input_size, key, options, None, None, force)
+    write_raw_stdin_archive_output_from_reader(output, &mut reader, archive_path, input_size, key, options, None, None, bootstrap_out, force)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_file_inputs_ordered_parallel_to_output(
     output: &str,
     input_specs: &[InputSpec],
@@ -1394,6 +1433,7 @@ pub(crate) fn write_file_inputs_ordered_parallel_to_output(
     options: WriterOptions,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     root_auth_profile: Option<&CreateRootAuthProfile>,
+    bootstrap_out: Option<&str>,
     force: bool,
 ) -> Result<(WrittenArchiveSummary, Vec<u8>)> {
     if let (Some(profile), Some(root_auth)) = (root_auth_profile, root_auth) {
@@ -1405,12 +1445,14 @@ pub(crate) fn write_file_inputs_ordered_parallel_to_output(
             options,
             Some(root_auth),
             Some(&mut authenticator),
+            bootstrap_out,
             force,
         );
     }
-    write_file_inputs_ordered_parallel_to_output_with_authenticator(output, input_specs, key, options, None, None, force)
+    write_file_inputs_ordered_parallel_to_output_with_authenticator(output, input_specs, key, options, None, None, bootstrap_out, force)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_file_inputs_ordered_parallel_to_output_with_authenticator(
     output: &str,
     input_specs: &[InputSpec],
@@ -1418,10 +1460,11 @@ pub(crate) fn write_file_inputs_ordered_parallel_to_output_with_authenticator(
     options: WriterOptions,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     authenticator: Option<&mut CliRootAuthAuthenticator<'_>>,
+    bootstrap_out: Option<&str>,
     force: bool,
 ) -> Result<(WrittenArchiveSummary, Vec<u8>)> {
     let volume_count = options.stripe_width as usize;
-    write_stdin_archive_output_with_sink(output, volume_count, force, |sink| {
+    write_stdin_archive_output_with_sink(output, volume_count, bootstrap_out, force, |sink| {
         write_archive_sources_to_sink_ordered_parallel(input_specs, &key.master_key, options, &key.kdf_params, root_auth, authenticator, sink)
     })
 }
@@ -1432,10 +1475,11 @@ pub(crate) fn write_file_inputs_ordered_parallel_recipient_wrap_to_output(
     master_key: &MasterKey,
     options: WriterOptions,
     recipient_record: tzap_core::wire::RecipientRecordV1,
+    bootstrap_out: Option<&str>,
     force: bool,
 ) -> Result<(WrittenArchiveSummary, Vec<u8>)> {
     let volume_count = options.stripe_width as usize;
-    write_stdin_archive_output_with_sink(output, volume_count, force, |sink| {
+    write_stdin_archive_output_with_sink(output, volume_count, bootstrap_out, force, |sink| {
         write_archive_sources_to_sink_ordered_parallel_with_recipient_wrap_records(input_specs, master_key, options, vec![recipient_record], None, None, sink)
     })
 }
@@ -1450,10 +1494,11 @@ pub(crate) fn write_raw_stdin_archive_output_from_reader<R: Read>(
     options: WriterOptions,
     root_auth: Option<RootAuthWriterConfig<'_>>,
     authenticator: Option<&mut CliRootAuthAuthenticator<'_>>,
+    bootstrap_out: Option<&str>,
     force: bool,
 ) -> Result<(StreamingRawWriterSummary, Vec<u8>)> {
     let volume_count = options.stripe_width as usize;
-    write_stdin_archive_output_with_sink(output, volume_count, force, |sink| {
+    write_stdin_archive_output_with_sink(output, volume_count, bootstrap_out, force, |sink| {
         write_sized_raw_member_archive_to_sink_with_kdf_and_root_auth(
             reader,
             archive_path,
@@ -1471,6 +1516,7 @@ pub(crate) fn write_raw_stdin_archive_output_from_reader<R: Read>(
 pub(crate) fn write_stdin_archive_output_with_sink<T>(
     output: &str,
     volume_count: usize,
+    bootstrap_out: Option<&str>,
     force: bool,
     write_archive: impl FnOnce(&mut PathBackedArchiveSink<'_>) -> std::result::Result<T, ArchiveWriteError>,
 ) -> Result<(T, Vec<u8>)> {
@@ -1485,7 +1531,28 @@ pub(crate) fn write_stdin_archive_output_with_sink<T>(
         (summary, sink.bootstrap_sidecar)
     };
     flush_archive_output_temps(&mut temps, &output_paths)?;
-    publish_archive_output_temps(temps, &output_paths, force)?;
+    if let Some(path) = bootstrap_out {
+        if bootstrap_sidecar.is_empty() {
+            return Err(FormatError::WriterUnsupported("bootstrap output is unavailable for this archive shape").into());
+        }
+        let bootstrap_path = PathBuf::from(path);
+        for archive_path in &output_paths {
+            ensure_distinct_output_paths("archive output", archive_path, "bootstrap output", &bootstrap_path)?;
+        }
+        let parent = bootstrap_path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        let mut bootstrap_temp = tempfile::Builder::new().prefix(".tzap-write-").suffix(".partial").tempfile_in(parent)?;
+        bootstrap_temp.as_file_mut().write_all(&bootstrap_sidecar)?;
+        bootstrap_temp.as_file_mut().flush()?;
+        bootstrap_temp.as_file_mut().sync_all()?;
+        temps.push(bootstrap_temp);
+        let mut all_paths = output_paths;
+        all_paths.push(bootstrap_path);
+        publish_archive_output_temps(temps, &all_paths, force)?;
+        cleanup_stale_archive_volumes(output, volume_count, force)?;
+    } else {
+        publish_archive_output_temps(temps, &output_paths, force)?;
+        cleanup_stale_archive_volumes(output, volume_count, force)?;
+    }
     Ok((summary, bootstrap_sidecar))
 }
 
@@ -1512,27 +1579,44 @@ pub(crate) fn flush_archive_output_temps(temps: &mut [tempfile::NamedTempFile], 
 }
 
 pub(crate) fn publish_archive_output_temps(temps: Vec<tempfile::NamedTempFile>, output_paths: &[PathBuf], force: bool) -> Result<()> {
-    let volume_count = output_paths.len();
-    let publish_order = if volume_count == 1 { vec![0] } else { (1..volume_count).chain(std::iter::once(0)).collect() };
-    let mut temp_slots = temps.into_iter().map(Some).collect::<Vec<_>>();
-    let mut persisted_paths = Vec::new();
-    for volume_index in publish_order {
-        let temp = temp_slots[volume_index].take().ok_or_else(|| anyhow!("missing temporary archive volume {volume_index}"))?;
-        let output_path = &output_paths[volume_index];
-        let publish_result = if force { temp.persist(output_path) } else { temp.persist_noclobber(output_path) };
-        if let Err(error) = publish_result {
-            for path in &persisted_paths {
-                let _ = fs::remove_file(path);
-            }
-            return Err(error.error).with_context(|| format!("failed to publish archive {}", output_path.display()));
-        }
-        persisted_paths.push(output_path.clone());
+    if temps.len() != output_paths.len() {
+        bail!("temporary and destination output counts differ");
     }
-    Ok(())
+    let publish_order =
+        if output_paths.len() <= 1 { (0..output_paths.len()).collect::<Vec<_>>() } else { (1..output_paths.len()).chain(std::iter::once(0)).collect() };
+    let mut temp_slots = temps.into_iter().map(Some).collect::<Vec<_>>();
+    let ordered_temps = publish_order
+        .iter()
+        .map(|index| temp_slots[*index].take().ok_or_else(|| anyhow!("missing temporary archive volume {index}")))
+        .collect::<Result<Vec<_>>>()?;
+    let ordered_paths = publish_order.iter().map(|index| output_paths[*index].clone()).collect::<Vec<_>>();
+    super::publish_temp_files_transactionally(ordered_temps, &ordered_paths, force)
 }
 
-pub(crate) fn write_bootstrap_output(path: &str, bytes: &[u8], force: bool) -> Result<()> {
-    write_atomic_output_file("bootstrap output", Path::new(path), bytes, force)
+fn cleanup_stale_archive_volumes(output: &str, volume_count: usize, force: bool) -> Result<()> {
+    if !force || volume_count == 0 {
+        return Ok(());
+    }
+    let output_path = Path::new(output);
+    let file_name = output_path.file_name().and_then(OsStr::to_str).ok_or_else(|| anyhow!("output path has invalid UTF-8: {output}"))?;
+    let parent = output_path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let parsed_output = volume_file::parse_volume_file_name(file_name);
+    let base = parsed_output.as_ref().map_or_else(|| volume_file::multi_volume_base_name(file_name), |parsed| parsed.base.clone());
+    for entry in fs::read_dir(parent).with_context(|| format!("failed to inspect output directory {}", parent.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(parsed) = volume_file::parse_volume_file_name(name) else { continue };
+        let stale_single_volume_sibling = volume_count == 1 && parsed_output.as_ref().is_none_or(|output| parsed.volume_index != output.volume_index);
+        let is_stale = parsed.base == base && (stale_single_volume_sibling || parsed.volume_index >= volume_count);
+        if is_stale {
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_file() {
+                fs::remove_file(entry.path()).with_context(|| format!("failed to remove stale archive volume {}", entry.path().display()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn reject_create_stdout_sentinels(output: &str, bootstrap_out: Option<&str>) -> Result<()> {
@@ -1721,7 +1805,7 @@ pub(crate) fn resolve_create_volume_loss_tolerance(
 }
 
 pub(crate) fn validate_create_writer_options(options: &WriterOptions) -> Result<()> {
-    if options.block_size < 4096 || options.block_size % 2 != 0 {
+    if options.block_size < 4096 || !options.block_size.is_multiple_of(2) {
         return Err(anyhow!(FormatError::WriterUnsupported("writer requires an even block size of at least 4096",)));
     }
     if options.stripe_width == 0 {

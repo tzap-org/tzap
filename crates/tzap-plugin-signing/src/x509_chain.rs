@@ -319,35 +319,7 @@ pub fn verify_root_auth_footer_at_time(
     include_official_tzap_root: bool,
     chain_validation_time_unix_seconds: Option<i64>,
 ) -> Result<X509RootAuthReport, X509RootAuthError> {
-    if footer.authenticator_id != X509_AUTHENTICATOR_ID {
-        return Err(X509RootAuthError::Invalid("unsupported authenticator id"));
-    }
-    if footer.signer_identity_type != X509_SIGNER_IDENTITY_TYPE_DER_CERT {
-        return Err(X509RootAuthError::UnsupportedIdentity);
-    }
-
-    let leaf_certificate = X509::from_der(&footer.signer_identity_bytes).map_err(|_| X509RootAuthError::Invalid("invalid X.509 signer identity"))?;
-    let parsed = parse_authenticator_value(&footer.authenticator_value)?;
-    let root_auth_spec_id = root_auth_spec_id_for_revision(footer.format_version, footer.volume_format_rev)
-        .map_err(|_| X509RootAuthError::Invalid("unsupported RootAuthFooter root_auth_spec_id"))?;
-    let signing_input = signing_input_for_root_auth_spec_id(
-        &root_auth_spec_id,
-        &footer.archive_uuid,
-        &footer.session_id,
-        archive_root,
-        parsed.signed_at_unix_seconds,
-        &parsed.chain_digest,
-    );
-    let leaf_public_key = leaf_certificate.public_key()?;
-    validate_rsa_spki_signature_scheme(parsed.sig_scheme, footer.signer_identity_bytes.as_slice())?;
-    validate_public_key_matches_scheme(parsed.sig_scheme, &leaf_public_key)?;
-    validate_signature_for_scheme(parsed.sig_scheme, &leaf_public_key, &parsed.signature)?;
-    let mut verifier = verifier_for_scheme(parsed.sig_scheme, &leaf_public_key)?;
-    verifier.update(&signing_input)?;
-    if !verifier.verify(&parsed.signature)? {
-        return Err(X509RootAuthError::Invalid("X.509 RootAuth signature failed"));
-    }
-    validate_leaf_key_usage(&footer.signer_identity_bytes)?;
+    let (leaf_certificate, parsed) = verify_embedded_root_auth_signature(footer, archive_root)?;
     if trusted_roots_der.is_empty() && !use_system_roots {
         return Err(X509RootAuthError::MissingTrustPolicy);
     }
@@ -417,6 +389,20 @@ pub struct X509RootAuthSignatureReport {
 /// Any `Err` means "not authentic". A signature mismatch yields exactly
 /// `Invalid("X.509 RootAuth signature failed")`, distinct from parse errors.
 pub fn verify_root_auth_signature(footer: &RootAuthFooterV1, archive_root: &[u8; 32]) -> Result<X509RootAuthSignatureReport, X509RootAuthError> {
+    let (leaf_certificate, parsed) = verify_embedded_root_auth_signature(footer, archive_root)?;
+
+    let fingerprint = leaf_certificate.digest(MessageDigest::sha256())?;
+    let mut certificate_sha256 = [0u8; SHA256_LEN];
+    certificate_sha256.copy_from_slice(&fingerprint);
+
+    Ok(X509RootAuthSignatureReport {
+        signature_scheme: signature_scheme_name(parsed.sig_scheme).to_string(),
+        signed_at_unix_seconds: parsed.signed_at_unix_seconds,
+        certificate_sha256,
+    })
+}
+
+fn verify_embedded_root_auth_signature(footer: &RootAuthFooterV1, archive_root: &[u8; 32]) -> Result<(X509, ParsedAuthenticator), X509RootAuthError> {
     if footer.authenticator_id != X509_AUTHENTICATOR_ID {
         return Err(X509RootAuthError::Invalid("unsupported authenticator id"));
     }
@@ -446,16 +432,7 @@ pub fn verify_root_auth_signature(footer: &RootAuthFooterV1, archive_root: &[u8;
         return Err(X509RootAuthError::Invalid("X.509 RootAuth signature failed"));
     }
     validate_leaf_key_usage(&footer.signer_identity_bytes)?;
-
-    let fingerprint = leaf_certificate.digest(MessageDigest::sha256())?;
-    let mut certificate_sha256 = [0u8; SHA256_LEN];
-    certificate_sha256.copy_from_slice(&fingerprint);
-
-    Ok(X509RootAuthSignatureReport {
-        signature_scheme: signature_scheme_name(parsed.sig_scheme).to_string(),
-        signed_at_unix_seconds: parsed.signed_at_unix_seconds,
-        certificate_sha256,
-    })
+    Ok((leaf_certificate, parsed))
 }
 
 fn validate_rsa_spki_signature_scheme(sig_scheme: u16, leaf_certificate_bytes: &[u8]) -> Result<(), X509RootAuthError> {
@@ -925,7 +902,7 @@ fn u32_len(len: usize, field: &'static str) -> Result<u32, X509RootAuthError> {
 fn encode_hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        let _ = fmt::Write::write_fmt(&mut output, format_args!("{:02x}", byte));
+        let _ = fmt::Write::write_fmt(&mut output, format_args!("{byte:02x}"));
     }
     output
 }

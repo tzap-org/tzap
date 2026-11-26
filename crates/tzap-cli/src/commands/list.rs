@@ -43,12 +43,10 @@ pub(crate) fn run_list(quiet: bool, args: ListArgs) -> Result<()> {
                     non_seekable_reader_options(reader_options),
                 )
             }
+        } else if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+            list_unencrypted_non_seekable_stream_with_bootstrap_sidecar(stdin.lock(), bootstrap_bytes, non_seekable_reader_options(reader_options))
         } else {
-            if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
-                list_unencrypted_non_seekable_stream_with_bootstrap_sidecar(stdin.lock(), bootstrap_bytes, non_seekable_reader_options(reader_options))
-            } else {
-                list_unencrypted_non_seekable_stream(stdin.lock(), non_seekable_reader_options(reader_options))
-            }
+            list_unencrypted_non_seekable_stream(stdin.lock(), non_seekable_reader_options(reader_options))
         }
         .context("failed to list non-seekable archive stream")?;
         emit_entry_metadata_diagnostics(quiet, &report.entries)?;
@@ -110,7 +108,7 @@ pub(crate) fn run_list(quiet: bool, args: ListArgs) -> Result<()> {
             let gname = entry.gname.as_deref().unwrap_or("null");
             let created = entry.created.map_or("null".to_owned(), |t| t.to_string());
             let accessed = entry.accessed.map_or("null".to_owned(), |t| t.to_string());
-            let attributes = entry.attributes.map_or("null".to_owned(), |v| format!("{:#010X}", v));
+            let attributes = entry.attributes.map_or("null".to_owned(), |v| format!("{v:#010X}"));
             let link_target = entry.link_target.as_deref().unwrap_or("null");
             println!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",

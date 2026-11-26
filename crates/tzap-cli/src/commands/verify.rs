@@ -140,12 +140,10 @@ pub(crate) fn run_verify(quiet: bool, args: VerifyArgs) -> Result<()> {
                     non_seekable_reader_options(reader_options),
                 )
             }
+        } else if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+            verify_unencrypted_non_seekable_stream_with_bootstrap_sidecar(stdin.lock(), bootstrap_bytes, non_seekable_reader_options(reader_options))
         } else {
-            if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
-                verify_unencrypted_non_seekable_stream_with_bootstrap_sidecar(stdin.lock(), bootstrap_bytes, non_seekable_reader_options(reader_options))
-            } else {
-                verify_unencrypted_non_seekable_stream_with_options(stdin.lock(), non_seekable_reader_options(reader_options))
-            }
+            verify_unencrypted_non_seekable_stream_with_options(stdin.lock(), non_seekable_reader_options(reader_options))
         }
         .context("failed to verify non-seekable archive stream");
         let report = match result {

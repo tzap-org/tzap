@@ -271,7 +271,7 @@ impl CryptoHeaderFixed {
         if self.block_size < 4096 {
             return Err(FormatError::BlockSizeTooSmall(self.block_size));
         }
-        if self.block_size % 2 != 0 {
+        if !self.block_size.is_multiple_of(2) {
             return Err(FormatError::OddBlockSize(self.block_size));
         }
         validate_fec_class_data_shards("fec_data_shards", self.fec_data_shards, self.block_size)?;

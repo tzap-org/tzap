@@ -420,6 +420,47 @@ where
     Ok(member.diagnostics)
 }
 
+pub(crate) fn inspect_streaming_tar_member_group<R>(reader: &mut R, expected: StreamingMemberExpectation<'_>) -> Result<StreamedTarMemberMetadata, ExtractError>
+where
+    R: TarMemberGroupReader,
+{
+    let mut handler = MetadataOnlyHandler;
+    let member = stream_tar_member_group(
+        reader,
+        expected.path,
+        expected.file_data_size,
+        expected.file_flags,
+        expected.group_len,
+        expected.max_path_length,
+        &mut handler,
+    )?;
+    Ok(member)
+}
+
+struct MetadataOnlyHandler;
+
+impl TarMemberStreamHandler for MetadataOnlyHandler {
+    fn on_member(&mut self, _member: &StreamedTarMemberMetadata) -> Result<(), ExtractError> {
+        Ok(())
+    }
+
+    fn write_regular_payload(&mut self, _bytes: &[u8]) -> Result<(), ExtractError> {
+        Ok(())
+    }
+
+    fn begin_auxiliary_payload(&mut self, _record: &AuxiliaryRecord) -> Result<bool, ExtractError> {
+        Ok(true)
+    }
+
+    fn begin_sparse_payload(&mut self, _logical_size: u64, _extents: &[SparseExtent]) -> Result<bool, ExtractError> {
+        Ok(true)
+    }
+
+    fn write_sparse_extent(&mut self, _offset: u64, _bytes: &[u8]) -> Result<(), ExtractError> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StreamingMemberExpectation<'a> {
     pub path: &'a [u8],
@@ -464,7 +505,7 @@ where
     R: TarMemberGroupReader,
     H: TarMemberStreamHandler,
 {
-    if group_len < (TAR_BLOCK_LEN * 3) as u64 || group_len % TAR_BLOCK_LEN as u64 != 0 {
+    if group_len < (TAR_BLOCK_LEN * 3) as u64 || !group_len.is_multiple_of(TAR_BLOCK_LEN as u64) {
         return Err(FormatError::InvalidArchive("tar member group is not block aligned").into());
     }
 
@@ -2444,7 +2485,7 @@ fn apply_restored_linux_symlink_metadata(
     _path: &[u8],
     _metadata: &MemberMetadata,
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }
@@ -2782,9 +2823,9 @@ fn apply_restored_macos_symlink_metadata(
     _destination: &PreparedDestination,
     _path: &[u8],
     _metadata: &MemberMetadata,
-    _staged: &mut Vec<StagedAuxiliary>,
+    _staged: &mut [StagedAuxiliary],
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Ok(())
 }
@@ -3219,9 +3260,9 @@ fn create_posix_special_object(
     _path: &[u8],
     _kind: TarEntryKind,
     _metadata: &MemberMetadata,
-    _staged: &mut Vec<StagedAuxiliary>,
+    _staged: &mut [StagedAuxiliary],
     _options: SafeExtractionOptions,
-    _diagnostics: &mut Vec<MetadataDiagnostic>,
+    _diagnostics: &mut [MetadataDiagnostic],
 ) -> Result<(), FormatError> {
     Err(FormatError::ReaderUnsupported("POSIX special-object restore is unavailable on this host"))
 }

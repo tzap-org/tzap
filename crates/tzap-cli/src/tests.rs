@@ -56,6 +56,81 @@ fn test_master_key() -> MasterKey {
     MasterKey::from_raw_key(&[0x42; MASTER_KEY_LEN]).unwrap()
 }
 
+#[test]
+fn collect_input_specs_rejects_directory_roots_with_duplicate_archive_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first").join("shared");
+    let second = temp.path().join("second").join("shared");
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(&second).unwrap();
+    fs::write(first.join("one.txt"), b"one").unwrap();
+    fs::write(second.join("two.txt"), b"two").unwrap();
+
+    let error = collect_input_specs(&[first.to_string_lossy().into_owned(), second.to_string_lossy().into_owned()]).unwrap_err();
+    assert!(error.to_string().contains("multiple inputs map to the same archive path"));
+}
+
+#[test]
+fn collect_input_specs_keeps_case_distinct_archive_paths_distinct() {
+    let temp = tempfile::tempdir().unwrap();
+    let uppercase = temp.path().join("upper").join("Shared");
+    let lowercase = temp.path().join("lower").join("shared");
+    fs::create_dir_all(&uppercase).unwrap();
+    fs::create_dir_all(&lowercase).unwrap();
+    fs::write(uppercase.join("one.txt"), b"one").unwrap();
+    fs::write(lowercase.join("two.txt"), b"two").unwrap();
+
+    let specs = collect_input_specs(&[uppercase.to_string_lossy().into_owned(), lowercase.to_string_lossy().into_owned()]).unwrap();
+    assert!(specs.iter().any(|spec| spec.archive_path == "Shared/one.txt"));
+    assert!(specs.iter().any(|spec| spec.archive_path == "shared/two.txt"));
+}
+
+#[test]
+fn failed_forced_multi_output_publish_restores_existing_outputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let existing = temp.path().join("existing.out");
+    let destination_directory = temp.path().join("destination-directory");
+    fs::write(&existing, b"old contents").unwrap();
+    fs::create_dir(&destination_directory).unwrap();
+    let first_temp = tempfile::NamedTempFile::new_in(temp.path()).unwrap();
+    let second_temp = tempfile::NamedTempFile::new_in(temp.path()).unwrap();
+
+    let error = publish_temp_files_transactionally(vec![first_temp, second_temp], &[existing.clone(), destination_directory], true).unwrap_err();
+
+    assert!(error.to_string().contains("output path is not a file"));
+    assert_eq!(fs::read(existing).unwrap(), b"old contents");
+}
+
+#[test]
+fn forced_single_volume_recreate_removes_obsolete_volume_siblings() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("backup.tzap");
+    let old_zero = temp.path().join("backup.vol000.tzap");
+    let old_one = temp.path().join("backup.vol001.tzap");
+    fs::write(&old_zero, b"old zero").unwrap();
+    fs::write(&old_one, b"old one").unwrap();
+
+    write_archive_outputs(output.to_str().unwrap(), &[b"new archive".to_vec()], true).unwrap();
+
+    assert_eq!(fs::read(&output).unwrap(), b"new archive");
+    assert!(!old_zero.exists());
+    assert!(!old_one.exists());
+}
+
+#[test]
+fn forced_single_volume_recreate_cleans_siblings_when_output_is_volume_named() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("backup.vol000.tzap");
+    let stale = temp.path().join("backup.vol001.tzap");
+    fs::write(&output, b"old zero").unwrap();
+    fs::write(&stale, b"old one").unwrap();
+
+    write_archive_outputs(output.to_str().unwrap(), &[b"new archive".to_vec()], true).unwrap();
+
+    assert_eq!(fs::read(&output).unwrap(), b"new archive");
+    assert!(!stale.exists());
+}
+
 /// Clear `FILE_ATTRIBUTE_READONLY` so a temp directory can be removed.
 ///
 /// `Permissions::set_readonly(false)` is what `clippy::permissions_set_readonly_false`
@@ -313,6 +388,7 @@ fn tar_stdin_signer_failure_removes_temporary_archive_output() {
         WriterOptions { stripe_width: 1, volume_loss_tolerance: 0, bit_rot_buffer_pct: 0, ..WriterOptions::default() },
         Some(root_auth),
         Some(&mut authenticator),
+        None,
         false,
     )
     .unwrap_err();
@@ -356,6 +432,7 @@ fn raw_spool_multi_volume_signer_failure_removes_temporary_archive_outputs_and_s
             WriterOptions { stripe_width: 3, volume_loss_tolerance: 0, bit_rot_buffer_pct: 0, ..WriterOptions::default() },
             Some(root_auth),
             Some(&mut authenticator),
+            None,
             false,
         )
         .unwrap_err();

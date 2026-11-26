@@ -920,7 +920,6 @@ pub(crate) fn portable_symlink_metadata(identity: InputIdentity, _input: &Path) 
 /// `capture_portable_file_metadata`, which this host must not diverge from.
 /// `mtime` is deliberately not here: losing it silently is a different decision.
 fn portable_optional_times(metadata: &fs::Metadata) -> (Option<ArchiveTimestamp>, Option<ArchiveTimestamp>) {
-    let encodable = |time: ArchiveTimestamp| time.canonical_pax_value().is_ok().then_some(time);
     // Preserve a real birth time when the host exposes one. std cannot expose
     // the birth time on musl (statx/STATX_BTIME is unsupported there), so fall
     // back to ctime only when no birth time was supplied. A real but
@@ -932,8 +931,8 @@ fn portable_optional_times(metadata: &fs::Metadata) -> (Option<ArchiveTimestamp>
         use std::os::unix::fs::MetadataExt as _;
         Some(ArchiveTimestamp::new(metadata.ctime(), u32::try_from(metadata.ctime_nsec()).unwrap_or(0)))
     });
-    let created = created.and_then(encodable);
-    (created, metadata.accessed().ok().and_then(|time| archive_timestamp(time).ok()).and_then(encodable))
+    let created = created.and_then(tzap_core::entry_metadata::optional_timestamp_if_encodable);
+    (created, metadata.accessed().ok().and_then(|time| archive_timestamp(time).ok()).and_then(tzap_core::entry_metadata::optional_timestamp_if_encodable))
 }
 
 /// Ownership as observed when the input was first identified, not re-read here:

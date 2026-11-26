@@ -169,8 +169,8 @@ fn capture_portable_file_metadata_once(input: &Path) -> io::Result<CapturedPorta
         use std::os::unix::fs::MetadataExt as _;
         Some(crate::entry_metadata::ArchiveTimestamp::new(metadata.ctime(), u32::try_from(metadata.ctime_nsec()).unwrap_or(0)))
     });
-    let created = created.filter(encodable);
-    let accessed = metadata.accessed().ok().and_then(archive_timestamp_from_system_time).filter(encodable);
+    let created = created.and_then(crate::entry_metadata::optional_timestamp_if_encodable);
+    let accessed = metadata.accessed().ok().and_then(archive_timestamp_from_system_time).and_then(crate::entry_metadata::optional_timestamp_if_encodable);
 
     #[cfg(target_os = "macos")]
     let captured_macos = crate::macos_metadata::capture_macos_metadata(input, symlink)?;
@@ -194,18 +194,6 @@ fn capture_portable_file_metadata_once(input: &Path) -> io::Result<CapturedPorta
         #[cfg(target_os = "macos")]
         macos_identity: captured_macos.identity,
     })
-}
-
-/// Whether a time survives the §16.7.2 encoding, applied where the contract to
-/// drop it is stated rather than left to the writer.
-///
-/// Only the last second before the epoch fails: its integer part would be `-0`,
-/// which the format forbids. The writer propagates that as an error, so without
-/// this an optional `atime` or birth time in that window fails the whole archive
-/// instead of being omitted -- and `mtime`, which genuinely should fail loudly,
-/// is the caller's and is untouched here.
-fn encodable(timestamp: &ArchiveTimestamp) -> bool {
-    timestamp.canonical_pax_value().is_ok()
 }
 
 #[cfg(unix)]

@@ -39,7 +39,7 @@ pub(crate) fn parse_block_region(
     }
     let record_len = block_size.checked_add(BLOCK_RECORD_FRAMING_LEN).ok_or(FormatError::InvalidArchive("BlockRecord length overflow"))?;
     let region_len = end - start;
-    if region_len % record_len != 0 {
+    if !region_len.is_multiple_of(record_len) {
         return Err(FormatError::InvalidArchive("BlockRecord region length is not aligned"));
     }
     let observed_count = region_len / record_len;
@@ -84,7 +84,7 @@ pub(crate) fn validate_seekable_block_region_layout(start: u64, end: u64, block_
     }
     let record_len = block_record_len(block_size)?;
     let region_len = end - start;
-    if region_len % record_len != 0 {
+    if !region_len.is_multiple_of(record_len) {
         return Err(FormatError::InvalidArchive("BlockRecord region length is not aligned"));
     }
     let observed_count = region_len / record_len;
@@ -118,7 +118,7 @@ pub(crate) fn parse_public_block_observation(
     }
     let record_len = block_size.checked_add(BLOCK_RECORD_FRAMING_LEN).ok_or(FormatError::InvalidArchive("BlockRecord length overflow"))?;
     let region_len = scan_limit - start;
-    if region_len % record_len != 0 {
+    if !region_len.is_multiple_of(record_len) {
         return Err(FormatError::InvalidArchive("public BlockRecord observation window is not aligned"));
     }
 
@@ -215,7 +215,7 @@ pub(crate) fn parse_public_block_observation_read_at(
     let record_len_usize = block_size.checked_add(BLOCK_RECORD_FRAMING_LEN).ok_or(FormatError::InvalidArchive("BlockRecord length overflow"))?;
     let record_len = u64::try_from(record_len_usize).map_err(|_| FormatError::InvalidArchive("BlockRecord length overflow"))?;
     let region_len = scan_limit - start;
-    if region_len % record_len != 0 {
+    if !region_len.is_multiple_of(record_len) {
         return Err(FormatError::InvalidArchive("public BlockRecord observation window is not aligned"));
     }
 
@@ -1315,7 +1315,11 @@ pub(crate) fn observed_archive_size(sizes: impl IntoIterator<Item = u64>) -> Res
 }
 
 pub(crate) fn total_extraction_size_cap(options: ReaderOptions, observed_archive_bytes: u64) -> u64 {
-    options.max_total_extraction_size.min(observed_archive_bytes.saturating_mul(10))
+    if options.max_total_extraction_size == DEFAULT_MAX_TOTAL_EXTRACTION_SIZE {
+        DEFAULT_MAX_TOTAL_EXTRACTION_SIZE.min(observed_archive_bytes.saturating_mul(10))
+    } else {
+        options.max_total_extraction_size
+    }
 }
 
 pub(crate) fn utf8_path(bytes: &[u8]) -> Result<String, FormatError> {

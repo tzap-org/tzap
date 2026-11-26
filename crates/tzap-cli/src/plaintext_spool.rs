@@ -83,7 +83,7 @@ pub(crate) fn spool_unknown_size_raw_stdin_in<R: Read>(
         }
         let read = read as u64;
         if read > max_plaintext_bytes.saturating_sub(spool.size) {
-            bail!("plaintext spool cap exceeded: raw stdin is larger than {} bytes", max_plaintext_bytes);
+            bail!("plaintext spool cap exceeded: raw stdin is larger than {max_plaintext_bytes} bytes");
         }
         spool.file.as_mut().expect("spool file is present until drop").write_all(&buffer[..read as usize]).context("failed to write plaintext spool")?;
         spool.size += read;

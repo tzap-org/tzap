@@ -53,7 +53,7 @@ pub(crate) fn run_extract(quiet: bool, args: ExtractArgs) -> Result<()> {
         if dry_run {
             eprintln!("extract dry-run summary:");
             eprintln!("  input: archive stdin");
-            eprintln!("  destination: {}", directory);
+            eprintln!("  destination: {directory}");
             eprintln!("  mode: staged non-seekable extract-all");
             return Ok(());
         }
@@ -102,18 +102,16 @@ pub(crate) fn run_extract(quiet: bool, args: ExtractArgs) -> Result<()> {
                     options,
                 )
             }
+        } else if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
+            extract_unencrypted_non_seekable_stream_to_dir_with_bootstrap_sidecar(
+                stdin.lock(),
+                bootstrap_bytes,
+                Path::new(&directory),
+                non_seekable_reader_options(reader_options),
+                options,
+            )
         } else {
-            if let Some(bootstrap_bytes) = bootstrap_bytes.as_deref() {
-                extract_unencrypted_non_seekable_stream_to_dir_with_bootstrap_sidecar(
-                    stdin.lock(),
-                    bootstrap_bytes,
-                    Path::new(&directory),
-                    non_seekable_reader_options(reader_options),
-                    options,
-                )
-            } else {
-                extract_unencrypted_non_seekable_stream_to_dir(stdin.lock(), Path::new(&directory), non_seekable_reader_options(reader_options), options)
-            }
+            extract_unencrypted_non_seekable_stream_to_dir(stdin.lock(), Path::new(&directory), non_seekable_reader_options(reader_options), options)
         }
         .context("failed to extract non-seekable archive stream")?;
         emit_success_summary(
@@ -159,7 +157,7 @@ pub(crate) fn run_extract(quiet: bool, args: ExtractArgs) -> Result<()> {
 
     if dry_run {
         eprintln!("extract dry-run summary:");
-        eprintln!("  destination: {}", directory);
+        eprintln!("  destination: {directory}");
         eprintln!("  archive members:");
         for entry in &requested_entries {
             eprintln!("    {} ({} bytes)", entry.path, entry.file_data_size);

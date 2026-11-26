@@ -1676,15 +1676,26 @@ fn validate_v45_member_graph_and_owned_restore_plan_error_branches() {
     let m2_bytes = member(b"duplicate.txt", b'0', b"b", b"");
     let m2 = parse_tar_member_group(&m2_bytes, 4096).unwrap().to_owned_member().unwrap();
     assert_eq!(
-        validate_owned_restore_plan(&[&m1, &m2], SafeExtractionOptions::default()).unwrap_err(),
+        validate_owned_restore_plan(&[&m1, &m2], SafeExtractionOptions::default(), false).unwrap_err(),
         FormatError::InvalidArchive("restore plan contains duplicate selected paths")
     );
+
+    {
+        let upper_bytes = member(b"Letter.txt", b'0', b"a", b"");
+        let upper = parse_tar_member_group(&upper_bytes, 4096).unwrap().to_owned_member().unwrap();
+        let lower_bytes = member(b"letter.txt", b'0', b"b", b"");
+        let lower = parse_tar_member_group(&lower_bytes, 4096).unwrap().to_owned_member().unwrap();
+        assert_eq!(
+            validate_owned_restore_plan(&[&upper, &lower], SafeExtractionOptions::default(), true).unwrap_err(),
+            FormatError::InvalidArchive("restore plan contains duplicate selected paths")
+        );
+    }
 
     // Case 5: validate_owned_restore_plan hardlink target missing in restore graph
     let h1_bytes = member(b"alias.txt", b'1', b"", b"missing.txt");
     let h1 = parse_tar_member_group(&h1_bytes, 4096).unwrap().to_owned_member().unwrap();
     assert_eq!(
-        validate_owned_restore_plan(&[&h1], SafeExtractionOptions::default()).unwrap_err(),
+        validate_owned_restore_plan(&[&h1], SafeExtractionOptions::default(), false).unwrap_err(),
         FormatError::InvalidArchive("hardlink target is not present in the selected restore graph")
     );
 }
