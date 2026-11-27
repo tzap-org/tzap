@@ -16,8 +16,8 @@ signing profile logic.
 
 ```toml
 [dependencies]
-tzap-core = "0.3.0"
-tzap-plugin-signing = "0.3.0"
+tzap-core = "0.3"
+tzap-plugin-signing = "0.3"
 ```
 
 Follow the [OpenSSL 3.5.9 build setup](https://github.com/tzap-org/tzap/blob/main/public-docs/tzap-installation.md#openssl-for-source-builds)

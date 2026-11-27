@@ -129,7 +129,9 @@ fn package_readmes_render_without_workspace_paths() {
     let signing_readme = read_workspace_file("crates/tzap-plugin-signing/README.md");
     let keywrap_readme = read_workspace_file("crates/tzap-plugin-keywrap/README.md");
 
-    let ver = workspace_version();
+    let workspace_version = workspace_version();
+    let mut version_parts = workspace_version.split('.');
+    let readme_version = format!("{}.{}", version_parts.next().unwrap(), version_parts.next().unwrap());
     assert!(root_readme.contains("brew install tzap"));
     assert!(root_readme.contains("public-docs/tzap-installation.md"));
     assert!(cli_readme.contains("# tzap"));
@@ -139,13 +141,13 @@ fn package_readmes_render_without_workspace_paths() {
     assert!(core_readme.contains("use tzap_core::"));
     assert!(core_readme.contains("write_archive"));
     assert!(core_readme.contains("standalone archive foundation"));
-    assert!(core_readme.contains(&format!("tzap-core = \"{ver}\"")));
+    assert!(core_readme.contains(&format!("tzap-core = \"{readme_version}\"")));
     assert!(signing_readme.contains("# tzap-plugin-signing"));
-    assert!(signing_readme.contains(&format!("tzap-plugin-signing = \"{ver}\"")));
+    assert!(signing_readme.contains(&format!("tzap-plugin-signing = \"{readme_version}\"")));
     assert!(signing_readme.contains("authenticator_value_for_request"));
     assert!(keywrap_readme.contains("# tzap-plugin-keywrap"));
     assert!(keywrap_readme.contains("tzap-core"));
-    assert!(keywrap_readme.contains(&format!("tzap-plugin-keywrap = \"{ver}\"")));
+    assert!(keywrap_readme.contains(&format!("tzap-plugin-keywrap = \"{readme_version}\"")));
     assert!(keywrap_readme.contains("RecipientWrap"));
 
     for readme in [cli_readme, core_readme, signing_readme, keywrap_readme] {
